@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fraud &amp; Imbalanced Data</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#shape">The shape of fraud data</a>
+    <a href="#tactics">Tactics for imbalance</a>
+    <a href="#threshold">Threshold tuning</a>
+    <a href="#cost">Cost-sensitive learning</a>
+    <a href="#labels">Label scarcity &amp; delay</a>
+    <a href="#evaluation">Evaluation that holds in production</a>
+    <a href="#adversarial">Adversarial drift</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-feature-engineering.html">← Previous</a>
+    <a href="06-prompt-engineering-applied.html">Next: Prompt engineering →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Core DS</span>
+  <h1>Fraud &amp; Imbalanced Data</h1>
+  <p class="subtitle">The realities of fraud modeling — class imbalance at 1% or lower, delayed labels, threshold tuning at scale, and adversaries that evolve. SentiLink-flavored throughout.</p>
+</header>
+
+<section id="shape">
+  <h2>The shape of fraud data</h2>
+  <p>Modeling fraud is structurally different from modeling churn or conversion. Three properties to internalize:</p>
+  <ol>
+    <li><strong>Severe class imbalance.</strong> 0.1%–2% positive rate is typical. A naive model can score 99% accuracy by predicting "all clean" — useless.</li>
+    <li><strong>Delayed and partial labels.</strong> Fraud isn't always confirmed at decision time. A chargeback can land 60 days later. A SAR can be filed months after. The label set you train on lags reality.</li>
+    <li><strong>Adversarial.</strong> Fraudsters adapt to your model. Whatever feature catches them today, they evade tomorrow. Static evaluation under-states drift.</li>
+  </ol>
+</section>
+
+<section id="tactics">
+  <h2>Tactics for imbalance</h2>
+
+  <h3>Class weights</h3>
+  <p>Tell the loss function to penalize errors on the minority class more. Cheap and usually first-pass effective.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>class weights in LightGBM</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from lightgbm import LGBMClassifier
+
+# 'balanced' sets weights inversely to class frequency
+model = LGBMClassifier(class_weight='balanced')
+# or: scale_pos_weight = neg/pos for explicit control
+model = LGBMClassifier(scale_pos_weight=99)  # if 1% positives</code></pre>
+  </div>
+
+  <h3>Sample weights</h3>
+  <p>Per-row weights — useful when imbalance isn't just by class but by sub-population (some fraud types are rarer than others and worth more to catch).</p>
+
+  <h3>Undersample the majority</h3>
+  <p>Drop most of the negatives so positives are 5–10% of training. Faster training, sometimes better calibration after recalibration. Watch: undersampling biases probabilities — you must recalibrate to the true rate before serving.</p>
+
+  <h3>SMOTE and synthetic oversampling</h3>
+  <p>Generate synthetic minority examples in feature space. Famous, frequently misused. Two cautions:</p>
+  <ul>
+    <li>SMOTE on categorical / mixed-type features (typical for fraud) produces nonsense synthetic rows. Use SMOTENC for mixed types, but the benefit is smaller.</li>
+    <li>SMOTE outside cross-validation folds <em>leaks</em>. Always synthesize inside each fold.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">SMOTE is not the default answer</span>
+    <p>SMOTE is what intermediate ML candidates reach for. Senior practitioners reach for class weights, threshold tuning, and cost-sensitive learning first — they're simpler, equally effective for tabular fraud, and don't have the leakage risks. "SMOTE" as a knee-jerk answer is a small negative signal.</p>
+  </div>
+
+  <h3>Anomaly detection as a complement</h3>
+  <p>For very rare fraud types (&lt; 0.1%) or "novel" fraud you have no labels for, semi-supervised anomaly detection (isolation forest, autoencoders) can flag candidates for review even when the supervised model misses them. Run in parallel, combine scores.</p>
+</section>
+
+<section id="threshold">
+  <h2>Threshold tuning</h2>
+  <p>The default 0.5 threshold is almost never right for fraud. Pick the threshold based on operational constraints:</p>
+
+  <h3>Fixed-capacity tuning</h3>
+  <p>"Risk ops can review the top 1000 flagged applications per day." Threshold = the score below which fewer than 1000/day are flagged. Track recall at that threshold.</p>
+
+  <h3>Fixed-precision tuning</h3>
+  <p>"We need precision ≥ 80% — false positives are expensive." Find the highest threshold that keeps precision above the line, report recall.</p>
+
+  <h3>Fixed false-positive-rate tuning</h3>
+  <p>"We can tolerate flagging 0.1% of legitimate applications." Threshold = the value that holds FPR at 0.1%.</p>
+
+  <h3>Cost-optimal tuning</h3>
+  <p>If you can dollarize the cost of FP and FN, pick the threshold minimizing expected cost. The most defensible framing in interviews.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>threshold sweep with metric outputs</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import numpy as np
+from sklearn.metrics import precision_score, recall_score
+
+def sweep_thresholds(y_true, y_scores, n=100):
+    cuts = np.linspace(0.01, 0.99, n)
+    results = []
+    for c in cuts:
+        y_pred = (y_scores >= c).astype(int)
+        results.append({
+            'threshold': c,
+            'precision': precision_score(y_true, y_pred, zero_division=0),
+            'recall':    recall_score(y_true, y_pred),
+            'flagged_rate': y_pred.mean(),
+        })
+    return results</code></pre>
+  </div>
+</section>
+
+<section id="cost">
+  <h2>Cost-sensitive learning</h2>
+  <p>The honest framing for fraud. Treat each error as having a dollar cost — false positive costs $X (lost legitimate transaction), false negative costs $Y (fraud loss). Optimize expected cost rather than balanced accuracy.</p>
+
+  <h3>Two implementations</h3>
+  <ul>
+    <li><strong>Per-row sample weights</strong> proportional to dollar value at risk. A $50k loan application has 50× the training weight of a $1k application — and 50× the cost of a wrong prediction.</li>
+    <li><strong>Bayes-decision threshold</strong>. After training a calibrated probabilistic model, the cost-minimizing threshold is the one where the expected cost of acting (precision × FP-cost) equals the expected cost of not acting (1 − precision × FN-cost). Solve for it directly.</li>
+  </ul>
+</section>
+
+<section id="labels">
+  <h2>Label scarcity &amp; delay</h2>
+  <p>Fraud labels aren't all there at training time. Three patterns to handle:</p>
+
+  <h3>Truncated labels</h3>
+  <p>Recent applications might still become fraudulent (chargeback in 30 days, SAR in 60). Treating them as "not fraud" at training time is wrong. Fix: exclude rows from the most recent N days, or model the time-to-event explicitly.</p>
+
+  <h3>Selection bias from manual review</h3>
+  <p>The applications your team manually reviewed and flagged are not a random sample — they're the ones suspicious enough to review. Labels on the un-reviewed population are essentially missing. Methods: inverse-propensity weighting (review-propensity model), bandit-style exploration on a random small fraction of low-risk applications to gather labels.</p>
+
+  <h3>Noisy labels</h3>
+  <p>"Fraud" is often a judgment call by an investigator. Inter-rater agreement on borderline cases is often 70–80%. Robust losses (focal loss), label smoothing, or explicit uncertainty in the loss function help.</p>
+</section>
+
+<section id="evaluation">
+  <h2>Evaluation that holds in production</h2>
+  <p>Most "great offline AUC, mediocre production" cases are due to evaluation methodology, not modeling. The discipline:</p>
+  <ul>
+    <li><strong>Time-based splits</strong>: train on the past, validate on the next month, test on the month after. Mirrors deployment.</li>
+    <li><strong>Group-aware splits</strong>: entities don't repeat across folds.</li>
+    <li><strong>Realistic label maturity</strong>: don't validate on data where labels are still arriving.</li>
+    <li><strong>Report at operational threshold</strong>: AUC is a summary; the deployed system runs at a single threshold. Report metrics there.</li>
+    <li><strong>Stratify reporting</strong>: by product, geography, segment. Average lift masks segment-level regressions.</li>
+  </ul>
+</section>
+
+<section id="adversarial">
+  <h2>Adversarial drift</h2>
+  <p>Fraudsters are an adversary. Things to remember:</p>
+  <ul>
+    <li>A feature that works today may stop working when fraudsters notice. Build features that are <strong>hard to evade</strong>: derived from joint behavior across multiple signals, not single attributes.</li>
+    <li>Retraining cadence matters more for fraud than for static problems. Weekly to monthly is typical.</li>
+    <li>Monitor calibration drift, not just AUC drift. Calibration breaks first when fraudsters mimic legitimate patterns.</li>
+    <li>Keep a fraction of decisions <strong>uncorrelated with the model</strong> (random review) to detect novel patterns the model hasn't learned.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal">
+    <summary>Show probe 1: "Class imbalance is 99/1. What do you do?"</summary>
+    <div class="reveal-body">
+      <p>Don't reach for SMOTE first. Start with: (1) class weights or scale_pos_weight in the model, (2) report PR curve and lift at K%, not accuracy, (3) tune threshold to the operational constraint (capacity, precision, FPR, or cost). SMOTE only if the simpler approaches don't clear the bar, and even then with care about leakage (synthesize inside CV folds) and mixed types (use SMOTENC).</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 2: "How would you pick a threshold for fraud?"</summary>
+    <div class="reveal-body">
+      <p>Four options. (1) Fixed-capacity — match risk ops' review bandwidth. (2) Fixed-precision — false positives are expensive, pick the threshold that holds precision above the line. (3) Fixed-FPR — tolerable rate of flagging legitimate apps. (4) Cost-optimal — dollarize FP and FN costs, minimize expected cost. The last is the most defensible but requires a real cost model; the first is the most operational. Default 0.5 is never the right answer.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 3: "Some of your recent applications might still chargeback. How does that affect training?"</summary>
+    <div class="reveal-body">
+      <p>Truncated labels — labeling them as 'not fraud' is wrong because labels are still arriving. Two fixes. (1) Exclude the most recent N days from training, where N is the typical label maturity window. (2) Model time-to-event explicitly with survival analysis, where unresolved cases are censored, not labeled negative. The first is the simpler default; the second is staff bar when label maturity is highly variable.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 4: "Your model used to catch ring X. It's stopped. Why?"</summary>
+    <div class="reveal-body">
+      <p>Four hypotheses. (1) Ring evolved — they noticed a feature that flagged them and changed behavior. Verify by looking at recent caught examples from that ring vs current evaders. (2) Drift in unrelated features made the model less sensitive — check feature drift and importance over time. (3) Label drift — definition of what counts as ring X changed in the labeling process. (4) The ring genuinely retired. Investigate by examining recent escapes by hand.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 5: "Why keep a random review fraction even when the model is good?"</summary>
+    <div class="reveal-body">
+      <p>To detect novel patterns the model hasn't learned. If you only review what the model flags, you only label what looks like known fraud — and you miss new fraud types entirely. A small random sample (1–5%) of low-risk applications goes to manual review purely as exploration. Catches new patterns before they scale, builds labels for retraining.</p>
+    </div>
+  </details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

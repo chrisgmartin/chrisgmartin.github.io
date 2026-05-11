@@ -22,6 +22,14 @@
       guides: [
         { name: 'Data Analytics Engineering', folder: 'data-analytics-interview-prep' }
       ]
+    },
+    {
+      name: 'Data Science',
+      folder: 'data-science',
+      guides: [
+        { name: 'Product & Analytics Data Science', folder: 'product-analytics-ds' },
+        { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' }
+      ]
     }
   ];
 

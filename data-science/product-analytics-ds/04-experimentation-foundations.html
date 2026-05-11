@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Experimentation Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why this is the load-bearing skill</a>
+    <a href="#anatomy">Anatomy of an experiment</a>
+    <a href="#hypothesis">Hypothesis and metric</a>
+    <a href="#power">Power and sample size</a>
+    <a href="#tests">The tests</a>
+    <a href="#analysis">Analysis time</a>
+    <a href="#pitfalls">The pitfalls</a>
+    <a href="#design-from-prompt">Designing from a fuzzy prompt</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-sql-for-product-analytics.html">← Previous</a>
+    <a href="05-advanced-experimentation.html">Next: Advanced experimentation →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Core DS</span>
+  <h1>Experimentation Foundations</h1>
+  <p class="subtitle">Designing, sizing, running, and analyzing an A/B test — including the failure modes interviewers will probe. Both target JDs call experimentation out by name.</p>
+</header>
+
+<section id="why">
+  <h2>Why this is the load-bearing skill</h2>
+  <p>Both JDs put experimentation at the center. HeyGen lists "design and execute A/B tests" in the responsibilities. Cohere says "design and lead experimentation programs including A/B tests, multi-armed bandits, causal inference studies, that directly map to product and go-to-market decisions." The senior-IC version of this role is judged by the experimentation programs they ran, not the analyses they wrote up.</p>
+  <p>The expectation in a loop is that you can:</p>
+  <ol>
+    <li>Take a vague product prompt ("we want to launch X — how should we measure success?") and produce a defensible experimental design in 10 minutes.</li>
+    <li>Compute power and sample size, including the recovery from "this needs 4 weeks at our traffic" → "what's the smallest detectable effect we can call shipped at 2 weeks?"</li>
+    <li>Name three failure modes that would invalidate your result, and the guardrails that would catch each.</li>
+  </ol>
+</section>
+
+<section id="anatomy">
+  <h2>Anatomy of an experiment</h2>
+  <p>The pieces every interviewer expects you to name, in order:</p>
+  <table>
+    <thead><tr><th>Piece</th><th>What it commits to</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hypothesis</strong></td><td>What change you're making, why it might work, and what you'd expect to see.</td></tr>
+      <tr><td><strong>Unit of randomization</strong></td><td>User, account, session, server, country. Determines what kind of bias your test is vulnerable to.</td></tr>
+      <tr><td><strong>Primary metric</strong></td><td>One. The decision metric. Drive your power calc off this.</td></tr>
+      <tr><td><strong>Secondary metrics</strong></td><td>What you'd report alongside, with appropriate skepticism about multiple-comparison adjustments.</td></tr>
+      <tr><td><strong>Guardrails</strong></td><td>Metrics you'd halt on if they moved badly (latency, crash rate, revenue, customer support volume).</td></tr>
+      <tr><td><strong>Power &amp; sample size</strong></td><td>What effect size you can detect with what α and β at this traffic level.</td></tr>
+      <tr><td><strong>Duration</strong></td><td>Driven by sample size and by novelty effect — at least a full week to cover the weekly cycle, usually two.</td></tr>
+      <tr><td><strong>Decision rule</strong></td><td>What outcomes lead to ship / kill / iterate, written down <em>before</em> the test runs.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The decision rule trap</span>
+    <p>If your team can't agree on what outcome ships the feature <em>before</em> the test runs, the test won't settle the question — people will rationalize whatever shipped. Writing the decision rule down up front is one of the highest-leverage process moves a senior DS makes.</p>
+  </div>
+</section>
+
+<section id="hypothesis">
+  <h2>Hypothesis and metric</h2>
+  <p>A useful hypothesis has three parts:</p>
+  <ol>
+    <li><strong>Change</strong>: "We'll move the upgrade CTA from the settings page to the header."</li>
+    <li><strong>Why it might work</strong>: "Settings is a low-traffic surface; users who'd upgrade aren't seeing the prompt."</li>
+    <li><strong>Expected effect</strong>: "We'd expect a 5–10% lift in weekly upgrade conversion among free users, with no impact on retention."</li>
+  </ol>
+  <p>The "why" line forces specificity. If you can't articulate the mechanism, the test is a fishing expedition.</p>
+  <p>Metric selection: pick a metric that's <strong>sensitive enough to move</strong> in the experiment window (revenue per user often isn't, conversion-to-paid usually is) and <strong>tied directly to the decision</strong> (don't optimize page views when you care about upgrades).</p>
+  <div class="callout warn">
+    <span class="callout-label">Don't optimize a proxy when the goal is downstream</span>
+    <p>"Clicks on the upgrade CTA" is a proxy for "users upgraded." If you ship based on clicks, you can move clicks without moving upgrades. Always carry the downstream metric — and call clicks a secondary metric, not the primary.</p>
+  </div>
+</section>
+
+<section id="power">
+  <h2>Power and sample size</h2>
+  <p>The simple version, internalized: for a two-sample test of proportions at α=0.05, β=0.20 (80% power), to detect a relative lift of <em>r</em> on a baseline rate <em>p</em>, you need roughly</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>back-of-envelope sample size per arm</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import math
+
+def sample_size_per_arm(p_baseline: float, relative_lift: float,
+                        alpha: float = 0.05, power: float = 0.8) -> int:
+    """Two-sample proportion test, two-sided, equal arms."""
+    from scipy.stats import norm
+    p1 = p_baseline
+    p2 = p_baseline * (1 + relative_lift)
+    z_alpha = norm.ppf(1 - alpha / 2)
+    z_beta = norm.ppf(power)
+    pbar = (p1 + p2) / 2
+    numerator = (z_alpha * math.sqrt(2 * pbar * (1 - pbar))
+                 + z_beta * math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2
+    return math.ceil(numerator / (p1 - p2) ** 2)
+
+# Example: 5% baseline, want to detect 10% relative lift
+print(sample_size_per_arm(0.05, 0.10))  # → 30,809 per arm</code></pre>
+  </div>
+  <p>The intuition every senior DS carries:</p>
+  <ul>
+    <li><strong>Smaller relative lifts need quadratically more sample.</strong> Detecting 1% lift costs 100× the sample of detecting 10% lift.</li>
+    <li><strong>Lower baselines need more sample.</strong> Conversion at 1% is much harder to A/B test than conversion at 20%.</li>
+    <li><strong>Variance reduction matters.</strong> CUPED (covered in <a href="05-advanced-experimentation.html">05-advanced-experimentation</a>) can cut required sample by 30–50% for free.</li>
+  </ul>
+
+  <h3>For continuous metrics</h3>
+  <p>The Cohen's d framing: required n per arm is roughly <code>n ≈ 16 / d²</code> at 80% power, where <code>d = (μ1 − μ2) / σ</code>. For session length in minutes (μ=10, σ=15) to detect a 1-minute lift: d=0.067, n ≈ 3,600 per arm.</p>
+  <div class="callout tip">
+    <span class="callout-label">The "what's the smallest lift we can call?" move</span>
+    <p>When traffic is tight, invert the question: "given two weeks of traffic, what's the minimum detectable effect (MDE) at 80% power?" If MDE = 12% and the team thinks the feature is worth 5%, the test won't settle it. Better to know up front than to run it.</p>
+  </div>
+</section>
+
+<section id="tests">
+  <h2>The tests</h2>
+
+  <h3>Two-proportion z-test</h3>
+  <p>For conversion-style binary outcomes. Equivalent to chi-squared. Most experimentation platforms use this.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>two-proportion z-test</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from statsmodels.stats.proportion import proportions_ztest
+
+# 1200/30000 in control, 1380/30000 in treatment
+stat, p_value = proportions_ztest(
+    count=[1200, 1380],
+    nobs=[30000, 30000],
+    alternative='two-sided'
+)
+print(stat, p_value)</code></pre>
+  </div>
+
+  <h3>Welch's t-test</h3>
+  <p>For continuous metrics with potentially unequal variances. Don't use Student's t unless you've verified equal variance — and you usually haven't.</p>
+
+  <h3>Mann–Whitney U (rank-sum)</h3>
+  <p>When your continuous metric is heavily skewed (revenue, session length). Tests whether one distribution stochastically dominates. Don't trust t-tests on revenue data with whales — Mann–Whitney is more honest about what's actually different.</p>
+
+  <h3>Bootstrap confidence intervals</h3>
+  <p>When in doubt, bootstrap. Resample with replacement, compute the metric, repeat 10k times, take percentiles. Works for any metric definition, including ratios.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>bootstrap CI for a ratio metric</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import numpy as np
+
+def bootstrap_diff(treatment, control, n_iter=10000, agg=np.mean):
+    diffs = np.empty(n_iter)
+    for i in range(n_iter):
+        t = np.random.choice(treatment, size=len(treatment), replace=True)
+        c = np.random.choice(control,   size=len(control),   replace=True)
+        diffs[i] = agg(t) - agg(c)
+    return np.percentile(diffs, [2.5, 97.5])</code></pre>
+  </div>
+</section>
+
+<section id="analysis">
+  <h2>Analysis time</h2>
+  <p>You ran the test. Now what.</p>
+  <ol>
+    <li><strong>Sample Ratio Mismatch check</strong> first. Your randomizer was supposed to split 50/50. Did it? Chi-squared the assignment counts against the expected ratio. If it fails (p &lt; 0.001), <em>stop</em>. SRM is the loudest possible signal that something is wrong with the test infrastructure, and any result downstream is suspect.</li>
+    <li><strong>Pre-experiment balance check</strong>. Are the two arms similar on pre-period metrics? If not, your randomization didn't work cleanly — could be a bot in one bucket, a CDN cache, an SDK bug.</li>
+    <li><strong>Primary metric</strong>. Point estimate, confidence interval, p-value. Report all three.</li>
+    <li><strong>Guardrails</strong>. Did any move adversely? If so, weigh the primary lift against the guardrail decline.</li>
+    <li><strong>Secondary metrics</strong>. Adjust for multiple comparisons (Bonferroni or Benjamini-Hochberg) before claiming any of them moved.</li>
+    <li><strong>Heterogeneous effects</strong>. Slice by platform, country, plan type — but only if you'd already committed to those slices before running, otherwise you're p-hacking.</li>
+  </ol>
+</section>
+
+<section id="pitfalls">
+  <h2>The pitfalls</h2>
+  <p>The named failures every loop will ask about:</p>
+
+  <h3>Peeking</h3>
+  <p>Looking at the test repeatedly and stopping when it crosses significance inflates Type I error dramatically. Fix: either pre-commit to a duration and don't peek, or use a sequential test (mSPRT, group sequential, Bayesian) that's valid under continuous monitoring.</p>
+
+  <h3>Sample Ratio Mismatch (SRM)</h3>
+  <p>Assignment ratio drifts from expected. Indicates a bug in the randomizer, in event logging, or in your filter on the downstream table. Cited as the single most common reason experiment platforms produce wrong results.</p>
+
+  <h3>Network effects / SUTVA violations</h3>
+  <p>"Stable Unit Treatment Value Assumption" — one user's outcome shouldn't depend on others' assignment. Violated by: marketplaces (a treatment seller competes with a control seller), social features (treatment user posts content seen by control user), supply-side caps. Fix: randomize at the cluster level (city, marketplace, day).</p>
+
+  <h3>Novelty / primacy effects</h3>
+  <p>Users react to <em>any</em> change initially, then revert to baseline. A 1-week test with a strong first-day signal might be measuring novelty, not steady-state. Fix: run longer, or fit a curve and report the asymptote.</p>
+
+  <h3>Selection bias in opt-in</h3>
+  <p>If you can only run the test on users who landed on a specific surface, the population isn't representative. Be explicit about that in the writeup.</p>
+
+  <h3>p-hacking on secondary slices</h3>
+  <p>"The primary didn't move, but in Tier-2 cities the effect was huge" — only legitimate if you committed to that slice before the test. Otherwise multiple-comparison adjustment is mandatory.</p>
+</section>
+
+<section id="design-from-prompt">
+  <h2>Designing from a fuzzy product prompt</h2>
+  <p>Common interview prompt: <em>"We're considering moving the upgrade CTA to the header. How would you measure success?"</em> The right answer follows a script:</p>
+
+  <ol>
+    <li><strong>Restate the decision</strong>. "We want to know whether moving the CTA increases upgrades, without harming X." Get the interviewer's nod.</li>
+    <li><strong>Pick the primary metric</strong> and defend why. "Weekly conversion to paid, per free user. It's downstream, sensitive on this timescale, ties to revenue." Avoid clicks as primary — they're a proxy.</li>
+    <li><strong>Pick guardrails</strong>. "Crash rate, latency, free-user retention, customer support tickets." Name them; don't wave your hands.</li>
+    <li><strong>Unit of randomization</strong>. "User. Sticky assignment via a hash on user_id."</li>
+    <li><strong>Power</strong>. "Free-to-paid is ~3% weekly. To detect a 10% relative lift at 80% power, we need ~25k users per arm — about a week at our scale."</li>
+    <li><strong>Decision rule</strong>. "If primary lifts ≥5% with p &lt; 0.05 and no guardrail regresses meaningfully, ship. If primary is flat and a guardrail is fine, kill. If the primary is positive but a guardrail moved badly, escalate to product."</li>
+    <li><strong>Risks</strong>. "Novelty effect — we'll commit to two weeks regardless of when the test crosses significance. SRM — we'll check assignment ratios daily."</li>
+  </ol>
+
+  <p>Practice this script with three prompts: a CTA move, a price change, an algorithmic recommendation change. The shape repeats.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal">
+    <summary>Show probe 1: "What does p &lt; 0.05 mean?"</summary>
+    <div class="reveal-body">
+      <p>If the null hypothesis is true (no real effect), there's a less-than-5% chance of seeing a test statistic at least as extreme as what we observed. It's <em>not</em> "5% chance the null is true" — that's a common mis-statement. It's a long-run frequency property of the test under the null.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 2: "Why is peeking bad?"</summary>
+    <div class="reveal-body">
+      <p>Repeated significance tests on the same accumulating data inflate the Type I error rate. At 10 looks, your effective false-positive rate is closer to 20% than 5%. Either commit to a fixed sample size and don't peek, or use a sequential test (mSPRT, group sequential boundaries) that's valid under continuous monitoring.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 3: "When would you not run an A/B test?"</summary>
+    <div class="reveal-body">
+      <p>Five cases: (1) the change is reversible and the downside is bounded — just ship it; (2) you don't have the traffic for adequate power on the primary metric; (3) the unit you'd need to randomize on is a region/market and you'd contaminate (use a switchback or quasi-experiment instead); (4) the change is required for compliance or contract — there's no "kill" option; (5) the metric you care about is too long-horizon to measure in a test window — use a leading indicator and triangulate.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 4: "Your test ran for two weeks, primary moved +3%, p = 0.04. Ship?"</summary>
+    <div class="reveal-body">
+      <p>"Probably, but I'd check four things first. (1) SRM — was the split clean? (2) Pre-experiment balance — were the arms similar on pre-period? (3) Did any guardrail regress meaningfully? (4) Was the +3% concentrated in a sub-segment or distributed? If all clean, I'd ship and continue monitoring the primary in the post-period for novelty fade." Notice: I didn't just say "yes." The reasoning is the answer.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 5: "What's a SUTVA violation? Give an example."</summary>
+    <div class="reveal-body">
+      <p>The Stable Unit Treatment Value Assumption: user A's outcome doesn't depend on whether user B is in treatment or control. Violations: (a) marketplace tests where a treatment seller competes with a control seller for the same buyer; (b) social-feed changes where treatment posts are seen by control users; (c) supply-side caps where treatment uses inventory control was supposed to have. Fix: cluster-randomize at the level that contains the spillover (city, market, day).</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 6: "What's CUPED and when do you use it?"</summary>
+    <div class="reveal-body">
+      <p>Controlled-experiment Using Pre-Experiment Data — variance reduction via covariate adjustment with a pre-period covariate (typically the same metric measured pre-experiment). Reduces required sample by 30–50% if the pre-period covariate is correlated with the outcome. Standard at scale; covered in <a href="05-advanced-experimentation.html">05-advanced-experimentation</a>.</p>
+    </div>
+  </details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

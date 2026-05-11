@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Production ML</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#bar">The "end-to-end ownership" bar</a>
+    <a href="#code">Production code quality</a>
+    <a href="#testing">Testing</a>
+    <a href="#inference">Real-time inference</a>
+    <a href="#monitoring">Monitoring</a>
+    <a href="#retraining">Retraining cadence</a>
+    <a href="#rollout">Rollouts &amp; canaries</a>
+    <a href="#oncall">On-call considerations</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-data-pipelines-applied.html">← Previous</a>
+    <a href="10-coding-fundamentals.html">Next: Coding →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Core DS</span>
+  <h1>Production ML</h1>
+  <p class="subtitle">The operational craft a staff DS at SentiLink is expected to bring — production code quality, real-time inference patterns, monitoring, retraining, rollouts, and on-call.</p>
+</header>
+
+<section id="bar">
+  <h2>The "end-to-end ownership" bar</h2>
+  <p>SentiLink's JD: <em>"This is a full-stack data science role, involving model development, analysis, and writing production code."</em> And: <em>"Write production-ready code that can be relied on for real-time decision making by our partners."</em></p>
+  <p>What that means in interviews: you'll be asked about how your code looks, how it's tested, how it deploys, how it's monitored, and what happens when it breaks. Not just "show me an AUC curve."</p>
+</section>
+
+<section id="code">
+  <h2>Production code quality</h2>
+  <p>The dividing line between research code and production code:</p>
+
+  <h3>Modules, not notebooks</h3>
+  <p>Code lives in <code>.py</code> files, organized into modules. Notebooks are exploration; the deliverable is importable code.</p>
+
+  <h3>Types</h3>
+  <p>Type hints everywhere. Modern Python: <code>list[int]</code>, <code>dict[str, float]</code>, <code>Optional[X]</code>. <code>mypy</code> or <code>pyright</code> in CI.</p>
+
+  <h3>Small functions</h3>
+  <p>One responsibility per function. Pure where possible. Mocking and testing become easy when functions don't have hidden dependencies.</p>
+
+  <h3>Configuration over hard-coded values</h3>
+  <p>Thresholds, model paths, feature flags — externalize. Read from environment or a config file. Don't <code>edit the model_path = "..."</code> line every deploy.</p>
+
+  <h3>Error handling</h3>
+  <p>Be explicit about what fails how. Validate inputs at module boundaries; trust within the module. Don't catch broadly when you should let the failure propagate.</p>
+
+  <h3>Logging</h3>
+  <p>Structured logging (JSON) at appropriate levels. INFO for normal operation, WARNING for unusual but handled, ERROR for failures that need attention. Include correlation IDs so a single request can be traced across services.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>shape of a production scoring function</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import logging
+from dataclasses import dataclass
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class ScoringResult:
+    score: float
+    decision: str
+    model_version: str
+    features_used: dict[str, float]
+    correlation_id: str
+
+class Scorer:
+    def __init__(self, model, threshold: float, version: str):
+        self.model = model
+        self.threshold = threshold
+        self.version = version
+
+    def score(self, features: dict[str, float], correlation_id: str) -> ScoringResult:
+        if not features:
+            raise ValueError("empty features dict")
+        probs = self.model.predict_proba([list(features.values())])[0]
+        score = float(probs[1])
+        decision = "flag" if score >= self.threshold else "pass"
+        logger.info("scored", extra={
+            "correlation_id": correlation_id,
+            "score": score,
+            "decision": decision,
+            "model_version": self.version,
+        })
+        return ScoringResult(score, decision, self.version, features, correlation_id)</code></pre>
+  </div>
+</section>
+
+<section id="testing">
+  <h2>Testing</h2>
+  <p>Production ML needs three layers of tests:</p>
+
+  <h3>Unit tests</h3>
+  <p>Each function tested in isolation. Feature transformations, scoring logic, threshold decisions. Use <code>pytest</code>. Aim for high coverage on critical paths.</p>
+
+  <h3>Integration tests</h3>
+  <p>The scoring pipeline end-to-end on a known input. "Given this raw application, the service produces this score." Catches issues at module boundaries that unit tests miss.</p>
+
+  <h3>Model-quality regression tests</h3>
+  <p>Special to ML. Hold a frozen labeled test set. On every model change, score the test set and require AUC (or lift at K%) to be at least X. Prevents accidental quality regressions from deploy.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The discipline that signals staff bar</span>
+    <p>"I wouldn't ship a model change without the regression test set passing" is the line that separates a researcher from a production engineer. Mention it unprompted.</p>
+  </div>
+</section>
+
+<section id="inference">
+  <h2>Real-time inference</h2>
+  <p>SentiLink's APIs run in the milliseconds. Patterns that matter:</p>
+
+  <h3>Feature precomputation</h3>
+  <p>For features that can't be computed in the request budget (cross-entity aggregates, graph features), precompute and cache. The request looks up the cached value.</p>
+
+  <h3>Model serialization</h3>
+  <p>Don't load Pickled models per request. Load once at service startup; keep the model in memory; reuse across requests.</p>
+
+  <h3>Batching</h3>
+  <p>When latency permits, batch multiple requests into one model call. Gradient boosting and neural network inference benefit substantially from batching.</p>
+
+  <h3>Cold-path vs hot-path</h3>
+  <p>Some features need synchronous lookup (call a bureau API). Some don't (lookup in a precomputed feature store). Separate the two paths; budget the latency accordingly.</p>
+
+  <h3>Fallbacks</h3>
+  <p>If a downstream feature service times out, return a conservative default rather than failing the request. The decision has to happen; missing a feature isn't a reason to deny the application.</p>
+</section>
+
+<section id="monitoring">
+  <h2>Monitoring</h2>
+  <p>Four layers of monitoring for a deployed model:</p>
+
+  <h3>1. Service health</h3>
+  <p>Latency p50/p95/p99, error rate, throughput. SRE-style metrics, alertable.</p>
+
+  <h3>2. Input drift</h3>
+  <p>PSI per feature in a rolling window. Alert when distribution shifts beyond a threshold. Catches upstream data issues fast.</p>
+
+  <h3>3. Output drift</h3>
+  <p>Score distribution shifts. Mean, median, P95, fraction above the threshold. Alert when these drift past historical bands.</p>
+
+  <h3>4. Outcome metrics</h3>
+  <p>When labels arrive (chargebacks, manual reviews), score the model on the new labels and confirm AUC, calibration, and lift haven't degraded. This is the slow but ground-truth signal.</p>
+
+  <h3>The dashboard</h3>
+  <p>A senior DS owns the model's monitoring dashboard. It shows all four layers on one page, with thresholds and recent alerts. Stakeholders can glance at it and see model health.</p>
+</section>
+
+<section id="retraining">
+  <h2>Retraining cadence</h2>
+  <p>How often to retrain depends on the rate of drift:</p>
+  <ul>
+    <li><strong>Stable problems</strong> (legal-text classification, equipment-failure prediction): quarterly retrain is plenty.</li>
+    <li><strong>Moderate drift</strong> (lending propensity, churn): monthly.</li>
+    <li><strong>High drift / adversarial</strong> (fraud detection): weekly to bi-weekly. SentiLink-scale.</li>
+    <li><strong>Continuous</strong>: online learning with frequent micro-updates. Rare in production fraud because validation rigor is harder; usually a batch retrain on a fast cycle is sufficient.</li>
+  </ul>
+
+  <h3>Triggered retraining</h3>
+  <p>Beyond cadence, retrain when monitoring triggers fire: significant input drift, output drift, outcome regression. Build the path for triggered retraining alongside the scheduled one.</p>
+</section>
+
+<section id="rollout">
+  <h2>Rollouts &amp; canaries</h2>
+  <p>A new model isn't a deploy you flip in one shot. Stages:</p>
+
+  <h3>Shadow mode</h3>
+  <p>New model scores every request alongside the current model. Decisions still made by the current model. Compare new scores to old; check for unexpected behavior. Run for days to weeks.</p>
+
+  <h3>Canary</h3>
+  <p>New model makes decisions on a small slice (1–5%) of traffic, in addition to its shadow scoring on the rest. Monitor outcome metrics on the canary. Promote to full rollout if metrics hold.</p>
+
+  <h3>A/B rollout</h3>
+  <p>50/50 split. Compare outcome metrics. Promote winner. Useful when you want a clean lift estimate, not just a quality regression check.</p>
+
+  <h3>Full rollout</h3>
+  <p>New model is the decision-maker. Old model kept in shadow for a while for comparison and easy revert.</p>
+</section>
+
+<section id="oncall">
+  <h2>On-call considerations</h2>
+  <p>A production ML service is on the on-call rotation if it's serving live decisions. The senior DS owns:</p>
+  <ul>
+    <li><strong>Runbooks</strong>: when X alert fires, do Y. Covers common failures (input feature stale, model not loaded, downstream timeout).</li>
+    <li><strong>Rollback procedure</strong>: how to revert to the previous model version in under a minute.</li>
+    <li><strong>Escalation</strong>: who do you wake up at 3 AM? When?</li>
+    <li><strong>Post-mortems</strong>: every incident gets one. Root cause, contributing factors, action items, and (critically) what evaluation gap let the issue ship.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal">
+    <summary>Show probe 1: "Walk me through deploying a new fraud model."</summary>
+    <div class="reveal-body">
+      <p>Stages: (1) Model-quality regression test on the frozen labeled set must pass. (2) Shadow mode against production traffic for 1–2 weeks; compare score distribution and feature usage against the existing model. (3) Canary on 1–5% of traffic; monitor outcome metrics until labels arrive. (4) A/B or full rollout if outcomes hold. (5) Keep old model in shadow for fast revert. Plus runbooks and on-call handoff at each stage.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 2: "What do you monitor for a deployed model?"</summary>
+    <div class="reveal-body">
+      <p>Four layers. (1) Service health — latency p95/p99, error rate, throughput. (2) Input drift — PSI per feature in a rolling window. (3) Output drift — score distribution shifts. (4) Outcome metrics — AUC, calibration, lift on a rolling labeled window, once labels arrive. Senior signal: naming all four; many candidates name only the first three.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 3: "Your model's calibration is drifting. What do you do?"</summary>
+    <div class="reveal-body">
+      <p>(1) Confirm drift is real (not a small sample artifact). (2) Decide: recalibrate or retrain? Recalibration on recent labels is faster and reversible; retraining addresses underlying changes in feature-target relationship. (3) Run a temporary recalibrator (isotonic on the latest labeled window) to bridge while preparing a full retrain. (4) Communicate to consumers — calibration changes affect downstream thresholds.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 4: "How do you test ML code?"</summary>
+    <div class="reveal-body">
+      <p>Three layers. Unit tests on transformation, scoring, threshold functions. Integration tests on the end-to-end scoring pipeline with known inputs and expected outputs. Model-quality regression tests — a frozen labeled set with a minimum AUC or lift threshold that must pass before merging a model change. The third is what separates production ML from research ML.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 5: "Sub-100ms latency for fraud scoring. How do you achieve it?"</summary>
+    <div class="reveal-body">
+      <p>Precompute expensive features (cross-entity aggregates, graph features) into a feature store keyed for fast lookup. Model loaded once at service startup, kept in memory. Lightweight serialization (e.g., LightGBM's native format, not Pickle). No synchronous calls to slow downstreams in the hot path — if you must call a bureau, do it async with a tight timeout and a fallback. Profile the path; usually the model itself is &lt;5ms; the rest is feature lookup and serialization.</p>
+    </div>
+  </details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

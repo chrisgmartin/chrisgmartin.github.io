@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL for Product Analytics</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why SQL is the gatekeeper</a>
+    <a href="#windows">Window functions</a>
+    <a href="#cohorts">Cohort retention</a>
+    <a href="#funnels">Funnels</a>
+    <a href="#sessions">Sessionization</a>
+    <a href="#gaps">Gaps &amp; islands</a>
+    <a href="#gotchas">The gotchas</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-experimentation-foundations.html">Next: Experimentation →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Core DS</span>
+  <h1>SQL for Product Analytics</h1>
+  <p class="subtitle">The dialect of SQL that product DS loops actually test — window functions, cohorts, funnels, sessionization, gaps-and-islands, and the gotchas interviewers love.</p>
+</header>
+
+<section id="why">
+  <h2>Why SQL is the gatekeeper</h2>
+  <p>Both target JDs name SQL explicitly. HeyGen wants "expert SQL." Cohere wants "strong command of SQL, Python, and Git." For product DS loops at AI companies, the SQL screen is almost always the first technical filter — usually one or two timed problems where you live-share a screen, get a schema, and write queries against it on the spot.</p>
+  <p>The bar isn't "knows SQL." The bar is <strong>writes correct SQL fast, with appropriate use of window functions, without flinching at gotchas</strong>. Interviewers are looking for three signals:</p>
+  <ol>
+    <li>You reach for window functions before self-joins, when both work.</li>
+    <li>You handle NULLs and dedupe deliberately, not by accident.</li>
+    <li>You can read a schema and ask one or two sharp clarifying questions before writing anything.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Calibration</span>
+    <p>If you can answer the "find the second-highest salary per department" problem with a window function in under 3 minutes including the NULL edge case, you're at the entry bar. If you can also write a 7-day rolling DAU with a partitioned window, you're at the comfortable bar. The Cohere-level bar is comfortable plus quasi-experimental quirks like CUPED variance reduction (which we'll meet in <a href="05-advanced-experimentation.html">05-advanced-experimentation</a>).</p>
+  </div>
+</section>
+
+<section id="windows">
+  <h2>Window functions</h2>
+  <p>Window functions are the dividing line between "SQL fluent" and "SQL strong" for analytics. Everything else in this chapter rests on them. The four families to know cold:</p>
+
+  <h3>Ranking: <code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code></h3>
+  <p>Pick exactly one row per group ("most recent order per user"), or rank within groups ("top 3 products by revenue per category"). The difference matters in tie cases:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>row_number vs rank vs dense_rank</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Most recent order per user
+SELECT user_id, order_id, ordered_at
+FROM (
+  SELECT
+    user_id,
+    order_id,
+    ordered_at,
+    ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ordered_at DESC) AS rn
+  FROM orders
+) t
+WHERE rn = 1;
+
+-- ROW_NUMBER: ties broken arbitrarily, exactly 1 row per group
+-- RANK:       ties share a rank, next rank skips (1,2,2,4)
+-- DENSE_RANK: ties share a rank, next rank doesn't skip (1,2,2,3)</code></pre>
+  </div>
+
+  <h3>Offset: <code>LAG</code>, <code>LEAD</code></h3>
+  <p>Compare a row to the previous or next row in its partition. Use for diffs, retention, churn detection, time-between-events.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>days between consecutive orders per user</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  user_id,
+  ordered_at,
+  LAG(ordered_at) OVER (PARTITION BY user_id ORDER BY ordered_at) AS prev_order_at,
+  DATE_DIFF('day',
+    LAG(ordered_at) OVER (PARTITION BY user_id ORDER BY ordered_at),
+    ordered_at) AS days_since_prev
+FROM orders;</code></pre>
+  </div>
+
+  <h3>Aggregate windows: <code>SUM</code>, <code>AVG</code>, <code>COUNT</code> with <code>OVER</code></h3>
+  <p>Running totals, moving averages, share-of-total. Frame clauses matter — default is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> when you specify <code>ORDER BY</code>, which trips people up.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>7-day rolling DAU</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT user_id) AS dau
+  FROM events
+  GROUP BY event_date
+)
+SELECT
+  event_date,
+  dau,
+  AVG(dau) OVER (
+    ORDER BY event_date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS dau_7d_avg
+FROM daily
+ORDER BY event_date;</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">Frame trap</span>
+    <p>Use <code>ROWS BETWEEN</code> for moving averages over time, not <code>RANGE</code>. <code>RANGE</code> treats <em>logical</em> ranges (e.g., "all rows with the same timestamp"), which breaks when your data has gaps. This is a classic interviewer gotcha.</p>
+  </div>
+
+  <h3>First/last: <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, <code>NTH_VALUE</code></h3>
+  <p>Carry a value from the first/last row of a partition into every other row. Useful for "what was the user's first plan?" or "what was the last touchpoint before conversion?"</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>first plan per user, carried forward</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  user_id,
+  event_at,
+  plan,
+  FIRST_VALUE(plan) OVER (
+    PARTITION BY user_id
+    ORDER BY event_at
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS first_plan
+FROM plan_changes;</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">LAST_VALUE trap</span>
+    <p><code>LAST_VALUE</code> with a default frame returns the current row, not the last in the partition — because the default frame ends at CURRENT ROW. Always specify <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code> when you want the partition-wide last.</p>
+  </div>
+</section>
+
+<section id="cohorts">
+  <h2>Cohort retention</h2>
+  <p>"Of users who signed up in week N, how many came back in week N+k?" — the question every product DS gets asked. Two versions: <strong>classical retention</strong> (came back at all by week N+k) and <strong>n-day return</strong> (came back exactly on day N+k).</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>classical weekly retention triangle</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH cohorts AS (
+  SELECT
+    user_id,
+    DATE_TRUNC('week', signup_at) AS cohort_week
+  FROM users
+),
+activity AS (
+  SELECT DISTINCT
+    user_id,
+    DATE_TRUNC('week', event_at) AS activity_week
+  FROM events
+)
+SELECT
+  c.cohort_week,
+  DATE_DIFF('week', c.cohort_week, a.activity_week) AS weeks_since_signup,
+  COUNT(DISTINCT c.user_id) AS retained_users,
+  COUNT(DISTINCT c.user_id) * 1.0 /
+    FIRST_VALUE(COUNT(DISTINCT c.user_id)) OVER (
+      PARTITION BY c.cohort_week
+      ORDER BY DATE_DIFF('week', c.cohort_week, a.activity_week)
+    ) AS retention_rate
+FROM cohorts c
+LEFT JOIN activity a
+  ON c.user_id = a.user_id
+  AND a.activity_week >= c.cohort_week
+GROUP BY 1, 2
+ORDER BY 1, 2;</code></pre>
+  </div>
+  <p>The denominator trick (<code>FIRST_VALUE</code> over the cohort partition) avoids the second pass that beginner versions of this query use.</p>
+</section>
+
+<section id="funnels">
+  <h2>Funnels</h2>
+  <p>"Of users who hit step 1, how many reached step N?" — with an ordering constraint (step N must come after step N-1 in time, for the same user). The naive self-join answer is O(steps²); the right answer uses a window function:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>signup → upload → publish funnel</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH user_steps AS (
+  SELECT
+    user_id,
+    MAX(CASE WHEN event = 'signup'  THEN event_at END) AS signup_at,
+    MAX(CASE WHEN event = 'upload'  THEN event_at END) AS upload_at,
+    MAX(CASE WHEN event = 'publish' THEN event_at END) AS publish_at
+  FROM events
+  GROUP BY user_id
+)
+SELECT
+  COUNT(*)                                                                  AS signup_count,
+  COUNT(CASE WHEN upload_at  > signup_at THEN 1 END)                        AS upload_count,
+  COUNT(CASE WHEN publish_at > upload_at AND upload_at > signup_at THEN 1 END) AS publish_count
+FROM user_steps;</code></pre>
+  </div>
+  <p>Two refinements interviewers will probe:</p>
+  <ul>
+    <li><strong>First occurrence vs any occurrence.</strong> If a user signs up, uploads, signs up again (via referral?), then uploads — does the second upload count? Usually you want <code>MIN()</code> for signup and the next-step <code>MIN()</code> that follows it. Be explicit about the rule.</li>
+    <li><strong>Time-window funnels.</strong> "Reached step N within 7 days of step N-1" requires keeping the previous step's timestamp via window function and filtering on the diff.</li>
+  </ul>
+</section>
+
+<section id="sessions">
+  <h2>Sessionization</h2>
+  <p>Group consecutive events into sessions based on a gap rule ("if more than 30 minutes elapsed, start a new session"). The canonical pattern uses <code>LAG</code> + a running sum on the "is this a new session" flag:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>30-minute gap sessionization</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH gapped AS (
+  SELECT
+    user_id,
+    event_at,
+    CASE
+      WHEN DATE_DIFF('minute',
+                     LAG(event_at) OVER (PARTITION BY user_id ORDER BY event_at),
+                     event_at) > 30
+        OR LAG(event_at) OVER (PARTITION BY user_id ORDER BY event_at) IS NULL
+      THEN 1 ELSE 0
+    END AS is_new_session
+  FROM events
+),
+sessioned AS (
+  SELECT
+    user_id,
+    event_at,
+    SUM(is_new_session) OVER (PARTITION BY user_id ORDER BY event_at) AS session_id
+  FROM gapped
+)
+SELECT
+  user_id,
+  session_id,
+  MIN(event_at) AS session_start,
+  MAX(event_at) AS session_end,
+  COUNT(*)      AS event_count
+FROM sessioned
+GROUP BY 1, 2;</code></pre>
+  </div>
+</section>
+
+<section id="gaps">
+  <h2>Gaps and islands</h2>
+  <p>The classical pattern: given a sequence of events, group consecutive runs (subscribers continuously active week-over-week, days a user logged in consecutively). The trick is the "tabibitosan" identity — subtract a running rank from the date to collapse runs into the same group:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>consecutive login streaks per user</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT DISTINCT user_id, DATE_TRUNC('day', event_at) AS login_day
+  FROM events
+),
+grouped AS (
+  SELECT
+    user_id,
+    login_day,
+    DATE_DIFF('day', '1970-01-01', login_day) -
+      ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_day) AS streak_key
+  FROM daily
+)
+SELECT
+  user_id,
+  MIN(login_day) AS streak_start,
+  MAX(login_day) AS streak_end,
+  COUNT(*)       AS streak_days
+FROM grouped
+GROUP BY user_id, streak_key
+ORDER BY user_id, streak_start;</code></pre>
+  </div>
+  <p>Read carefully: the streak_key is <em>"date number minus rank"</em>. For consecutive dates, both increase by 1, so the difference is constant within a run — and changes only at the gap. Same trick with <code>generate_series</code> for "find missing dates."</p>
+</section>
+
+<section id="gotchas">
+  <h2>The gotchas interviewers love</h2>
+  <p>If they're testing you, they're testing these:</p>
+
+  <h3>NULL semantics</h3>
+  <ul>
+    <li><code>COUNT(*)</code> counts NULLs, <code>COUNT(col)</code> doesn't. <code>COUNT(DISTINCT col)</code> ignores NULLs.</li>
+    <li><code>col != 'x'</code> excludes NULL rows. If you want them, write <code>col IS DISTINCT FROM 'x'</code> (or <code>COALESCE(col,'') != 'x'</code> in older dialects).</li>
+    <li><code>NOT IN (subquery)</code> returns zero rows if any subquery row is NULL. Use <code>NOT EXISTS</code>.</li>
+  </ul>
+
+  <h3>Dedupe before you join</h3>
+  <p>If your join key isn't unique on both sides, you'll silently multiply rows. Dedupe with <code>ROW_NUMBER()</code> or <code>DISTINCT</code> explicitly. A sanity check interviewers love: "what's the row count of left, right, joined? Does the joined count make sense?"</p>
+
+  <h3>Time-zone and DST</h3>
+  <p>Always say which time zone you're truncating to. <code>DATE_TRUNC('day', event_at)</code> in UTC vs the user's local zone produces different daily metrics. The right answer is usually "use the customer's reporting zone, store UTC in the warehouse, convert in the metric query."</p>
+
+  <h3>Group-by-with-CASE for pivots</h3>
+  <p>Long-to-wide reshapes use <code>SUM(CASE WHEN ... THEN ... END)</code>. Don't reach for <code>PIVOT</code> unless your dialect supports it and your interviewer specifically asks.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+  <p>The questions you should be able to answer cold:</p>
+
+  <details class="reveal">
+    <summary>Show probe 1: "Difference between ROW_NUMBER, RANK, DENSE_RANK?"</summary>
+    <div class="reveal-body">
+      <p>All three rank within a partition by an order. ROW_NUMBER always assigns 1,2,3 — ties broken arbitrarily. RANK gives ties the same rank, then skips (1,2,2,4). DENSE_RANK gives ties the same rank and doesn't skip (1,2,2,3). Use ROW_NUMBER for "exactly one row per group"; use RANK or DENSE_RANK when ties are real and you want them surfaced.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 2: "Why does <code>NOT IN (SELECT ...)</code> sometimes return zero rows?"</summary>
+    <div class="reveal-body">
+      <p>If the subquery returns even one NULL, the whole <code>NOT IN</code> evaluates to UNKNOWN for every row, which filters everything out. <code>NOT EXISTS</code> uses correlated lookup with proper NULL handling. Default to <code>NOT EXISTS</code>.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 3: "Why does LAST_VALUE return the current row by default?"</summary>
+    <div class="reveal-body">
+      <p>When you specify <code>ORDER BY</code> in a window without an explicit frame, the default frame is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. LAST_VALUE applies to that frame, so the "last" is the current row. Fix: <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code>.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 4: "How would you compute MAU as a 28-day rolling window per day?"</summary>
+    <div class="reveal-body">
+      <p>Build the daily distinct-user log, then for each day count distinct users in the prior 28 days. Naive version: self-join. Better version: precompute first-seen / last-seen and use it; or, in dialects that support it, use HyperLogLog-style approximate distinct counts. Be ready to discuss the "I can't COUNT(DISTINCT) in a window frame" constraint and the workarounds.</p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Show probe 5: "Walk me through a query that's slow. How do you debug it?"</summary>
+    <div class="reveal-body">
+      <p>Six-step protocol: (1) check the query plan / <code>EXPLAIN</code> for full scans or hash spills; (2) confirm partition pruning is happening on date-partitioned tables; (3) check skew in any GROUP BY or JOIN keys; (4) confirm join cardinality — Cartesian explosions hide in many-to-many joins; (5) sample the input tables and see if pre-filtering helps; (6) for warehouse SQL, check whether materializing an intermediate CTE as a table speeds it up.</p>
+    </div>
+  </details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
