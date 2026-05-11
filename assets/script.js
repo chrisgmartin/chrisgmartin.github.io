@@ -170,7 +170,7 @@
     crumbs.appendChild(sep('·'));
     crumbs.appendChild(link(root + ctx.topic.folder + '/index.html', ctx.topic.name));
     crumbs.appendChild(sep('›'));
-    crumbs.appendChild(link(root + ctx.guide.folder + '/index.html', ctx.guide.name));
+    crumbs.appendChild(link(root + ctx.topic.folder + '/' + ctx.guide.folder + '/index.html', ctx.guide.name));
     crumbs.appendChild(sep('›'));
     const current = document.createElement('span');
     current.setAttribute('aria-current', 'page');

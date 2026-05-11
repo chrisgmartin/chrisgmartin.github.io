@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Modeling — Kimball, Star Schema, SCDs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Foundations</h2>
+    <a href="#grain">Grain — the first thing</a>
+    <a href="#facts-dims">Facts and dimensions</a>
+    <a href="#star">Star schema</a>
+    <a href="#snowflake">Snowflake schema</a>
+    <a href="#obt">One Big Table (OBT)</a>
+
+    <h2>Time</h2>
+    <a href="#scd">Slowly Changing Dimensions</a>
+    <a href="#scd-types">SCD types 1/2/3/6</a>
+    <a href="#date-dim">The date dimension</a>
+
+    <h2>Patterns</h2>
+    <a href="#snapshot-fact">Snapshot fact tables</a>
+    <a href="#bridge">Bridge tables</a>
+    <a href="#degenerate">Degenerate dimensions</a>
+    <a href="#conformed">Conformed dimensions</a>
+
+    <h2>Design</h2>
+    <a href="#design-question">How to answer "design a model for X"</a>
+    <a href="#talking-points">Talking points</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-dbt-deep-dive.html">← Previous</a>
+    <a href="07-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Critical</span>
+  <h1>Data Modeling</h1>
+  <p class="subtitle">Kimball star schema, slowly-changing dimensions, OBT, grain. The conceptual heart of analytics engineering — get this right and most other questions get easier.</p>
+</header>
+
+<section id="grain">
+  <h2>Grain — the first thing you ask, always</h2>
+  <p>Before designing anything, before writing any SQL, before any modeling discussion: <strong>what is the grain of this table?</strong></p>
+  <p>Grain = what does one row represent. <em>"One row per order."</em> <em>"One row per user per day."</em> <em>"One row per GPU per minute."</em> <em>"One row per inference request."</em></p>
+  <p>If you can't state the grain of a table in one sentence, the model isn't right yet.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Senior tell</span>
+    <p>Saying <em>"what's the grain of this table?"</em> out loud in any modeling discussion. Interviewers physically lean in.</p>
+  </div>
+
+  <h3>Atomic grain vs aggregated grain</h3>
+  <p>Always model facts at the <em>atomic</em> grain (the lowest possible), then aggregate on top. <em>"One row per order_item"</em> is more atomic than <em>"one row per order"</em>. Atomic grain is harder to recreate from aggregated grain; the reverse is easy.</p>
+</section>
+
+<section id="facts-dims">
+  <h2>Facts and dimensions — the Kimball vocabulary</h2>
+
+  <h3>Fact tables (<code>fct_*</code>)</h3>
+  <ul>
+    <li><strong>Hold measures</strong> — things you sum/count/average (revenue, count, duration).</li>
+    <li><strong>Tall and narrow</strong> — many rows, relatively few columns.</li>
+    <li><strong>Time-anchored</strong> — almost always have an event timestamp.</li>
+    <li><strong>Foreign keys to dimensions</strong> — <code>user_id</code>, <code>product_id</code>, <code>date_key</code>.</li>
+    <li><strong>One row per atomic event</strong> — order_placed, inference_request, gpu_minute.</li>
+  </ul>
+
+  <h3>Dimension tables (<code>dim_*</code>)</h3>
+  <ul>
+    <li><strong>Hold attributes / descriptions</strong> — name, status, country, tier.</li>
+    <li><strong>Short and wide</strong> — fewer rows, many columns.</li>
+    <li><strong>One row per entity</strong> — one row per user, one row per product, one row per date.</li>
+    <li><strong>Updated when entities change</strong> (slowly — hence "slowly changing dimensions").</li>
+  </ul>
+
+  <h3>Three types of fact tables</h3>
+  <table>
+    <thead><tr><th>Type</th><th>What it captures</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Transaction fact</strong></td><td>One row per atomic event</td><td><code>fct_orders</code>, <code>fct_inference_requests</code></td></tr>
+      <tr><td><strong>Periodic snapshot fact</strong></td><td>One row per entity per period</td><td><code>fct_daily_account_balance</code>, <code>fct_gpu_hourly_utilization</code></td></tr>
+      <tr><td><strong>Accumulating snapshot fact</strong></td><td>One row per process, columns for each milestone</td><td><code>fct_order_lifecycle</code> (ordered, paid, shipped, delivered)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Measure types in facts</h3>
+  <ul>
+    <li><strong>Additive</strong> — sum across any dimension makes sense. <em>Revenue, units sold.</em> Easiest to model.</li>
+    <li><strong>Semi-additive</strong> — sums across some dimensions but not time. <em>Account balance — summable across customers, not across time.</em></li>
+    <li><strong>Non-additive</strong> — ratios, percentages. <em>Conversion rate. Margin %.</em> Store the numerator and denominator separately; compute the ratio at query time.</li>
+  </ul>
+</section>
+
+<section id="star">
+  <h2>Star schema — the default</h2>
+  <p>A central fact table surrounded by dimension tables, each connected by a foreign key. Visually it looks like a star.</p>
+<div class="flow">                    ┌──────────┐
+                    │ dim_date │
+                    └────┬─────┘
+                         │
+       ┌──────────┐      │      ┌────────────┐
+       │ dim_user ├──────┤──────┤ dim_product│
+       └──────────┘      │      └────────────┘
+                    ┌────▼─────┐
+                    │ fct_orders│
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │ dim_region│
+                    └──────────┘</div>
+
+  <h3>Why star schema wins</h3>
+  <ul>
+    <li><strong>Query-friendly</strong> — joins are simple and consistent (one hop from fact to dim).</li>
+    <li><strong>Performance</strong> — modern warehouses optimize star schema joins explicitly.</li>
+    <li><strong>BI-tool-friendly</strong> — Looker, Tableau, Power BI all model around it.</li>
+    <li><strong>Easy to extend</strong> — add a new fact or dim without breaking existing ones.</li>
+    <li><strong>Self-documenting</strong> — the structure tells you what the business cares about.</li>
+  </ul>
+
+  <h3>Surrogate keys</h3>
+  <p>Each dimension has a synthetic primary key (a hash or sequence) called a <strong>surrogate key</strong>. The fact references that, not the natural key.</p>
+  <p>Why surrogate keys:</p>
+  <ul>
+    <li>SCD Type 2 versions need their own keys (a customer can have multiple rows in <code>dim_customer</code> across time).</li>
+    <li>Natural keys can change. Surrogate keys don't.</li>
+    <li>Joins are faster on small integer/hash keys than on long strings.</li>
+  </ul>
+  <p>In dbt: <code>{{ dbt_utils.generate_surrogate_key(['col1', 'col2']) }}</code> generates a hash.</p>
+</section>
+
+<section id="snowflake">
+  <h2>Snowflake schema (the technique, not the warehouse)</h2>
+  <p>Same as star schema, but dimensions are <em>normalized</em> — a dimension can reference other dimension tables.</p>
+  <p>Example: <code>dim_product</code> → <code>dim_category</code> → <code>dim_department</code>. Three tables instead of one wide product dim.</p>
+  <p><strong>Trade-off:</strong></p>
+  <ul>
+    <li>Pro: saves storage, reduces update anomalies.</li>
+    <li>Con: more joins, harder for BI users, slower queries.</li>
+  </ul>
+  <p>Modern best practice: <strong>denormalize dimensions</strong> (single wide <code>dim_product</code> table) unless you have a specific reason to snowflake. Storage is cheap; query simplicity is valuable.</p>
+</section>
+
+<section id="obt">
+  <h2>One Big Table (OBT) — the modern alternative</h2>
+  <p>Instead of fact + dimensions joined at query time, materialize a single wide table that pre-joins everything. Each fact row already contains all dimension attributes.</p>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>No joins for analysts — point and click in BI.</li>
+    <li>Faster query latency on flat data.</li>
+    <li>Simpler mental model.</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>Storage cost — denormalized data balloons.</li>
+    <li>Maintenance — when a dim attribute changes, every fact row needs updating.</li>
+    <li>SCD handling is messier.</li>
+    <li>Less flexible — you've baked in specific joins.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Hybrid approach</span>
+    <p>Most mature teams use both. Star schema as the canonical model layer; OBT-style "wide" tables built on top for specific BI use cases or for ML feature serving. The wide tables are derived from the star; they're not the source of truth.</p>
+  </div>
+</section>
+
+<section id="scd">
+  <h2>Slowly Changing Dimensions — the time-travel problem</h2>
+  <p>Dimensions change. A customer's plan changes from Basic to Pro. A product's price changes. A GPU provider's location changes. How do you model this?</p>
+  <p>The question is: <strong>when looking at a historical fact, do you want to see the dimension attributes as they were <em>then</em>, or as they are <em>now</em>?</strong></p>
+</section>
+
+<section id="scd-types">
+  <h2>SCD types — know all of them by name</h2>
+  <table>
+    <thead><tr><th>Type</th><th>What it does</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Type 0</strong></td><td>Never changes. Original values preserved forever.</td><td>Birth date, original signup date.</td></tr>
+      <tr><td><strong>Type 1</strong></td><td>Overwrite. Current value only; history lost.</td><td>Don't care about history. Email updates, typos fixed.</td></tr>
+      <tr><td><strong>Type 2</strong></td><td>Add a new row per change. Versioned with <code>valid_from</code> / <code>valid_to</code>.</td><td><strong>Most common.</strong> When you need point-in-time accuracy.</td></tr>
+      <tr><td><strong>Type 3</strong></td><td>Add a column for "previous value." Only keeps one version of history.</td><td>Rare. When you specifically need "current and previous."</td></tr>
+      <tr><td><strong>Type 4</strong></td><td>Maintain a separate history table. Main dim is current-only.</td><td>Hybrid approach when history is queried rarely.</td></tr>
+      <tr><td><strong>Type 6</strong></td><td>1+2+3 combined. Type 2 versioning + a "current value" column on each row.</td><td>You want point-in-time joins <em>and</em> easy "current state" filtering.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>SCD Type 2 — the shape</h3>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>dim_users with SCD2</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">user_id  | user_key | plan      | valid_from  | valid_to    | is_current
+─────────┼──────────┼───────────┼─────────────┼─────────────┼───────────
+123      | abc      | basic     | 2024-01-01  | 2024-06-15  | false
+123      | def      | pro       | 2024-06-15  | 2025-02-01  | false
+123      | ghi      | enterprise| 2025-02-01  | 9999-12-31  | true
+456      | jkl      | basic     | 2024-03-10  | 9999-12-31  | true</code></pre>
+</div>
+
+  <h3>Joining a fact to an SCD Type 2 dim</h3>
+  <p>This is the interview gotcha. Don't join on <code>user_id</code> alone — you'll fan out.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>point-in-time join</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  o.order_id,
+  o.ordered_at,
+  o.revenue,
+  u.plan AS plan_at_order_time
+FROM fct_orders o
+JOIN dim_users u
+  ON o.user_id = u.user_id
+  AND o.ordered_at &gt;= u.valid_from
+  AND o.ordered_at &lt;  u.valid_to</code></pre>
+</div>
+  <p>This gives the plan the user was on <em>when they placed the order</em>. That's the whole point of SCD2.</p>
+
+  <p>For "what plan are they on <em>now</em>?" — filter on <code>is_current</code> and skip the time-range join.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Common bug: open-ended <code>valid_to</code></span>
+    <p>Use <code>9999-12-31</code> or similar sentinel for the current row's <code>valid_to</code>, never NULL. Otherwise joins with <code>BETWEEN</code> silently exclude current rows. This is in every "Kimball-style SCD" gotcha question.</p>
+  </div>
+</section>
+
+<section id="date-dim">
+  <h2>The date dimension</h2>
+  <p>Every warehouse should have a <code>dim_date</code> table. One row per date, with columns for year, quarter, month, week, day-of-week, fiscal-year, holiday flags, business-day flags.</p>
+
+  <h3>Why bother</h3>
+  <ul>
+    <li>BI tools can pivot/filter on rich date attributes (fiscal quarter, week-over-week).</li>
+    <li>Avoids re-deriving date attributes in every query.</li>
+    <li>Holiday and business-day logic lives in one place.</li>
+    <li>Outer-joining dim_date to fact_daily_x guarantees a row for every day (handles gaps).</li>
+  </ul>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>dim_date example columns</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">date_day, year, quarter, month, month_name, week, day_of_week, day_name,
+fiscal_year, fiscal_quarter, is_weekend, is_business_day, is_holiday,
+days_in_month, is_first_of_month, is_last_of_month, ...</code></pre>
+</div>
+  <p>dbt's <code>dbt_utils.date_spine</code> macro is the standard way to generate it.</p>
+</section>
+
+<section id="snapshot-fact">
+  <h2>Periodic snapshot fact tables</h2>
+  <p>Some questions don't have a natural transaction grain. <em>"What's the GPU utilization right now?"</em> — there's no single event. You take a snapshot at regular intervals.</p>
+
+  <p>Example: <code>fct_gpu_hourly_utilization</code> — one row per GPU per hour. Captures <code>utilization_pct</code>, <code>memory_used_gb</code>, <code>requests_served</code>, <code>customer_id_currently_assigned</code>, etc.</p>
+  <p>Different from a transaction fact (one row per event) — same shape, different semantics. You can sum measures across GPUs but be careful summing across hours (semi-additive).</p>
+</section>
+
+<section id="bridge">
+  <h2>Bridge tables — many-to-many</h2>
+  <p>When a fact has a many-to-many relationship to a dim, you can't join directly. Example: an order can have multiple coupons applied; a coupon can apply to many orders.</p>
+  <p>Bridge table: <code>fct_order_coupons</code> with <code>(order_id, coupon_id)</code>. The bridge sits between the fact and the dim.</p>
+  <p><strong>Warning:</strong> joining a fact to a bridge to a dim causes fanout. Aggregate first or use grouping aggregations.</p>
+</section>
+
+<section id="degenerate">
+  <h2>Degenerate dimensions</h2>
+  <p>A dimension that has no attributes — just an ID. Example: <code>order_id</code> on a fact_order_items table. You'd never look up attributes about an order_id from a dim table; the ID itself is the dim.</p>
+  <p>Live them in the fact table; don't create a 1-column <code>dim_order</code> for them.</p>
+</section>
+
+<section id="conformed">
+  <h2>Conformed dimensions</h2>
+  <p>The same dim used by multiple fact tables. <code>dim_users</code> joined by <code>fct_orders</code>, <code>fct_logins</code>, and <code>fct_support_tickets</code> all uses the same dim.</p>
+  <p><strong>The principle:</strong> a dim is conformed when its meaning and grain is identical across uses. This is what enables drill-across analysis: "Show me revenue (from orders) and ticket count (from support) by user segment."</p>
+  <p>Lack of conformed dimensions = "we have three different definitions of <em>customer</em> and the numbers don't tie." Common mid-size company problem.</p>
+</section>
+
+<section id="design-question">
+  <h2>How to answer "design a data model for X"</h2>
+  <p>The framework that makes you look senior. They'll give you a business — design the warehouse for them.</p>
+
+  <ol>
+    <li><strong>Ask about the business questions.</strong> <em>"Before I model — what are the top three questions the business needs to answer? Revenue by segment? Retention? Unit economics?"</em></li>
+    <li><strong>Identify the core entities.</strong> Users, products, orders, GPUs, inference requests — whatever's central. These become <strong>dimensions</strong>.</li>
+    <li><strong>Identify the core events.</strong> What happens in the world that we want to count or measure? Each event becomes a <strong>fact table</strong>.</li>
+    <li><strong>State the grain of each fact.</strong> <em>"<code>fct_orders</code> is one row per order. <code>fct_inference_requests</code> is one row per inference request."</em></li>
+    <li><strong>Identify measures vs attributes.</strong> Measures go in facts (numeric, additive where possible). Attributes go in dims (descriptive).</li>
+    <li><strong>Decide on SCD strategy</strong> for each dim. Most are SCD1 (overwrite) by default; SCD2 where point-in-time accuracy matters.</li>
+    <li><strong>Sketch the diagram.</strong> Draw it. Star schema. Foreign keys. Talk through one query path.</li>
+    <li><strong>Mention edge cases.</strong> Late-arriving facts. Backfills. Time zones. Soft deletes. NULL handling.</li>
+    <li><strong>Discuss the layer strategy.</strong> Staging → marts. Where dbt fits.</li>
+  </ol>
+
+  <h3>Worked example: design for an AI inference platform</h3>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>inference-platform model sketch</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">FACTS
+─────
+fct_inference_requests       — one row per API request
+  request_id, customer_id, model_id, gpu_id, region_id, date_key,
+  ts, latency_ms, input_tokens, output_tokens, cost_usd, status
+
+fct_gpu_hourly_utilization   — one row per GPU per hour
+  gpu_id, hour_ts, utilization_pct, memory_used_gb, requests_served,
+  revenue_generated_usd, current_customer_id
+
+fct_billing_events           — one row per billing event
+  event_id, customer_id, date_key, ts, event_type, amount_usd
+
+DIMENSIONS
+──────────
+dim_customers (SCD2)         — one row per customer per attribute version
+  customer_key, customer_id, plan, region, signup_date, valid_from, valid_to
+
+dim_models                   — one row per model
+  model_id, model_name, family, parameter_count, hosted_since
+
+dim_gpus (SCD2)              — one row per GPU per location change
+  gpu_key, gpu_id, gpu_type, provider_id, region_id, valid_from, valid_to
+
+dim_providers                — one row per GPU provider
+dim_regions                  — one row per region
+dim_date                     — one row per calendar day</code></pre>
+</div>
+
+  <p>With this model you can answer:</p>
+  <ul>
+    <li>"Revenue per customer per month" — sum cost_usd from fct_inference_requests, point-in-time joined to dim_customers.</li>
+    <li>"GPU utilization by region" — fct_gpu_hourly_utilization joined to dim_gpus (current version) joined to dim_regions.</li>
+    <li>"Provider payout this month" — fct_gpu_hourly_utilization × pricing logic per provider.</li>
+    <li>"Average latency per model" — fct_inference_requests grouped by model_id.</li>
+  </ul>
+</section>
+
+<section id="talking-points">
+  <h2>Interview talking points</h2>
+
+  <div class="talking-point">
+    <span class="label">"How do you start a modeling project?"</span>
+    <p>"With the business questions, not the source data. I ask the team what the top three to five things they need to answer are, and what 'good' looks like. Then I identify the entities — the dimensions — and the events — the facts. I state the grain of each fact out loud and confirm it with stakeholders before writing SQL. The schema falls out of that conversation, not the other way around. Source data is a constraint; the business question is the goal."</p>
+  </div>
+
+  <div class="talking-point">
+    <span class="label">"When do you SCD2 a dimension?"</span>
+    <p>"Default to SCD1 — overwrite — for most dimensions, because most BI questions ask 'what does the world look like now.' I reach for SCD2 when the business genuinely needs point-in-time accuracy. The clearest case: financial reporting, where you need to know 'what plan was this customer on when they placed this order' — not what plan they're on today. Also: pricing, organizational changes (region/segment), anything regulators might ask about. The cost of SCD2 is more complex joins and more storage; the cost of <em>not</em> SCD2-ing something that needed it is silent wrong numbers in historical reports."</p>
+  </div>
+
+  <div class="talking-point">
+    <span class="label">"Star schema or OBT?"</span>
+    <p>"Star schema as the canonical layer — that's where source-of-truth lives. OBT-style wide tables built on top for specific consumption use cases: self-serve BI, ML feature serving, dashboards where join cost matters. The wide tables are derived from the star; they're not what we test or document — the star is. The hybrid gives you the maintainability of normalized modeling and the query speed of denormalized consumption."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="05-dbt-deep-dive.html">← dbt deep dive</a> · <a href="07-data-pipelines.html">Next: Data pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -7,21 +7,25 @@ description: Add a new numbered chapter to an existing guide. Generates the HTML
 
 Use when the user says things like "add a chapter to <guide> about X" or "create chapter NN in <guide>".
 
+## Layout reminder
+
+Guides live at `<topic-folder>/<guide-folder>/`. Chapter files are at the guide level (siblings of the hub `index.html`).
+
 ## Inputs
 
 Ask via AskUserQuestion if not provided:
-- **Guide**: the destination guide (display name or folder). Resolve against `SITE_NAV` in `assets/script.js`.
+- **Guide**: the destination guide (display name or folder). Resolve against `SITE_NAV` in `assets/script.js` and locate the disk path as `<topic.folder>/<guide.folder>/`.
 - **Title**: the chapter `<h1>` text.
-- **Number**: chapter number — default to the next integer above `ls <guide>/[0-9]*.html`. For stretch-style suffixes (04a, 04b, …), match the existing pattern.
+- **Number**: chapter number — default to the next integer above `ls <topic>/<guide>/[0-9]*.html`. For stretch-style suffixes (04a, 04b, …), match the existing pattern.
 - **Outline**: optional — a short list of section names. If omitted, scaffold a single placeholder section.
 - **Section group**: which `Section X · …` block on the guide hub the new card belongs to. Infer from chapter number if obvious; otherwise ask.
 
 ## Steps
 
-1. Read an existing chapter of similar length as the structural template (e.g., `<guide>/00-START-HERE.html` for short, `<guide>/03-*.html` for longer). Copy its head + sidebar shape.
+1. Read an existing chapter of similar length as the structural template (e.g., `<topic>/<guide>/00-START-HERE.html`).
 
-2. Generate `<guide>/<NN>-<slug>.html`:
-   - Assets: `../assets/style.css` and `../assets/script.js`. Include the hljs CDN `<link>` + `<script>` if the chapter contains code blocks.
+2. Generate `<topic>/<guide>/<NN>-<slug>.html`:
+   - Assets: `../../assets/style.css` and `../../assets/script.js`. Include the hljs CDN `<link>` + `<script>` if the chapter contains code blocks.
    - `<div class="layout">` → `<aside class="sidebar" id="sidebar">` with `<button class="mobile-toc-toggle">` + `<nav>`.
    - Inside `<nav>`, **two** `<h2>` blocks in this order:
      - `<h2>Sections</h2>` followed by `<a href="#anchor">` for each outline item.
@@ -33,7 +37,7 @@ Ask via AskUserQuestion if not provided:
 
 3. Update the **previous** chapter's `Navigation` block: rewrite its `Next:` link to point at the new file. If you inserted between two existing chapters, also update the next chapter's `← Previous:` link.
 
-4. Add a card to `<guide>/index.html` inside the matching `<div class="guide-grid">` under the chosen section:
+4. Add a card to `<topic>/<guide>/index.html` inside the matching `<div class="guide-grid">` under the chosen section:
    ```
    <a class="guide-card" href="<NN>-<slug>.html">
      <span class="number">NN</span>
@@ -50,7 +54,7 @@ Ask via AskUserQuestion if not provided:
 
 ## Gotchas
 
-- Asset paths from a guide folder are `../assets/...`. Never absolute, never `assets/...`.
+- Asset paths from a chapter (2 levels deep) are `../../assets/...`. Never absolute, never `assets/...`, never just `../assets/...`.
 - Don't add a breadcrumb in the chapter file — it's injected by JS.
 - Don't add a `<div class="site-nav">` panel — it's injected by JS.
 - Every chapter must have a single `<h1>` inside `<main>` (used by the breadcrumb injector to label the current page).
