@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dbt Deep Dive — Data Analytics Engineering</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Core</h2>
+    <a href="#mental-model">What dbt is</a>
+    <a href="#project">Project layout</a>
+    <a href="#models">Models &amp; materializations</a>
+    <a href="#sources">Sources</a>
+    <a href="#ref">ref &amp; source</a>
+
+    <h2>Practice</h2>
+    <a href="#tests">Tests</a>
+    <a href="#snapshots">Snapshots (SCD type 2)</a>
+    <a href="#seeds">Seeds</a>
+    <a href="#macros">Macros &amp; Jinja</a>
+    <a href="#incremental">Incremental models</a>
+    <a href="#packages">Packages</a>
+    <a href="#exposures">Exposures &amp; semantic layer</a>
+
+    <h2>Operations</h2>
+    <a href="#cli">CLI essentials</a>
+    <a href="#ci">CI / CD</a>
+    <a href="#perf">Performance</a>
+
+    <h2>Interview</h2>
+    <a href="#talking-point">Talking points</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-sql-deep-dive.html">← Previous</a>
+    <a href="06-data-modeling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Critical</span>
+  <h1>dbt Deep Dive</h1>
+  <p class="subtitle">Models, sources, tests, snapshots, macros, incremental loads. The defining tool of analytics engineering — fluency here separates senior from mid-level.</p>
+</header>
+
+<section id="mental-model">
+  <h2>What dbt actually is</h2>
+  <p>dbt (data build tool) is — at its core — <strong>a SQL compiler with conventions</strong>. You write SELECT statements; dbt wraps them in CREATE TABLE / CREATE VIEW / INCREMENTAL INSERT logic and runs them against your warehouse in the right order.</p>
+
+  <p>The pieces that make it more than that:</p>
+  <ul>
+    <li><strong>Dependency graph</strong> — uses <code>{{ ref('model_name') }}</code> to determine build order. The DAG is the entire reason dbt works.</li>
+    <li><strong>Materialization strategies</strong> — view, table, incremental, ephemeral, snapshot. Same SQL, different runtime behavior.</li>
+    <li><strong>Tests</strong> — first-class SQL-based assertions on data. Run alongside builds.</li>
+    <li><strong>Jinja templating</strong> — Python-like macros over SQL.</li>
+    <li><strong>Documentation as code</strong> — yaml descriptions + auto-generated docs site with lineage graph.</li>
+    <li><strong>Environments + targets</strong> — same code, different warehouses/schemas (dev / staging / prod).</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The pitch in one sentence</span>
+    <p><em>"dbt is the T in ELT — it takes raw loaded data in the warehouse and turns it into analytics-ready, tested, documented models, using version-controlled SQL and a dependency graph."</em></p>
+  </div>
+</section>
+
+<section id="project">
+  <h2>Project layout — know it</h2>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>typical dbt project</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">my_dbt_project/
+├── dbt_project.yml          # project config — name, profile, paths, configs
+├── packages.yml             # external dbt packages
+├── models/
+│   ├── staging/             # 1:1 with source tables, light cleanup
+│   │   ├── _sources.yml     # declares raw schemas
+│   │   ├── stg_users.sql
+│   │   └── stg_orders.sql
+│   ├── intermediate/        # complex joins, reusable building blocks
+│   │   └── int_user_lifetime_value.sql
+│   └── marts/               # business-facing tables (fct_, dim_)
+│       ├── core/
+│       │   ├── fct_orders.sql
+│       │   └── dim_users.sql
+│       └── finance/
+│           └── fct_daily_revenue.sql
+├── tests/                   # singular (custom) tests
+├── macros/                  # reusable Jinja macros
+├── snapshots/               # SCD type 2 tracking
+├── seeds/                   # CSVs that get loaded as tables
+└── analyses/                # one-off SQL files (NOT materialized)</code></pre>
+</div>
+
+  <h3>The staging → intermediate → marts pattern</h3>
+  <ul>
+    <li><strong>Staging</strong> (<code>stg_*</code>): one model per source table. Rename columns, cast types, light filtering. <strong>No business logic.</strong></li>
+    <li><strong>Intermediate</strong> (<code>int_*</code>): complex joins and computations that get reused. Optional layer.</li>
+    <li><strong>Marts</strong> (<code>fct_*</code>, <code>dim_*</code>): the analytics-facing layer. Star schema tables. This is what BI tools query.</li>
+  </ul>
+  <p>This convention comes from dbt Labs' style guide. Most companies follow it. If asked "how do you organize a dbt project?" — name these three layers.</p>
+</section>
+
+<section id="models">
+  <h2>Models &amp; materializations</h2>
+  <p>A model is just a SELECT in a <code>.sql</code> file. dbt wraps it based on the materialization config:</p>
+
+  <table>
+    <thead><tr><th>Materialization</th><th>What dbt does</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr><td><code>view</code></td><td><code>CREATE OR REPLACE VIEW</code></td><td>Cheap, always fresh; OK for small datasets or staging layer</td></tr>
+      <tr><td><code>table</code></td><td><code>CREATE OR REPLACE TABLE AS SELECT</code></td><td>Full rebuild every run; default for most marts</td></tr>
+      <tr><td><code>incremental</code></td><td>Initial CREATE; subsequent runs MERGE/INSERT new rows only</td><td>Large fact tables where full rebuild is too slow/expensive</td></tr>
+      <tr><td><code>ephemeral</code></td><td>Inlined as a CTE in downstream models — no table created</td><td>Reusable transformations you don't want to materialize</td></tr>
+      <tr><td><code>materialized_view</code> / <code>dynamic_table</code></td><td>Warehouse-native incremental refresh (Snowflake Dynamic Tables, BigQuery Materialized Views)</td><td>Near-real-time freshness with low operational overhead</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Config — three places to set it</h3>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>materialization config</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- 1. In the model file (highest precedence for that model):
+{{ config(materialized='incremental', unique_key='order_id', on_schema_change='append_new_columns') }}
+
+SELECT ...
+
+-- 2. In a yaml file alongside the model:
+-- models/marts/_marts.yml
+models:
+  - name: fct_orders
+    config:
+      materialized: incremental
+
+-- 3. In dbt_project.yml (lowest precedence — folder-level defaults):
+models:
+  my_project:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table</code></pre>
+</div>
+  <p>Most teams set folder-level defaults in <code>dbt_project.yml</code> (staging = view, marts = table) and override at the model level when needed.</p>
+</section>
+
+<section id="sources">
+  <h2>Sources — declare your raw data</h2>
+  <p>Sources declare which raw tables in your warehouse dbt depends on. Two reasons they matter:</p>
+  <ol>
+    <li><strong>Lineage</strong> — dbt's DAG starts at source tables.</li>
+    <li><strong>Freshness checks</strong> — dbt can run <code>dbt source freshness</code> to alert when source data is stale.</li>
+  </ol>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>models/staging/_sources.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">version: 2
+
+sources:
+  - name: raw_app
+    database: raw
+    schema: app_prod
+    loaded_at_field: _ingested_at
+    freshness:
+      warn_after: {count: 2, period: hour}
+      error_after: {count: 6, period: hour}
+
+    tables:
+      - name: users
+        description: "User accounts from the app database"
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+      - name: orders
+        loaded_at_field: created_at  # override per-table</code></pre>
+</div>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>models/staging/stg_users.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  id           AS user_id,
+  email,
+  created_at,
+  updated_at,
+  is_active
+FROM {{ source('raw_app', 'users') }}</code></pre>
+</div>
+</section>
+
+<section id="ref">
+  <h2><code>ref()</code> and <code>source()</code> — the magic</h2>
+  <p>These are the two Jinja functions that make dbt's DAG work:</p>
+  <ul>
+    <li><code>{{ source('schema', 'table') }}</code> — references a raw source table.</li>
+    <li><code>{{ ref('model_name') }}</code> — references another dbt model. dbt builds it first, then yours.</li>
+  </ul>
+  <p>Never hard-code a table name. Always use <code>ref()</code>. This:</p>
+  <ul>
+    <li>Builds the dependency graph.</li>
+    <li>Handles environment-specific schemas automatically (dev vs prod).</li>
+    <li>Lets dbt resolve cross-database / cross-project references.</li>
+  </ul>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>marts/fct_orders.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH orders AS (
+    SELECT * FROM {{ ref('stg_orders') }}
+),
+order_items AS (
+    SELECT * FROM {{ ref('stg_order_items') }}
+),
+users AS (
+    SELECT * FROM {{ ref('stg_users') }}
+)
+SELECT ...</code></pre>
+</div>
+</section>
+
+<section id="tests">
+  <h2>Tests — first-class data quality</h2>
+  <p>dbt has two kinds of tests:</p>
+
+  <h3>1. Generic tests (declarative, in yaml)</h3>
+  <p>Built in: <code>unique</code>, <code>not_null</code>, <code>accepted_values</code>, <code>relationships</code>.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>models/marts/_marts.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: dim_users
+    description: "One row per user"
+    columns:
+      - name: user_id
+        description: "Primary key"
+        tests:
+          - unique
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['active', 'inactive', 'churned']
+      - name: plan_id
+        tests:
+          - relationships:
+              to: ref('dim_plans')
+              field: plan_id</code></pre>
+</div>
+
+  <h3>2. Singular tests (custom SQL in <code>tests/</code>)</h3>
+  <p>A singular test is just a SQL file in <code>tests/</code> that returns the failing rows. Empty result = test passes.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>tests/revenue_never_negative.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT *
+FROM {{ ref('fct_orders') }}
+WHERE revenue &lt; 0</code></pre>
+</div>
+
+  <h3>Powerful packages</h3>
+  <p><code>dbt-utils</code> and <code>dbt-expectations</code> add dozens of tests: <code>expression_is_true</code>, <code>recency</code>, <code>at_least_one</code>, distribution tests, etc. Mention these in interviews to show ecosystem awareness.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">"Severity: warn"</span>
+    <p>Tests can be configured with <code>severity: warn</code> (vs default <code>error</code>). Warn-level tests show in logs but don't fail the run. Useful for "I want to know about this" without paging the on-call. Mention this pattern.</p>
+  </div>
+</section>
+
+<section id="snapshots">
+  <h2>Snapshots — SCD Type 2 for free</h2>
+  <p>A snapshot tracks how a row's columns change over time. Each version gets <code>valid_from</code> and <code>valid_to</code> columns. This is the canonical way to implement Slowly Changing Dimension Type 2 in dbt.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>snapshots/users_snapshot.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{% snapshot users_snapshot %}
+
+{{
+  config(
+    target_schema='snapshots',
+    unique_key='user_id',
+    strategy='check',
+    check_cols=['plan_id', 'status', 'email']
+  )
+}}
+
+SELECT * FROM {{ source('raw_app', 'users') }}
+
+{% endsnapshot %}</code></pre>
+</div>
+
+  <p>Strategies:</p>
+  <ul>
+    <li><strong><code>check</code></strong>: dbt compares the columns you list; new row written when any change.</li>
+    <li><strong><code>timestamp</code></strong>: dbt watches an <code>updated_at</code> column. More efficient when available.</li>
+  </ul>
+  <p>Run with <code>dbt snapshot</code> on a schedule (usually nightly).</p>
+</section>
+
+<section id="seeds">
+  <h2>Seeds — small CSVs as tables</h2>
+  <p>Drop a CSV into <code>seeds/</code>, run <code>dbt seed</code>, get a table. Good for: country code mappings, manually-curated business rules, fixture data for tests. <strong>Not</strong> for: anything large or that changes often.</p>
+</section>
+
+<section id="macros">
+  <h2>Macros &amp; Jinja</h2>
+  <p>Macros are reusable Jinja functions over SQL. Useful for DRYing up repeated logic.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>macros/cents_to_dollars.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{% macro cents_to_dollars(column_name, precision=2) %}
+  ROUND(({{ column_name }} / 100.0), {{ precision }})
+{% endmacro %}</code></pre>
+</div>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>using the macro</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  order_id,
+  {{ cents_to_dollars('amount_cents') }} AS amount_usd
+FROM {{ ref('stg_orders') }}</code></pre>
+</div>
+
+  <h3>Common Jinja patterns</h3>
+  <ul>
+    <li><code>{% if target.name == 'dev' %} ... {% endif %}</code> — environment-conditional SQL.</li>
+    <li><code>{% for col in get_columns_in_relation(ref('x')) %}</code> — iterate over columns at compile time.</li>
+    <li><code>{{ var('start_date') }}</code> — parameterize via project variables.</li>
+    <li><code>{{ env_var('SOMETHING') }}</code> — read from environment.</li>
+  </ul>
+</section>
+
+<section id="incremental">
+  <h2>Incremental models — the most-asked-about</h2>
+  <p>When a fact table has billions of rows and you can't afford to rebuild it nightly, you go incremental.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>models/marts/fct_events.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{{ config(
+    materialized='incremental',
+    unique_key='event_id',
+    incremental_strategy='merge',
+    on_schema_change='append_new_columns'
+) }}
+
+SELECT
+  event_id,
+  user_id,
+  event_type,
+  occurred_at,
+  payload
+FROM {{ ref('stg_events') }}
+
+{% if is_incremental() %}
+  -- only process new events on subsequent runs
+  WHERE occurred_at &gt; (SELECT MAX(occurred_at) FROM {{ this }})
+{% endif %}</code></pre>
+</div>
+
+  <h3>Incremental strategies</h3>
+  <table>
+    <thead><tr><th>Strategy</th><th>What it does</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>append</code></td><td>Just INSERT new rows</td><td>Immutable event logs</td></tr>
+      <tr><td><code>merge</code></td><td>UPSERT by unique_key (warehouse MERGE INTO)</td><td>Most common — when rows can update</td></tr>
+      <tr><td><code>delete+insert</code></td><td>Delete matching rows then insert</td><td>When MERGE isn't supported or you want partition-replace semantics</td></tr>
+      <tr><td><code>insert_overwrite</code></td><td>Replace whole partitions (BigQuery, Spark)</td><td>Partition-based reprocessing</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Common bugs</span>
+    <p><strong>1. Late-arriving data falls off the window</strong> — if your filter is <code>WHERE occurred_at &gt; MAX(occurred_at)</code>, an event that arrives 2 hours late but happened 4 hours ago will be missed. Use a wider lookback: <code>&gt; MAX(occurred_at) - INTERVAL '24 hours'</code> + merge.</p>
+    <p><strong>2. Schema drift breaks the model</strong> — when upstream adds a column, the existing table has the old shape. Use <code>on_schema_change='append_new_columns'</code> or <code>'sync_all_columns'</code>.</p>
+    <p><strong>3. Full refresh forgotten</strong> — when business logic changes, you need <code>dbt run --full-refresh -s fct_events</code>. Document this.</p>
+  </div>
+</section>
+
+<section id="packages">
+  <h2>Packages — don't reinvent</h2>
+  <p>dbt has a Hub. Common packages:</p>
+  <ul>
+    <li><strong><code>dbt-utils</code></strong> — generic tests, macros (<code>generate_surrogate_key</code>, <code>pivot</code>, <code>star</code>, <code>group_by</code>).</li>
+    <li><strong><code>dbt-expectations</code></strong> — Great Expectations-style tests ported to dbt.</li>
+    <li><strong><code>codegen</code></strong> — generates yaml from your warehouse schema.</li>
+    <li><strong><code>elementary</code></strong> — data observability layer over dbt artifacts.</li>
+    <li><strong><code>dbt_audit_helper</code></strong> — compare two model outputs (for refactors / migrations).</li>
+  </ul>
+</section>
+
+<section id="exposures">
+  <h2>Exposures &amp; the semantic layer</h2>
+  <p><strong>Exposures</strong> declare the downstream consumers of your models — dashboards, ML models, applications. They appear in the lineage graph.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>models/_exposures.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">version: 2
+exposures:
+  - name: gpu_utilization_dashboard
+    type: dashboard
+    maturity: high
+    owner:
+      name: Data Team
+      email: data@example.com
+    depends_on:
+      - ref('fct_gpu_hours')
+      - ref('dim_providers')</code></pre>
+</div>
+
+  <p><strong>Semantic Layer</strong> (dbt's metrics framework, also called MetricFlow): centralizes metric definitions. Instead of every dashboard re-defining "MRR," you define it once in YAML, and BI tools query it via a unified API.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">For senior interviews</span>
+    <p>Have an opinion on the metrics layer. <em>"I'd reach for dbt Semantic Layer when there's any real risk of metric drift across teams — finance, product, and ops disagreeing on what 'active customer' means is the #1 problem the semantic layer solves."</em></p>
+  </div>
+</section>
+
+<section id="cli">
+  <h2>CLI essentials</h2>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>dbt CLI cheat sheet</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash"># Build everything (run + test)
+dbt build
+
+# Just compile templates — no warehouse calls
+dbt compile
+
+# Run a specific model and its descendants
+dbt run -s fct_orders+
+
+# Run a model and its ancestors
+dbt run -s +fct_orders
+
+# Run a folder, models tagged "daily", or by source
+dbt run -s marts.finance
+dbt run -s tag:daily
+dbt run -s source:raw_app+
+
+# Run only models changed in this PR (state-based)
+dbt run -s state:modified+ --state ./prod-manifest
+
+# Run tests
+dbt test
+dbt test -s fct_orders
+
+# Full refresh an incremental model
+dbt run --full-refresh -s fct_events
+
+# Build docs site
+dbt docs generate
+dbt docs serve</code></pre>
+</div>
+  <p>The <code>+</code> graph syntax is essential. <code>+model+</code> = ancestors and descendants. Know it cold.</p>
+</section>
+
+<section id="ci">
+  <h2>CI / CD with dbt</h2>
+  <p>Modern dbt teams treat models like code:</p>
+  <ul>
+    <li><strong>PR opens</strong> → CI runs <code>dbt build -s state:modified+</code> against a staging schema (Slim CI).</li>
+    <li><strong>Tests must pass</strong> before merge.</li>
+    <li><strong>Slim CI</strong> uses the production manifest as state — only rebuilds what changed.</li>
+    <li><strong>Production scheduler</strong> (dbt Cloud, Airflow, Dagster) runs <code>dbt build</code> on a cron + after upstream loads complete.</li>
+    <li><strong>Audit packages</strong> (<code>dbt_audit_helper</code>) used during PR review to diff before/after of model output.</li>
+  </ul>
+</section>
+
+<section id="perf">
+  <h2>Performance &amp; cost</h2>
+  <ul>
+    <li><strong>Materialize wisely</strong> — view for staging, table for marts, incremental for big facts.</li>
+    <li><strong>Cluster / partition</strong> — Snowflake: <code>cluster_by</code> in config; BigQuery: <code>partition_by</code> + <code>cluster_by</code>; Databricks: <code>partitioned_by</code> + Z-order.</li>
+    <li><strong>Limit ephemeral chains</strong> — many ephemerals in a chain produce monstrous compiled SQL.</li>
+    <li><strong>Tag and schedule</strong> — not every model needs to run every hour. Tag by SLA, schedule accordingly.</li>
+    <li><strong>Look at <code>dbt_artifacts</code> / Elementary</strong> — track run times, see which models are getting slow.</li>
+  </ul>
+</section>
+
+<section id="talking-point">
+  <h2>Interview talking points</h2>
+
+  <div class="talking-point">
+    <span class="label">"How do you organize a dbt project?"</span>
+    <p>"Staging, intermediate, marts. Staging models are 1:1 with sources — rename columns, cast types, no business logic. Intermediate models are reusable building blocks for complex joins. Marts are the analytics-facing layer organized by business domain — fact tables for events, dimension tables for entities. The convention's not magic but it makes onboarding easier and PR review faster. I'd default staging to views, marts to tables, and reach for incremental only when scale demands it."</p>
+  </div>
+
+  <div class="talking-point">
+    <span class="label">"How do you decide on materialization?"</span>
+    <p>"Default to <code>view</code> for staging — cheap, always fresh, no real cost. For marts, <code>table</code> is the default. I reach for <code>incremental</code> when full rebuild is too slow or too expensive — usually event tables or transactional logs at the billions-of-rows scale. For incremental, I think about: what's the unique key for merge, what's the lookback window for late-arriving data, and what happens on schema change. <code>ephemeral</code> for small reusable transformations I don't want to materialize."</p>
+  </div>
+
+  <div class="talking-point">
+    <span class="label">"How do you handle data quality?"</span>
+    <p>"Three layers. One, dbt tests on every model — <code>unique</code>, <code>not_null</code>, <code>relationships</code>, <code>accepted_values</code> at minimum, plus custom singular tests for business rules. Two, source freshness checks that alert when upstream stops loading. Three, a data observability layer — Elementary or Monte Carlo — for things tests can't catch: anomalies, distribution shifts, volume drops. I severity-warn the tests that are signal-not-blocker and severity-error the ones that should fail the build."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="04-sql-deep-dive.html">← SQL deep dive</a> · <a href="06-data-modeling.html">Next: Data modeling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

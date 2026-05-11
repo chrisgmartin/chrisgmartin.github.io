@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG Applied — Production Patterns</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Concept</h2>
+    <a href="#why">Why RAG for compliance</a>
+    <a href="#pipeline">Naïve pipeline</a>
+
+    <h2>Failure modes</h2>
+    <a href="#fm1">1 · Bad retrieval</a>
+    <a href="#fm2">2 · Bad chunks</a>
+    <a href="#fm3">3 · Hallucination</a>
+    <a href="#fm4">4 · Stale data</a>
+    <a href="#fm5">5 · Access bleed</a>
+
+    <h2>Architectures</h2>
+    <a href="#arch">Six patterns</a>
+    <a href="#embeddings">Embeddings</a>
+    <a href="#vector-dbs">Vector DBs</a>
+    <a href="#evals">Evaluating RAG</a>
+    <a href="#ops">Operational concerns</a>
+
+    <h2>Interview</h2>
+    <a href="#probes">Drillable probes</a>
+    <a href="#talking-point">Talking point</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">← All guides</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Production RAG · Concept &amp; drill</span>
+  <h1>RAG Applied</h1>
+  <p class="subtitle">From naïve top-K to hybrid + reranking + agentic. The failure modes that show up only at scale, and the patterns that distinguish a serious answer from a textbook one.</p>
+  <div class="meta-row">
+    <span>📚 Reference</span>
+    <span>🎯 7 interview probes with answers</span>
+    <span>🔁 Drill mode supported</span>
+  </div>
+</header>
+
+<section id="why">
+  <h2>Why RAG is the right default for compliance</h2>
+  <p>Compliance is fundamentally about <strong>grounded reasoning over authoritative documents</strong>. The model must:</p>
+  <ul>
+    <li>Answer based on the <em>current</em> regulation, not training-time recollection</li>
+    <li>Cite the source so a reviewer can verify</li>
+    <li>Refuse to answer when the source doesn't cover the question</li>
+    <li>Surface the version / effective date of what it's referencing</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">RAG vs long context — when to pick which</span>
+    <p>Long-context models are tempting ("just stuff the whole regulation in") but RAG usually wins because: your KB is bigger than any one context, you want to <em>select</em> relevant context not pay tokens to skim everything, you want the citation trail RAG produces naturally, and you can update the KB without touching the agent.</p>
+  </div>
+</section>
+
+<section id="pipeline">
+  <h2>The naïve RAG pipeline (start here)</h2>
+  <div class="flow">[Question]
+   ↓
+[Embed question]
+   ↓
+[Top-K cosine-similarity search in vector store]
+   ↓
+[Insert top-K chunks into prompt]
+   ↓
+[Generate answer]</div>
+  <p>This works for demos. It fails in production. Below is a tour of what breaks and how to fix it.</p>
+</section>
+
+<section id="fm1">
+  <h2>Failure mode 1 · Bad retrieval (most common)</h2>
+  <p><strong>Symptom:</strong> model answers without grounding, hallucinates, or contradicts the source.</p>
+  <p><strong>Causes:</strong> question doesn't lexically match source chunks; chunks lack context to be retrievable alone; top-K are similar to each other (redundant); vector similarity isn't aligned with relevance for the domain.</p>
+
+  <h3>Fixes</h3>
+  <ul>
+    <li><strong>Hybrid search</strong> — combine BM25 (keyword) and vector. BM25 catches exact-term matches embeddings miss; embeddings catch semantic matches BM25 misses. Combine via Reciprocal Rank Fusion (RRF).</li>
+    <li><strong>Reranking</strong> — retrieve top 50 with cheap method, then run a cross-encoder (Cohere Rerank, BGE-Reranker, Voyage Rerank). Keep top 5-10. Slower but far more accurate.</li>
+    <li><strong>Query expansion / rewriting</strong> — LLM rewrites the question into 2-3 variants. HyDE (Hypothetical Document Embeddings) is one such technique.</li>
+    <li><strong>Multi-hop retrieval</strong> — agent retrieves, reads, decides what to retrieve next.</li>
+  </ul>
+</section>
+
+<section id="fm2">
+  <h2>Failure mode 2 · Bad chunks</h2>
+  <p><strong>Symptom:</strong> chunks contain wrong context; answers wrap around chunk boundaries.</p>
+
+  <h3>Fixes</h3>
+  <ul>
+    <li><strong>Structural chunking</strong> — respect document hierarchy (headings, sections). Non-negotiable for regulatory documents.</li>
+    <li><strong>Chunk size</strong> — sweet spot 500-1500 tokens with 10-20% overlap. Tune per corpus.</li>
+    <li><strong>Contextual retrieval (Anthropic)</strong> — prepend a 50-100 token context paragraph to each chunk before embedding ("This chunk is from FATF Recommendation 10's section on ongoing CDD..."). Use Claude Haiku to generate.</li>
+    <li><strong>Parent-child / small-to-big</strong> — index small chunks for retrieval precision; return parent chunk for generation context.</li>
+  </ul>
+</section>
+
+<section id="fm3">
+  <h2>Failure mode 3 · Hallucination on retrieved context</h2>
+  <p><strong>Symptom:</strong> model says things not in the retrieved chunks; fabricates citations.</p>
+
+  <h3>Fixes</h3>
+  <ul>
+    <li><strong>System prompt discipline</strong> — explicit instructions to <em>only</em> answer from provided context, refuse if context is insufficient.</li>
+    <li><strong>Citation-required output</strong> — every claim tagged with chunk ID. Post-process to verify.</li>
+    <li><strong>Grounding verification</strong> — separate validation step asks "is this claim supported by these chunks?" (Ragas faithfulness metric).</li>
+    <li><strong>Refuse-when-unsure prompt</strong> — explicit "answer 'I don't have enough information' if context doesn't cover the question."</li>
+  </ul>
+</section>
+
+<section id="fm4">
+  <h2>Failure mode 4 · Stale data</h2>
+  <p><strong>Symptom:</strong> model cites outdated regulation or policy.</p>
+
+  <h3>Fixes</h3>
+  <ul>
+    <li><strong>Index versioning</strong> — each chunk has <code>effective_date</code>, <code>superseded_date</code> metadata. Filter retrieval by date.</li>
+    <li><strong>Refresh pipeline</strong> — scheduled re-ingestion when source changes; change-detection at document level.</li>
+    <li><strong>Source-of-truth references</strong> — the index points to a canonical store; the canonical store is the source of truth.</li>
+  </ul>
+</section>
+
+<section id="fm5">
+  <h2>Failure mode 5 · Access control bleed</h2>
+  <p><strong>Symptom:</strong> agent retrieves a document the user shouldn't see.</p>
+
+  <h3>Fixes</h3>
+  <ul>
+    <li><strong>Per-tenant indexes</strong> or <strong>metadata-filtered retrieval</strong> — at query time, restrict to chunks the user has permission to read.</li>
+    <li><strong>Authorization at retrieval, not at generation</strong> — don't rely on the model to "not mention" something it shouldn't have seen.</li>
+    <li><strong>Audit log of every retrieval</strong> — who, what, when.</li>
+  </ul>
+</section>
+
+<section id="arch">
+  <h2>RAG architectures — the spectrum</h2>
+
+  <div class="cards">
+    <div class="card">
+      <p class="card-title">1 · Naïve / single-shot</p>
+      <p class="card-desc">Embed query → retrieve top-K → generate. Baseline.</p>
+    </div>
+    <div class="card">
+      <p class="card-title">2 · Hybrid</p>
+      <p class="card-desc">BM25 + vector + reranking. Minimum bar for production.</p>
+    </div>
+    <div class="card">
+      <p class="card-title">3 · Agentic</p>
+      <p class="card-desc">Agent has retrieval as a <em>tool</em>. Decides when and how to retrieve, can iterate. Modern default for complex queries.</p>
+    </div>
+    <div class="card">
+      <p class="card-title">4 · Graph RAG</p>
+      <p class="card-desc">Entities and relationships extracted into a knowledge graph; retrieval traverses graph + retrieves text.</p>
+    </div>
+    <div class="card">
+      <p class="card-title">5 · Self-RAG / CRAG</p>
+      <p class="card-desc">Model assesses retrieved context, decides whether to retrieve more, regenerate, or refuse. Research-flavored but practical.</p>
+    </div>
+    <div class="card">
+      <p class="card-title">6 · Router RAG</p>
+      <p class="card-desc">Different KBs for different queries. Small classifier or LLM routes the query to the right index.</p>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Agentic RAG pattern — compliance fit</span>
+    <p>The agentic pattern fits compliance well: investigators iterate; the agent should too. <em>Agent decides to call <code>lookup_regulation(query="EU AML transaction threshold")</code> → reads → decides it also needs <code>lookup_regulation(query="Wirecard precedent")</code> → synthesizes draft with citations.</em></p>
+  </div>
+</section>
+
+<section id="embeddings">
+  <h2>Embeddings — what to know</h2>
+  <ul>
+    <li><strong>Model choice matters</strong>: OpenAI <code>text-embedding-3-large</code>, Voyage AI, Cohere, Anthropic, open-source (BGE, E5, MXBai). Benchmark on your data.</li>
+    <li><strong>Dimension</strong>: 1024-1536 common; 3072+ for highest quality. Tradeoff vs storage/latency.</li>
+    <li><strong>Domain adaptation</strong>: fine-tuning embeddings on your domain data lifts retrieval significantly when quality plateaus.</li>
+    <li><strong>Multi-vector / late interaction</strong>: ColBERT and similar represent each token with its own vector. Higher quality, more storage.</li>
+  </ul>
+</section>
+
+<section id="vector-dbs">
+  <h2>Vector databases — by use case</h2>
+  <table>
+    <thead><tr><th>Choice</th><th>Why pick it</th></tr></thead>
+    <tbody>
+      <tr><td><strong>pgvector</strong></td><td>You already have Postgres. Easiest operationally.</td></tr>
+      <tr><td><strong>OpenSearch / Elasticsearch</strong></td><td>Hybrid search (BM25 + vector) in one place, mature ops.</td></tr>
+      <tr><td><strong>Pinecone</strong></td><td>Managed, fast, simple API. Cost grows with scale.</td></tr>
+      <tr><td><strong>Weaviate</strong></td><td>Rich filtering, hybrid, open source.</td></tr>
+      <tr><td><strong>Qdrant, Chroma, Milvus, LanceDB</strong></td><td>Each has a niche; all credible.</td></tr>
+      <tr><td><strong>Bedrock KB / Vertex AI Vector Search</strong></td><td>Cloud-managed, integrate cleanly with the rest of the stack.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="evals">
+  <h2>Evaluating RAG specifically</h2>
+  <p>RAG has its own metrics; <strong>Ragas</strong> is the well-known framework.</p>
+  <ul>
+    <li><strong>Faithfulness</strong> — are the answer's claims supported by the retrieved context? (LLM-as-judge.)</li>
+    <li><strong>Answer relevance</strong> — does the answer address the question?</li>
+    <li><strong>Context precision</strong> — are the retrieved chunks relevant?</li>
+    <li><strong>Context recall</strong> — do the retrieved chunks contain everything needed to answer?</li>
+  </ul>
+  <p>Beyond Ragas: <strong>citation correctness</strong> (most important for compliance — is the cited regulation actually the source?), <strong>refusal accuracy</strong> (does the system refuse when it should?), <strong>end-to-end answer correctness</strong> (human or LLM-judge against gold answers).</p>
+</section>
+
+<section id="ops">
+  <h2>Production RAG — operational concerns</h2>
+  <ul>
+    <li><strong>Refresh cadence</strong> — daily at minimum for regulatory KBs; on-demand on publication.</li>
+    <li><strong>Index size and shard strategy</strong> — billion-vector indexes are doable but design matters.</li>
+    <li><strong>Cache layer</strong> — identical/near-identical queries hit cache, not re-retrieve.</li>
+    <li><strong>Cost monitoring</strong> — embedding + vector reads + LLM calls add up. Per-query and per-tenant budgets.</li>
+    <li><strong>Privacy at retrieval</strong> — tokenize PII before it touches anything third-party.</li>
+    <li><strong>Disaster recovery</strong> — can you rebuild the index from source of truth in a known time?</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Common interview probes — with answers</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Why use RAG over long context?"</summary>
+    <div class="reveal-body">
+      <p><em>"Three reasons. Cost — RAG retrieves only the few chunks relevant to a query; long context pays for the whole corpus on every call. Selectivity — long context suffers from 'lost in the middle,' where the model misses details buried mid-prompt; RAG puts only the relevant material in view. Operational decoupling — a RAG index updates independently of the agent, so adding a new regulation doesn't require touching the prompt. Long context is the right call when the task genuinely needs whole-document reasoning — say, drafting an impact analysis on a single 200-page regulation. RAG is the default when the corpus is bigger than any one task, when freshness matters, and when you need citations. In a compliance KB you almost always want RAG; you might use long context as a downstream step after retrieval narrows the relevant document."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "How do you choose chunk size?"</summary>
+    <div class="reveal-body">
+      <p><em>"It's the tradeoff between retrieval precision and answer context. Smaller chunks — 200-500 tokens — give precise retrieval but lose surrounding context, so the model sees a sentence stripped of its section heading. Larger chunks — 1000-1500 — preserve context but dilute the embedding signal and waste tokens on irrelevant content. The pragmatic default I'd start with is 500-800 tokens with 10-20% overlap, then tune based on retrieval evals. Better than guessing size: respect document structure. For regulatory documents that means recursive chunking by chapter then section then paragraph — chunks become natural units, not arbitrary slices. And the parent-child trick is often the right answer: index small chunks for retrieval precision, but return the parent paragraph or section for generation context."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "How do you handle queries the KB can't answer?"</summary>
+    <div class="reveal-body">
+      <p><em>"Make refusal a first-class output, not a failure. Three layers. One, system prompt discipline — explicit instruction that the model must answer 'I don't have enough information' rather than guess when retrieved context doesn't cover the question. Two, grounding validation — a post-generation check that every claim in the answer maps back to a cited chunk; ungrounded claims fail the answer. Three, retrieval-quality signal — if top-K scores are below a threshold, the system surfaces 'no good match' and routes to human review rather than generating. For compliance specifically, the refusal itself is valuable signal — it tells the team where the KB has gaps. I'd capture refusals into the eval dataset and use them to prioritize content gaps."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "How do you keep retrievals fresh when the source updates?"</summary>
+    <div class="reveal-body">
+      <p><em>"Source-of-truth lives outside the index. The index is a derived artifact rebuilt from canonical sources. Change-detection runs on the source — document version, hash, last-modified — and triggers re-ingestion only for what changed. You don't re-embed the whole corpus nightly; you re-embed deltas. Each chunk carries metadata for </em><code>effective_date</code><em> and </em><code>superseded_date</code><em>. Retrieval filters by date so a query about today's rule doesn't surface last year's superseded version — but the superseded version stays in the index because a regulator may still ask about historical decisions. For regulations published on a known cadence, schedule the refresh; for ad-hoc updates, webhook the publisher or poll. And version the index itself so audit logs can pin which index version answered which query."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "How do you eval whether retrieval is good vs whether the answer is good?"</summary>
+    <div class="reveal-body">
+      <p><em>"Separate the two — they're different failure modes. Retrieval quality uses Ragas-style metrics: context precision asks 'are the retrieved chunks relevant?', context recall asks 'do the chunks contain everything needed to answer?'. Those require a labeled set where you know the right answer and the right supporting chunks. Answer quality is the next layer: faithfulness — are the answer's claims supported by the cited chunks — plus answer relevance and citation correctness. The diagnostic move: when an answer is wrong, check retrieval first. If the right chunks weren't retrieved, the retriever is the bug — fix chunking, reranking, or query expansion. If the right chunks were retrieved but the answer is still wrong, the generator is the bug — fix the prompt, grounding instructions, or model choice. That split tells you where to invest."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "Walk me through how you'd add hybrid search to a vector-only system."</summary>
+    <div class="reveal-body">
+      <p><em>"Goal: combine BM25 keyword matching with vector similarity so you catch both lexical exact matches and semantic matches. Two implementation paths. One, if the vector store supports hybrid natively — OpenSearch, Weaviate, recent versions of pgvector with full-text — enable the BM25 side and use reciprocal rank fusion or a weighted score to combine. Two, if not, run two retrievers in parallel: vector search returning top-50 with scores, BM25 search returning top-50 with scores, then merge with RRF — for each doc, score = sum of 1/(k + rank_in_each_retriever). RRF is simple and surprisingly robust because it sidesteps the score-normalization problem between BM25 and cosine similarity. Then layer a cross-encoder reranker on the merged top-50 to get final top-5-to-10. Eval the change against a held-out set before swapping it in — hybrid usually wins, but the weighting needs tuning per corpus."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q7: "An investigator says the AI cited a regulation that doesn't exist. How do you debug?"</summary>
+    <div class="reveal-body">
+      <p>"Pull the trace first — every agent run should have one. Find the exact retrieved chunks for that query and the model output. Then triage:</p>
+      <ol>
+        <li>Was the cited regulation in the retrieved chunks? If <em>no</em>, the model fabricated the citation — that's a generator failure. Tighten the system prompt's citation discipline, add a post-generation validator that every cited ID exists in the retrieved set, and add a runtime guardrail: every cited reg ID must resolve in your citation registry or the answer is rejected.</li>
+        <li>Was it in the retrieved chunks but the cite is wrong? That's an ingestion failure — likely chunk metadata got mis-tagged during indexing. Check the source-of-truth, fix the metadata, re-index that document, add a data-quality check to the ingestion pipeline.</li>
+        <li>Either way, add this case to the eval set so the regression test catches it forever.</li>
+        <li>Report back to the investigator with what happened, what was fixed, and how we'll prevent it. <em>That last step matters for trust</em> — compliance teams need to see the AI's failure mode being treated as a real incident, not waved away."</li>
+      </ol>
+    </div>
+  </details>
+</section>
+
+<section id="talking-point">
+  <h2>The "design a RAG for compliance" talking point</h2>
+  <div class="talking-point">
+    <span class="label">~90 seconds out loud</span>
+    <p>"Start with the corpus shape — regulatory documents are highly structured, so I'd respect the structure with recursive structural chunking by chapter and section, with metadata for jurisdiction, document type, effective date. Embedding model: a strong production embedder, ideally domain-fine-tuned if I have labeled data. Index: hybrid — BM25 plus vector — because regulatory queries often have specific terminology that pure embedding misses. I'd add contextual retrieval — that Anthropic technique of prepending a Haiku-generated context paragraph before embedding — because regulatory chunks lose meaning without the surrounding section. At query time: query rewriting to expand variants, retrieve top 30-50, rerank to top 5-10 with a cross-encoder. The agent calls retrieval as a tool so it can re-retrieve based on what it learned mid-task. Generation has explicit prompt instructions to cite chunk IDs and refuse when context is insufficient. Validation pass post-generation checks that every claim is grounded in the cited chunks. Eval suite uses Ragas-style metrics — faithfulness, context precision, citation correctness — plus a human-graded sample. Refresh: change-detection on the source store; only re-embed what changed; effective-date metadata so superseded versions don't surface as current."</p>
+  </div>
+  <p>Memorize the structure: <strong>corpus → chunking → embedding → index → query-time → agent → eval → operations</strong>. Substitute as needed.</p>
+</section>
+
+<footer>
+  <p>See also <a href="03-ai-development.html">03-ai-development</a> for RAG basics. | <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Quality &amp; Testing</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#layers">Three layers of quality</a>
+    <a href="#tests">Tests — dbt and beyond</a>
+    <a href="#freshness">Freshness</a>
+    <a href="#anomaly">Anomaly detection</a>
+    <a href="#contracts">Data contracts</a>
+    <a href="#severity">Severity strategy</a>
+    <a href="#incidents">Incident response</a>
+    <a href="#talking-points">Talking points</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-data-pipelines.html">← Previous</a>
+    <a href="09-warehouses.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Quality</span>
+  <h1>Data Quality &amp; Testing</h1>
+  <p class="subtitle">Tests, freshness, anomaly detection, contracts. How data teams build trust — and lose it.</p>
+</header>
+
+<section id="layers">
+  <h2>Three layers of data quality</h2>
+  <ol>
+    <li><strong>Schema / structural</strong> — does the data have the right shape? (column existence, types, nullability)</li>
+    <li><strong>Logical / business rules</strong> — does the data satisfy expected invariants? (primary keys unique, foreign keys resolve, values in expected set, business arithmetic holds)</li>
+    <li><strong>Statistical / distributional</strong> — does the data <em>look right</em>? (row counts in expected range, column distributions stable, no anomalous spikes/drops)</li>
+  </ol>
+  <p>Different tools handle each. dbt tests cover layers 1 and 2 well. Layer 3 needs observability tooling — Monte Carlo, Anomalo, Elementary, or custom anomaly checks.</p>
+</section>
+
+<section id="tests">
+  <h2>Tests — dbt and beyond</h2>
+
+  <h3>The dbt built-ins</h3>
+  <ul>
+    <li><code>unique</code> — column has no duplicates.</li>
+    <li><code>not_null</code> — column has no nulls.</li>
+    <li><code>accepted_values</code> — column values are within a list.</li>
+    <li><code>relationships</code> — every value in column A exists in column B of another table (foreign key check).</li>
+  </ul>
+
+  <h3>dbt-utils additions</h3>
+  <ul>
+    <li><code>unique_combination_of_columns</code> — composite unique key.</li>
+    <li><code>not_null_proportion</code> — at least X% of rows have non-null.</li>
+    <li><code>recency</code> — most recent row is within X hours.</li>
+    <li><code>at_least_one</code> — table has at least one row.</li>
+    <li><code>expression_is_true</code> — arbitrary boolean expression.</li>
+  </ul>
+
+  <h3>dbt-expectations (Great Expectations port)</h3>
+  <p>Distribution tests, regex tests, statistical bounds. Useful for layer 3 checks within dbt.</p>
+
+  <h3>Singular tests</h3>
+  <p>Custom SQL in <code>tests/</code> that returns failing rows. Empty result = pass. Use for business-logic checks no built-in covers:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>tests/order_revenue_matches_line_items.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  o.order_id,
+  o.revenue AS order_revenue,
+  SUM(oi.line_revenue) AS line_revenue_sum
+FROM {{ ref('fct_orders') }} o
+JOIN {{ ref('fct_order_items') }} oi USING (order_id)
+GROUP BY o.order_id, o.revenue
+HAVING ABS(o.revenue - SUM(oi.line_revenue)) &gt; 0.01</code></pre>
+</div>
+</section>
+
+<section id="freshness">
+  <h2>Freshness</h2>
+  <p>Data that's stale lies. Worse, it lies <em>silently</em> — the dashboard looks the same, the numbers just stop moving.</p>
+
+  <h3>dbt source freshness</h3>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>_sources.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">sources:
+  - name: raw_app
+    loaded_at_field: _ingested_at
+    freshness:
+      warn_after:  {count: 2, period: hour}
+      error_after: {count: 6, period: hour}
+    tables:
+      - name: orders</code></pre>
+</div>
+  <p>Run <code>dbt source freshness</code> in CI / scheduled job. Page or alert on errors.</p>
+
+  <h3>Model freshness</h3>
+  <p>Test that downstream models have recent data:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>recency test (dbt-utils)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">models:
+  - name: fct_orders
+    tests:
+      - dbt_utils.recency:
+          datepart: hour
+          field: ordered_at
+          interval: 2</code></pre>
+</div>
+</section>
+
+<section id="anomaly">
+  <h2>Anomaly detection</h2>
+  <p>Tests catch boolean invariants. They don't catch <em>"revenue dropped 60% today and no one noticed."</em> That's anomaly territory.</p>
+
+  <h3>Built-in patterns</h3>
+  <ul>
+    <li><strong>Row count anomalies</strong> — today's row count is N standard deviations from the trailing average.</li>
+    <li><strong>Schema anomalies</strong> — column added / removed / type changed unexpectedly.</li>
+    <li><strong>Distribution anomalies</strong> — column's distribution shifted (mean, p50, p95).</li>
+    <li><strong>NULL anomalies</strong> — null proportion changed.</li>
+  </ul>
+
+  <h3>Tools</h3>
+  <ul>
+    <li><strong>Elementary</strong> — open-source, dbt-native. Stores test results + anomaly detection in your warehouse.</li>
+    <li><strong>Monte Carlo, Anomalo, Bigeye</strong> — commercial, ML-driven, less config.</li>
+    <li><strong>Roll your own</strong> — a few dbt-utils tests + scheduled queries can do a lot.</li>
+  </ul>
+</section>
+
+<section id="contracts">
+  <h2>Data contracts</h2>
+  <p>An explicit, versioned agreement between data producer and consumer. The producer commits to: these columns, these types, this freshness, these uniqueness guarantees. The consumer commits to: only relying on what's documented.</p>
+
+  <p>Implementation:</p>
+  <ul>
+    <li><strong>dbt model contracts</strong> — declare expected columns + types in YAML; CI fails if the model output doesn't match.</li>
+    <li><strong>Schema registry</strong> for streaming events (Confluent, Glue Schema Registry).</li>
+    <li><strong>Backstage / data catalogs</strong> for org-wide visibility.</li>
+  </ul>
+
+  <p>The cultural piece matters as much as the technical piece. Contracts shift "data team gets blindsided when engineer drops a column" to "producer can't ship without breaking the build."</p>
+</section>
+
+<section id="severity">
+  <h2>Severity strategy</h2>
+  <p>If every test is "error severity, page on-call," tests become noise and get ignored. Smart severity:</p>
+  <ul>
+    <li><strong>Severity error</strong> — true contracts. Page if violated. Examples: PK uniqueness, freshness on source data, business rules where wrong data = wrong decisions.</li>
+    <li><strong>Severity warn</strong> — signal, not gate. Investigate when convenient. Examples: distribution shifts, low-importance accepted-values lists, soft thresholds.</li>
+    <li><strong>Threshold-based errors</strong> — allow some failures. Example: <code>error_if: &gt;100</code> means warn at 1-100 failing rows, error at 101+.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The trap</span>
+    <p>Adding tests without owners. A test that fails and no one fixes is noise. Every test should have a clear owner in the model's YAML and a runbook for what to do when it fires.</p>
+  </div>
+</section>
+
+<section id="incidents">
+  <h2>Incident response</h2>
+  <p>When a quality alert fires, the discipline is:</p>
+  <ol>
+    <li><strong>Triage</strong> — is it real, or a flaky test? Look at the failing rows.</li>
+    <li><strong>Communicate</strong> — if downstream dashboards are affected, post in the data channel. Don't wait until stakeholders find it.</li>
+    <li><strong>Fix the data</strong> — the immediate priority. Backfill, re-run, mark records, whatever.</li>
+    <li><strong>Root-cause</strong> — what change introduced this? Was it a schema change, a logic bug, a data drift?</li>
+    <li><strong>Prevent</strong> — add a test that would have caught this earlier. Document the gotcha in the model's yaml.</li>
+    <li><strong>Postmortem</strong> for the painful ones. Mature data teams run them like SREs run incident reviews.</li>
+  </ol>
+</section>
+
+<section id="talking-points">
+  <h2>Talking points</h2>
+  <div class="talking-point">
+    <span class="label">"How would you onboard data quality?"</span>
+    <p>"Three layers. First, dbt tests on every model — unique, not_null, relationships, accepted_values at minimum. Custom singular tests for business rules. Second, source freshness checks that alert when upstream stops loading. Third, an observability layer — Elementary or Monte Carlo — for anomalies tests can't catch: distribution shifts, volume drops, schema drift. Critical operational piece: severity strategy. Severity-error for true contracts (PK uniqueness, freshness), severity-warn for signal-not-gate. And every test needs an owner — a test that fails and nobody fixes is just noise."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="07-data-pipelines.html">← Data pipelines</a> · <a href="09-warehouses.html">Next: Warehouses →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

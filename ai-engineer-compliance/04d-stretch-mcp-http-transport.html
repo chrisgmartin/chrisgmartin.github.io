@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stretch: HTTP Transport — compliance-toolkit tutorial</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Overview</h2>
+    <a href="#intro">Introduction</a>
+    <a href="#why">Why HTTP exists</a>
+
+    <h2>Build</h2>
+    <ol class="step-list">
+      <li><a href="#step-1">Run as HTTP server</a></li>
+      <li><a href="#step-2">Test with the inspector</a></li>
+      <li><a href="#step-3">Add JWT auth</a></li>
+      <li><a href="#step-4">Compare stdio vs HTTP</a></li>
+    </ol>
+
+    <h2>After</h2>
+    <a href="#interview-claim">Interview claim</a>
+
+    <h2>Navigation</h2>
+    <a href="04-mcp-build-guide.html">← Main MCP tutorial</a>
+    <a href="04c-stretch-mcp-real-api.html">← Previous stretch</a>
+    <a href="index.html">All guides</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero" id="intro">
+  <span class="eyebrow">Stretch Goal · 30 min</span>
+  <h1>Run the Server Over HTTP</h1>
+  <p class="subtitle">Switch from stdio to Streamable HTTP. Experience both transports and answer "when do I pick which?" with conviction.</p>
+  <div class="meta-row">
+    <span>⏱ 30 minutes</span>
+    <span>🌐 HTTP transport</span>
+    <span>🔐 Auth pattern</span>
+  </div>
+</header>
+
+<div class="callout warn">
+  <span class="callout-label">Prerequisite</span>
+  <p>You've completed <a href="04-mcp-build-guide.html">the main MCP build tutorial</a>. You should have a working <code>server.py</code> in your <code>compliance-mcp</code> directory.</p>
+</div>
+
+<section id="why">
+  <h2>Why HTTP exists</h2>
+  <p>Stdio is great for local, single-user, host-spawns-server scenarios. It's not great for:</p>
+  <ul>
+    <li>Multi-user — many clients connecting to one shared server</li>
+    <li>Multi-host — one team's tools, many laptops</li>
+    <li>Centralized state — the server holds session data, caches, locks</li>
+    <li>Production observability — standard HTTP infra: load balancing, mTLS, request logs</li>
+    <li>Cross-language — clients in any language can speak HTTP</li>
+  </ul>
+
+  <p>MCP's <strong>Streamable HTTP</strong> transport is a single endpoint that handles both regular requests (JSON-RPC over HTTP POST) and streaming (Server-Sent Events for long-running operations). It replaces the older SSE-based pattern with a simpler one-endpoint design.</p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>stdio</th><th>HTTP</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Who runs it</strong></td><td>Host spawns as child process</td><td>Long-lived service, separately managed</td></tr>
+      <tr><td><strong>Auth</strong></td><td>Process boundary</td><td>Bring your own (JWT, OAuth, mTLS)</td></tr>
+      <tr><td><strong>Multi-user</strong></td><td>No — one process per user</td><td>Yes — N clients share one server</td></tr>
+      <tr><td><strong>Observability</strong></td><td>Process logs, manual</td><td>Standard HTTP infra</td></tr>
+      <tr><td><strong>Network surface</strong></td><td>Zero</td><td>One port — must be secured</td></tr>
+      <tr><td><strong>Fit for</strong></td><td>Developer tools, single-user agents</td><td>Production compliance services</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2 id="step-1"><span class="step-num">1</span>Run as HTTP server<span class="step-time">~5 min</span></h2>
+  <p>FastMCP supports both transports with a single line change. First, flip the constructor at the top of <code>server.py</code> to enable stateless HTTP — this lets each request stand on its own without an <code>initialize</code> handshake and a session ID. It's the simpler mode for pure tool servers and is what makes the single-curl tests in step 4 work:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>server.py — top</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># Was: mcp = FastMCP("compliance-toolkit")
+mcp = FastMCP("compliance-toolkit", stateless_http=True)</code></pre>
+</div>
+
+  <p>Then add a transport switch at the bottom of the file so the same script runs as either stdio or HTTP:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>server.py — bottom of file</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">if __name__ == "__main__":
+    import sys
+    transport = sys.argv[1] if len(sys.argv) &gt; 1 else "stdio"
+    if transport == "http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()  # stdio (default)</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Stateful vs stateless HTTP</span>
+    <p>With the default (stateful) Streamable HTTP, every request after the first must include an <code>Mcp-Session-Id</code> header that the server returns from <code>initialize</code>. Skip the handshake and the server replies <code>Bad Request: Missing session ID</code>. Stateless mode (<code>stateless_http=True</code>) drops that requirement — each request is independent. <strong>When to use which:</strong> stateful is right when the server holds per-session state (auth tokens scoped to a session, in-flight subscriptions, long-running operations). Stateless is right for pure tool servers where every call is idempotent and self-describing — most compliance/scoring/screening tools fit this profile, and it's much easier to scale horizontally.</p>
+  </div>
+
+  <p>Now you can launch the same server in either mode:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>shell (venv active)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash"># stdio mode (what Claude Desktop uses):
+python server.py
+
+# HTTP mode (long-lived service):
+python server.py http</code></pre>
+</div>
+
+  <p>Run the HTTP mode. By default FastMCP serves on <code>http://localhost:8000/mcp</code>. You should see startup logs in your terminal.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Configuring host and port</span>
+    <p>For production you'd configure these explicitly via environment variables or FastMCP options. For learning, the defaults are fine.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="step-2"><span class="step-num">2</span>Test with the inspector<span class="step-time">~5 min</span></h2>
+  <p>Open a <em>second</em> terminal (the first is running the server). Point the MCP inspector at your HTTP endpoint:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>shell (second terminal)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash">npx @modelcontextprotocol/inspector</code></pre>
+</div>
+
+  <p>In the inspector UI:</p>
+  <ol>
+    <li>Set <strong>Transport</strong> to <code>Streamable HTTP</code></li>
+    <li>Set <strong>URL</strong> to <code>http://localhost:8000/mcp</code></li>
+    <li>Click <strong>Connect</strong></li>
+  </ol>
+
+  <p>You should see the same three tools, two resources, and (if you did stretch 04b) two prompts as before. Invoke <code>summarize_alert</code> with the standard payload — it works identically.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">What just happened</span>
+    <p>The server is the same code. The protocol is the same JSON-RPC. The <em>only</em> difference is transport: instead of bytes flowing through pipes between a parent and child process, they're flowing through TCP between two separate processes — potentially on different machines. That's the whole conceptual difference between stdio and HTTP. Everything else is plumbing.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="step-3"><span class="step-num">3</span>Add JWT auth (the production-ready piece)<span class="step-time">~15 min</span></h2>
+  <p>An HTTP MCP server with no auth is a wide-open door to your compliance tools. Production deployments need auth. Let's add a minimal JWT-bearer pattern.</p>
+
+  <p>Install PyJWT:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>shell</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash">pip install pyjwt</code></pre>
+</div>
+
+  <p>Create a separate file <code>mint_token.py</code> for issuing test tokens:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>mint_token.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">"""Mint a JWT for testing the compliance-toolkit HTTP server.
+
+In production this lives in a server-side mint endpoint with proper user auth,
+short TTLs, and scoping. For learning, we'll mint a 1-hour token for a fake user.
+"""
+
+import jwt
+from datetime import datetime, timedelta, timezone
+
+SECRET = "dev-secret-do-not-use-in-production"  # in prod: env var, KMS, etc.
+
+def mint(user_id: str, allowed_tools: list[str], ttl_minutes: int = 60) -&gt; str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ttl_minutes)).timestamp()),
+        "scope": {"tools": allowed_tools},
+        "purpose": "compliance-toolkit-access",
+    }
+    return jwt.encode(payload, SECRET, algorithm="HS256")
+
+
+if __name__ == "__main__":
+    # Issue a token that allows all tools
+    token = mint(
+        user_id="analyst.demo@example.com",
+        allowed_tools=["lookup_sanctions_hit", "check_jurisdiction_risk", "summarize_alert"],
+    )
+    print(token)</code></pre>
+</div>
+
+  <p>Run it once to get a token:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>shell</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash">python mint_token.py
+# eyJhbGciOiJIUzI1NiIs... (copy this)</code></pre>
+</div>
+
+  <p>Now add an HTTP middleware-style check inside your tools. The cleanest pattern with FastMCP is a small auth decorator:</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>server.py — top, after imports</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import jwt
+from contextvars import ContextVar
+from functools import wraps
+from mcp.server.fastmcp import Context
+
+SECRET = "dev-secret-do-not-use-in-production"
+
+# Threaded through the request via ContextVar so tool signatures stay clean.
+# FastMCP rejects tool parameters that start with '_', so we can't pass the
+# auth identity as a function kwarg. Tools read it via current_auth_user().
+_current_auth_user: ContextVar[str] = ContextVar("_current_auth_user", default="anonymous")
+
+
+def current_auth_user() -&gt; str:
+    """Return the authenticated subject ('sub' claim) for the in-flight tool call."""
+    return _current_auth_user.get()
+
+
+def require_auth(tool_name: str):
+    """Decorator: validate a Bearer JWT from the request headers and check scope."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, ctx: Context = None, **kwargs):
+            # FastMCP makes the request available via ctx.request_context
+            headers = {}
+            if ctx and hasattr(ctx, "request_context"):
+                req = ctx.request_context.request
+                if req:
+                    headers = dict(req.headers)
+
+            auth = headers.get("authorization", "")
+            if not auth.startswith("Bearer "):
+                return {"error": "missing or malformed Authorization header", "isError": True}
+
+            token = auth.removeprefix("Bearer ").strip()
+            try:
+                payload = jwt.decode(token, SECRET, algorithms=["HS256"])
+            except jwt.ExpiredSignatureError:
+                return {"error": "token expired", "isError": True}
+            except jwt.InvalidTokenError as e:
+                return {"error": f"invalid token: {e}", "isError": True}
+
+            scope_tools = payload.get("scope", {}).get("tools", [])
+            if tool_name not in scope_tools:
+                return {
+                    "error": f"token does not authorize tool '{tool_name}'",
+                    "authorized": scope_tools,
+                    "isError": True,
+                }
+
+            token_ref = _current_auth_user.set(payload["sub"])
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _current_auth_user.reset(token_ref)
+        return wrapper
+    return deco</code></pre>
+</div>
+
+  <p>Apply it to one tool to see the pattern. This is a two-step refactor of the <code>lookup_sanctions_hit</code> you already have: (1) rename the existing function — body unchanged — to a private helper <code>_do_screening</code>; (2) create a new public <code>lookup_sanctions_hit</code> that wraps the helper with <code>@require_auth</code> and stamps the caller's identity onto the response for the audit trail.</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>server.py — step 1: rename existing function to a private helper</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># Was: @mcp.tool()
+# Was: def lookup_sanctions_hit(name: str) -&gt; dict:
+def _do_screening(name: str) -&gt; dict:
+    """Existing screening logic — cache, OpenSanctions API call, fallback.
+    No changes to the body; just renamed and the @mcp.tool() decorator removed.
+    """
+    cached = _cache_get(name)
+    if cached is not None:
+        return {**cached, "from_cache": True}
+    # ... rest of your existing cache + API + fallback logic unchanged ...
+    # (the body you wrote in the real-API stretch)</code></pre>
+</div>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>server.py — step 2: new wrapped tool</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">@mcp.tool()
+@require_auth("lookup_sanctions_hit")
+def lookup_sanctions_hit(name: str, ctx: Context = None) -&gt; dict:
+    """Screen a person or entity name against the live OpenSanctions database.
+
+    Requires a Bearer JWT in the Authorization header with 'lookup_sanctions_hit'
+    in its tool scope. The caller's identity is recorded on every response.
+    """
+    result = _do_screening(name)
+    result["screened_by"] = current_auth_user()  # audit trail!
+    return result</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">Heads-up: three traps to know</span>
+    <p><strong>1. The tool function must declare <code>ctx: Context = None</code>.</strong> FastMCP introspects the inner function's signature (via <code>functools.wraps</code>) to decide which framework-injected parameters to pass. If <code>ctx</code> isn't in the signature, FastMCP won't inject one, the wrapper's <code>headers</code> dict stays empty, and every call fails with "missing or malformed Authorization header" — even when you sent a valid token. <code>Context</code>-typed parameters are auto-injected by the framework and excluded from the JSON schema the model sees, so the model can't pass anything for <code>ctx</code>.</p>
+    <p><strong>2. Don't pass auth identity via a kwarg.</strong> FastMCP rejects tool parameters whose name starts with <code>_</code> at registration time (<code>InvalidSignature: Parameter _auth_user of lookup_sanctions_hit cannot start with '_'</code>). It also rejects passing it as a regular kwarg like <code>auth_user</code> because then the model sees it as a tool argument it can supply, which lets it impersonate any user. The <code>ContextVar</code> pattern above keeps the tool's public signature clean while still threading identity through the request.</p>
+    <p><strong>3. Decorator order matters.</strong> <code>@mcp.tool()</code> must sit <em>above</em> <code>@require_auth(...)</code>, so FastMCP registers the auth-wrapped callable rather than the raw one.</p>
+  </div>
+
+  <p>Test it with curl from the second terminal. The <code>Accept</code> header is required — MCP's Streamable HTTP transport rejects requests that don't advertise support for both JSON and SSE responses (<code>Not Acceptable</code> error otherwise):</p>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>shell</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash"># Replace TOKEN with the JWT you minted
+TOKEN="eyJhbGc..."
+
+# Should succeed with that token's scope:
+curl -X POST http://localhost:8000/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lookup_sanctions_hit","arguments":{"name":"Vladimir Petrov"}}}'
+
+# Should fail with no token (401):
+curl -X POST http://localhost:8000/mcp \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lookup_sanctions_hit","arguments":{"name":"Vladimir Petrov"}}}'</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">The pattern, regardless of FastMCP version specifics</span>
+    <p>The key idea: JWT validation happens <em>before</em> the tool runs. The token carries the user identity (which goes into the audit log) and the scope (which tools this token authorizes). A short TTL means a leaked token's blast radius is bounded. A rotation path on the mint side means revoking the long-lived credential invalidates derived tokens.</p>
+    <p>The SDK details for accessing request headers in FastMCP evolve quickly — if the above doesn't fit your installed version, check the <a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">official docs</a>. The <em>pattern</em> (verify-before-execute, scope-per-token, user-in-audit) is universal.</p>
+  </div>
+</section>
+
+<section>
+  <h2 id="step-4"><span class="step-num">4</span>Now you can answer "stdio vs HTTP" with conviction<span class="step-time">~2 min</span></h2>
+  <p>You've run both transports. The pros and cons are no longer abstract:</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Pick stdio when</span>
+    <p>The user is on their laptop running Claude Desktop. There's no shared state. There's no need for separate auth — the OS user identity is the identity. Operations are local to the user (their files, their workspace, their session). Examples: developer tools, single-user productivity agents.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Pick HTTP when</span>
+    <p>Multiple users share the server. The server hits production systems (compliance databases, case management, vendor APIs). You need centralized observability, rate limiting, secrets management. You need to enforce auth, scope, and audit. Examples: every production compliance MCP server.</p>
+  </div>
+</section>
+
+<section id="interview-claim">
+  <h2>What you can now say in the interview</h2>
+  <div class="talking-point">
+    <span class="label">Sample answer — ~75 seconds</span>
+    <p>"I've run the same MCP server in both transports — stdio for local single-user, HTTP for production-ready. The decision is straightforward once you've done it. Stdio is right when the host can spawn the server as a child process and the OS user identity is the auth — developer tools, single-user agents. HTTP is right whenever you need multiple clients, centralized state, real observability, or non-OS-level auth — every production compliance use case. The piece that matters most is auth: HTTP needs a real story, and I wired up the JWT pattern — short-lived bearer token, scope-per-token specifying which tools it authorizes, user identity in every audit log entry, and a mint endpoint that holds the long-lived credential so it never leaves the server. The blast radius of a leaked HTTP MCP token is bounded by the scope and the TTL. That's the difference between 'we exposed a tool over HTTP' and 'we exposed a tool over HTTP in a way Compliance would approve.'"</p>
+  </div>
+</section>
+
+<footer>
+  <p>Stretch goal 4 of 4. You've completed the MCP stretch series. ← <a href="04-mcp-build-guide.html">Return to main MCP tutorial</a> | <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
