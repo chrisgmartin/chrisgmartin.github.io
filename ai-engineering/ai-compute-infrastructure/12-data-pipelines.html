@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#telemetry">The telemetry pipeline</a>
+    <a href="#dcgm">DCGM exporter — what you actually scrape</a>
+    <a href="#prometheus">Prometheus shape &amp; scaling</a>
+    <a href="#logs">Logs from inference servers</a>
+    <a href="#tracing">Tracing across inference</a>
+    <a href="#metrics-catalog">Metrics catalog</a>
+    <a href="#cost-pipeline">Cost pipeline</a>
+    <a href="#training-data">Training-side data flows</a>
+    <a href="#weights">Model weight pipeline</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">The telemetry plumbing that makes a GPU fleet observable, the metrics worth scraping, traces across inference calls, the cost pipeline that turns metrics into dollars, and the weight/data flows that train and feed models.</p>
+</header>
+
+<section id="telemetry">
+  <h2>The telemetry pipeline</h2>
+  <p>The basic shape, drawn left to right:</p>
+  <pre style="background:#1a1a1a;padding:16px;border-radius:8px;color:#ddd;line-height:1.6;">
+GPU nodes ──┐
+            │  DCGM exporter (DaemonSet)        Prometheus / Mimir / Cortex
+            ├──────────────────────────────────▶ scrape /metrics ──▶ TSDB
+Serving pods│  /metrics from vLLM, Triton                                    ─▶ Grafana
+            └──────────────────────────────────▶                              ─▶ Alertmanager
+                                                                              ─▶ Cost ETL ──▶ data warehouse
+
+Logs:    pods ──▶ fluent-bit ──▶ Loki / ELK / Datadog
+Traces:  pods (OTel SDK) ──▶ OTel collector ──▶ Tempo / Jaeger / Honeycomb
+  </pre>
+  <p>You don't need to use these specific tools; you need to know <em>what each layer does</em> and what failure modes each has.</p>
+</section>
+
+<section id="dcgm">
+  <h2>DCGM exporter — what you actually scrape</h2>
+  <p>NVIDIA's <strong>DCGM</strong> (Data Center GPU Manager) reads telemetry directly from the GPU. The <strong>dcgm-exporter</strong> exposes it as Prometheus metrics. Default fields aren't enough; you'll add profiling fields.</p>
+  <table>
+    <thead><tr><th>Metric</th><th>Field ID</th><th>What it tells you</th></tr></thead>
+    <tbody>
+      <tr><td><code>DCGM_FI_DEV_SM_CLOCK</code></td><td>100</td><td>SM clock speed — throttling shows here</td></tr>
+      <tr><td><code>DCGM_FI_DEV_MEM_CLOCK</code></td><td>101</td><td>Memory clock speed</td></tr>
+      <tr><td><code>DCGM_FI_DEV_GPU_TEMP</code></td><td>150</td><td>GPU temperature</td></tr>
+      <tr><td><code>DCGM_FI_DEV_POWER_USAGE</code></td><td>155</td><td>Power draw (W)</td></tr>
+      <tr><td><code>DCGM_FI_DEV_GPU_UTIL</code></td><td>203</td><td><em>The naive number from nvidia-smi</em>; mostly useless alone</td></tr>
+      <tr><td><code>DCGM_FI_DEV_MEM_COPY_UTIL</code></td><td>204</td><td>Memory copy engine util</td></tr>
+      <tr><td><code>DCGM_FI_DEV_FB_USED</code></td><td>252</td><td>HBM used</td></tr>
+      <tr><td><code>DCGM_FI_DEV_FB_FREE</code></td><td>253</td><td>HBM free</td></tr>
+      <tr><td><code>DCGM_FI_PROF_GR_ENGINE_ACTIVE</code></td><td>1001</td><td>Graphics engine active fraction</td></tr>
+      <tr><td><code>DCGM_FI_PROF_SM_ACTIVE</code></td><td>1002</td><td>SM-active — <strong>better utilization signal</strong></td></tr>
+      <tr><td><code>DCGM_FI_PROF_SM_OCCUPANCY</code></td><td>1003</td><td>SM occupancy — best signal</td></tr>
+      <tr><td><code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code></td><td>1004</td><td>Tensor core active fraction</td></tr>
+      <tr><td><code>DCGM_FI_PROF_DRAM_ACTIVE</code></td><td>1005</td><td>Memory bandwidth util — critical for decode</td></tr>
+      <tr><td><code>DCGM_FI_PROF_NVLINK_TX_BYTES</code></td><td>1011</td><td>NVLink TX bytes</td></tr>
+      <tr><td><code>DCGM_FI_DEV_XID_ERRORS</code></td><td>230</td><td>Xid error count — hardware/driver health</td></tr>
+      <tr><td><code>DCGM_FI_DEV_ECC_*</code></td><td>various</td><td>ECC error counters (single-bit, double-bit)</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">The profiling fields cost something</span>
+    <p>The <code>DCGM_FI_PROF_*</code> fields use the GPU's profiling counters. They have a small overhead and may conflict with user-space profilers (Nsight). Production typically samples at 1-5s intervals and accepts the small cost.</p>
+  </div>
+</section>
+
+<section id="prometheus">
+  <h2>Prometheus shape &amp; scaling</h2>
+  <p>Prometheus is the de facto metrics backbone. For a fleet:</p>
+  <ul>
+    <li><strong>Cardinality</strong> is the enemy. Labels with high cardinality (request_id, prompt_hash) will balloon the index. Stay at: node, gpu_index, model, namespace, deployment, instance.</li>
+    <li><strong>Federation or remote-write</strong> to a long-term store (Mimir, Cortex, Thanos, VictoriaMetrics) for cross-cluster queries and retention.</li>
+    <li><strong>Recording rules</strong> precompute heavy expressions (p95 latency over 5m windowed) so dashboards are snappy.</li>
+    <li><strong>Histograms over averages</strong> for any latency metric — <code>histogram_quantile</code> on a <code>_bucket</code> series.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># A representative ServiceMonitor (Prometheus Operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  labels: { release: prometheus }
+spec:
+  selector:
+    matchLabels: { app: dcgm-exporter }
+  endpoints:
+    - port: metrics
+      interval: 5s
+      scrapeTimeout: 4s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+</code></pre></div>
+</section>
+
+<section id="logs">
+  <h2>Logs from inference servers</h2>
+  <p>Don't log the prompt body by default. <em>Do</em> log:</p>
+  <ul>
+    <li><strong>Request ID</strong> (correlatable across services).</li>
+    <li><strong>Tenant / API key hash.</strong></li>
+    <li><strong>Model and version.</strong></li>
+    <li><strong>Prompt token count, response token count.</strong></li>
+    <li><strong>TTFT, total latency.</strong></li>
+    <li><strong>Cache hit indicator</strong> (prefix-cache reused or not).</li>
+    <li><strong>Outcome</strong>: success / error / aborted by client / timeout.</li>
+    <li><strong>Error class</strong> if applicable (OOM, NCCL, downstream).</li>
+  </ul>
+  <p>Structured JSON. Fluent-bit (lightweight) or Vector to a backend (Loki, Elastic, Datadog). Retention sized to the regulatory window for any audit-relevant logs.</p>
+</section>
+
+<section id="tracing">
+  <h2>Tracing across model invocations</h2>
+  <p>For complex pipelines (RAG, agents, multi-stage) traces beat logs. OpenTelemetry is the default standard.</p>
+  <ul>
+    <li>Gateway opens the root span on a request.</li>
+    <li>Each downstream — retriever, embedding service, reranker, LLM — opens a child span.</li>
+    <li>Spans carry attributes: model, tokens, cache hit, GPU node.</li>
+    <li>Sampling is essential. Tail-based sampling (keep all traces with errors or high latency) gives the best signal-to-cost.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("inference-gateway")
+
+async def handle(request):
+    with tracer.start_as_current_span("infer") as span:
+        span.set_attribute("model", request.model)
+        span.set_attribute("prompt.tokens", request.prompt_tokens)
+        try:
+            with tracer.start_as_current_span("backend.vllm") as backend_span:
+                resp = await call_backend(request)
+                backend_span.set_attribute("response.tokens", resp.tokens)
+            return resp
+        except Exception as e:
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+</code></pre></div>
+</section>
+
+<section id="metrics-catalog">
+  <h2>The metrics catalog — what every service should expose</h2>
+  <p>If you build a serving service, expose this minimum metric set. vLLM and Triton ship most of these by default.</p>
+  <ul>
+    <li><code>{service}_requests_total{status, model}</code> — counter.</li>
+    <li><code>{service}_request_duration_seconds_bucket{model, le}</code> — histogram for percentiles.</li>
+    <li><code>{service}_time_to_first_token_seconds_bucket{model}</code> — histogram.</li>
+    <li><code>{service}_tokens_generated_total{model}</code> — counter.</li>
+    <li><code>{service}_tokens_prompt_total{model}</code> — counter.</li>
+    <li><code>{service}_num_requests_running{model}</code> — gauge.</li>
+    <li><code>{service}_num_requests_waiting{model}</code> — gauge.</li>
+    <li><code>{service}_kv_cache_usage_perc{model}</code> — gauge.</li>
+    <li><code>{service}_prefix_cache_hit_ratio{model}</code> — gauge.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The dashboard one-liner</span>
+    <p>"With <code>num_requests_waiting</code>, <code>request_duration_p95</code>, <code>tokens_generated</code>, and <code>kv_cache_usage</code>, you can diagnose 80% of serving incidents."</p>
+  </div>
+</section>
+
+<section id="cost-pipeline">
+  <h2>The cost pipeline</h2>
+  <p>Cost is a derived metric. The pipeline:</p>
+  <ol>
+    <li>Source: Prometheus GPU-hour-equivalent usage per pod (sum of allocated GPUs × time).</li>
+    <li>Source: cloud billing API (or on-prem amortization table) giving $/GPU-hour by instance type, including the team's reservation/spot mix.</li>
+    <li>ETL: nightly job joins usage × unit cost, attributes via labels (team, namespace, model).</li>
+    <li>Sink: data warehouse (BigQuery, Snowflake, Redshift) with daily granularity.</li>
+    <li>Surface: Grafana dashboards, Slack weekly digest, internal cost portal.</li>
+  </ol>
+  <p>Tools to know: <strong>Kubecost</strong> / <strong>OpenCost</strong> (Kubernetes-native), <strong>AWS Cost &amp; Usage Reports</strong>, <strong>GCP Billing Export to BigQuery</strong>, <strong>Cloudability</strong>. None replaces a custom join when you need cross-cloud or on-prem attribution.</p>
+</section>
+
+<section id="training-data">
+  <h2>Training-side data flows</h2>
+  <p>This role probably won't own training data quality, but you'll own its plumbing.</p>
+  <ul>
+    <li><strong>Dataset storage</strong> — Parquet on S3 with manifest files. Petabyte-class for serious training.</li>
+    <li><strong>Data loaders</strong> — feeding the GPUs is its own performance problem. PyTorch <code>DataLoader</code> workers, prefetch, pin_memory, IterableDataset for streaming.</li>
+    <li><strong>Throughput target</strong> — keep the GPU saturated. The "GPU starved on I/O" pathology is real; profile data-loader idle time as part of training health.</li>
+    <li><strong>Filesystem</strong> — for HPC-style training, Lustre/Weka/FSx-for-Lustre over IB. For lighter training, S3 with a local cache (e.g. <code>s3fs</code>, <code>mountpoint-s3</code>, or pre-staged copies).</li>
+    <li><strong>Sharding strategy</strong> — pre-shard datasets by rank so workers don't all read the same files.</li>
+  </ul>
+</section>
+
+<section id="weights">
+  <h2>Model weight pipeline</h2>
+  <p>Weights flow from training to serving. The pipeline you build:</p>
+  <ol>
+    <li><strong>Source of truth</strong> — Hugging Face Hub mirror or internal model registry (e.g. MLflow, custom artifact store backed by S3 with signed manifests).</li>
+    <li><strong>Versioning</strong> — every checkpoint has an immutable ID. Tags like <code>llama3-70b-finetune-2026-05-08</code> resolve to a hash.</li>
+    <li><strong>Quantization step</strong> — produce FP8/INT4 derivatives, store them as siblings of the source FP16.</li>
+    <li><strong>Conversion to serving format</strong> — TensorRT-LLM engine builds happen on the target GPU type; safetensors is the source format for vLLM.</li>
+    <li><strong>Distribution</strong> — pre-stage to local NVMe on every relevant node; cache for re-use across pod restarts.</li>
+    <li><strong>Garbage collection</strong> — old checkpoints are big; lifecycle rules age them out of hot storage to glacier.</li>
+  </ol>
+  <div class="callout warn">
+    <span class="callout-label">Don't let pods download from the internet</span>
+    <p>Pods pulling weights from Hugging Face on every restart is slow, expensive, and a supply-chain risk. Mirror to your internal store, pre-stage to nodes, and pin by digest.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Previous</a> · <a href="13-deployment-and-ops.html">Next: Deployment &amp; ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — Agentic Workflow Architecture</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-this">Why this is the primary deep dive</a>
+    <a href="#single-vs-multi">Single-agent vs. multi-agent</a>
+    <a href="#patterns">Core orchestration patterns</a>
+    <a href="#planner-worker">Planner / worker in detail</a>
+    <a href="#tool-use">Tool use &amp; function calling</a>
+    <a href="#mcp">MCP — the shared tool fabric</a>
+    <a href="#n8n-vs-code">n8n vs. code-first orchestration</a>
+    <a href="#close-workflow">Designing an agentic close workflow</a>
+    <a href="#whiteboard">Whiteboard answer template</a>
+    <a href="#anti-patterns">Anti-patterns to call out</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core · Primary</span>
+  <h1>Agentic Workflow Architecture</h1>
+  <p class="subtitle">Multi-agent design, planner/worker patterns, tool use, function calling, MCP for shared tooling, n8n vs. code-first orchestration — and how to design an agentic close workflow on a whiteboard in 20 minutes.</p>
+</header>
+
+<section id="why-this">
+  <h2>Why this is the primary deep dive</h2>
+  <p>The JD literally says: <em>"Design the long-term architecture for an AI-native finance operating system. Define how agentic systems interact with financial infrastructure, data pipelines, and control and reporting frameworks."</em> The applied-design round will almost certainly hand you a workflow ("design an agentic close" / "design a treasury monitor") and ask you to architect it on a whiteboard. This chapter is the muscle for that.</p>
+</section>
+
+<section id="single-vs-multi">
+  <h2>Single-agent vs. multi-agent</h2>
+  <p>The first design question on any whiteboard problem is: <strong>does this need more than one agent?</strong> Most people over-reach to multi-agent because it sounds sophisticated. In finance, a single agent with a focused tool catalog is usually the right starting point.</p>
+  <table>
+    <thead><tr><th></th><th>Single-agent</th><th>Multi-agent</th></tr></thead>
+    <tbody>
+      <tr><td>When</td><td>Workflow has a clear sequence; tools are bounded; one persona.</td><td>Distinct skill domains (recon vs. tax vs. treasury); long horizon; specialization helps eval.</td></tr>
+      <tr><td>Pros</td><td>Simpler context, easier eval, cheaper, fewer failure modes.</td><td>Specialization, parallelism, scoped prompts (smaller, cleaner).</td></tr>
+      <tr><td>Cons</td><td>Context bloat as scope grows; single prompt hard to maintain.</td><td>Coordination overhead, harder audit trail, more failure surfaces.</td></tr>
+      <tr><td>Finance default</td><td>Start here for any single workflow (bank rec, intercompany rec).</td><td>Reserve for cross-domain orchestration (e.g., quarter-end close manager spawning recon, accrual, FX agents).</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Interview move</span>
+    <p>If the interviewer hands you a problem and you instinctively reach for three agents — pause. Say out loud: <em>"I could split this into agents A/B/C. Before I do that, let me argue for the single-agent version first; if its context blows up or its tool catalog crosses a clean boundary, then I split."</em> That sentence alone reads as senior.</p>
+  </div>
+</section>
+
+<section id="patterns">
+  <h2>Core orchestration patterns</h2>
+  <p>The seven patterns you should be able to name and place:</p>
+  <ol>
+    <li><strong>Sequential chain</strong>: A → B → C. Each step is deterministic; AI in one or more steps. Good for close-checklist execution.</li>
+    <li><strong>Router</strong>: classifier picks one of N downstream paths. Good for triage ("is this a bank txn, intercompany, or crypto recon?").</li>
+    <li><strong>Tool-using single agent</strong>: agent loop with N tools, runs until done or stop condition. Default for bounded workflows.</li>
+    <li><strong>Planner / worker</strong>: planner decomposes a goal into a task list; workers execute each task. Good for close orchestration.</li>
+    <li><strong>Critic / reviewer</strong>: a second LLM call evaluates the first call's output before it leaves the system. Useful as an additional eval gate on Tier 2/3 outputs.</li>
+    <li><strong>Human-in-the-loop</strong>: pauses on approval gates. <em>Mandatory</em> in SOX-regulated tiers.</li>
+    <li><strong>Parallel fan-out / gather</strong>: many independent subtasks run in parallel, results aggregated. Good for "run N reconciliations for 50 entities simultaneously."</li>
+  </ol>
+</section>
+
+<section id="planner-worker">
+  <h2>Planner / worker in detail</h2>
+  <p>The planner/worker pattern is the workhorse for multi-step finance workflows. The planner is an LLM call that produces a structured plan; workers are subsequent LLM calls (or deterministic functions) that execute each plan step.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">PLANNER_PROMPT = """You are a finance close orchestrator. Given a goal,
+produce a JSON plan of steps. Each step must specify:
+- step_id (e.g. "S1")
+- type: one of [fetch, reconcile, propose_je, summarize, request_approval]
+- inputs: required inputs
+- depends_on: list of upstream step_ids
+- risk_tier: 1|2|3
+- requires_human: bool
+
+Do not invent capabilities. Use only the tools in the catalog.
+If a step would post to the GL, set requires_human: true.
+"""
+
+# Worker dispatch
+def execute_plan(plan: list[dict]):
+    results = {}
+    for step in topo_sort(plan):
+        if step["requires_human"]:
+            results[step["step_id"]] = await_human_approval(step)
+        else:
+            results[step["step_id"]] = workers[step["type"]](step, results)
+        audit_log(step, results[step["step_id"]])
+    return results
+</code></pre></div>
+
+  <h3>Why this is finance-friendly</h3>
+  <ul>
+    <li>The plan is <strong>inspectable</strong> before any tool fires — humans can review it, auditors can read it.</li>
+    <li>Risk tier is encoded per step, not per agent.</li>
+    <li>The dependency graph means failures are local and rollback is bounded.</li>
+    <li>The same plan can be replayed for audit reconstruction.</li>
+  </ul>
+</section>
+
+<section id="tool-use">
+  <h2>Tool use &amp; function calling</h2>
+  <p>Recap from <a href="03-core-fundamentals.html">03</a>: tools are declared by name + description + JSON schema. The model picks one and emits arguments; your harness executes; results return. Finance-specific design rules:</p>
+  <ul>
+    <li><strong>Granularity</strong>: tools should be verbs at a single level of abstraction. <code>fetch_trial_balance(entity, period)</code> ✔. <code>do_close(entity)</code> ✘ (too coarse — opaque to audit).</li>
+    <li><strong>Read/write split</strong>: prefix tools <code>fetch_</code>, <code>list_</code>, <code>get_</code> for read; <code>propose_</code>, <code>stage_</code> for write-to-staging; <code>commit_</code> for production write (rarely exposed).</li>
+    <li><strong>Idempotency</strong>: every write tool requires an <code>idempotency_key</code>.</li>
+    <li><strong>Scope tokens</strong>: every tool call carries the agent's identity, the Process Owner, and the workflow run id.</li>
+    <li><strong>Tool count</strong>: aim for &lt; 20 tools per agent. Beyond that, accuracy of tool selection degrades — split agents or use a router.</li>
+  </ul>
+</section>
+
+<section id="mcp">
+  <h2>MCP — the shared tool fabric</h2>
+  <p>The Model Context Protocol is Anthropic's open standard for how an agent connects to tools, resources, and prompts. It matters here because <strong>every finance integration you build for one agent should be reusable by every other agent and human</strong>. MCP gives you that.</p>
+
+  <h3>MCP primitives</h3>
+  <ul>
+    <li><strong>Tools</strong> — callable functions ("fetch GL balance for entity E period P").</li>
+    <li><strong>Resources</strong> — read-only data the model can consult ("the May trial balance for entity E").</li>
+    <li><strong>Prompts</strong> — reusable templates ("standard intercompany recon prompt").</li>
+  </ul>
+
+  <h3>Transports</h3>
+  <ul>
+    <li><strong>stdio</strong> — local subprocess. Good for dev, local tools.</li>
+    <li><strong>HTTP + SSE</strong> — remote MCP servers, scalable.</li>
+  </ul>
+
+  <h3>Finance use of MCP, concretely</h3>
+  <p>Build one MCP server per system, exposed to every agent:</p>
+  <ul>
+    <li><strong>netsuite-mcp</strong> — tools for GL queries, JE staging, vendor lookups; resources for chart of accounts.</li>
+    <li><strong>blackline-mcp</strong> — tools for recon status, matching rules, certification state.</li>
+    <li><strong>kyriba-mcp</strong> — tools for cash positions, sweeps, FX rates.</li>
+    <li><strong>fireblocks-mcp</strong> — tools for vault balances, transaction lookups.</li>
+    <li><strong>lukka-mcp</strong> — tools for crypto subledger queries, fair-value snapshots.</li>
+  </ul>
+  <p>Build it once. Every future agent uses it. That's the platform foundation in section 5 of the JD.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Architectural payoff</span>
+    <p>MCP is also the substrate for <strong>identity &amp; access control</strong>. The MCP server enforces "this caller can read but not stage" — not the agent prompt. SOX auditors love this: the control lives in the integration layer, not in trust of the model.</p>
+  </div>
+</section>
+
+<section id="n8n-vs-code">
+  <h2>n8n vs. code-first orchestration</h2>
+  <p>One of the most common interview questions for this role: <em>"When do you reach for n8n vs. writing Python?"</em> The honest answer:</p>
+  <table>
+    <thead><tr><th></th><th>n8n</th><th>Code-first (Python)</th></tr></thead>
+    <tbody>
+      <tr><td>Strength</td><td>Visual workflow non-engineers can read; built-in nodes for Slack/email/HTTP; HITL approval primitives; schedules &amp; retries; self-host = SOX-friendly.</td><td>Full expressive power, version control, real testing, custom logic, performance at scale.</td></tr>
+      <tr><td>Weakness</td><td>Logic that exceeds drag-and-drop becomes spaghetti; testing is hard; PR review is awkward.</td><td>No visual artifact for the Controller to read; you build retries/approvals yourself.</td></tr>
+      <tr><td>Use for</td><td>The <strong>shell</strong>: schedules, fan-out, HITL approvals, Slack/email steps, simple branching.</td><td>The <strong>core</strong>: Claude API calls, recon logic, decimal math, MCP servers, eval harness.</td></tr>
+    </tbody>
+  </table>
+  <p>The pattern: <strong>n8n calls Python; Python calls Claude; Claude calls MCP tools.</strong> n8n owns the workflow narrative; Python owns the substance.</p>
+</section>
+
+<section id="close-workflow">
+  <h2>Designing an agentic close workflow — end to end</h2>
+  <p>The whiteboard problem you should be able to draw cold. Goal: <strong>automate the month-end close for one entity, with humans gating high-risk steps.</strong></p>
+
+  <h3>1. Decompose the close</h3>
+  <p>A typical close has ~80 tasks. Group them:</p>
+  <ul>
+    <li><strong>Pre-close</strong>: cutoffs, accruals checklist, FX rates locked.</li>
+    <li><strong>Reconciliations</strong>: bank, custody, on-chain, intercompany, AR, AP.</li>
+    <li><strong>Adjusting entries</strong>: accruals, deferrals, reclassifications.</li>
+    <li><strong>Consolidation</strong>: roll up entities; intercompany eliminations.</li>
+    <li><strong>Review &amp; sign-off</strong>: variance analytics, Controller review, CFO sign-off.</li>
+    <li><strong>Reporting</strong>: financial statements, board package.</li>
+  </ul>
+
+  <h3>2. Risk-tier each cluster</h3>
+  <table>
+    <thead><tr><th>Cluster</th><th>Tier</th><th>Agent role</th></tr></thead>
+    <tbody>
+      <tr><td>Pre-close checklist</td><td>1</td><td>Status tracker, nudge owners, summarize blockers.</td></tr>
+      <tr><td>Reconciliations</td><td>1-2</td><td>Match, propose reconciling items to staging, flag exceptions.</td></tr>
+      <tr><td>Adjusting entries</td><td>2-3</td><td>Propose JE for human approval. Never auto-post.</td></tr>
+      <tr><td>Consolidation</td><td>3</td><td>Run consolidation engine (deterministic); agent narrates &amp; flags.</td></tr>
+      <tr><td>Review</td><td>1</td><td>Variance analytics, anomaly callouts, draft commentary.</td></tr>
+      <tr><td>Reporting</td><td>1-2</td><td>Draft financial commentary; human edits and signs.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3. Architecture (planner/worker + MCP)</h3>
+  <pre>
+                      ┌────────────────────────┐
+                      │  Close Orchestrator    │
+                      │  (planner agent)       │
+                      └─────────┬──────────────┘
+                                │ plan
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
+        ┌─────▼─────┐    ┌──────▼──────┐    ┌─────▼─────┐
+        │ Recon     │    │ Adjusting   │    │ Reporting │
+        │ workers   │    │ Entry agent │    │ agent     │
+        └─────┬─────┘    └──────┬──────┘    └─────┬─────┘
+              │                 │                 │
+              └──────── MCP fabric ────────────────┘
+                          │
+        ┌──────┬──────┬───┴───┬──────┬────────┐
+      NetSuite Black- Kyriba Fire-  Lukka   Banks
+              Line          blocks
+  </pre>
+
+  <h3>4. HITL gates (the non-negotiables)</h3>
+  <ul>
+    <li>Every proposed JE → Controller approves in Slack/n8n inbox before staging to NetSuite.</li>
+    <li>Variance &gt; threshold on any account → halt and escalate.</li>
+    <li>Confidence &lt; threshold on any recon → halt and escalate.</li>
+    <li>Consolidation eliminations → human review before sign-off.</li>
+  </ul>
+
+  <h3>5. Audit log (the spine)</h3>
+  <p>Every plan, every tool call, every approval, every output is logged to an append-only store with: <code>run_id, step_id, model_version, prompt_hash, inputs_hash, outputs, latency, cost, approver_user, approval_ts</code>. Retention: 7 years (SOX). See <a href="09-governance-and-audit.html">chapter 09</a> for the schema.</p>
+
+  <h3>6. Eval &amp; rollout</h3>
+  <p>Don't ship this all at once. <strong>Sequence</strong>:</p>
+  <ol>
+    <li>Pre-close status tracker (Tier 1). Ship in week 6.</li>
+    <li>Bank rec assistant (Tier 1 → 2). Ship in week 10.</li>
+    <li>Intercompany rec (Tier 2). Ship in month 4.</li>
+    <li>Variance commentary draft (Tier 1). Ship in month 5.</li>
+    <li>JE proposal for recurring accruals (Tier 2-3). Ship in month 6+, only after evals are green for two cycles.</li>
+  </ol>
+</section>
+
+<section id="whiteboard">
+  <h2>Whiteboard answer template — 20-minute version</h2>
+  <p>When you get an "architect an agentic workflow" question, walk this template aloud:</p>
+  <ol>
+    <li><strong>Clarify scope (2 min)</strong> — which entities, which period cadence, which systems, what's the must-have output?</li>
+    <li><strong>Risk tier the workflow (2 min)</strong> — read-only? write-to-staging? production write? Who's the Process Owner?</li>
+    <li><strong>Decompose (3 min)</strong> — what are the 4-8 distinct steps? Which need an LLM vs. deterministic code?</li>
+    <li><strong>Pick a pattern (1 min)</strong> — single-agent, planner/worker, router. Defend the choice.</li>
+    <li><strong>Sketch tools &amp; MCP (4 min)</strong> — what tools does the agent need? Which MCP server hosts each? Read vs. write split.</li>
+    <li><strong>Sketch HITL gates (2 min)</strong> — where does a human approve? Where does the agent bail to a human?</li>
+    <li><strong>Audit &amp; rollback (2 min)</strong> — what's logged, what's the rollback story.</li>
+    <li><strong>Evals &amp; rollout (2 min)</strong> — golden dataset, success metric, rollout sequence.</li>
+    <li><strong>Failure modes (2 min)</strong> — name three concrete things that go wrong and how the design handles them.</li>
+  </ol>
+  <p>That's the senior shape. Most candidates jump to "I'd use Claude with these three tools" without ever risk-tiering or naming a Process Owner. Don't be most candidates.</p>
+</section>
+
+<section id="anti-patterns">
+  <h2>Anti-patterns to call out</h2>
+  <div class="callout warn">
+    <span class="callout-label">If you see yourself doing these, stop</span>
+    <ul>
+      <li><strong>Multi-agent because it sounds smart.</strong> Justify the split or stay single-agent.</li>
+      <li><strong>One huge "do the close" tool.</strong> Tools should be granular verbs, not capabilities.</li>
+      <li><strong>Agent posts to NetSuite directly.</strong> Production writes go through approval gates, never the agent.</li>
+      <li><strong>No idempotency key on write tools.</strong> A retry will double-post; that's a SOX incident.</li>
+      <li><strong>Hot-swapping models without change control.</strong> The model is part of the SOX control narrative.</li>
+      <li><strong>"The agent will figure it out."</strong> If the design relies on model heroics, the design is wrong.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: Finance systems integration →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

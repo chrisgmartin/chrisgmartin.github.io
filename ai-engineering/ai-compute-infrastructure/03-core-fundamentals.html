@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#linux">Linux for GPU hosts</a>
+    <a href="#networking">Networking &amp; fabric</a>
+    <a href="#storage">Storage for model weights</a>
+    <a href="#containers">Containers &amp; the NVIDIA toolkit</a>
+    <a href="#k8s">Kubernetes basics</a>
+    <a href="#runtimes">Distributed runtimes</a>
+    <a href="#prod-debug">What "production debugging" means here</a>
+    <a href="#triangle">The cost-perf-reliability triangle</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The substrate every other chapter sits on. Linux, networking, storage, containers, Kubernetes, distributed runtimes, and what "production debugging" actually looks like on a GPU fleet.</p>
+</header>
+
+<section id="linux">
+  <h2>Linux for GPU hosts</h2>
+  <p>GPU nodes are Linux machines first. The unusual parts are NUMA topology, hugepages, kernel modules, and the device files. The fundamentals you must be fluent in:</p>
+  <ul>
+    <li><strong>cgroups v2 &amp; namespaces</strong> — how container isolation actually works. GPU access flows through bind-mounted device nodes (<code>/dev/nvidia*</code>) and a hook.</li>
+    <li><strong>NUMA topology</strong> — H100 nodes have multiple NUMA domains. PCIe lanes attach to specific sockets. Cross-NUMA traffic is slow. <code>nvidia-smi topo -m</code> shows the PCIe / NVLink topology; <code>numactl --hardware</code> shows the CPU side.</li>
+    <li><strong>Hugepages</strong> — RDMA and some CUDA paths benefit from hugepage backing. Misconfigured hugepages cause silent perf cliffs.</li>
+    <li><strong>Kernel modules</strong> — <code>nvidia</code>, <code>nvidia_uvm</code>, <code>nvidia_drm</code>, <code>nvidia_peermem</code>. A bad mismatch between the loaded module and userspace driver is a top-5 outage source.</li>
+    <li><strong>Systemd units</strong> — <code>nvidia-persistenced</code> keeps the driver warm; <code>nvidia-fabricmanager</code> sets up NVLink/NVSwitch.</li>
+    <li><strong>journalctl + dmesg</strong> — the first place driver and Xid errors land. You should reflexively check both during a GPU incident.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># The interview-grade Linux/GPU triage cheatsheet
+nvidia-smi                          # are GPUs visible, healthy, temp/power sane?
+nvidia-smi topo -m                  # NVLink / PCIe topology
+nvidia-smi -q -d ECC,POWER,CLOCK    # detail per device
+dmesg | grep -i -E 'nvidia|xid|nvrm' # driver-level errors
+journalctl -u nvidia-fabricmanager  # NVSwitch fabric state
+cat /proc/driver/nvidia/version     # loaded driver version vs userspace
+lspci | grep -i nvidia              # PCIe enumeration sanity
+numactl --hardware                  # NUMA layout
+ibstat                              # InfiniBand link state (if applicable)
+</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Xid errors</span>
+    <p>NVIDIA driver errors get a numeric Xid. <strong>Xid 79</strong> = GPU fell off bus (often hardware), <strong>Xid 31</strong> = MMU fault (often app), <strong>Xid 13/63</strong> = graphics engine fault, <strong>Xid 74</strong> = NVLink error, <strong>Xid 119/120</strong> = GSP RPC timeout. You don't need to memorize them all — you do need to know they exist and where to look them up.</p>
+  </div>
+</section>
+
+<section id="networking">
+  <h2>Networking and the fabric</h2>
+  <p>GPU training is bottlenecked by interconnect bandwidth, not compute, more often than people expect. Three layers:</p>
+  <ol>
+    <li><strong>Intra-node</strong> — NVLink between GPUs on the same chassis (900 GB/s aggregate on H100 SXM). NVSwitch enables all-to-all at full bandwidth.</li>
+    <li><strong>PCIe</strong> — host-to-GPU, NIC-to-GPU. Gen5 x16 ≈ 64 GB/s. GPUDirect RDMA lets a NIC DMA directly into GPU memory, bypassing the host.</li>
+    <li><strong>Inter-node fabric</strong> — InfiniBand HDR/NDR (200/400 Gbps) or RoCE (RDMA over Converged Ethernet). NCCL uses this for cross-node all-reduce.</li>
+  </ol>
+  <p>For inference, the fabric matters less unless you're doing tensor parallelism across nodes. For training, it's load-bearing.</p>
+  <table>
+    <thead><tr><th>Symptom</th><th>Likely networking culprit</th></tr></thead>
+    <tbody>
+      <tr><td>All-reduce throughput half of expected</td><td>Wrong NCCL transport selected (TCP instead of IB), or PCIe lane downgrade</td></tr>
+      <tr><td>Step time variance node-to-node</td><td>Network congestion, stragglers, or one NIC at degraded speed</td></tr>
+      <tr><td>NCCL hangs at startup</td><td>Subnet manager issue, firewall, NCCL_SOCKET_IFNAME misconfigured</td></tr>
+      <tr><td>Cross-node training much slower than single-node</td><td>Missing GPUDirect RDMA, falling back to host-staged transfers</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="storage">
+  <h2>Storage for model weights &amp; checkpoints</h2>
+  <p>A 70B-parameter model in FP16 is ~140 GB. A 405B model is ~810 GB. Sharded checkpoints during training generate terabytes per checkpoint. Three storage tiers:</p>
+  <ul>
+    <li><strong>Object storage</strong> (S3, GCS, R2) — durable, cheap, slow first-byte. Source of truth for weights.</li>
+    <li><strong>Network filesystem</strong> (Lustre, Weka, FSx) — high parallel throughput, good for shared training scratch.</li>
+    <li><strong>Local NVMe</strong> — fastest, ephemeral. Used for staging weights into a serving pod, for KV-cache spill, for fast checkpoint write-then-flush.</li>
+  </ul>
+  <p>A practical pattern for inference: <strong>bake or stage weights to local NVMe on pod start</strong>, then mmap them. Loading a 70B model over the network for every pod restart is a pager-class mistake.</p>
+</section>
+
+<section id="containers">
+  <h2>Containers and the NVIDIA toolkit</h2>
+  <p>Containers see GPUs because <code>nvidia-container-toolkit</code> injects device nodes and libraries via an OCI hook. The flow:</p>
+  <ol>
+    <li>Container runtime (containerd, CRI-O, Docker) invokes the OCI hook.</li>
+    <li>Hook reads <code>NVIDIA_VISIBLE_DEVICES</code> and <code>NVIDIA_DRIVER_CAPABILITIES</code>.</li>
+    <li>Bind-mounts <code>/dev/nvidia*</code>, <code>libcuda.so</code>, and friends into the container namespace.</li>
+    <li>Container starts; <code>nvidia-smi</code> works inside.</li>
+  </ol>
+  <p>The classic failure: the host driver is updated but the toolkit / device plugin doesn't restart cleanly, and new pods come up without GPUs. The drain-and-replace runbook lives in <a href="13-deployment-and-ops.html">chapter 13</a>.</p>
+  <div class="callout warn">
+    <span class="callout-label">Driver vs CUDA toolkit mismatch</span>
+    <p>The host driver provides a CUDA <em>runtime</em>. Apps built against CUDA toolkit version X work on driver versions ≥ X (forward-compatible). Driver Y &lt; CUDA toolkit version X fails at load with <code>CUDA driver version is insufficient</code>. This is the most common new-cluster gotcha.</p>
+  </div>
+</section>
+
+<section id="k8s">
+  <h2>Kubernetes basics for GPU workloads</h2>
+  <p>K8s itself doesn't know about GPUs. The <strong>NVIDIA device plugin</strong> (a DaemonSet) advertises <code>nvidia.com/gpu</code> as an allocatable resource. A pod requesting <code>nvidia.com/gpu: 2</code> gets two whole GPUs bound exclusively.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-server
+spec:
+  nodeSelector:
+    accelerator: nvidia-h100
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  priorityClassName: inference-online
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:latest
+      args: ["--model", "meta-llama/Llama-3.1-70B-Instruct",
+             "--tensor-parallel-size", "4"]
+      resources:
+        limits:
+          nvidia.com/gpu: 4
+          memory: "256Gi"
+          cpu: "32"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: model-cache
+      hostPath: { path: /mnt/nvme/hf-cache }
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 64Gi }
+</code></pre></div>
+  <p>Key primitives the role asks about:</p>
+  <ul>
+    <li><strong>NodeSelector / nodeAffinity / taints / tolerations</strong> for accelerator placement.</li>
+    <li><strong>PriorityClass &amp; preemption</strong> for fair scheduling between research and production.</li>
+    <li><strong>ResourceQuota &amp; LimitRange</strong> per namespace for quota enforcement.</li>
+    <li><strong>PodDisruptionBudget</strong> so cluster operations don't murder live inference.</li>
+    <li><strong>HorizontalPodAutoscaler with custom metrics</strong> (queue depth, GPU util) — not just CPU.</li>
+    <li><strong>Gang scheduling controllers</strong> — Volcano, Kueue, Yunikorn — for "schedule all N pods or none."</li>
+  </ul>
+</section>
+
+<section id="runtimes">
+  <h2>Distributed runtimes</h2>
+  <p>"Distributed" in this role means two different things, and you should be able to talk about both.</p>
+  <h3>Training-side</h3>
+  <ul>
+    <li><strong>PyTorch DDP</strong> — data parallel, one process per GPU, NCCL all-reduce on gradients.</li>
+    <li><strong>FSDP</strong> — fully sharded data parallel, shards optimizer state + grads + params.</li>
+    <li><strong>DeepSpeed ZeRO 1/2/3</strong> — analogous sharding stages.</li>
+    <li><strong>Megatron-LM</strong> — tensor + pipeline parallelism for very large models.</li>
+    <li><strong>Ray</strong> — task-level distributed compute, often used for orchestration around training.</li>
+  </ul>
+  <h3>Inference-side</h3>
+  <ul>
+    <li><strong>vLLM</strong> — server with paged attention and continuous batching.</li>
+    <li><strong>Triton Inference Server</strong> — multi-model multi-backend serving.</li>
+    <li><strong>Ray Serve</strong> — flexible multi-stage pipelines.</li>
+    <li><strong>TensorRT-LLM</strong> — compiled, often combined with Triton.</li>
+  </ul>
+  <p>The depth is in <a href="04-deep-dive-primary.html">chapter 04</a>.</p>
+</section>
+
+<section id="prod-debug">
+  <h2>What "production debugging" means for GPU infra</h2>
+  <p>For this role, "production debugging" almost always means one of these:</p>
+  <table>
+    <thead><tr><th>Surface</th><th>Tools you reach for</th></tr></thead>
+    <tbody>
+      <tr><td>"My inference latency p99 doubled at 14:00"</td><td>Prometheus (queue depth, GPU util, batch size histogram), traces, recent deploys, KV-cache pressure</td></tr>
+      <tr><td>"My training job hangs at NCCL init"</td><td>NCCL_DEBUG=INFO, IB link state, NCCL topology dump, firewall, NCCL_SOCKET_IFNAME</td></tr>
+      <tr><td>"This kernel is slow"</td><td>Nsight Systems (timeline), Nsight Compute (kernel-level), PyTorch profiler</td></tr>
+      <tr><td>"OOM at step 47 of training"</td><td>Memory snapshot, gradient checkpointing settings, batch size, activation memory, fragmentation</td></tr>
+      <tr><td>"Pods land on node, get no GPU"</td><td>Device plugin DaemonSet health, driver/toolkit version, dmesg Xids, container runtime hook</td></tr>
+      <tr><td>"Throughput regressed after driver upgrade"</td><td>Bisect: revert driver on canary, profile, compare NCCL/CUDA versions, check P2P state</td></tr>
+    </tbody>
+  </table>
+  <p>Interviewers love asking debug scenarios because they reveal whether you've actually held the pager. The strongest answer always starts: <em>"First I'd look at what changed. Then I'd narrow the blast radius..."</em></p>
+</section>
+
+<section id="triangle">
+  <h2>The cost-perf-reliability triangle</h2>
+  <p>Every nontrivial design call in this role lives inside this triangle. Pick any two; the third bends.</p>
+  <ul>
+    <li><strong>Maximize throughput, hold reliability</strong> → cost goes up (more reserved capacity, less spot).</li>
+    <li><strong>Minimize cost, hold throughput</strong> → reliability gets shakier (spot preemption, packing, less headroom).</li>
+    <li><strong>Hold cost &amp; reliability</strong> → throughput is fixed; you can't grow free.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Senior signal</span>
+    <p>When asked a design question, <em>name the triangle out loud</em> before answering. "I'm going to optimize for tail latency and reliability here, accepting ~20% higher steady-state cost, because this serves a customer-facing path." That single sentence raises your read.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Previous</a> · <a href="04-deep-dive-primary.html">Next: Deep dive — inference serving →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

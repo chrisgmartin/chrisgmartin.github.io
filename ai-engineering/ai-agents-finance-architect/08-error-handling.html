@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — Finance Agents</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#taxonomy">Failure taxonomy</a>
+    <a href="#hallucination">Hallucinated numbers &amp; entries</a>
+    <a href="#double-book">Double-booking &amp; idempotency</a>
+    <a href="#missed">Missed entries</a>
+    <a href="#integration">Broken integrations</a>
+    <a href="#partial">Partial workflow failure</a>
+    <a href="#retry-repair">Retry, repair, rollback</a>
+    <a href="#fail-safe">Fail-safe defaults</a>
+    <a href="#circuit-breakers">Circuit breakers</a>
+    <a href="#incident">Incident response</a>
+    <a href="#interview-stories">Interview-ready failure stories</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core · Reliability</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">What goes wrong in finance automation, why each thing is dangerous, and the retry / repair / rollback patterns that keep an agent on the safe side of "halt instead of guess."</p>
+</header>
+
+<section id="taxonomy">
+  <h2>Failure taxonomy</h2>
+  <p>Group failures by what causes them. The mitigations are very different.</p>
+  <table>
+    <thead><tr><th>Class</th><th>Cause</th><th>Defense</th></tr></thead>
+    <tbody>
+      <tr><td>Transient infra</td><td>Rate limits, 5xx, network blip, API timeout</td><td>Exponential backoff + jitter + cap</td></tr>
+      <tr><td>Schema / contract</td><td>Tool returned malformed data; API version drift</td><td>Pydantic validation; pin API versions; alert on unknown fields</td></tr>
+      <tr><td>Semantic LLM error</td><td>Hallucinated value, invalid tool args, wrong tool</td><td>Output schema validation; corrective retry; bail on second failure</td></tr>
+      <tr><td>Idempotency violation</td><td>Same operation executed twice</td><td>Idempotency keys; downstream dedup; explicit replay tooling</td></tr>
+      <tr><td>State mismatch</td><td>Source system changed mid-run; period closed; rate changed</td><td>Optimistic locks; period-id checks; refresh + re-evaluate</td></tr>
+      <tr><td>Governance breach</td><td>Agent tried to act outside its tier</td><td>Enforce at MCP/tool layer; never trust prompt-level guardrails</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hallucination">
+  <h2>Hallucinated numbers &amp; entries</h2>
+  <p>The most dangerous failure in finance, and the easiest to hide.</p>
+  <h3>What it looks like</h3>
+  <ul>
+    <li>Agent claims "GL balance is $4,231,007.42" but never actually called the GL tool.</li>
+    <li>Agent cites a transaction id that doesn't exist.</li>
+    <li>Agent infers a counterparty name from context and runs with it.</li>
+    <li>Agent computes a sum in its head (i.e., from the language model's arithmetic) rather than via deterministic code.</li>
+  </ul>
+  <h3>Defenses</h3>
+  <ol>
+    <li><strong>Never accept a numeric claim that didn't come from a tool call.</strong> Validate every number in the output against the tool-call log. If a number appears in the output but wasn't returned by any tool, fail the run.</li>
+    <li><strong>Citation validation.</strong> Every cited id must exist; verify against the universe before passing the output downstream.</li>
+    <li><strong>Tool-do-math.</strong> Don't let the LLM compute totals or variances. Expose a <code>sum</code> / <code>subtract</code> / <code>variance</code> tool, or do the math in Python after the agent finishes.</li>
+    <li><strong>Anti-fabrication prompt clause.</strong> "If a value is not present in the inputs, return null and the flag <code>missing</code>. Do not infer."</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">def validate_numbers_came_from_tools(agent_output: dict, tool_log: list[dict]) -&gt; list[str]:
+    """Return a list of numbers in output that did NOT come from a tool result."""
+    tool_numbers = {n for call in tool_log for n in extract_numbers(call["result"])}
+    output_numbers = extract_numbers(agent_output)
+    return [n for n in output_numbers if n not in tool_numbers]
+</code></pre></div>
+</section>
+
+<section id="double-book">
+  <h2>Double-booking &amp; idempotency</h2>
+  <p>The retry that breaks production: an agent's run failed halfway, the orchestration retried, and the same JE got posted twice.</p>
+
+  <h3>Why this happens</h3>
+  <ul>
+    <li>Worker crashed after tool call but before checkpoint.</li>
+    <li>Webhook redelivery from the upstream system.</li>
+    <li>Human approval clicked twice.</li>
+    <li>Two concurrent runs racing on the same close task.</li>
+  </ul>
+
+  <h3>Defenses (defense in depth)</h3>
+  <ol>
+    <li><strong>Idempotency key on every write.</strong> Deterministic from the logical operation: <code>sha256(entity|period|account|action|hash(inputs))</code>.</li>
+    <li><strong>Downstream uniqueness</strong>. NetSuite has external-id uniqueness; use it. BlackLine similarly.</li>
+    <li><strong>Workflow-level locks.</strong> A close task can be claimed by exactly one runner; second runner sees "in progress" and waits.</li>
+    <li><strong>Two-phase commits where possible.</strong> Stage → confirm. Never combine.</li>
+    <li><strong>Explicit replay tooling.</strong> When something needs to be redone, an operator runs a replay tool that knows about idempotency, rather than re-running the agent.</li>
+  </ol>
+</section>
+
+<section id="missed">
+  <h2>Missed entries</h2>
+  <p>The silent failure: a transaction that should have been reconciled was never seen by the agent. No error fired; just a missing match.</p>
+  <h3>Defenses</h3>
+  <ul>
+    <li><strong>Manifest checks.</strong> Pull a count + total from both sides. After matching, both sides should account for all items (matched + unmatched + reconciling). If counts don't balance, halt.</li>
+    <li><strong>Period completeness.</strong> Before running, confirm both sides have published their period-close data. If GL period is closed but bank statement is mid-month, halt.</li>
+    <li><strong>Watermarks.</strong> Track last-seen transaction id / timestamp per source. Detect gaps.</li>
+  </ul>
+</section>
+
+<section id="integration">
+  <h2>Broken integrations</h2>
+  <p>NetSuite is rate-limited and reloads can stall. Fireblocks webhook deliveries can spike. Bank file feeds can be delayed.</p>
+  <ul>
+    <li><strong>Health checks per integration.</strong> A periodic ping with expected response. Dashboard surfaces stale connections.</li>
+    <li><strong>Graceful degradation.</strong> If Lukka is unreachable, the close-orchestrator should mark crypto-recon tasks as "blocked: Lukka unavailable" and proceed with what it can do.</li>
+    <li><strong>Schema drift detection.</strong> If a tool gets a field it didn't expect, log and alert. Don't ignore.</li>
+    <li><strong>Version pinning.</strong> Pin SuiteTalk version, BlackLine API version. Upgrades are change-managed.</li>
+  </ul>
+</section>
+
+<section id="partial">
+  <h2>Partial workflow failure</h2>
+  <p>A close has 80 tasks. Task 47 fails. What do you do?</p>
+  <ul>
+    <li><strong>Don't roll back what's already done</strong> — most tasks aren't rollback-able cheaply (a posted JE, a sent email).</li>
+    <li><strong>Mark the failure</strong> on the task; surface to the Process Owner; halt anything <em>downstream of</em> the failed task; let upstream-complete work stand.</li>
+    <li><strong>Provide a resume tool</strong> that picks up from the failed step after the human fixes the underlying issue.</li>
+    <li><strong>Never silently skip.</strong> A skipped task in close is the silent killer.</li>
+  </ul>
+</section>
+
+<section id="retry-repair">
+  <h2>Retry, repair, rollback — picking the right one</h2>
+  <table>
+    <thead><tr><th>Situation</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>Transient infra error</td><td>Retry with backoff</td></tr>
+      <tr><td>Validation failure of agent output</td><td>Repair: corrective prompt + retry, max 2 attempts, then escalate</td></tr>
+      <tr><td>Write failed mid-flight; outcome unknown</td><td>Query downstream by idempotency key; retry only if not present</td></tr>
+      <tr><td>Agent acted on stale data (period changed)</td><td>Discard work, refresh, restart</td></tr>
+      <tr><td>Posted JE was wrong</td><td>Reversing JE (with approval); never delete; keep audit trail of both</td></tr>
+      <tr><td>Hallucinated output detected post-hoc</td><td>Immediate halt of agent class; root cause; replay validation; controlled re-enable</td></tr>
+    </tbody>
+  </table>
+  <p>The pattern: <strong>retry mechanical; repair semantic; rollback in finance means reversing entries, not deleting them.</strong> Finance has no DELETE.</p>
+</section>
+
+<section id="fail-safe">
+  <h2>Fail-safe defaults</h2>
+  <div class="callout insight">
+    <span class="callout-label">The single most important rule in this chapter</span>
+    <p>The default behavior when uncertain is <strong>halt, do not post</strong>. Every threshold, every check, every retry budget should fail in the direction of <em>doing less</em>, never of <em>doing more</em>.</p>
+  </div>
+  <p>Concrete instances:</p>
+  <ul>
+    <li>Confidence below threshold → halt, escalate. Never "best guess."</li>
+    <li>Multiple plausible matches → halt, do not pick.</li>
+    <li>Period mismatch between sources → halt, do not reconcile.</li>
+    <li>Tool returned an unexpected field → halt, do not interpret.</li>
+    <li>Two retries failed → halt, do not try a third.</li>
+  </ul>
+  <p>"Halt to a human" is always cheaper than "guess and recover from a SOX issue."</p>
+</section>
+
+<section id="circuit-breakers">
+  <h2>Circuit breakers</h2>
+  <p>Past a certain failure rate, you stop letting the agent attempt anything.</p>
+  <ul>
+    <li>Per-agent error budget: e.g., &gt; 5% of runs fail in an hour → open circuit, pause agent, page on-call.</li>
+    <li>Per-integration breaker: NetSuite 429 rate &gt; threshold → pause writes until backoff clears.</li>
+    <li>Per-Process-Owner breaker: agent's outputs being &gt; X% rejected by humans → flag for review and pause.</li>
+  </ul>
+  <p>Circuit-breaker state is itself logged and dashboarded. A breaker tripping is a signal, not just an outage.</p>
+</section>
+
+<section id="incident">
+  <h2>Incident response — when something does go wrong</h2>
+  <p>You will have an incident. The shape of a good response:</p>
+  <ol>
+    <li><strong>Halt the agent class</strong> immediately. Not just the failing run — the type of run. (Pause the agent, not the data.)</li>
+    <li><strong>Identify scope</strong>: query the audit log for every action this agent class took since last known good. Bound the exposure.</li>
+    <li><strong>Notify Process Owner</strong> and (depending on materiality) SOX Lead and Controller.</li>
+    <li><strong>Triage</strong>: is this a code bug, a prompt regression, a model regression, an integration drift, an input data issue?</li>
+    <li><strong>Reverse if needed</strong> (reversing JEs, not deletes; with approvals).</li>
+    <li><strong>Add the case to the golden set</strong> and write a regression test.</li>
+    <li><strong>Post-mortem</strong>: structured, blameless, signed by the Process Owner.</li>
+    <li><strong>Controlled re-enable</strong>: only after eval passes and a Controller approves.</li>
+  </ol>
+  <p>This is exactly the discipline that SOX expects of any control. Apply it to your agents from day one and you'll never get caught off-guard by a regulator's question.</p>
+</section>
+
+<section id="interview-stories">
+  <h2>Interview-ready failure stories</h2>
+  <p>Interviewers love these. Have one of each shape ready, drawn from real (or recent prototype) experience:</p>
+  <ul>
+    <li>A time you <strong>halted a build</strong> because it wasn't ready.</li>
+    <li>A time an agent <strong>hallucinated</strong> and how you caught it.</li>
+    <li>A time you found a <strong>silent failure mode</strong> (missed entry, drift, integration schema change).</li>
+    <li>A time a <strong>retry caused a double-action</strong> and how you redesigned for idempotency.</li>
+  </ul>
+  <p>If you don't have these stories from production, you can have them from a prototype. The story shape is identical: situation → what broke → what you saw in logs → what you changed.</p>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; audit →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

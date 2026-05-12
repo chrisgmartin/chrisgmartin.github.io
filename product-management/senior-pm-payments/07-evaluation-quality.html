@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation &amp; Quality</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#big-six">The big six payments metrics</a>
+    <a href="#aar">Authorization rate, rigorously</a>
+    <a href="#conversion">Conversion vs AAR — the trap</a>
+    <a href="#cost">Cost per successful payment</a>
+    <a href="#fraud">Fraud and chargeback rates</a>
+    <a href="#availability">Time to availability</a>
+    <a href="#rail-slo">Defining a rail-health SLO</a>
+    <a href="#cohort">Cohort analysis</a>
+    <a href="#instrumentation">Instrumentation requirements</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-applied-patterns.html">← Previous</a>
+    <a href="08-error-handling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core</span>
+  <h1>Evaluation &amp; Quality</h1>
+  <p class="subtitle">The metrics, the cohort cuts, and the rail-health SLOs that separate a senior payments PM from a generalist. Plus the metric traps interviewers test for.</p>
+</header>
+
+<section id="big-six">
+  <h2>The big six payments metrics</h2>
+  <p>Memorize these. Be able to define each, name the failure mode, and write a SQL skeleton for it.</p>
+  <table>
+    <thead><tr><th>Metric</th><th>Definition</th><th>Common gotcha</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Authorization rate (AAR)</strong></td><td>Approved auths ÷ total auth attempts</td><td>Denominator must exclude duplicate retries on same intent</td></tr>
+      <tr><td><strong>Conversion</strong></td><td>Successful deposits ÷ initiated deposit intents</td><td>Includes UX dropoff, not just decline</td></tr>
+      <tr><td><strong>Cost per successful payment</strong></td><td>Total payment cost ÷ approved txns</td><td>Must include retry cost, chargeback cost, fraud loss</td></tr>
+      <tr><td><strong>Fraud rate</strong></td><td>Fraud loss in bps of TPV</td><td>Different windows yield different numbers; align to scheme reporting</td></tr>
+      <tr><td><strong>Chargeback rate</strong></td><td>Disputes ÷ approved txns (count or value)</td><td>Scheme uses count over rolling window</td></tr>
+      <tr><td><strong>Time to availability</strong></td><td>Time from user intent to spendable balance</td><td>Includes hold periods; not just settlement</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="aar">
+  <h2>Authorization rate, rigorously</h2>
+  <p>AAR sounds simple. It isn't. There are many ways to count it, and which you pick changes the story.</p>
+  <table>
+    <thead><tr><th>Variant</th><th>How it's counted</th><th>Why it's used</th></tr></thead>
+    <tbody>
+      <tr><td>First-attempt AAR</td><td>Approved-on-first-try ÷ first-attempt count</td><td>Cleanest measure of issuer behaviour</td></tr>
+      <tr><td>Final AAR</td><td>Approved-eventually ÷ unique payment intents</td><td>Captures retry/cascade lift</td></tr>
+      <tr><td>Per-PSP AAR</td><td>Same, but per PSP route</td><td>Vendor performance comparison</td></tr>
+      <tr><td>Per-BIN AAR</td><td>Per issuer BIN cohort</td><td>Issuer-level diagnosis</td></tr>
+      <tr><td>Value-weighted AAR</td><td>Approved value ÷ attempted value</td><td>Skewed by high-value declines</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- First-attempt AAR by issuer BIN, last 7 days
+WITH first_attempts AS (
+  SELECT DISTINCT ON (payment_intent_id)
+    payment_intent_id,
+    bin,
+    issuer_country,
+    status,
+    created_at
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '7 days'
+  ORDER BY payment_intent_id, created_at ASC
+)
+SELECT
+  bin,
+  issuer_country,
+  COUNT(*) AS attempts,
+  COUNT(*) FILTER (WHERE status='approved') AS approved,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE status='approved') / COUNT(*), 2) AS aar_pct
+FROM first_attempts
+GROUP BY bin, issuer_country
+HAVING COUNT(*) &gt; 100
+ORDER BY attempts DESC;
+</code></pre></div>
+</section>
+
+<section id="conversion">
+  <h2>Conversion vs AAR — the trap interviewers love</h2>
+  <p>AAR measures issuer behaviour. Conversion measures the whole funnel. They diverge whenever UX dropoff or pre-auth abandonment is material.</p>
+  <ul>
+    <li>If your AAR is 92% and conversion is 70%, you have a UX problem, not an issuer problem.</li>
+    <li>If your AAR is 65% and conversion is 60%, you have an issuer problem; the funnel is mostly waiting on auth.</li>
+    <li><strong>Lifting AAR can sometimes lower conversion</strong> — e.g. forcing 3DS step-up improves AAR via liability shift, but the step-up itself causes dropoff.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Interview answer</span>
+    <p>"I'd never optimize for AAR alone — I'd track <strong>net intent-to-success conversion</strong> and decompose into AAR × completion-given-auth. Lifting AAR while tanking completion is a regression."</p>
+  </div>
+</section>
+
+<section id="cost">
+  <h2>Cost per successful payment — the right denominator</h2>
+  <p>Naïve: total spend ÷ all txns. Wrong. You're charged for retries, declines, chargebacks. The right framing:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- All-in cost per successful payment, last 30 days, by rail
+SELECT
+  rail,
+  geo,
+  SUM(approved_count) AS successes,
+  SUM(processor_fees + scheme_fees + interchange + xborder_fees + fx_spread
+      + retry_fees + chargeback_fees + fraud_loss) AS total_cost_cents,
+  ROUND(
+    SUM(processor_fees + scheme_fees + interchange + xborder_fees + fx_spread
+        + retry_fees + chargeback_fees + fraud_loss)::numeric
+    / NULLIF(SUM(approved_count), 0)::numeric,
+    2
+  ) AS cost_per_success
+FROM payment_economics_daily
+WHERE date &gt;= CURRENT_DATE - 30
+GROUP BY rail, geo
+ORDER BY rail, geo;
+</code></pre></div>
+  <p>Many companies under-report this because retry/fraud costs sit in different ledgers. Owning the all-in number is a senior signal.</p>
+</section>
+
+<section id="fraud">
+  <h2>Fraud and chargeback rates</h2>
+  <p>Two different things, often confused.</p>
+  <ul>
+    <li><strong>Fraud rate</strong> — confirmed fraudulent transactions / volume. Internal classification.</li>
+    <li><strong>Chargeback rate</strong> — scheme-recorded disputes. External. Card-scheme programs count this.</li>
+    <li><strong>3DS-attempted rate</strong> — what % of eligible txns are routed through 3DS.</li>
+    <li><strong>3DS-frictionless rate</strong> — of 3DS-attempted, what % were issuer-decided frictionless.</li>
+  </ul>
+  <p>Visa's VDMP / Mastercard's ECP set thresholds (e.g. 0.9% dispute rate, 100 disputes/month). Crossing thresholds triggers fees, then de-platforming. PMs must instrument early-warning at e.g. 0.5%.</p>
+</section>
+
+<section id="availability">
+  <h2>Time to availability — the user-perceived speed</h2>
+  <p>Settlement speed is bank-side. <em>Availability</em> is what your customer sees. The user-facing clock:</p>
+  <ul>
+    <li>UPI / PIX: seconds.</li>
+    <li>Faster Payments: usually seconds, sometimes minutes for first-time payee.</li>
+    <li>SEPA Instant: ~10s where supported.</li>
+    <li>Card: auth instant, but you may impose a hold-then-release policy for fraud reasons (sometimes hours-days).</li>
+    <li>ACH: hours-days; hold policies often days.</li>
+  </ul>
+  <p>The PM question: <em>do you release funds on auth, or do you wait for settlement?</em> Tradeoff: trust vs fraud loss. Best practice: <strong>risk-tier the hold</strong> — long-history customer + low-amount = instant release; new customer + high-amount = delayed.</p>
+</section>
+
+<section id="rail-slo">
+  <h2>Defining a rail-health SLO</h2>
+  <p>SLOs aren't only for engineering. Define an SLO per rail that bundles uptime, AAR, latency, error budget. Example for "BR Card":</p>
+  <ul>
+    <li><strong>Availability</strong>: 99.95% successful API request rate from the company to PSP, measured at minute-granularity.</li>
+    <li><strong>AAR floor</strong>: first-attempt AAR ≥ 78% (BR market baseline) over rolling 7 days.</li>
+    <li><strong>Latency</strong>: p99 auth response &lt; 1500 ms.</li>
+    <li><strong>Settlement</strong>: T+1 funds in nostro for 99.5% of txns.</li>
+  </ul>
+  <p>Below the floor, the rail is "in incident" and ops opens a partner ticket. Define the off-ramp explicitly: at AAR floor breach for 3 consecutive days, traffic shifts X% to the secondary route automatically.</p>
+</section>
+
+<section id="cohort">
+  <h2>Cohort analysis by issuer / BIN</h2>
+  <p>Aggregate AAR hides everything. The real diagnoses live in cohort cuts.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- AAR change week-over-week by issuer × MCC × country, last 4 weeks
+WITH weekly AS (
+  SELECT
+    DATE_TRUNC('week', created_at) AS wk,
+    issuer_name,
+    mcc,
+    issuer_country,
+    COUNT(*) AS attempts,
+    COUNT(*) FILTER (WHERE status='approved') AS approved
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '4 weeks'
+  GROUP BY 1, 2, 3, 4
+  HAVING COUNT(*) &gt; 200
+)
+SELECT
+  wk,
+  issuer_name,
+  mcc,
+  issuer_country,
+  ROUND(100.0 * approved / attempts, 2) AS aar_pct,
+  ROUND(100.0 * approved / attempts
+        - LAG(100.0 * approved / attempts)
+          OVER (PARTITION BY issuer_name, mcc, issuer_country ORDER BY wk),
+        2) AS wow_change_pp
+FROM weekly
+ORDER BY issuer_name, issuer_country, wk;
+</code></pre></div>
+  <p>This kind of query is what you'd open in front of an interviewer who asks "AAR is down — how do you investigate?"</p>
+</section>
+
+<section id="instrumentation">
+  <h2>Instrumentation requirements</h2>
+  <p>None of the above metrics are recoverable if you didn't log them correctly at the time. Non-negotiable fields per attempt:</p>
+  <ul>
+    <li><code>payment_intent_id</code> (single identity across retries)</li>
+    <li><code>attempt_seq</code> (1, 2, 3...)</li>
+    <li><code>psp_name</code>, <code>acquirer</code>, <code>route_rule_id</code></li>
+    <li><code>bin</code>, <code>issuer_country</code>, <code>card_type</code>, <code>scheme</code>, <code>mcc</code></li>
+    <li><code>amount_cents</code>, <code>currency</code></li>
+    <li><code>status</code>, <code>decline_reason</code>, <code>decline_family</code></li>
+    <li><code>auth_latency_ms</code>, <code>three_ds_outcome</code>, <code>network_token_used</code></li>
+    <li><code>created_at</code>, <code>responded_at</code></li>
+  </ul>
+  <p>If any of these are missing, you can't do post-hoc cohort cuts. The earliest PM lever in a new rail is the event schema.</p>
+</section>
+
+<footer>
+  <p><a href="06-applied-patterns.html">← Applied patterns</a> · <a href="08-error-handling.html">Next: Error handling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

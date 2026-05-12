@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PagedAttention from First Principles — Deep Dive</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout layout-wide">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>On this page</h2>
+    <a href="#why">Why this guide exists</a>
+    <a href="#problem">1. The problem PagedAttention solves</a>
+    <a href="#kvcache">2. What lives in the KV cache</a>
+    <a href="#fragmentation">3. Fragmentation: internal &amp; external</a>
+    <a href="#os-analogy">4. The OS analogy</a>
+    <a href="#algorithm">5. The PagedAttention algorithm</a>
+    <a href="#block-table">6. The block table, byte by byte</a>
+    <a href="#kernel">7. Inside the attention kernel</a>
+    <a href="#math">8. The math of savings</a>
+    <a href="#prefix-cache">9. Prefix caching</a>
+    <a href="#cow">10. Copy-on-write &amp; beam search</a>
+    <a href="#continuous-batching">11. Continuous batching</a>
+    <a href="#chunked-prefill">12. Chunked prefill</a>
+    <a href="#goodput">13. Throughput vs goodput</a>
+    <a href="#spec-decode">14. Speculative decoding</a>
+    <a href="#offload">15. KV offload &amp; disaggregation</a>
+    <a href="#multi-lora">16. Multi-LoRA serving</a>
+    <a href="#code-tour">17. Reading the vLLM code</a>
+    <a href="#pitfalls">18. Pitfalls &amp; misconceptions</a>
+    <a href="#references">19. References</a>
+  </nav>
+</aside>
+
+<main>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="../../index.html">← Home</a>
+  <span class="sep">›</span>
+  <a href="../index.html">AI Engineering</a>
+  <span class="sep">›</span>
+  <span aria-current="page">PagedAttention from First Principles</span>
+</nav>
+
+<header class="hero">
+  <span class="eyebrow">Deep Dive · Inference Internals</span>
+  <h1>PagedAttention from First Principles</h1>
+  <p class="subtitle">vLLM's KV-cache trick is the most consequential systems idea in LLM inference. This guide explains <em>why</em> the layout looks the way it does — not just what it is — and how the family of optimizations built on top (prefix caching, chunked prefill, continuous batching, disaggregated serving) all hang off the same primitive.</p>
+</header>
+
+<section id="why">
+  <h2>Why this guide exists</h2>
+  <p>If you've read the vLLM blog post, you know the headline: "PagedAttention gives <strong>up to 24× higher throughput</strong> than HuggingFace Transformers" (Kwon et al., 2023). That's a real number, but it tends to land as folklore. The reader walks away knowing PagedAttention is good, without quite knowing <em>why</em> a different memory layout produces twenty-four times the throughput.</p>
+
+  <p>The answer is that LLM inference is, almost entirely, a memory-bound problem. The model weights are huge, the KV cache is huger still over a batch, and on an A100 or H100 the FLOPs sit idle waiting for HBM. Anything that lets you fit more concurrent requests in the same memory budget turns directly into throughput, because the GPU was going to spin on memory bandwidth anyway. PagedAttention is, fundamentally, a memory layout change. Everything else — prefix caching, continuous batching, chunked prefill, LoRA hot-swapping — is a downstream consequence of the layout being page-shaped.</p>
+
+  <p>This guide is structured to build the intuition from the bottom up. We start with what the KV cache actually <em>is</em> in memory, why naive allocation is so wasteful, how the page-table indirection works, and then walk up through the family of optimizations that the indirection enables. By the end you should be able to read <code>vllm/core/block_manager.py</code> and recognize what you're looking at.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Audience</span>
+    <p>You know transformers exist, you've used an LLM API, you can read Python and broad-stroke CUDA. You don't need to know vLLM internals — that's what we're here for.</p>
+  </div>
+</section>
+
+<section id="problem">
+  <h2>1. The problem PagedAttention solves</h2>
+  <p>Start with the simplest possible inference server. A user sends a prompt, the model generates tokens one at a time, you stream them back. To avoid recomputing attention over the entire prefix at every step, the model caches the key and value tensors of every attention layer for every prompt token, and appends to that cache as it generates. This is the <strong>KV cache</strong>.</p>
+
+  <p>For a single layer of a single request, the KV cache has shape <code>[seq_len, num_kv_heads, head_dim]</code> for K, and an identical shape for V. Multiply by 2 (K and V), by <code>num_layers</code>, and by the dtype size (2 bytes for fp16/bf16) and you get the bytes per token of context.</p>
+
+  <p>Plug in numbers for Llama-3-70B: 80 layers, 8 KV heads (GQA), head_dim 128. Per token:</p>
+
+<pre class="diagram">
+bytes_per_token  = 2 (K and V)
+                 × num_layers          (80)
+                 × num_kv_heads        (8)
+                 × head_dim            (128)
+                 × dtype_bytes         (2  for bf16)
+                 = 327,680 bytes  ≈  320 KiB per token
+</pre>
+
+  <p>So one token of KV state for Llama-3-70B is <strong>~320 KiB</strong>. A 2,048-token context is <strong>~640 MiB</strong> per request just for the cache. An 80 GB H100 fits the 140 GB model across two cards, leaving maybe 20 GB per card for KV cache — so you've got headroom for perhaps ~50 concurrent 2k-context requests, before you've even considered activations and CUDA workspace.</p>
+
+  <p>Now the trap. The classical way to allocate the KV cache, before vLLM, was to pre-allocate a contiguous tensor sized for <code>max_tokens</code> per request. <code>max_tokens</code> is the worst case — the most tokens the user might ever generate. So if a user sets <code>max_tokens=2048</code> but the model emits an EOS at token 80, you have just paid for 1,968 tokens of unused KV state, and you can't reclaim it until that request finishes, because the GPU memory allocator can't move tensors around mid-decode.</p>
+
+  <p>Empirically, real workloads have actual generation lengths that are 5–10× shorter than the <code>max_tokens</code> users set. The vLLM paper measures this directly on ShareGPT and Alpaca traces: <strong>only 20.4% to 38.2% of the pre-allocated cache is ever used</strong>. The rest is dead weight, holding the GPU hostage so it can refuse a new request because "memory is full" while sitting on hundreds of megabytes of zeros.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">The headline number</span>
+    <p>In production traces, naive KV pre-allocation wastes <strong>60–80% of GPU memory</strong>. PagedAttention recovers nearly all of it. That recovered memory translates directly into batch size, and batch size translates directly into throughput, because you were memory-bound the whole time.</p>
+  </div>
+</section>
+
+<section id="kvcache">
+  <h2>2. What lives in the KV cache, exactly</h2>
+  <p>Before we look at the layout, pin down what the cache actually stores. For each transformer layer, after the QKV projection, the model has three tensors per token: Q, K, V. Q is consumed immediately by the attention op and discarded. K and V are needed again at every subsequent step, because attention at step <code>t</code> reads keys and values for every token at positions <code>1..t</code>.</p>
+
+  <p>So the cache shape per layer is:</p>
+
+<pre class="diagram">
+K[i] : [num_kv_heads, head_dim]       # per token i, per layer
+V[i] : [num_kv_heads, head_dim]       # per token i, per layer
+</pre>
+
+  <p>For a request of length <code>L</code> tokens, that's <code>L × num_layers × 2 × num_kv_heads × head_dim × dtype</code> bytes. The cache is append-only during generation: at decode step <code>t</code>, you produce one new K and V vector per layer and append.</p>
+
+  <p>This append-only-but-bounded structure is what makes blocks work. You don't need random writes — you only ever append at the tail. You just need the tail to be allowed to physically live anywhere in memory.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">GQA changes the constant, not the shape</span>
+    <p>Grouped-query attention (GQA) shrinks <code>num_kv_heads</code> from the full attention-head count down to a small number (8 for Llama-3, 4 for some Mistral variants). This is huge for KV cache size — it's roughly the only architectural change that has reduced KV memory in five years — but it doesn't change the <em>layout</em> question. Whether you have 32 KV heads or 8, you still need to decide where to put them in memory, and the answer is still "pages".</p>
+  </div>
+</section>
+
+<section id="fragmentation">
+  <h2>3. Fragmentation: internal &amp; external</h2>
+  <p>"Fragmentation" is a term operating-systems people use for memory you have but can't use. There are two kinds, and naive KV allocation suffers both.</p>
+
+  <h3>Internal fragmentation</h3>
+  <p>You allocated more than you need, inside an allocation that's still alive. This is the <code>max_tokens=2048</code> request that only generates 80 tokens — the other 1,968 token slots are <em>internal</em> to the request's allocation, but unused. The allocator sees them as "in use" because the request still holds the slab.</p>
+
+  <h3>External fragmentation</h3>
+  <p>You have enough total free memory but no contiguous block big enough. Imagine 8 GB free, scattered as 16 holes of 512 MB each, and a new request needs a contiguous 1 GB slab — it can't be allocated, even though there's 8× the memory it needs. CUDA's caching allocator (<code>cudaMalloc</code> wrapped in a slab allocator) hits this constantly when KV slabs have varying <code>max_tokens</code>.</p>
+
+  <p>Here's a visual of a four-request memory layout under naive allocation, with each request allocating a 2,048-token-shaped slab:</p>
+
+<pre class="diagram">
+GPU HBM (KV region, simplified — each cell is one token slot of ~320 KiB)
+
+Request A (slab capacity 2048, actual length 120):
+  [AAAA AAAA AAAA . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .]
+   ^120 used                ^1928 wasted (internal fragmentation)
+
+Request B (slab capacity 2048, actual length 1900):
+  [BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB B..]
+   ^1900 used                                                              ^148 wasted
+
+Request C (slab capacity 2048, actual length 60):
+  [CCCC C . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .]
+   ^60 used         ^1988 wasted
+
+Request D (slab capacity 2048, actual length 800):
+  [DDDD DDDD DDDD DDDD DDDD DDDD DDDD DDDD . . . . . . . . . . . . . . . . . . .]
+   ^800 used                            ^1248 wasted
+</pre>
+
+  <p>Across these four requests, you've paid for 8,192 token slots and used 2,880 of them. <strong>~65% wasted</strong>, and that's before counting external fragmentation between slabs as some requests finish and free their slab while neighbours are still live.</p>
+
+  <p>The point of PagedAttention is to attack both at once: allocate in small fixed-size blocks (kills internal fragmentation — you waste at most one partial block per request), and let blocks live anywhere via an indirection table (kills external fragmentation — any free block is usable).</p>
+</section>
+
+<section id="os-analogy">
+  <h2>4. The OS analogy: why "Paged"</h2>
+  <p>The naming is intentional. The KV cache problem in 2023 is structurally identical to the virtual-memory problem operating systems solved in the 1960s. Process address spaces are too big and too varied to live in contiguous physical RAM, so the OS splits them into fixed-size <strong>pages</strong> (typically 4 KiB), keeps a per-process <strong>page table</strong> that maps virtual page numbers to physical frames, and lets the hardware MMU do the translation on every access.</p>
+
+  <p>The mapping in PagedAttention:</p>
+
+<table>
+  <thead>
+    <tr><th>Virtual memory</th><th>PagedAttention</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Process address space</td><td>Per-request KV cache (one logical sequence)</td></tr>
+    <tr><td>Page (4 KiB)</td><td>KV block (16 tokens × layer × heads × head_dim × 2)</td></tr>
+    <tr><td>Frame (physical 4 KiB)</td><td>Physical KV block in GPU HBM</td></tr>
+    <tr><td>Page table</td><td><code>block_tables[req_id]</code> — list of physical block indices</td></tr>
+    <tr><td>TLB</td><td>(implicit in the attention kernel's gather pattern)</td></tr>
+    <tr><td>Page fault</td><td>Allocate a new physical block when the logical sequence grows past a block boundary</td></tr>
+    <tr><td>Copy-on-write</td><td>Same: shared prefix blocks become private on divergence</td></tr>
+    <tr><td>Shared memory (mmap)</td><td>Prefix-cache sharing of common system prompts across requests</td></tr>
+  </tbody>
+</table>
+
+  <p>This analogy is more than rhetorical. The vLLM team explicitly designed around it, and once you internalize the mapping you can predict roughly half the engineering decisions before reading the code. Why is block size a tunable? Same reason page size is a tunable: small pages reduce internal fragmentation but blow up the page table; large pages do the opposite. Why is there a copy-on-write path? Same reason <code>fork()</code> has one: shared prefixes across requests are the common case, divergence is the exception. Why does the kernel walk an indirection? Same reason your CPU walks a page table on every load.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">A reframe that helps</span>
+    <p>PagedAttention isn't really a new attention algorithm. The actual attention math — <code>softmax(QKᵀ/√d)V</code> — is unchanged. What changed is the <em>memory layout</em> that the kernel reads from. The "Paged" in PagedAttention modifies the noun "cache", not the noun "attention". Once you see it that way, the rest of the design falls out.</p>
+  </div>
+</section>
+
+<section id="algorithm">
+  <h2>5. The PagedAttention algorithm</h2>
+  <p>Here's the layout in concrete terms. Pick a block size <code>B</code> (vLLM defaults to <code>B = 16</code> tokens). Pre-allocate a large pool of physical KV blocks at server startup, sized to fill the available GPU memory minus model weights minus activation headroom. Each block holds the K and V tensors for <code>B</code> tokens, for <em>one</em> layer, for <em>one</em> request.</p>
+
+  <p>Wait — for one layer? Yes. There are subtle layout choices here. vLLM's actual layout stores the cache as two big tensors per layer:</p>
+
+<pre class="diagram">
+k_cache[layer] : [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+v_cache[layer] : [num_blocks, num_kv_heads, head_dim,    block_size   ]
+</pre>
+
+  <p>The <code>x</code> dimension on the K cache is a vectorization trick (8 fp16 elements packed for coalesced loads). Don't get hung up on it; the conceptual picture is "per layer, a flat array of blocks indexed by physical block id".</p>
+
+  <p>For each logical request, vLLM maintains a <strong>block table</strong>: a list of physical block IDs that, in order, make up the request's KV sequence. When a request grows past a block boundary (token <code>B+1</code>, <code>2B+1</code>, etc.), it asks the block manager for a new physical block and appends its ID to the block table.</p>
+
+<pre class="diagram">
+Logical view (one request, 50 tokens, B=16):
+
+  tokens   0..15      16..31     32..47     48..49
+           ┌───────┐  ┌───────┐  ┌───────┐  ┌──┐
+  logical  │ blk 0 │  │ blk 1 │  │ blk 2 │  │3 │
+           └───────┘  └───────┘  └───────┘  └──┘
+
+Physical mapping via block_table for this request:
+  block_table = [7, 23, 4, 19]       # arbitrary, depends on what was free
+
+Physical GPU HBM (k_cache, simplified):
+  [ blk0=. blk1=. blk2=. blk3=. blk4=req_X blk5=. blk6=. blk7=req_X
+    blk8=. blk9=. blk10=. ... blk19=req_X ... blk23=req_X ... ]
+</pre>
+
+  <p>Physically, the four logical blocks of the request live at HBM offsets 7, 23, 4, and 19. They're not contiguous, they're not even in order. The attention kernel doesn't care, because it reads through the block table.</p>
+
+  <p>The pseudocode for a single decode step is brutally simple at the dispatcher level:</p>
+
+<div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># Simplified — this is the algorithm, not the literal vLLM code
+
+def paged_attention_decode(query, k_cache, v_cache, block_table, context_len):
+    """
+    query        : [num_kv_heads, head_dim]            # this step's Q
+    k_cache      : [num_blocks, num_kv_heads, head_dim, block_size]
+    v_cache      : same shape
+    block_table  : [num_blocks_in_seq]                 # logical -> physical
+    context_len  : int, number of valid tokens
+    """
+    num_blocks = (context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    out = torch.zeros_like(query)
+    running_max = -inf
+    running_sum = 0.0
+
+    for i in range(num_blocks):
+        physical_id = block_table[i]
+        k_block = k_cache[physical_id]    # [heads, head_dim, block_size]
+        v_block = v_cache[physical_id]
+
+        # tokens in this block that are actually valid
+        block_start = i * BLOCK_SIZE
+        block_end   = min(block_start + BLOCK_SIZE, context_len)
+        valid       = block_end - block_start
+
+        # standard masked attention restricted to valid tokens
+        scores = query @ k_block[..., :valid] / sqrt(head_dim)   # [heads, valid]
+        # online softmax accumulation (FlashAttention-style)
+        block_max  = scores.max(dim=-1)
+        running_max = max(running_max, block_max)
+        # ...rescale running_sum and out by exp(old_max - new_max)...
+        attn = exp(scores - running_max)
+        running_sum += attn.sum(dim=-1)
+        out += attn @ v_block[..., :valid].transpose(-1, -2)
+
+    return out / running_sum
+</code></pre></div>
+
+  <p>The crucial bits:</p>
+  <ol>
+    <li><strong>Indirection</strong>: every block read is <code>k_cache[block_table[i]]</code>, not <code>k_cache[i]</code>. The kernel chases a pointer per block.</li>
+    <li><strong>Tail handling</strong>: the last block of a request is usually partial. The kernel knows this and masks off the unused slots in that block. This is where internal fragmentation goes — at most <code>(B - 1)</code> tokens per request, which for <code>B=16</code> is 15 tokens of waste worst-case, vs. potentially thousands under naive allocation.</li>
+    <li><strong>Online softmax</strong>: the kernel accumulates max and sum across blocks à la FlashAttention, so it never has to materialize the full <code>[1, context_len]</code> attention vector. This matters because PagedAttention and FlashAttention compose: vLLM ships its own kernel ("PagedAttention v2") that does both.</li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="callout-label">Decode vs prefill use different kernels</span>
+    <p>The pseudocode above is for <em>decode</em> (Q has length 1, K/V has length <code>context_len</code>). Prefill (Q has length <code>seq_len</code>, K/V has the same length) uses a different kernel because the work shape is different — prefill is compute-bound and looks like a standard FlashAttention forward, just feeding the resulting K/V into paged storage at the end. vLLM has both <code>flash_attn_varlen</code> for prefill and <code>paged_attention_v1/v2</code> for decode.</p>
+  </div>
+</section>
+
+<section id="block-table">
+  <h2>6. The block table, byte by byte</h2>
+  <p>The block table is the single most important data structure in PagedAttention. Let's look at what it costs.</p>
+
+  <p>For a batch of <code>N</code> concurrent requests, with each request potentially having up to <code>max_blocks_per_seq</code> blocks (where <code>max_blocks_per_seq = ceil(max_model_len / block_size)</code>), vLLM keeps a single 2D int32 tensor on the GPU:</p>
+
+<pre class="diagram">
+block_tables : torch.int32  shape [N, max_blocks_per_seq]
+
+Example with N=200, max_model_len=8192, block_size=16:
+  max_blocks_per_seq = 512
+  block_tables.shape = [200, 512]
+  block_tables.numel() = 102,400
+  bytes              = 409,600  ≈  400 KiB
+</pre>
+
+  <p>That's it. 400 KiB on the GPU to keep track of where every block of every request in a 200-deep batch lives. The savings on the KV cache side dwarf this by four to five orders of magnitude.</p>
+
+  <p>Unused slots in the block table are filled with a sentinel (typically zero or <code>-1</code>). The kernel reads <code>context_lens[req]</code> separately to know how far into the request's row to walk, so it never dereferences a sentinel.</p>
+
+  <p>Now layer on the physical block pool. The pool is the giant tensor that actually holds bytes. For Llama-3-70B with <code>num_kv_heads=8</code>, <code>head_dim=128</code>, <code>num_layers=80</code>, <code>block_size=16</code>, <code>dtype=bf16</code>:</p>
+
+<pre class="diagram">
+bytes per block = block_size × num_kv_heads × head_dim × 2 (K+V) × dtype_bytes
+                = 16 × 8 × 128 × 2 × 2
+                = 65,536 bytes  =  64 KiB per block per layer
+
+Total per block (all 80 layers) = 80 × 64 KiB = 5.0 MiB
+                                  (this is the cost of one logical block of context)
+
+If you reserve 40 GiB for the KV pool:
+  40 GiB / 5.0 MiB per block ≈ 8,192 blocks
+  8,192 blocks × 16 tokens   = 131,072 tokens of total KV capacity
+</pre>
+
+  <p>That 131k token capacity is the total <em>pooled</em> capacity across all concurrent requests. Under naive allocation, if every request reserved <code>max_tokens=2048</code>, you'd fit 64 requests. Under paged allocation with average actual length 400, you'd fit ~327 requests in the same memory. The 5× factor on the math is real.</p>
+</section>
+
+<section id="kernel">
+  <h2>7. Inside the attention kernel</h2>
+  <p>A worry someone always raises: doesn't the gather hurt performance? Pointer-chasing through a block table sounds slow.</p>
+
+  <p>The honest answer: it costs something, but much less than you'd expect, for three reasons.</p>
+
+  <h3>The reads are large and coalesced</h3>
+  <p>Within a block, the memory is contiguous: all 16 tokens of a block live side-by-side, all heads of one token live side-by-side, all elements of one head live side-by-side. The block table only fragments at the granularity of 16-token chunks. A warp loading one block does a clean coalesced burst from HBM. The indirection cost is one int32 lookup <em>per block</em>, not per token.</p>
+
+  <h3>The work is memory-bound anyway</h3>
+  <p>Decode attention reads <code>O(context_len)</code> bytes of KV cache to produce one output token's worth of work. The compute is trivial — a sequence of dot products. So the kernel sits on HBM bandwidth waiting for the data, and the cost of looking up where the data lives is amortized across the read. A back-of-envelope: an H100 has 3.35 TB/s HBM bandwidth. A 4k-context decode reads <code>4096 × 8 × 128 × 2 × 2 = 16 MiB</code> of KV from one layer; that's ~4.8 µs of bandwidth. The block table walk is single-digit nanoseconds per block; it's noise.</p>
+
+  <h3>The kernel is fused</h3>
+  <p>vLLM doesn't gather blocks into a contiguous buffer and then do attention. It fuses the gather and the attention math. The block-by-block loop is the kernel. Each warp loads its assigned block(s), does the per-block softmax accumulation, and writes back partial results, all without round-tripping through global memory.</p>
+
+  <p>The result is that PagedAttention's decode kernel is competitive with, and sometimes faster than, a contiguous-layout reference, because being able to fit a larger batch overwhelms the per-block lookup cost. <em>The slow path is the one that ran out of memory and had to evict a request.</em></p>
+
+  <details class="collapse-card">
+    <summary>Aside: PagedAttention v1 vs v2 kernels</summary>
+    <div class="collapse-card-body">
+      <p>vLLM ships two variants:</p>
+      <ul>
+        <li><strong>v1</strong>: one CUDA block per request, walks the block table sequentially. Good for short contexts (where there aren't many blocks anyway).</li>
+        <li><strong>v2</strong>: parallelizes across blocks of a single request — useful for very long contexts where a single sequence has hundreds of blocks. Uses a partial-softmax reduction across blocks.</li>
+      </ul>
+      <p>The dispatcher picks based on context length. You can see the heuristic in <code>vllm/attention/ops/paged_attn.py</code>.</p>
+    </div>
+  </details>
+</section>
+
+<section id="math">
+  <h2>8. The math of savings — a worked example</h2>
+  <p>Let's make this concrete with numbers you could defend in a design review.</p>
+
+  <p>Scenario: a Llama-3-70B endpoint with 200 concurrent requests, served on a 4×H100 node. Users set <code>max_tokens=2048</code> by default. Looking at three months of production traces, the actual generated length distribution has mean 400 and p95 of 1,200.</p>
+
+  <p>KV memory per token, from earlier: <strong>320 KiB</strong>.</p>
+
+  <h3>Naive allocation</h3>
+
+<pre class="diagram">
+Per request (worst case = max_tokens):
+  2048 tokens × 320 KiB     = 640 MiB
+
+200 concurrent requests:
+  200 × 640 MiB             = 128,000 MiB  =  125 GiB
+
+Across 4 H100s with ~50 GiB free per card for KV (after weights):
+  4 × 50 GiB                = 200 GiB available
+  Headroom                  = 200 - 125 = 75 GiB free
+
+But — you must reserve for the worst case at admission time.
+Effective concurrency cap = floor(200 GiB / 640 MiB)  =  320 requests
+
+Of the 125 GiB actually reserved:
+  Used     = 200 × 400 tokens × 320 KiB  = 25.0 GiB
+  Wasted   = 125 - 25                    = 100 GiB  (80% waste)
+</pre>
+
+  <h3>Paged allocation, block_size=16</h3>
+
+<pre class="diagram">
+Per request (actual usage rounded up to block boundary):
+  ceil(400 / 16) × 16 tokens × 320 KiB = 400 tokens × 320 KiB ≈ 125 MiB
+  (worst tail-block waste: 15 tokens × 320 KiB = 4.8 MiB)
+
+200 requests at mean length:
+  200 × 125 MiB           = 25,000 MiB  =  24.4 GiB
+
+The same 200 GiB budget now fits, on average:
+  200 GiB / 125 MiB        = 1,638 requests at the mean
+
+In practice you set max_num_seqs to something like 256-512
+because compute (not memory) becomes the new bottleneck.
+
+Block table overhead:
+  512 reqs × 512 max_blocks_per_seq × 4 bytes = 1 MiB
+  (negligible)
+</pre>
+
+  <h3>Throughput consequence</h3>
+  <p>If batch size goes from 64 (naive) to 256 (paged), and decode is memory-bandwidth-bound (it is), then throughput scales nearly linearly with batch size up to the point where compute saturates. The vLLM paper measures ~<strong>5× higher throughput</strong> on real ShareGPT traces from this effect alone, with further gains from continuous batching and prefix caching layered on top. The 24× headline number requires all three plus a comparison against a particularly slow baseline (HuggingFace's <code>transformers.generate</code> with naive padding), but the 5–10× factor over a competently-built naive server is robust.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The savings come from the long tail</span>
+    <p>The bigger the gap between <code>max_tokens</code> and actual length, the more PagedAttention helps. Chat apps where users set generous <code>max_tokens</code> "just in case" but most replies are short are the sweet spot. RAG with long context but short answers also wins. Workloads where users always generate near <code>max_tokens</code> (long-form writing, code completion of full files) see smaller gains.</p>
+  </div>
+</section>
+
+<section id="prefix-cache">
+  <h2>9. Prefix caching</h2>
+  <p>Once you have blocks, sharing them across requests is almost free. This is prefix caching, and it's the second-biggest win in vLLM after PagedAttention itself.</p>
+
+  <p>The observation: if two requests start with the same prefix (a common system prompt, a few-shot exemplar, a retrieved document), they would compute identical KV state for those prefix tokens. Naive servers do this computation twice and store it twice. Paged servers can share the physical blocks and only compute it once.</p>
+
+  <p>vLLM's implementation:</p>
+
+  <ol>
+    <li>Hash each block by the token IDs it contains. The hash is <code>H(prev_block_hash, token_ids_in_block)</code> — i.e. it includes the chain back to the start, so two blocks with the same 16 tokens are only considered identical if their <em>entire prefix</em> matches.</li>
+    <li>Maintain a global hash table <code>{block_hash → physical_block_id, ref_count}</code>.</li>
+    <li>When a new request comes in, walk its prompt block-by-block. For each fully-filled prefix block, look up the hash. If a physical block exists, point the new request's block table at it and bump the ref count. If not, allocate a fresh block, compute, and insert into the hash table.</li>
+  </ol>
+
+  <p>The savings are dramatic when system prompts are long. A 1,500-token system prompt that's shared across a million daily requests means you compute its KV state once a server lifetime (or once per cold start), not a million times. That's 1,500 prefill tokens × 1M requests = 1.5B FLOPs saved per day per prompt, and an equivalent KV-cache-bytes saved by sharing.</p>
+
+<pre class="diagram">
+Two requests, shared prefix "You are a helpful AI assistant. Always..." (32 tokens):
+
+Request 1 block_table:  [P0, P1, U1a, U1b]
+                         ↑    ↑    ↑    ↑
+                         shared    private (user-specific)
+Request 2 block_table:  [P0, P1, U2a]
+                         ↑    ↑    ↑
+                         shared    private
+
+Physical block pool:
+  P0 (refcount=2, hash=h0)
+  P1 (refcount=2, hash=h1=H(h0, tokens 16..31))
+  U1a (refcount=1), U1b (refcount=1), U2a (refcount=1)
+</pre>
+
+  <p>The eviction policy matters: when the block pool is full and a new block is needed, vLLM evicts the least-recently-used block with refcount=0. Blocks with refcount &gt; 0 (in use by an active request) are pinned. This is essentially page replacement in OS land, and the LRU choice is the simplest thing that works — Belady's anomaly notwithstanding, LRU is what production runs.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">When prefix caching wins</span>
+    <ul>
+      <li><strong>Chatbots</strong>: identical system prompt across all sessions. Very high hit rate.</li>
+      <li><strong>RAG</strong>: the retrieved documents change, but the instruction prompt and the document delimiter pattern often don't. Partial hits on prompt boilerplate.</li>
+      <li><strong>Few-shot</strong>: examples shared across a batch of evaluations. Near-perfect hit rate.</li>
+      <li><strong>Agent loops</strong>: the same tool definitions and conversation history get replayed every turn. Each new step is a "longest-prefix-match" against the last step's KV state. Huge.</li>
+    </ul>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">When it loses</span>
+    <ul>
+      <li>One-shot prompts with no shared structure. Hit rate ≈ 0.</li>
+      <li>Long-tail of users with unique short prompts. Hashing overhead dwarfs the savings.</li>
+      <li>Tokenizer differences between requests (rare in practice but real if you're multi-tenant across model families).</li>
+    </ul>
+    <p>vLLM lets you toggle prefix caching with <code>--enable-prefix-caching</code>. The default off-by-default for stability rather than performance reasons; in production with stable workloads, you want it on.</p>
+  </div>
+</section>
+
+<section id="cow">
+  <h2>10. Copy-on-write and beam search</h2>
+  <p>Prefix sharing is read-only by construction (the prefix doesn't change). But there's a richer case: <strong>beam search</strong>, or sampling multiple candidates from the same prefix, where each candidate <em>extends</em> the shared prefix differently.</p>
+
+  <p>This is the same problem <code>fork()</code> solved with copy-on-write. The child process shares parent pages until it writes one, at which point the kernel duplicates that page and gives the child its own copy.</p>
+
+  <p>vLLM does exactly this. When a request is "split" (e.g. parallel sampling with <code>n=4</code> sampled completions), each child gets a block table that initially points at the parent's blocks. As each child generates and fills up new blocks past the divergence point, those new blocks are private. The shared prefix blocks stay shared, and their refcount reflects all live children.</p>
+
+<pre class="diagram">
+Parallel sampling, n=4, shared prompt of 48 tokens (3 blocks):
+
+   parent prompt blocks
+   ┌────┐ ┌────┐ ┌────┐
+   │ P0 │ │ P1 │ │ P2 │            refcount=4 each
+   └────┘ └────┘ └────┘
+      │      │      │
+      ├──── child A ─── [A3, A4, ...]   (private completion)
+      ├──── child B ─── [B3, ...]
+      ├──── child C ─── [C3, C4, C5, ...]
+      └──── child D ─── [D3, ...]
+</pre>
+
+  <p>If a child needs to write into a shared block (very rare — only happens with mid-block divergence, like when the user message ends mid-block), the block manager allocates a new physical block, copies the existing tokens in, and rewrites the child's block table entry. Pure COW.</p>
+
+  <p>This same primitive powers tree-of-thought, MCTS-over-token-trees, and any other algorithm that wants to explore multiple continuations from a shared prefix without paying the prefix cost N times.</p>
+</section>
+
+<section id="continuous-batching">
+  <h2>11. Continuous batching (the partner mechanism)</h2>
+  <p>PagedAttention is necessary but not sufficient for vLLM-style throughput. The other half is <strong>continuous batching</strong>, sometimes called iteration-level scheduling.</p>
+
+  <p>Traditional batching: gather N requests, pad them to the same length, run them as a single batch through the model, return all N when the last one finishes. The problem is variable-length completions. If 19 requests in your batch of 20 finished at token 50 but the 20th is still going at token 2000, the GPU is wasting 95% of its work computing attention for tokens that have already terminated.</p>
+
+  <p>Continuous batching dissolves this. The scheduler maintains a set of "running" requests. At each forward pass, it:</p>
+
+  <ol>
+    <li>Selects which subset of running requests to step this iteration.</li>
+    <li>For each selected request, computes one decode step (or chunk of prefill — see next section).</li>
+    <li>Checks termination conditions; finished requests are evicted from the running set, their blocks freed, and their slots reused.</li>
+    <li>Admits new requests from the waiting queue, allocating their initial blocks.</li>
+  </ol>
+
+  <p>The forward pass batches across requests, but each request's <em>length</em> is independent. The kernel takes <code>(query_per_request, block_tables_per_request, context_lens_per_request)</code> as inputs and computes them all in one fused launch.</p>
+
+  <p>Why does this need PagedAttention? Because without paged storage, evicting a finished request and admitting a new one would require either a contiguous reshuffle of the KV cache (impossible at GPU memory speeds) or pre-allocating slots for every potential admission (back to naive). With pages, "freeing" a request is just decrementing refcounts on its blocks, and "admitting" a new request is just allocating fresh blocks from the pool. Both are O(blocks-in-request) and trivial to do between iterations.</p>
+
+<pre class="diagram">
+Iteration t   : running = [A(@token 50), B(@token 12), C(@token 800)]
+Iteration t+1 : C terminates ─→ free its 50 blocks
+Iteration t+2 : admit D (new) ─→ allocate its prefix blocks
+Iteration t+2 : running = [A(@token 51), B(@token 13), D(@token 0 prefill)]
+</pre>
+
+  <p>Note that D's prefill and A,B's decode coexist in the same batch. They have different work shapes — D is doing O(prompt_len²) attention, A/B are doing O(context_len) — but a properly written kernel handles both. This is where <strong>chunked prefill</strong> comes in.</p>
+</section>
+
+<section id="chunked-prefill">
+  <h2>12. Chunked prefill</h2>
+  <p>A new request with a 10,000-token prompt is going to spend a long time in prefill. If you naively put that prefill in the same iteration as a batch of decodes, every decode-only request waits for the prefill to finish — a classic head-of-line block. Latency p99 goes through the roof.</p>
+
+  <p>Chunked prefill says: split the prefill into chunks of, say, 512 tokens at a time. Each iteration of the scheduler can process one chunk of one prefilling request <em>plus</em> a bunch of decode steps from running requests, all in the same forward pass. The prefilling request doesn't finish prefill in a single iteration, but the decodes don't have to wait.</p>
+
+  <p>The scheduler has a <strong>budget</strong> for each iteration — typically expressed in tokens (e.g. "step at most 2048 tokens of work this iteration"). It fills the budget greedily: decodes first (1 token each, very cheap), then as much of a pending prefill as fits. If a prefill request needs more than one chunk, it stays in a "prefilling" state across iterations.</p>
+
+<pre class="diagram">
+Iter t budget = 2048 tokens:
+  decode A   :    1 token
+  decode B   :    1 token
+  decode C   :    1 token
+  ...
+  decode (×64): 64 tokens of decode  (one per running request)
+  prefill D  : 1984 tokens of D's 8000-token prompt
+                                       ↑ first chunk
+  total       = 2048 tokens
+
+Iter t+1:
+  decode (×65)  :  65 tokens (D is still prefilling, doesn't decode yet)
+  prefill D     : 1983 tokens
+  ...
+
+Iter t+5:
+  decode (×65)  :  65 tokens
+  prefill D     : final 256 tokens, D enters decode set at t+6
+</pre>
+
+  <p>The win: tail latency for short requests doesn't depend on the longest concurrent prefill. The cost: peak throughput on prefill-heavy workloads drops slightly because each chunk has to re-load the model weights and KV state from HBM rather than fusing the whole prefill into one big matmul.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">When chunked prefill hurts</span>
+    <p>For small models (where prefill is so fast that head-of-line blocks are sub-millisecond anyway) and for workloads with very short prompts, the chunking overhead can cost a few percent of throughput with no latency benefit. For 70B-class models with long contexts and mixed traffic, it's a near-universal win. vLLM enables it by default in recent versions; you can disable with <code>--disable-chunked-prefill</code>.</p>
+  </div>
+</section>
+
+<section id="goodput">
+  <h2>13. Throughput vs goodput</h2>
+  <p>Now we're in the part of inference systems engineering that's poorly named in the literature. "Throughput" — tokens per second — is the headline metric in vendor benchmarks. It's also a bit of a lie, because users don't experience throughput. They experience latency.</p>
+
+  <p>Three latencies matter:</p>
+
+  <ul>
+    <li><strong>TTFT</strong> (time to first token): how long from request received until the first token streams back. Dominated by prefill cost. Felt acutely in chat (the spinner-while-thinking experience).</li>
+    <li><strong>TPOT</strong> (time per output token): the inter-token delay during streaming. Dominated by per-step decode latency, which is dominated by batch size and KV memory bandwidth. Felt as "the typing speed".</li>
+    <li><strong>End-to-end latency</strong>: TTFT + (output_length × TPOT). What actually shows up in your SLO.</li>
+  </ul>
+
+  <p>A "fast" server in pure tokens/sec terms might have terrible TTFT — it batched your request behind a giant prefill and your spinner spun for four seconds. Conversely, a server with low p50 TTFT but tiny batch size might be wasting GPU.</p>
+
+  <p>Hence <strong>goodput</strong>: tokens per second that arrived <em>under SLO</em>. If your SLO is "TTFT &lt; 1s and TPOT &lt; 50ms" and 30% of your output tokens come from requests that breached one of those, your goodput is 70% of your throughput.</p>
+
+<pre class="diagram">
+Hypothetical server stats:
+
+                    throughput   |   p99 TTFT   |   p99 TPOT   |   goodput (SLO: TTFT&lt;1s, TPOT&lt;50ms)
+  config A          12,000 tok/s |   3.2 s      |   28 ms      |   ~4,000 tok/s   (most requests breach TTFT)
+  config B           9,500 tok/s |   0.7 s      |   42 ms      |   ~9,200 tok/s
+  config C           6,000 tok/s |   0.4 s      |   18 ms      |   ~6,000 tok/s
+
+  → config B has the highest goodput despite being middle-of-pack on throughput.
+</pre>
+
+  <p>This is why SLO-aware scheduling exists. Chunked prefill is one tool — by bounding prefill chunks, you bound TTFT for waiting requests. Another is prioritization (admit prefills that improve goodput, defer those that won't make SLO anyway). DistServe and Splitwise take this further by separating prefill and decode onto different physical GPUs entirely.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">A useful framing for design reviews</span>
+    <p>If someone shows you a benchmark with one number labelled "throughput", ask what the latency distribution looked like. A 10× throughput improvement that comes with a 5× tail-latency regression is a regression in production, regardless of the headline. Goodput is the honest metric.</p>
+  </div>
+</section>
+
+<section id="spec-decode">
+  <h2>14. Speculative decoding and how it interacts with PagedAttention</h2>
+  <p>Speculative decoding: use a small fast model (the "draft") to propose a short sequence of tokens, then use the big model (the "verifier") to check them in a single forward pass. If the draft was right, you got multiple tokens for the cost of one big-model step. If wrong, you fall back to one token at a time.</p>
+
+  <p>The bargain works when:</p>
+  <ul>
+    <li>The draft model is much smaller than the verifier (e.g. Llama-3-8B drafting for Llama-3-70B).</li>
+    <li>The draft's acceptance rate is high (the draft and verifier mostly agree).</li>
+    <li>The verifier's forward pass dominates the draft's — true when the verifier is 10–20× larger.</li>
+  </ul>
+
+  <p>How does this interact with PagedAttention? The verifier still uses paged KV storage. Speculative tokens are appended to the verifier's KV cache speculatively — if they're accepted, the appended blocks stay; if rejected, they're discarded (blocks freed back to the pool). This is the same allocate/free machinery already in place. The block manager doesn't need to know it's serving speculative tokens.</p>
+
+  <p>Where the interaction matters: <strong>batch size</strong>. Speculative decoding can hurt the verifier's batch efficiency because each verifier step now produces, say, 4 tokens per request (assuming 75% acceptance over 5 drafted tokens) — so the batch shape changes. With paged storage and continuous batching, this falls out automatically: the scheduler treats a verifier step that accepts 4 tokens identically to four decode steps, freeing the slots back to the pool at the next iteration.</p>
+
+  <p>Speculative decoding is enabled in vLLM via <code>--speculative-config</code>. Production gains are usually 1.5–2× on throughput when properly tuned. The main pitfall is choosing a draft model with poor acceptance rate — a draft that disagrees often is worse than no draft.</p>
+</section>
+
+<section id="offload">
+  <h2>15. KV-cache offloading and disaggregated serving</h2>
+  <p>GPU HBM is expensive (literal dollars per GiB, plus the bandwidth premium). Host RAM is cheap. NVMe is cheaper. The natural extension to PagedAttention is to tier the block pool across memory levels.</p>
+
+  <p>Once the KV cache is page-shaped, offloading is mechanical: a page on HBM that hasn't been touched recently can be DMA'd out to host RAM and the HBM slot freed. When the request needs it again (e.g. it returns to the active scheduling window), copy it back. This is page-swapping, full stop.</p>
+
+  <p>vLLM has a swap mechanism for preempted requests: when memory pressure is high and a low-priority request needs to be evicted, its KV blocks are copied to host RAM rather than discarded. When the request is scheduled again, the blocks are copied back in. The cost is two PCIe round trips, but the alternative is recomputing the prefill, which can be much worse for long-context requests.</p>
+
+  <h3>Disaggregated serving (PD disagg)</h3>
+  <p>The frontier idea: prefill and decode have such different compute/memory profiles that putting them on the same GPU is suboptimal.</p>
+  <ul>
+    <li><strong>Prefill</strong>: compute-bound (full FlashAttention over the prompt). Wants tensor parallelism, big matmuls. Wants very few concurrent prefills to maximize utilization.</li>
+    <li><strong>Decode</strong>: memory-bound (one new Q per step against a long K/V). Wants large batch sizes to amortize KV-cache reads. Wants many concurrent decodes.</li>
+  </ul>
+
+  <p>DistServe (OSDI '24) and Splitwise (ISCA '24) propose dedicating prefill GPUs and decode GPUs separately, transferring the prompt's KV cache from prefill to decode GPU over a high-bandwidth interconnect when prefill finishes. This is non-trivial — you're moving hundreds of MiB over the network — but with NVLink or RDMA it's tractable, and the throughput-per-dollar gains can be 2–3× for mixed workloads.</p>
+
+  <p>vLLM is moving in this direction. See the <code>P2P_NCCL</code> KV transfer experiments in recent vLLM versions. The block-shaped layout is what makes this tractable: you transfer blocks, not slabs.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why pages keep paying off</span>
+    <p>Every new optimization in this space — prefix caching, swap, PD disagg, multi-tenant LoRA — presupposes that the KV cache is allocated in small, addressable, transferable units. The block is the universal unit of currency. Without it, each of these features would need its own bespoke allocator.</p>
+  </div>
+</section>
+
+<section id="multi-lora">
+  <h2>16. Multi-LoRA serving</h2>
+  <p>One more downstream consequence worth understanding. LoRA adapters are small (~1% of model weight count), and you often want to serve many adapters from one base model — different customers, different fine-tunes, different versions, all hitting the same GPU fleet.</p>
+
+  <p>The serving challenge is that each request can specify a different adapter. Naively you'd run a separate model server per adapter, paying for the full base weights N times. With multi-LoRA serving (S-LoRA, vLLM's LoRA support), you keep the base model resident once and hot-swap adapter matrices per request, fused into the kernel.</p>
+
+  <p>PagedAttention's role here is indirect but real: because requests share base weights and have KV state that's compatible across adapters (the K/V projections share base + adapter), the same paged storage works. The kernel reads <code>(adapter_id_per_request, block_tables_per_request)</code> and dispatches. You couldn't easily do this with naive per-request slabs; the bookkeeping is what scales.</p>
+
+  <p>The block-shaped layout also enables <strong>adapter-aware prefix caching</strong>: a shared prefix's K/V state under adapter A is different from under adapter B (because A and B modify the K and V projections differently), so the prefix cache must key on (block_hash, adapter_id). This is what vLLM does; it's a one-line change in the cache key once you've already got the hashing infrastructure.</p>
+</section>
+
+<section id="code-tour">
+  <h2>17. Reading the vLLM code</h2>
+  <p>If this guide has done its job, you can now open the vLLM source and read it. Here's a guided tour of where the magic lives, as of mid-2025 release branches.</p>
+
+  <h3><code>vllm/core/block_manager.py</code></h3>
+  <p>The block manager owns the physical block pool and the per-request block tables. Key classes:</p>
+  <ul>
+    <li><code>BlockManagerV2</code> — the production block manager. Splits into <code>SelfAttnBlockSpaceManager</code> and (for encoder-decoder) <code>EncoderDecoderBlockSpaceManager</code>.</li>
+    <li><code>PrefixCachingBlockAllocator</code> vs <code>NaiveBlockAllocator</code> — flipped by the <code>--enable-prefix-caching</code> flag. The prefix-caching allocator wraps the naive one with a hash→block map.</li>
+    <li><code>can_allocate(seq_group)</code> — admission check: does the pool have enough free blocks for this new request's prompt? Returns one of <code>OK</code>, <code>NEVER</code> (request too big to ever fit), or <code>LATER</code> (currently full).</li>
+    <li><code>allocate(seq_group)</code>, <code>append_slots(seq_group)</code>, <code>free(seq_group)</code> — the lifecycle.</li>
+  </ul>
+
+  <h3><code>vllm/core/scheduler.py</code></h3>
+  <p>The scheduler decides which requests to step each iteration. The main entry point is <code>Scheduler.schedule()</code>, called once per forward pass. It returns a <code>SchedulerOutputs</code> describing which sequences to run, in what order, and with what slot allocations.</p>
+  <p>Internal state: three queues — <code>waiting</code>, <code>running</code>, <code>swapped</code>. Each iteration the scheduler tries to admit from waiting (subject to <code>can_allocate</code>), step everything in running, and bring back from swapped if memory frees up. The token budget for chunked prefill is enforced here, in <code>_schedule_chunked_prefill()</code>.</p>
+
+  <h3><code>vllm/attention/ops/paged_attn.py</code> and CUDA kernels</h3>
+  <p>The Python side dispatches to C++/CUDA kernels in <code>csrc/attention/</code>. The two main kernels are <code>paged_attention_v1_kernel</code> and <code>paged_attention_v2_kernel</code>. The v2 kernel has a reduce step that combines partial softmax outputs across blocks of the same sequence — useful when one sequence is so long it needs to parallelize across SMs.</p>
+
+  <h3><code>vllm/attention/backends/</code></h3>
+  <p>Different backends for different hardware: <code>flash_attn.py</code> (FlashAttention 2/3 on Ampere/Hopper), <code>xformers.py</code> (legacy), <code>torch_sdpa.py</code> (CPU/fallback), <code>flashinfer.py</code> (NVIDIA's FlashInfer kernel library, often faster on H100/B200 for specific shapes). The block-table interface is the same across backends.</p>
+
+  <h3><code>vllm/engine/llm_engine.py</code></h3>
+  <p>The orchestrator. Combines scheduler, model executor, and block manager. The main loop is <code>step()</code>: schedule → execute → sample → return. Reading this end-to-end will give you the full picture in maybe 200 lines.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">A reading order that works</span>
+    <ol>
+      <li><code>llm_engine.py</code> top-down — get the loop structure.</li>
+      <li><code>scheduler.py</code> — learn what one iteration looks like.</li>
+      <li><code>block_manager.py</code> — see how blocks get assigned.</li>
+      <li><code>paged_attn.py</code> Python wrapper — see what the kernel takes as input.</li>
+      <li>One of the C++ kernels — only if you want to write your own backend.</li>
+    </ol>
+  </div>
+</section>
+
+<section id="pitfalls">
+  <h2>18. Common misconceptions and pitfalls</h2>
+
+  <h3>"PagedAttention is a new attention algorithm"</h3>
+  <p>It's not. It's a memory-layout change to the KV cache. The math of attention is unchanged. The kernel does extra indirection to find blocks, but the softmax-of-QKᵀ is the same softmax-of-QKᵀ.</p>
+
+  <h3>"Block size 16 is optimal"</h3>
+  <p>It's a reasonable default. Smaller blocks reduce internal fragmentation but increase block-table overhead and kernel launch cost. Larger blocks (32, 64) can be faster for very long contexts where the indirection cost matters and prefixes are mostly fully filled. The right answer depends on workload; benchmark for yours. vLLM exposes <code>--block-size</code>.</p>
+
+  <h3>"Prefix caching is always on in vLLM"</h3>
+  <p>No — it's opt-in via <code>--enable-prefix-caching</code>. Default-off for backward compatibility and because some workloads (true one-shot, randomized prompts) see no benefit and a small hashing overhead. In production with stable workloads it should be on.</p>
+
+  <h3>"More batch size always = more throughput"</h3>
+  <p>Up to a point. Above some batch size, you saturate compute (FLOPs) rather than memory bandwidth, and adding more requests just adds latency without throughput. That point depends on the model and hardware; for Llama-3-70B on H100, it's typically around batch 256–512 at moderate context lengths. vLLM's <code>--max-num-seqs</code> caps this.</p>
+
+  <h3>"Continuous batching is the same as dynamic batching"</h3>
+  <p>Related but different. Dynamic batching (in TF Serving, Triton) gathers requests into a batch <em>once at admission</em> and runs them as one fixed batch. Continuous batching mutates the batch <em>every iteration</em>. The latter is strictly more flexible and is the right move when iterations are cheap (which they are for decode).</p>
+
+  <h3>"PagedAttention only matters for serving many concurrent requests"</h3>
+  <p>It matters most there, but even for a single-user single-stream case it helps because it makes long-context inference fit when naive allocation wouldn't. The <code>max_model_len=128k</code> configs you see on vLLM endpoints are only practical because the cache is paged.</p>
+
+  <h3>"Block table overhead might be significant"</h3>
+  <p>It's not. As we computed earlier, a 200-request × 512-block-per-request table is 400 KiB. Compared to GiB of KV cache, this is rounding noise. The myth probably comes from worrying about pointer-chasing, but that's a kernel concern, not a memory concern.</p>
+</section>
+
+<section id="references">
+  <h2>19. References and further reading</h2>
+
+  <h3>Primary source</h3>
+  <ul>
+    <li><strong>Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang, Stoica. "Efficient Memory Management for Large Language Model Serving with PagedAttention."</strong> SOSP 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>. The paper that introduced PagedAttention and vLLM. Reads cleanly — it's a systems paper, not an ML paper.</li>
+  </ul>
+
+  <h3>vLLM project resources</h3>
+  <ul>
+    <li><a href="https://github.com/vllm-project/vllm">vllm-project/vllm</a> on GitHub. The code we walked through above.</li>
+    <li><a href="https://docs.vllm.ai/">docs.vllm.ai</a> — official docs. The "Architecture" and "Design" sections are worth reading once you understand the paper.</li>
+    <li><a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM launch blog post</a> (June 2023). The first writeup, with the famous 24× throughput chart. Worth reading for the rhetorical framing.</li>
+  </ul>
+
+  <h3>Related work</h3>
+  <ul>
+    <li><strong>Dao et al. "FlashAttention" and "FlashAttention-2".</strong> The kernel-level innovation that PagedAttention composes with. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>, <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a>.</li>
+    <li><strong>Yu et al. "Orca: A Distributed Serving System for Transformer-Based Generative Models."</strong> OSDI 2022. Introduced iteration-level scheduling (the seed of continuous batching). <a href="https://www.usenix.org/conference/osdi22/presentation/yu">Open-access at USENIX</a>.</li>
+    <li><strong>Patel et al. "Splitwise: Efficient Generative LLM Inference Using Phase Splitting."</strong> ISCA 2024. PD disaggregation. <a href="https://arxiv.org/abs/2311.18677">arXiv:2311.18677</a>.</li>
+    <li><strong>Zhong et al. "DistServe: Disaggregating Prefill and Decoding for Goodput-Optimized Large Language Model Serving."</strong> OSDI 2024. The goodput framing, and a different cut at PD disagg. <a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a>.</li>
+    <li><strong>Sheng et al. "S-LoRA: Serving Thousands of Concurrent LoRA Adapters."</strong> MLSys 2024. The multi-tenant LoRA story. <a href="https://arxiv.org/abs/2311.03285">arXiv:2311.03285</a>.</li>
+    <li><strong>Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding."</strong> ICML 2023. The original speculative decoding paper. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a>.</li>
+  </ul>
+
+  <h3>Adjacent ecosystem</h3>
+  <ul>
+    <li><a href="https://github.com/NVIDIA/TensorRT-LLM">NVIDIA TensorRT-LLM</a> — NVIDIA's answer to vLLM. Different layout choices, similar block-based KV management. Worth comparing for pedagogical contrast.</li>
+    <li><a href="https://github.com/huggingface/text-generation-inference">HuggingFace TGI</a> — adopted PagedAttention-style management; useful for comparing engineering tradeoffs.</li>
+    <li><a href="https://github.com/flashinfer-ai/flashinfer">FlashInfer</a> — kernel library used by vLLM (and others) for paged attention on H100/B200.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">If you only read one</span>
+    <p>Read the original Kwon et al. paper. It's 16 pages, well-written, and the figures alone make the layout intuition click. This guide is a longer-form companion, not a substitute.</p>
+  </div>
+</section>
+
+<section id="closing">
+  <h2>Closing</h2>
+  <p>PagedAttention is the rare systems paper that landed at exactly the right moment with exactly the right abstraction. The block-table indirection looks trivial in retrospect — of course you'd page the KV cache, it works for every other large piece of memory humans have built — but the timing required someone to notice that LLM serving had become a memory-management problem rather than a compute problem, and to commit to a kernel rewrite to prove the point.</p>
+
+  <p>Everything in modern LLM inference now hangs off this primitive. Prefix caching, copy-on-write sampling, continuous batching, chunked prefill, KV offloading, PD disaggregation, multi-tenant LoRA — every one of these is "do the natural thing once your unit of allocation is a block instead of a slab". If you understand the block, you understand the rest.</p>
+
+  <p>The interesting question now is what the next layout shift looks like. Disaggregated serving suggests pages should be transferable between GPUs. Multi-tier KV suggests they should be transferable between HBM and DRAM and NVMe. Maybe future LLMs will have layer-asymmetric KV (some layers cheap, some layers expensive) and pages will need per-layer granularity. The page abstraction has another generation in it at least.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

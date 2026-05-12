@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analytics Fundamentals</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#orient">Why SQL, not LeetCode</a>
+    <a href="#schema">A canonical payments schema</a>
+    <a href="#funnel">Funnel by rail</a>
+    <a href="#aar-confounders">AAR with confounders</a>
+    <a href="#retry">Retry decision modeling</a>
+    <a href="#cost">Cost-per-success</a>
+    <a href="#recon">Daily settlement reconciliation</a>
+    <a href="#cohort">Cohort analysis</a>
+    <a href="#window">Window functions you should know</a>
+    <a href="#interview-tips">Live SQL tips</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Analytics Fundamentals</h1>
+  <p class="subtitle">For a Payments PM, "coding" means SQL — not LeetCode. The interview tests whether you can read payment data, decompose AAR, build cohort cuts, and not embarrass yourself in a live editor.</p>
+</header>
+
+<section id="orient">
+  <h2>Why SQL, not algorithmic LeetCode</h2>
+  <p>You will not be asked to invert a binary tree. You may be asked to write or read SQL on a payments event table — to compute AAR by issuer, find the retry-success rate, or reconcile a settlement file. The bar is: <strong>can you do real analytical SQL fluently on a payments dataset</strong>.</p>
+  <p>Comfortable with CTEs, window functions, conditional aggregates, and joins between event streams. That's it.</p>
+</section>
+
+<section id="schema">
+  <h2>A canonical payments schema (assume this)</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- One row per attempt (a payment intent can have many attempts)
+auth_attempts (
+  attempt_id        UUID PRIMARY KEY,
+  payment_intent_id UUID,           -- stable across retries
+  attempt_seq       INT,            -- 1, 2, 3...
+  user_id           UUID,
+  rail              TEXT,           -- 'card','upi','pix','sepa_inst','fps','ob_pis'
+  geo               TEXT,           -- ISO country code
+  psp_name          TEXT,
+  acquirer          TEXT,
+  bin               TEXT,
+  issuer_country    TEXT,
+  issuer_name       TEXT,
+  mcc               TEXT,
+  scheme            TEXT,           -- 'visa','mc','elo','rupay','mada'...
+  amount_cents      BIGINT,
+  currency          CHAR(3),
+  status            TEXT,           -- 'approved','soft_decline','hard_decline','timeout','3ds_pending'
+  decline_reason    TEXT,
+  decline_family    TEXT,           -- 'soft','hard','stepup','system'
+  three_ds_result   TEXT,           -- 'frictionless','challenge_passed','failed','not_attempted'
+  network_token     BOOLEAN,
+  fee_interchange_c INT,
+  fee_scheme_c      INT,
+  fee_psp_c         INT,
+  fee_xborder_c     INT,
+  fee_fx_c          INT,
+  auth_latency_ms   INT,
+  created_at        TIMESTAMP,
+  responded_at      TIMESTAMP
+);
+
+settlements (
+  settlement_id   UUID,
+  payment_intent_id UUID,
+  settled_at      TIMESTAMP,
+  settled_amount_c BIGINT,
+  psp_name        TEXT
+);
+
+disputes (
+  dispute_id    UUID,
+  payment_intent_id UUID,
+  filed_at      TIMESTAMP,
+  reason_code   TEXT,
+  amount_c      BIGINT,
+  status        TEXT  -- 'open','won','lost','accepted'
+);
+</code></pre></div>
+  <p>Every example below assumes this schema. Be ready to ask the interviewer for the schema if it's not given.</p>
+</section>
+
+<section id="funnel">
+  <h2>Funnel by rail</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Funnel: intents → first attempt → approved → settled, by rail, last 30d
+WITH intents AS (
+  SELECT payment_intent_id, MIN(rail) AS rail
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '30 days'
+  GROUP BY payment_intent_id
+),
+first_attempt AS (
+  SELECT DISTINCT ON (payment_intent_id)
+    payment_intent_id, status
+  FROM auth_attempts
+  ORDER BY payment_intent_id, attempt_seq ASC
+),
+final AS (
+  SELECT payment_intent_id,
+    BOOL_OR(status='approved') AS ever_approved
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '30 days'
+  GROUP BY payment_intent_id
+)
+SELECT
+  i.rail,
+  COUNT(*) AS intents,
+  COUNT(*) FILTER (WHERE f.ever_approved) AS approved_eventually,
+  COUNT(*) FILTER (WHERE fa.status='approved') AS approved_first_attempt,
+  COUNT(s.payment_intent_id) AS settled
+FROM intents i
+LEFT JOIN first_attempt fa USING (payment_intent_id)
+LEFT JOIN final f USING (payment_intent_id)
+LEFT JOIN settlements s USING (payment_intent_id)
+GROUP BY i.rail
+ORDER BY intents DESC;
+</code></pre></div>
+</section>
+
+<section id="aar-confounders">
+  <h2>AAR with confounders — the issuer × BIN × MCC × geo cut</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- First-attempt AAR by issuer × BIN × MCC × issuer_country, last 14 days
+WITH first_attempts AS (
+  SELECT DISTINCT ON (payment_intent_id)
+    payment_intent_id, issuer_name, bin, mcc, issuer_country, status
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '14 days'
+  ORDER BY payment_intent_id, attempt_seq ASC
+)
+SELECT
+  issuer_name, bin, mcc, issuer_country,
+  COUNT(*) AS attempts,
+  COUNT(*) FILTER (WHERE status='approved') AS approved,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE status='approved') / COUNT(*), 2) AS aar_pct
+FROM first_attempts
+GROUP BY issuer_name, bin, mcc, issuer_country
+HAVING COUNT(*) &gt;= 200
+ORDER BY aar_pct ASC;
+-- The bottom of this list is your AAR investigation queue.
+</code></pre></div>
+</section>
+
+<section id="retry">
+  <h2>Retry decision modeling</h2>
+  <p>Does retrying a soft decline actually help? Measure it.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Retry success rate by decline_family on first attempt, last 30d
+WITH first AS (
+  SELECT payment_intent_id,
+    MIN(attempt_seq) FILTER (WHERE status='approved')  AS approved_seq,
+    MAX(attempt_seq) AS max_seq,
+    FIRST_VALUE(decline_family) OVER (
+      PARTITION BY payment_intent_id ORDER BY attempt_seq
+    ) AS first_decline_family,
+    FIRST_VALUE(status) OVER (
+      PARTITION BY payment_intent_id ORDER BY attempt_seq
+    ) AS first_status
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '30 days'
+)
+SELECT
+  first_decline_family,
+  COUNT(DISTINCT payment_intent_id) AS first_declined,
+  COUNT(DISTINCT payment_intent_id) FILTER (WHERE approved_seq IS NOT NULL) AS recovered,
+  ROUND(100.0 * COUNT(DISTINCT payment_intent_id) FILTER (WHERE approved_seq IS NOT NULL)
+        / NULLIF(COUNT(DISTINCT payment_intent_id), 0), 2) AS recovery_pct
+FROM first
+WHERE first_status &lt;&gt; 'approved'
+GROUP BY first_decline_family;
+</code></pre></div>
+  <p>Strong recovery on <code>soft</code> and <code>system</code>; near-zero on <code>hard</code> (good — that's scheme-compliant).</p>
+</section>
+
+<section id="cost">
+  <h2>Cost-per-success including retries</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- All-in cost per successful payment, last 30d, by rail + geo
+WITH per_intent AS (
+  SELECT
+    payment_intent_id,
+    MIN(rail) AS rail,
+    MIN(geo) AS geo,
+    BOOL_OR(status='approved') AS approved,
+    SUM(fee_interchange_c + fee_scheme_c + fee_psp_c + fee_xborder_c + fee_fx_c) AS total_fees_c
+  FROM auth_attempts
+  WHERE created_at &gt;= NOW() - INTERVAL '30 days'
+  GROUP BY payment_intent_id
+)
+SELECT
+  rail, geo,
+  COUNT(*) FILTER (WHERE approved) AS successes,
+  SUM(total_fees_c) FILTER (WHERE approved) AS total_cost_c,
+  ROUND(SUM(total_fees_c) FILTER (WHERE approved)::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE approved), 0), 2) AS cost_per_success_c
+FROM per_intent
+GROUP BY rail, geo
+ORDER BY rail, geo;
+</code></pre></div>
+</section>
+
+<section id="recon">
+  <h2>Daily settlement reconciliation</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Compare expected settlement vs actual, by PSP, by settlement date
+WITH expected AS (
+  SELECT
+    DATE(responded_at + INTERVAL '1 day') AS expected_settle_date,
+    psp_name,
+    SUM(amount_cents) AS expected_amount_c,
+    COUNT(*) AS expected_count
+  FROM auth_attempts
+  WHERE status='approved'
+    AND responded_at &gt;= NOW() - INTERVAL '14 days'
+  GROUP BY 1, 2
+),
+actual AS (
+  SELECT
+    DATE(settled_at) AS settle_date,
+    psp_name,
+    SUM(settled_amount_c) AS actual_amount_c,
+    COUNT(*) AS actual_count
+  FROM settlements
+  WHERE settled_at &gt;= NOW() - INTERVAL '14 days'
+  GROUP BY 1, 2
+)
+SELECT
+  COALESCE(e.expected_settle_date, a.settle_date) AS d,
+  COALESCE(e.psp_name, a.psp_name) AS psp_name,
+  e.expected_amount_c, a.actual_amount_c,
+  e.expected_count, a.actual_count,
+  (a.actual_amount_c - e.expected_amount_c) AS delta_amount_c
+FROM expected e
+FULL OUTER JOIN actual a
+  ON e.expected_settle_date = a.settle_date AND e.psp_name = a.psp_name
+ORDER BY d DESC, psp_name;
+</code></pre></div>
+</section>
+
+<section id="cohort">
+  <h2>Cohort analysis with payment-method partitioning</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Repeat-deposit retention by first-deposit rail (weekly cohort), 8 weeks
+WITH first_deposit AS (
+  SELECT
+    user_id,
+    DATE_TRUNC('week', MIN(created_at)) AS cohort_wk,
+    (ARRAY_AGG(rail ORDER BY created_at))[1] AS first_rail
+  FROM auth_attempts
+  WHERE status='approved'
+  GROUP BY user_id
+),
+subsequent AS (
+  SELECT
+    a.user_id,
+    fd.cohort_wk,
+    fd.first_rail,
+    DATE_TRUNC('week', a.created_at) AS active_wk
+  FROM auth_attempts a
+  JOIN first_deposit fd USING (user_id)
+  WHERE a.status='approved'
+)
+SELECT
+  cohort_wk,
+  first_rail,
+  active_wk,
+  COUNT(DISTINCT user_id) AS active_users
+FROM subsequent
+WHERE active_wk &gt;= cohort_wk
+  AND cohort_wk &gt;= NOW() - INTERVAL '8 weeks'
+GROUP BY cohort_wk, first_rail, active_wk
+ORDER BY cohort_wk, first_rail, active_wk;
+</code></pre></div>
+</section>
+
+<section id="window">
+  <h2>Window functions you should know cold</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td><code>ROW_NUMBER()</code></td><td>Pick the first attempt per intent</td></tr>
+      <tr><td><code>LAG / LEAD</code></td><td>Week-over-week deltas</td></tr>
+      <tr><td><code>SUM() OVER</code></td><td>Running totals (e.g. cumulative TPV)</td></tr>
+      <tr><td><code>PERCENTILE_CONT</code></td><td>p50, p95, p99 latency</td></tr>
+      <tr><td><code>FIRST_VALUE / LAST_VALUE</code></td><td>First-rail used; last status</td></tr>
+      <tr><td><code>FILTER (WHERE ...)</code></td><td>Conditional aggregates without CASE</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview-tips">
+  <h2>Live SQL — interview tips</h2>
+  <ul>
+    <li><strong>Talk through your skeleton before typing.</strong> "I'd build a CTE for first-attempt, then aggregate, then filter HAVING count."</li>
+    <li><strong>Ask about schema.</strong> Confirm column names and what constitutes a "successful" payment.</li>
+    <li><strong>Watch your denominator.</strong> AAR over attempts vs intents differs.</li>
+    <li><strong>Use FILTER + boolean.</strong> Cleaner than CASE WHEN... THEN 1 ELSE 0.</li>
+    <li><strong>NULL-safe.</strong> <code>NULLIF(denominator, 0)</code> before dividing.</li>
+    <li><strong>Comment your CTE intent.</strong> One-line, in line.</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance</a> · <a href="11-coding-problems.html">Next: Practice problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 01 — Skeleton: axum, tracing, graceful shutdown</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#deps">Dependencies</a>
+    <a href="#config">Config struct</a>
+    <a href="#tracing">Structured tracing</a>
+    <a href="#router">Router and health</a>
+    <a href="#shutdown">Graceful shutdown</a>
+    <a href="#main">Putting it together</a>
+    <a href="#run">Run it</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="00-prereqs-and-mock.html">← Previous</a>
+    <a href="02-proxy-streaming.html">Next: Proxy &amp; streaming →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 01 · ~20 minutes</span>
+  <h1>Skeleton: axum, tracing, graceful shutdown</h1>
+  <p class="subtitle">Stand up the gateway binary with a health endpoint, structured logs, and shutdown semantics that drain in-flight requests instead of dropping them on the floor.</p>
+</header>
+
+<section id="deps">
+  <h2>Dependencies</h2>
+  <p>Drop this into <code>infergw/Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">[package]
+name = "infergw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum               = "0.7"
+tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tower              = { version = "0.4", features = ["timeout", "limit"] }
+tower-http         = { version = "0.5", features = ["trace", "timeout"] }
+hyper              = { version = "1", features = ["full"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+anyhow             = "1"
+thiserror          = "1"</code></pre>
+</div>
+
+  <p>That's the floor — we'll add <code>reqwest</code>, <code>futures</code>, <code>metrics</code>, <code>opentelemetry</code>, and friends in later chapters.</p>
+</section>
+
+<section id="config">
+  <h2>A small Config struct</h2>
+  <p>Read everything from env vars at startup. Twelve-factor by default. Create <code>infergw/src/config.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::env;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub bind_addr: String,
+    pub upstream_url: String,
+    pub upstream_timeout_ms: u64,
+    pub shutdown_grace_ms: u64,
+}
+
+impl Config {
+    pub fn from_env() -&gt; anyhow::Result&lt;Self&gt; {
+        Ok(Self {
+            bind_addr: env::var("INFERGW_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            upstream_url: env::var("INFERGW_UPSTREAM")
+                .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+            upstream_timeout_ms: env::var("INFERGW_UPSTREAM_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
+            shutdown_grace_ms: env::var("INFERGW_SHUTDOWN_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15_000),
+        })
+    }
+}</code></pre>
+</div>
+
+  <p>Defaults match the mock from Chapter 00. Override at runtime when we Docker-ize in Chapter 06.</p>
+</section>
+
+<section id="tracing">
+  <h2>Structured tracing</h2>
+  <p>One of the points of choosing Rust here is that <code>tracing</code> gives you compile-time-checked structured logging that's also the foundation for OpenTelemetry spans in Chapter 05. Set it up once and benefit forever.</p>
+
+  <p>Create <code>infergw/src/telemetry.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+pub fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("infergw=info,tower_http=info"));
+
+    // JSON when INFERGW_LOG_JSON=1, pretty otherwise.
+    let json_mode = std::env::var("INFERGW_LOG_JSON")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let registry = tracing_subscriber::registry().with(filter);
+
+    if json_mode {
+        registry.with(fmt::layer().json().with_current_span(true)).init();
+    } else {
+        registry.with(fmt::layer().with_target(true).compact()).init();
+    }
+}</code></pre>
+</div>
+
+  <div class="callout tip">
+    <span class="callout-label">Why two modes</span>
+    <p>Pretty output for local <code>cargo run</code>. JSON when <code>INFERGW_LOG_JSON=1</code> for production where logs get scraped by Loki / Datadog / CloudWatch. One toggle, no fork in the code path.</p>
+  </div>
+</section>
+
+<section id="router">
+  <h2>Router and health endpoints</h2>
+  <p>Two endpoints to start: <code>/healthz</code> (liveness — am I running?) and <code>/readyz</code> (readiness — should traffic come to me?). The K8s difference is real: failing readiness drains traffic, failing liveness restarts the pod.</p>
+
+  <p>Create <code>infergw/src/routes.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub ready: Arc&lt;AtomicBool&gt;,
+}
+
+impl AppState {
+    pub fn new() -&gt; Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+pub fn router(state: AppState) -&gt; Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(state)
+}
+
+async fn healthz() -&gt; impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+async fn readyz(
+    axum::extract::State(state): axum::extract::State&lt;AppState&gt;,
+) -&gt; impl IntoResponse {
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "draining")
+    }
+}</code></pre>
+</div>
+</section>
+
+<section id="shutdown">
+  <h2>Graceful shutdown</h2>
+  <p>This is the bit most tutorials skip. When K8s sends SIGTERM, you want to: flip <code>readyz</code> to <code>SERVICE_UNAVAILABLE</code> (so the load balancer stops sending new requests), wait for in-flight requests to finish, then exit. If you can't drain in 15 seconds, give up and exit anyway.</p>
+
+  <p>Create <code>infergw/src/shutdown.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::routes::AppState;
+use std::{sync::atomic::Ordering, time::Duration};
+use tokio::signal;
+
+/// Future that completes on SIGINT or SIGTERM, flips readiness to false,
+/// then yields so axum can finish in-flight requests up to the grace period.
+pub async fn shutdown_signal(state: AppState, grace: Duration) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::&lt;()&gt;();
+
+    tokio::select! {
+        _ = ctrl_c    =&gt; tracing::info!("received Ctrl-C, draining..."),
+        _ = terminate =&gt; tracing::info!("received SIGTERM, draining..."),
+    }
+
+    // Stop accepting new requests at the LB layer.
+    state.ready.store(false, Ordering::Relaxed);
+
+    // Give in-flight requests a chance to complete.
+    tokio::time::sleep(grace).await;
+    tracing::info!("grace period elapsed, exiting");
+}</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why we sleep instead of tracking in-flight</span>
+    <p>You <em>could</em> wire a per-request counter that this function awaits going to zero — and in Chapter 04 we'll do something like that for the connection pool. But for the request loop, axum's <code>with_graceful_shutdown</code> already stops accepting new connections and waits for the existing ones to finish. The sleep is the upper bound: even if some request is misbehaving, we exit eventually.</p>
+  </div>
+</section>
+
+<section id="main">
+  <h2>Putting it together</h2>
+  <p>Now the entry point. <code>infergw/src/main.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">mod config;
+mod routes;
+mod shutdown;
+mod telemetry;
+
+use std::time::Duration;
+use tower_http::trace::TraceLayer;
+
+#[tokio::main]
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
+    telemetry::init_tracing();
+    let cfg = config::Config::from_env()?;
+    tracing::info!(?cfg, "starting infergw");
+
+    let state = routes::AppState::new();
+    let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(&amp;cfg.bind_addr).await?;
+    tracing::info!(addr = %cfg.bind_addr, "listening");
+
+    let grace = Duration::from_millis(cfg.shutdown_grace_ms);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown::shutdown_signal(state, grace))
+        .await?;
+
+    tracing::info!("infergw shut down cleanly");
+    Ok(())
+}</code></pre>
+</div>
+
+  <p>That's the whole skeleton. ~150 lines of code, every line earning its keep.</p>
+</section>
+
+<section id="run">
+  <h2>Run it</h2>
+  <p>From the workspace root:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo run -p infergw</code></pre>
+</div>
+
+  <p>You should see:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">INFO infergw: starting infergw cfg=Config { bind_addr: "0.0.0.0:8080", ... }
+INFO infergw: listening addr=0.0.0.0:8080</code></pre>
+</div>
+
+  <p>From another terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -i http://127.0.0.1:8080/healthz
+# HTTP/1.1 200 OK
+# ...
+# ok
+
+curl -i http://127.0.0.1:8080/readyz
+# HTTP/1.1 200 OK
+# ...
+# ready</code></pre>
+</div>
+
+  <p>Now press Ctrl-C in the server terminal. Watch what happens:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">^C
+INFO infergw::shutdown: received Ctrl-C, draining...
+INFO infergw::shutdown: grace period elapsed, exiting
+INFO infergw: infergw shut down cleanly</code></pre>
+</div>
+
+  <p>During the grace window, hit <code>/readyz</code> again from a third terminal — you'll get <code>503 Service Unavailable: draining</code>. That's the load balancer's cue to stop routing to this pod.</p>
+
+  <details class="collapse-card">
+    <summary>Try this: prove the drain actually works</summary>
+    <div class="collapse-card-body">
+      <p>Add a deliberately slow route that sleeps 10 seconds before responding. Send a request, then immediately Ctrl-C the server. Watch the slow request still complete before the process exits.</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">// In routes.rs, add to the router:
+.route("/slow", get(slow))
+
+async fn slow() -&gt; impl IntoResponse {
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    "done"
+}</code></pre>
+</div>
+
+      <p>Run the server, <code>curl http://127.0.0.1:8080/slow &amp;</code>, immediately Ctrl-C the server. The curl will complete with "done" after 10 seconds — even though SIGINT arrived right away.</p>
+    </div>
+  </details>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li><code>cargo run -p infergw</code> binds to <code>:8080</code>.</li>
+    <li><code>GET /healthz</code> returns <code>200 ok</code>.</li>
+    <li><code>GET /readyz</code> returns <code>200 ready</code>, switches to <code>503 draining</code> on shutdown.</li>
+    <li>Ctrl-C drains in-flight requests up to the grace period then exits cleanly.</li>
+    <li>Logs are structured and respect <code>RUST_LOG</code>.</li>
+  </ul>
+
+  <p>Keep both processes running into the next chapter — we're about to make the gateway actually do something.</p>
+
+  <p style="margin-top: 24px;"><a href="02-proxy-streaming.html"><strong>→ Chapter 02: Proxy &amp; streaming</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems Worked — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#p1">1. Token rate limiter</a>
+    <a href="#p2">2. Sliding-window p99 latency</a>
+    <a href="#p3">3. Priority queue with preemption</a>
+    <a href="#p4">4. Stream batcher</a>
+    <a href="#p5">5. GPU memory bin-packing</a>
+    <a href="#p6">6. Connection pool sizer</a>
+    <a href="#p7">7. LRU / KV-block cache</a>
+    <a href="#p8">8. Queue/worker scheduler</a>
+    <a href="#p9">9. Topological pipeline order</a>
+    <a href="#how-to-drill">How to drill these</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding · Drill mode</span>
+  <h1>Coding Problems, Worked</h1>
+  <p class="subtitle">Nine problems shaped like real AI infra tasks. Each has a clarifying-questions section, a clean solution, the complexity, and a "what they really want to see" note.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Drill mode</span>
+  <p>First read: study the approaches. Second read: cover the solution with your hand, solve it, then reveal. Third read (day two): solve from scratch on paper or a blank editor with a 25-minute timer.</p>
+</div>
+
+<section id="p1">
+  <h2>Problem 1 — Token rate limiter</h2>
+  <p><strong>Prompt.</strong> Implement a rate limiter that allows up to C tokens per second on average, with bursts up to B. Method <code>allow(now, cost)</code> returns whether the request is allowed.</p>
+  <details class="collapse-card"><summary>Clarifying questions to ask first</summary>
+  <div class="collapse-card-body">
+    <ul>
+      <li>Time source — monotonic seconds (float)?</li>
+      <li>Single-threaded or do I need internal locking?</li>
+      <li>Per-key (per-tenant) or global?</li>
+      <li>What's "cost" — 1 per request, or N tokens for an LLM call?</li>
+    </ul>
+  </div></details>
+  <h3>Approach — token bucket</h3>
+  <p>State: current token count, last refill time. On each <code>allow</code> call, refill based on elapsed time, then debit cost if available.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class TokenBucket:
+    capacity: float
+    refill_per_sec: float
+    _tokens: float = 0.0
+    _last: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._tokens = self.capacity
+
+    def allow(self, now: float, cost: float = 1.0) -> bool:
+        elapsed = max(0.0, now - self._last)
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_per_sec)
+        self._last = now
+        if self._tokens >= cost:
+            self._tokens -= cost
+            return True
+        return False
+</code></pre></div>
+  <p>Complexity: O(1) per call. Constant memory.</p>
+  <h3>What interviewers want to see</h3>
+  <ul>
+    <li>You named the algorithm (token bucket).</li>
+    <li>You discussed alternatives briefly (leaky bucket, fixed window — and why token bucket fits LLM token costs).</li>
+    <li>You handled <code>now</code> going backward (clamp to zero).</li>
+    <li>You generalized to <code>cost</code>, which maps to LLM-token billing.</li>
+  </ul>
+</section>
+
+<section id="p2">
+  <h2>Problem 2 — Sliding-window p99 latency tracker</h2>
+  <p><strong>Prompt.</strong> Stream of (timestamp, latency_ms) tuples arrives. Support <code>record(t, ms)</code> and <code>percentile(t, p)</code> over the last W seconds.</p>
+  <details class="collapse-card"><summary>Approaches and tradeoffs</summary>
+  <div class="collapse-card-body">
+    <ul>
+      <li><strong>Exact:</strong> store all events in window. <code>record</code> O(1), <code>percentile</code> O(n log n) sort or O(n) quickselect. Memory O(events in window).</li>
+      <li><strong>Approximate:</strong> t-digest, HDR histogram, DDSketch. Bounded memory, fast queries, small error. Production choice.</li>
+      <li><strong>Bucketed:</strong> fixed-width histogram buckets per second; merge buckets across the window. Crude but effective.</li>
+    </ul>
+  </div></details>
+  <h3>Exact solution — clean reference</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from collections import deque
+import bisect
+
+class WindowedLatency:
+    def __init__(self, window_seconds: float) -> None:
+        self.window = window_seconds
+        self.events: deque[tuple[float, float]] = deque()  # (ts, ms)
+
+    def record(self, now: float, ms: float) -> None:
+        self.events.append((now, ms))
+        self._evict(now)
+
+    def _evict(self, now: float) -> None:
+        cutoff = now - self.window
+        while self.events and self.events[0][0] < cutoff:
+            self.events.popleft()
+
+    def percentile(self, now: float, p: float) -> float:
+        self._evict(now)
+        if not self.events:
+            return 0.0
+        values = sorted(ms for _, ms in self.events)
+        idx = min(len(values) - 1, int(p / 100.0 * len(values)))
+        return values[idx]
+</code></pre></div>
+  <p>Complexity: <code>record</code> O(1) amortized; <code>percentile</code> O(n log n). For production, mention HDR/t-digest as the replacement.</p>
+</section>
+
+<section id="p3">
+  <h2>Problem 3 — Priority queue with preemption for inference jobs</h2>
+  <p><strong>Prompt.</strong> Maintain a queue of jobs with priorities (higher number = higher priority). Workers call <code>next_job()</code>. If a higher-priority job arrives while lower-priority is running, return a "preempt me" signal.</p>
+  <h3>Approach</h3>
+  <p>Heap keyed on (-priority, arrival_seq). Track currently-running jobs by id; on enqueue of a new higher-priority job, mark the lowest-priority running job to be preempted.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import heapq
+from dataclasses import dataclass, field
+from itertools import count
+
+@dataclass(order=True)
+class _Entry:
+    sort_key: tuple
+    job_id: str = field(compare=False)
+    priority: int = field(compare=False)
+
+class PreemptiveQueue:
+    def __init__(self) -> None:
+        self._heap: list[_Entry] = []
+        self._seq = count()
+        self._running: dict[str, int] = {}  # job_id -> priority
+
+    def enqueue(self, job_id: str, priority: int) -> str | None:
+        heapq.heappush(self._heap, _Entry((-priority, next(self._seq)), job_id, priority))
+        # Return a job_id to preempt, if any
+        if self._running:
+            victim = min(self._running.items(), key=lambda kv: kv[1])
+            if priority > victim[1]:
+                return victim[0]
+        return None
+
+    def next_job(self) -> str | None:
+        if not self._heap:
+            return None
+        entry = heapq.heappop(self._heap)
+        self._running[entry.job_id] = entry.priority
+        return entry.job_id
+
+    def complete(self, job_id: str) -> None:
+        self._running.pop(job_id, None)
+</code></pre></div>
+  <p>Complexity: <code>enqueue</code> O(log n) + O(R) for victim scan where R = running. Replace running-scan with a second min-heap for O(log R).</p>
+</section>
+
+<section id="p4">
+  <h2>Problem 4 — Stream batcher</h2>
+  <p><strong>Prompt.</strong> Requests arrive on a stream. Batch them up to max batch size B or max wait W milliseconds, then emit the batch. (This is dynamic batching in 30 lines.)</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import asyncio
+from collections.abc import Callable, Awaitable
+
+class StreamBatcher:
+    def __init__(self, max_batch: int, max_wait_ms: float,
+                 handler: Callable[[list], Awaitable[list]]) -> None:
+        self.max_batch = max_batch
+        self.max_wait = max_wait_ms / 1000.0
+        self.handler = handler
+        self._buf: list = []
+        self._futures: list[asyncio.Future] = []
+        self._loop_task: asyncio.Task | None = None
+        self._wake = asyncio.Event()
+
+    async def submit(self, item) -> object:
+        fut = asyncio.get_event_loop().create_future()
+        self._buf.append(item)
+        self._futures.append(fut)
+        self._wake.set()
+        if self._loop_task is None or self._loop_task.done():
+            self._loop_task = asyncio.create_task(self._run())
+        return await fut
+
+    async def _run(self) -> None:
+        while self._buf:
+            # Wait either until batch full or timeout
+            try:
+                await asyncio.wait_for(self._wake.wait(),
+                                       timeout=self.max_wait if len(self._buf) < self.max_batch else 0)
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
+            if len(self._buf) >= self.max_batch or self._buf:
+                batch = self._buf[:self.max_batch]
+                futs  = self._futures[:self.max_batch]
+                self._buf = self._buf[self.max_batch:]
+                self._futures = self._futures[self.max_batch:]
+                try:
+                    results = await self.handler(batch)
+                    for f, r in zip(futs, results):
+                        f.set_result(r)
+                except Exception as e:
+                    for f in futs:
+                        f.set_exception(e)
+</code></pre></div>
+  <p>Note: production-grade variants handle backpressure, partial-batch flushes on shutdown, and per-request deadlines. Mention them.</p>
+</section>
+
+<section id="p5">
+  <h2>Problem 5 — GPU memory bin-packing</h2>
+  <p><strong>Prompt.</strong> N inference jobs each need M_i GB of HBM. K GPUs each have 80 GB. Place jobs onto GPUs maximizing the number placed (or minimizing GPUs used).</p>
+  <h3>Approach — first-fit decreasing</h3>
+  <p>Sort jobs by size descending; place each on the first GPU with enough space; open a new GPU if none fits. Classic approximation for bin packing: within 11/9 of optimal.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">def first_fit_decreasing(jobs: list[float], gpu_capacity: float = 80.0) -> list[list[int]]:
+    """Returns list of bins; each bin is a list of job indices."""
+    order = sorted(range(len(jobs)), key=lambda i: -jobs[i])
+    bins: list[list[int]] = []
+    remaining: list[float] = []
+    for i in order:
+        size = jobs[i]
+        placed = False
+        for b, free in enumerate(remaining):
+            if free >= size:
+                bins[b].append(i)
+                remaining[b] -= size
+                placed = True
+                break
+        if not placed:
+            bins.append([i])
+            remaining.append(gpu_capacity - size)
+    return bins
+</code></pre></div>
+  <p>Discuss: when does FFD fall short? When jobs have memory + compute constraints together (multi-dimensional packing — NP-hard in general; LP-relaxation or schedulers like Kueue do this).</p>
+</section>
+
+<section id="p6">
+  <h2>Problem 6 — Connection pool sizing</h2>
+  <p><strong>Prompt.</strong> A client calls a downstream model service. Given arrival rate λ requests/sec and mean service time S seconds, recommend a connection pool size.</p>
+  <h3>Approach — Little's Law</h3>
+  <p>Average concurrent requests in the system L = λ × S. Pool size = ceil(L × safety_factor). Add a safety factor (1.5-2×) for variance.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from math import ceil
+
+def pool_size(arrival_rate_rps: float, mean_service_s: float,
+              safety: float = 2.0, max_cap: int = 256) -> int:
+    """Apply Little's Law with a safety multiplier."""
+    little_l = arrival_rate_rps * mean_service_s
+    return min(max_cap, max(1, ceil(little_l * safety)))
+
+# Example: 50 RPS, mean LLM call 0.8s -> L=40, pool ~80
+print(pool_size(50, 0.8))   # 80
+</code></pre></div>
+  <p>Follow-ups they'll ask: "what about variance / tail?" Answer with the M/M/c queue intuition — if utilization approaches 1, queue length blows up; keep ρ &lt; 0.7-0.8 for stable tails. <em>Mention this; don't derive it.</em></p>
+</section>
+
+<section id="p7">
+  <h2>Problem 7 — LRU cache (and the KV-block parallel)</h2>
+  <p><strong>Prompt.</strong> Implement an LRU cache with O(1) get/put. Bonus: discuss how this maps to KV-cache block eviction in vLLM.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from collections import OrderedDict
+
+class LRU:
+    def __init__(self, capacity: int) -> None:
+        self.cap = capacity
+        self._d: OrderedDict = OrderedDict()
+
+    def get(self, key):
+        if key not in self._d:
+            return None
+        self._d.move_to_end(key)
+        return self._d[key]
+
+    def put(self, key, value) -> None:
+        if key in self._d:
+            self._d.move_to_end(key)
+        elif len(self._d) >= self.cap:
+            self._d.popitem(last=False)
+        self._d[key] = value
+</code></pre></div>
+  <p>The KV-block tie-in: vLLM's paged attention keeps a pool of fixed-size KV blocks. When a new sequence needs blocks and the pool is full, it evicts blocks from sequences that finished or by an LRU-ish policy on inactive prefix-cached blocks. <em>"It's the same algorithm wearing a different hat"</em> is the closing line.</p>
+</section>
+
+<section id="p8">
+  <h2>Problem 8 — Queue/worker scheduler</h2>
+  <p><strong>Prompt.</strong> N worker GPUs, M queued jobs each with a duration estimate. Assign jobs to workers minimizing makespan (longest-running worker).</p>
+  <h3>Approach — longest-processing-time-first (LPT)</h3>
+  <p>Sort jobs descending by duration; greedily assign each next job to the least-loaded worker. Approximation factor 4/3 - 1/(3m).</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import heapq
+
+def lpt_assign(durations: list[float], num_workers: int) -> tuple[list[list[int]], float]:
+    order = sorted(range(len(durations)), key=lambda i: -durations[i])
+    # heap of (current_load, worker_idx)
+    heap = [(0.0, w) for w in range(num_workers)]
+    heapq.heapify(heap)
+    assignments: list[list[int]] = [[] for _ in range(num_workers)]
+    for i in order:
+        load, w = heapq.heappop(heap)
+        assignments[w].append(i)
+        heapq.heappush(heap, (load + durations[i], w))
+    makespan = max(load for load, _ in heap)
+    return assignments, makespan
+</code></pre></div>
+</section>
+
+<section id="p9">
+  <h2>Problem 9 — Topological pipeline order</h2>
+  <p><strong>Prompt.</strong> Inference pipeline stages with dependencies (e.g., tokenizer → retriever → reranker → LLM → detokenizer; some are independent and could parallelize). Produce a valid execution order.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from collections import defaultdict, deque
+
+def topo_order(num_nodes: int, edges: list[tuple[int, int]]) -> list[int]:
+    """edges[i] = (u, v) means u must run before v. Returns one valid order or [] on cycle."""
+    indeg = [0] * num_nodes
+    adj: dict[int, list[int]] = defaultdict(list)
+    for u, v in edges:
+        adj[u].append(v)
+        indeg[v] += 1
+    ready = deque(i for i in range(num_nodes) if indeg[i] == 0)
+    order: list[int] = []
+    while ready:
+        u = ready.popleft()
+        order.append(u)
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                ready.append(v)
+    return order if len(order) == num_nodes else []
+</code></pre></div>
+  <p>Extension to discuss: producing <em>parallel layers</em> (nodes ready at the same time can run concurrently) — useful for diagramming pipeline parallelism.</p>
+</section>
+
+<section id="how-to-drill">
+  <h2>How to drill these</h2>
+  <ol>
+    <li><strong>Day 1.</strong> Read all nine. Take notes on the clarifying questions.</li>
+    <li><strong>Day 2.</strong> Solve 1-3 from scratch with a 25-minute timer.</li>
+    <li><strong>Day 3.</strong> Solve 4-6 same way.</li>
+    <li><strong>Day 4.</strong> Solve 7-9 same way.</li>
+    <li><strong>Day 5.</strong> Re-solve the three you found hardest in the original timer.</li>
+    <li><strong>Day 6.</strong> Pick any three at random; explain the algorithm out loud before coding. This is the actual interview format.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">The meta-skill</span>
+    <p>Senior coding rounds aren't about whether you've seen the problem. They're about whether, under time pressure, you set up cleanly, name the approach, write readable code, hit complexity correctly, and discuss tradeoffs. These nine problems will give you reps on all of that.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Previous</a> · <a href="12-data-pipelines.html">Next: Data &amp; pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

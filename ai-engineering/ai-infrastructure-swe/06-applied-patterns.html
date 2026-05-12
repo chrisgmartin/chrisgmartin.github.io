@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Production AI Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#gateway">Inference gateway with circuit breakers</a>
+    <a href="#hedging">Request hedging</a>
+    <a href="#sandbox">Agent execution sandbox</a>
+    <a href="#tool-router">Tool router</a>
+    <a href="#plan-executor">Plan executor with persistence</a>
+    <a href="#idempotent">Idempotent retries</a>
+    <a href="#replay">Deterministic replay</a>
+    <a href="#build-list">Things to prototype before the loop</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Applied</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">The patterns interviewers expect you to know by name and be able to sketch — inference gateway, hedging, sandbox, tool router, plan executor, idempotent retries, replay.</p>
+</header>
+
+<section id="gateway">
+  <h2>Inference gateway with circuit breakers</h2>
+  <p>The inference gateway sits in front of one or more model backends. Its responsibilities, by layer:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td>Edge (ingress)</td><td>TLS termination, request size limits, basic auth, request ID minting</td></tr>
+      <tr><td>Auth + policy</td><td>JWT validation, tenant rate limit, model allow-list, cost budget check</td></tr>
+      <tr><td>Routing</td><td>Pick a backend pool (model family), pick a node (prefix-cache-aware hashing)</td></tr>
+      <tr><td>Resilience</td><td>Timeout, retry, circuit breaker, hedging, load shedding</td></tr>
+      <tr><td>Observability</td><td>Span open, structured logs, cost accounting, audit event</td></tr>
+      <tr><td>Backend call</td><td>HTTP/gRPC to vLLM/Triton/internal; stream tokens back</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Circuit breakers</strong>: after N failures in a window, open the breaker — subsequent calls fail fast without hitting the backend. After a cool-down, half-open: let one probe through. If it succeeds, close.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::atomic::{AtomicU64, Ordering};
+
+pub struct CircuitBreaker {
+    failure_count: AtomicU64,
+    last_failure_ms: AtomicU64,
+    threshold: u64,
+    cooldown_ms: u64,
+}
+
+impl CircuitBreaker {
+    pub fn allow(&amp;self) -&gt; bool {
+        let failures = self.failure_count.load(Ordering::Relaxed);
+        if failures &lt; self.threshold { return true; }
+        let last = self.last_failure_ms.load(Ordering::Relaxed);
+        let now = now_ms();
+        now - last &gt; self.cooldown_ms
+    }
+    pub fn record_success(&amp;self) {
+        self.failure_count.store(0, Ordering::Relaxed);
+    }
+    pub fn record_failure(&amp;self) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
+        self.last_failure_ms.store(now_ms(), Ordering::Relaxed);
+    }
+}
+</code></pre></div>
+  <p>In tower, <code>tower::limit</code> and community crates like <code>tower-circuit-breaker</code> give you this as a Layer.</p>
+</section>
+
+<section id="hedging">
+  <h2>Request hedging</h2>
+  <p>Hedging fires a duplicate request to a second backend after a small delay, takes whichever returns first, cancels the loser. Trades 2x cost for the slow tail to halve tail latency in many real distributions.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::{select, time::{sleep, Duration}};
+
+async fn hedged_call(backends: &amp;[Backend], req: Req, hedge_after: Duration)
+    -&gt; Result&lt;Resp, Error&gt;
+{
+    let primary = backends[0].call(&amp;req);
+    let secondary = async {
+        sleep(hedge_after).await;
+        backends[1].call(&amp;req).await
+    };
+    tokio::pin!(primary, secondary);
+    select! {
+        r = &amp;mut primary   =&gt; r,
+        r = &amp;mut secondary =&gt; r,
+    }
+}
+</code></pre></div>
+  <p>Rules of thumb:</p>
+  <ul>
+    <li>Hedge only idempotent (read-only or idempotency-keyed) calls.</li>
+    <li>Hedge at the p95 of the latency distribution, not earlier — earlier doubles cost without benefit.</li>
+    <li>Cap hedging as a fraction of total traffic (e.g., ≤10%) so a slow backend doesn't trigger fleet-wide doubling.</li>
+  </ul>
+</section>
+
+<section id="sandbox">
+  <h2>Agent execution sandbox</h2>
+  <p>When an agent's tool dispatches code, you need isolation. Options, in increasing strength:</p>
+  <ol>
+    <li><strong>In-process function call</strong> — fine for read-only tools you wrote yourself.</li>
+    <li><strong>WASM sandbox</strong> (<code>wasmtime</code>, <code>wasmer</code>) — capability-controlled, fast startup, memory-isolated. Good for arbitrary tool plugins.</li>
+    <li><strong>Container per call</strong> (gVisor, Firecracker microVMs) — strong isolation, slow startup. Reserve for "agent runs untrusted code."</li>
+    <li><strong>Out-of-process RPC</strong> — the tool is its own service. Isolation by process boundary plus normal RPC controls.</li>
+  </ol>
+  <p>For this fintech/crypto-exchange context, you're most likely doing (1) and (4) — well-defined internal tools called via RPC, with the orchestrator enforcing auth, idempotency, and audit.</p>
+  <div class="callout warn">
+    <span class="callout-label">Don't do this</span>
+    <p>Never let an agent dispatch shell commands directly in your service's process. Either it's a named tool you wrote, or it's a sandboxed code-exec service.</p>
+  </div>
+</section>
+
+<section id="tool-router">
+  <h2>Tool router</h2>
+  <p>The tool router is the registry-plus-dispatcher for the agent's available tools. It:</p>
+  <ul>
+    <li>Looks up tool by name → handler.</li>
+    <li>Validates args against the tool's JSON schema.</li>
+    <li>Checks the caller's permissions against the tool's auth requirements.</li>
+    <li>Enforces approval gates (some tools require human approval).</li>
+    <li>Dispatches with an idempotency key and a deadline.</li>
+    <li>Records an audit event (intent + outcome).</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">#[async_trait::async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&amp;self) -&gt; &amp;str;
+    fn schema(&amp;self) -&gt; &amp;serde_json::Value;
+    fn risk_tier(&amp;self) -&gt; RiskTier;
+    async fn call(&amp;self, args: &amp;serde_json::Value, ctx: &amp;CallCtx)
+        -&gt; Result&lt;ToolResult, ToolError&gt;;
+}
+
+pub struct ToolRouter {
+    tools: std::collections::HashMap&lt;String, Box&lt;dyn Tool&gt;&gt;,
+    auth: AuthService,
+    audit: AuditLog,
+    approval: ApprovalQueue,
+}
+
+impl ToolRouter {
+    pub async fn dispatch(&amp;self, name: &amp;str, args: serde_json::Value, ctx: CallCtx)
+        -&gt; Result&lt;ToolResult, RouterError&gt;
+    {
+        let tool = self.tools.get(name).ok_or(RouterError::UnknownTool)?;
+        self.auth.authorize(&amp;ctx.user, name).await?;
+        validate_against(&amp;args, tool.schema())?;
+        if tool.risk_tier() == RiskTier::High {
+            self.approval.wait_for_approval(&amp;ctx.run_id, name, &amp;args).await?;
+        }
+        self.audit.record_intent(&amp;ctx, name, &amp;args).await?;
+        let result = tool.call(&amp;args, &amp;ctx).await;
+        self.audit.record_outcome(&amp;ctx, name, &amp;result).await?;
+        Ok(result?)
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="plan-executor">
+  <h2>Plan executor with persistence</h2>
+  <p>The plan executor is the loop in chapter <a href="05-deep-dive-secondary.html#orchestration">05</a> turned into a real Rust service. Key features:</p>
+  <ul>
+    <li><strong>State stored in Postgres</strong> with optimistic concurrency control (a <code>version</code> column).</li>
+    <li><strong>Events appended to a separate audit log</strong> (Kafka or Postgres append-only table).</li>
+    <li><strong>One executor instance owns one run</strong> at a time (Postgres advisory lock).</li>
+    <li><strong>Resumable</strong> — on startup or after crash, executor scans for runs whose lock has expired and resumes them.</li>
+    <li><strong>Bounded</strong> — every run has a deadline, a step limit, and a cost budget. Exceeding any halts the run.</li>
+    <li><strong>Cancellable</strong> — a "cancel" signal published to a topic; the executor checks before each step.</li>
+  </ul>
+
+  <details class="collapse-card">
+    <summary><strong>State machine sketch</strong></summary>
+    <div class="collapse-card-body">
+      <pre><code>states: pending -&gt; running -&gt; awaiting_approval -&gt; running -&gt; complete | failed | cancelled
+
+transitions:
+  pending     +start          -&gt; running
+  running     +tool_call      -&gt; running (after dispatch)
+  running     +needs_approval -&gt; awaiting_approval
+  awaiting_approval +approved -&gt; running
+  awaiting_approval +denied   -&gt; failed
+  running     +final_answer   -&gt; complete
+  running     +error          -&gt; failed (after exhausted retries)
+  *           +cancel_signal  -&gt; cancelled</code></pre>
+    </div>
+  </details>
+</section>
+
+<section id="idempotent">
+  <h2>Idempotent retries</h2>
+  <p>The pattern combining everything above:</p>
+  <ol>
+    <li>Orchestrator generates a UUID per intended tool call. This is the idempotency key.</li>
+    <li>Tool router persists <code>(idem_key) -&gt; in_progress</code> before invoking.</li>
+    <li>On success, writes <code>(idem_key) -&gt; result</code>. TTL = retention window.</li>
+    <li>On retry with the same key, returns the recorded result without re-invoking.</li>
+    <li>On crash mid-call: the next attempt sees <code>in_progress</code>; either waits (cooperative recovery) or treats it as failed and retries with a new key after a grace period.</li>
+  </ol>
+  <p>Failure mode to discuss in interviews: the "doubly executed but never recorded" case. Happens when the server completes the side effect but crashes before persisting the result. The mitigation is making the underlying side effect idempotent end-to-end — e.g., the downstream API takes the same idem key.</p>
+</section>
+
+<section id="replay">
+  <h2>Deterministic replay for debugging</h2>
+  <p>When a regulator or an internal investigator asks "why did the agent do X at 2:14pm on Tuesday?", you need replay. The architecture:</p>
+  <ul>
+    <li><strong>Every step is an event in an append-only log</strong> — model call (prompt + model version + sampling config + response), tool call (name + args + idem key + result + version), approval (who, when, decision).</li>
+    <li><strong>External-data snapshots</strong> — what the retrieval index returned at that moment is recorded, not re-fetched.</li>
+    <li><strong>Replay tool</strong> — load the events, walk them in order, show the prompts, responses, and decisions in a UI.</li>
+    <li><strong>Counterfactual replay</strong> — optionally re-run with a different prompt or model version and diff the trajectory. Useful for "did the new prompt version regress on case X?"</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Determinism caveat</span>
+    <p>LLM calls are non-deterministic. Replay shows you exactly what happened. It does not re-derive the same answer if you re-call the model. That's why the prompt + response are both recorded, not just the prompt.</p>
+  </div>
+</section>
+
+<section id="build-list">
+  <h2>Things to prototype before the loop</h2>
+  <p>If you have a weekend, build one of these. The interview conversation gets categorically stronger when you can say "I built one of these last weekend."</p>
+  <ol>
+    <li><strong>A toy inference gateway</strong> in axum that fronts an OpenAI-compatible endpoint, adds a tower timeout layer, a per-key rate limit, and a structured-log layer with request IDs.</li>
+    <li><strong>An async LRU cache</strong> with a request-coalescing front (chapter <a href="11-coding-problems.html">11</a>'s "dedup/coalescing" problem).</li>
+    <li><strong>A tonic streaming server</strong> that returns 100 fake tokens with a small sleep between them, with a client that cancels mid-stream.</li>
+    <li><strong>A bounded worker pool</strong> with backpressure — 10 workers, channel of 100, producer that benchmarks throughput against varying worker count.</li>
+    <li><strong>A retry-with-backoff combinator</strong> (chapter 11's problem) with jitter and a retry budget.</li>
+  </ol>
+  <p>None take more than 4 hours each. All directly map to interview questions you'll get.</p>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← ML inference</a> · <a href="07-evaluation-quality.html">Next: Evaluation and quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

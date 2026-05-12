@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Patterns</h2>
+    <a href="#onboarding">1 · New-hire onboarding agent</a>
+    <a href="#leaver">2 · Leaver checklist agent</a>
+    <a href="#policy-qa">3 · Policy Q&amp;A agent</a>
+    <a href="#survey">4 · Survey synthesis agent</a>
+    <a href="#promotion">5 · Promotion-cycle analytics agent</a>
+    <a href="#recruiter">6 · Recruiter pipeline summary</a>
+    <a href="#templates">Reusable scaffolds</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Applied</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">Six production HR-agent patterns drawn out concretely. Inputs, tool calls, HITL gates, audit log. The patterns you should be able to whiteboard in a 45-minute design round.</p>
+</header>
+
+<section id="onboarding">
+  <h2>1 · New-hire onboarding orchestrator</h2>
+  <p><strong>Goal:</strong> turn an accepted Ashby offer into a complete, ready-to-approve Workday hire + provisioning plan, with HRBP / Payroll signoff before commit.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>Ashby webhook: offer accepted (or status → "Onboarding")</li>
+  </ul>
+
+  <h3>Inputs (reads, idempotent)</h3>
+  <ul>
+    <li><code>ashby_get_application(application_id)</code> — candidate, offer terms, start date</li>
+    <li><code>ashby_get_offer(offer_id)</code> — salary, bonus, equity, sign-on, location</li>
+    <li><code>workday_get_position(position_id)</code> — confirm the slot is still open</li>
+    <li><code>workday_get_supervisory_org(sup_org_id)</code> — manager, location defaults</li>
+    <li><code>policy_get(country=candidate.country, topic="new_hire")</code> — local statutory requirements</li>
+    <li><code>payroll_get_calendar(country)</code> — confirm start date is safely outside any lock window</li>
+    <li><code>workday_check_existing_worker(email, ssn_hash)</code> — rehire detection</li>
+  </ul>
+
+  <h3>Agent reasoning (Sonnet, tools attached)</h3>
+  <p>System prompt: "Draft a complete new-hire package. Validate the start date against payroll calendar. If the candidate is a rehire, surface that prominently. Propose, do not commit."</p>
+
+  <h3>Proposed actions (write-MCP, non-committing)</h3>
+  <ul>
+    <li><code>propose_workday_hire</code> — full Hire BP payload as an EIB-ready row</li>
+    <li><code>propose_okta_provision</code> — group memberships per role + location</li>
+    <li><code>propose_equipment_order</code> — laptop SKU per country</li>
+    <li><code>draft_welcome_email</code> — to candidate + buddy + manager</li>
+    <li><code>propose_calendar_invites</code> — day-1 orientation, week-1 1:1s</li>
+    <li><code>propose_benefits_enrollment_window</code> — per-country rules</li>
+  </ul>
+
+  <h3>HITL gates</h3>
+  <ul>
+    <li><strong>HRBP</strong> approves the Workday hire payload</li>
+    <li><strong>Payroll Ops</strong> approves if start date is within 5 business days of cutoff</li>
+    <li><strong>IT</strong> auto-approves Okta provisioning (low-risk, reversible)</li>
+  </ul>
+
+  <h3>Commit</h3>
+  <p>Approved proposals execute via n8n: EIB upload runs Hire BP, Okta API provisions, calendar invites send. Idempotency keys ensure retry safety.</p>
+
+  <h3>Audit log entry shape</h3>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-json">{
+  "run_id": "onb-2026-05-12-001",
+  "trigger": {"source": "ashby", "event": "offer_accepted", "id": "ASH-9921"},
+  "model": "claude-sonnet-4-5",
+  "system_prompt_hash": "sha256:1f3a...",
+  "tools_invoked": [
+    {"name": "ashby_get_offer", "ts": "...", "result_hash": "..."},
+    {"name": "workday_check_existing_worker", "ts": "...", "result": "no_match"}
+  ],
+  "proposals": [
+    {"id": "P-101", "kind": "workday_hire", "idempotency_key": "hire:ASH-9921:2026-06-01"},
+    {"id": "P-102", "kind": "okta_provision", "idempotency_key": "..."}
+  ],
+  "approvals": [
+    {"proposal_id": "P-101", "approver": "hrbp:janet@", "ts": "...", "decision": "approve"}
+  ],
+  "commits": [
+    {"proposal_id": "P-101", "executed_at": "...", "result": "eib_run_id:EIB-44919"}
+  ],
+  "pii_classification": "Confidential"
+}</code></pre>
+</div>
+</section>
+
+<section id="leaver">
+  <h2>2 · Leaver checklist agent</h2>
+  <p><strong>Goal:</strong> when a termination is initiated, produce an end-to-end offboarding plan that catches every dependency — access, equity, final pay, knowledge transfer.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>HRBP initiates Terminate BP in Workday → outbound webhook</li>
+  </ul>
+
+  <h3>Inputs</h3>
+  <ul>
+    <li><code>workday_get_worker(employee_id)</code> — current state</li>
+    <li><code>workday_get_compensation(employee_id)</code> — base, bonus, equity</li>
+    <li><code>policy_get_severance(country, role_band, tenure)</code></li>
+    <li><code>workday_list_pending_actions(employee_id)</code> — open BPs, future-dated changes</li>
+    <li><code>jira_list_open_tickets(reporter=employee_id)</code> — knowledge transfer scope</li>
+    <li><code>okta_list_groups(user)</code> — access to revoke</li>
+    <li><code>payroll_get_calendar(country)</code></li>
+    <li><code>equity_get_grants(employee_id)</code> — vesting, treatment per plan</li>
+  </ul>
+
+  <h3>Proposed actions</h3>
+  <ul>
+    <li><code>propose_workday_termination</code> — effective date, reason, last day worked</li>
+    <li><code>propose_final_pay_calc</code> — PTO payout, prorated bonus, severance</li>
+    <li><code>propose_equity_treatment</code> — accelerate / forfeit / convert per plan</li>
+    <li><code>propose_okta_offboarding</code> — staged revocation (last day vs. immediate)</li>
+    <li><code>draft_offboarding_communication</code> — to manager, to team, to candidate</li>
+    <li><code>create_knowledge_transfer_jira</code></li>
+    <li><code>propose_jurisdictional_notices</code> — e.g. WARN in US, redundancy notice in UK</li>
+  </ul>
+
+  <h3>HITL gates (two-key for payroll-affecting steps)</h3>
+  <ul>
+    <li>HRBP approves termination + comms</li>
+    <li>Payroll Ops approves final-pay calc (separate approver)</li>
+    <li>Legal approves jurisdictional notices when present</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Halt condition</span>
+    <p>If termination effective date is within 3 business days of payroll cutoff, agent halts and escalates. Payroll Ops decides whether to push the effective date or process under exception.</p>
+  </div>
+</section>
+
+<section id="policy-qa">
+  <h2>3 · Employee Q&amp;A agent over policies</h2>
+  <p><strong>Goal:</strong> answer "how does X work for me?" questions from employees in Slack — accurately, with sources, with jurisdiction-awareness.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>Slack mention in #ask-people or DM to People bot</li>
+  </ul>
+
+  <h3>Inputs</h3>
+  <ul>
+    <li><code>workday_get_worker(slack_user_id → employee_id)</code> — country, location, role, tenure</li>
+    <li><code>policy_retrieve(question, country=worker.country)</code> — RAG over policy library, jurisdiction-filtered</li>
+    <li><code>workday_get_balances(employee_id)</code> — PTO, sick balance if relevant</li>
+  </ul>
+
+  <h3>Agent reasoning</h3>
+  <p>System prompt: "Answer the employee's question using only retrieved policy chunks for their country. Cite each fact with the policy doc reference. If the question requires a Legal interpretation, say so and route to HRKX."</p>
+
+  <h3>Output</h3>
+  <ul>
+    <li>Structured response: <code>{answer, citations[], confidence, route_to_human}</code></li>
+    <li>If <code>route_to_human</code> or <code>confidence &lt; threshold</code> → HITL queue</li>
+    <li>Else → post to Slack with citations</li>
+  </ul>
+
+  <h3>Eval surface (heavy)</h3>
+  <ul>
+    <li>Accuracy on labeled policy Q&amp;A set per jurisdiction</li>
+    <li>Citation correctness (every claimed fact maps to a real chunk)</li>
+    <li>Jurisdictional cross-talk (UK question never answered with US policy)</li>
+    <li>PII leakage tests (employee A can't get answers referencing employee B's data)</li>
+  </ul>
+  <p>See <a href="07-evaluation-quality.html">07-evaluation-quality</a> for eval design.</p>
+</section>
+
+<section id="survey">
+  <h2>4 · Survey synthesis agent (Qualtrics)</h2>
+  <p><strong>Goal:</strong> at survey close, produce a leadership-ready synthesis of free-text responses — themes, sentiment, risk flags.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>Scheduled run after Qualtrics survey closes</li>
+  </ul>
+
+  <h3>Pipeline (multi-agent appropriate here)</h3>
+  <ol>
+    <li><strong>Clusterer</strong> (Sonnet) — embed responses, cluster by theme. Returns labeled clusters.</li>
+    <li><strong>Sentiment scorer</strong> (Haiku, per-response) — high-volume, simple. Returns sentiment + intensity.</li>
+    <li><strong>Risk flagger</strong> (Sonnet) — scans for red-flag content: harassment, retaliation, regulatory issues, leadership concerns. Routes flagged content to HRBP immediately, before synthesis.</li>
+    <li><strong>Narrative writer</strong> (Opus) — given clusters + sentiment + cross-cycle context, drafts a leadership summary.</li>
+  </ol>
+
+  <h3>HITL gate</h3>
+  <ul>
+    <li>People Analytics lead reviews and approves before distribution</li>
+    <li>Risk-flagged content is routed immediately to a designated HRBP, never goes through the synthesis path</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">PII handling</span>
+    <p>Survey responses are pseudonymous — but a free-text comment can contain identifying detail ("my manager Sarah said…"). The PII redaction pass happens <em>before</em> any data leaves the secured analytics environment. Logs of the redaction itself are restricted-access.</p>
+  </div>
+</section>
+
+<section id="promotion">
+  <h2>5 · Promotion-cycle analytics agent</h2>
+  <p><strong>Goal:</strong> support promotion committees by pre-scoring packets against the rubric, surfacing edge cases, and producing a calibration view across the org.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>Manual kickoff by People Analytics when cycle opens</li>
+  </ul>
+
+  <h3>Inputs</h3>
+  <ul>
+    <li>Promotion packets (from a Google Drive / Notion folder)</li>
+    <li>Role rubric for target level (from policy library — prompt-cached)</li>
+    <li>Performance review history (from Workday Talent module)</li>
+    <li>Tenure-in-role, scope, comp band data (Workday)</li>
+  </ul>
+
+  <h3>Agent reasoning</h3>
+  <p>For each candidate: score each rubric dimension (qualitative + cited evidence), flag inconsistencies (e.g. self-assessment 5/5 but manager 3/5), produce a recommendation tier (clear yes / clear no / committee discussion).</p>
+
+  <h3>HITL gate</h3>
+  <ul>
+    <li>The agent's output is <em>advisory</em>. Committees decide.</li>
+    <li>Edge cases are surfaced for explicit discussion ("this candidate's rubric scores diverge sharply from manager assessment").</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Bias risk — call it out</span>
+    <p>This is one of the highest bias-risk patterns. Eval must include fairness checks: does the agent's tier distribution differ systematically by demographic? See <a href="07-evaluation-quality.html">07-evaluation-quality</a>. Surface this risk yourself in interview before being asked.</p>
+  </div>
+</section>
+
+<section id="recruiter">
+  <h2>6 · Recruiter pipeline summary agent</h2>
+  <p><strong>Goal:</strong> produce a weekly hiring-health snapshot per recruiter / function from Ashby pipeline data.</p>
+
+  <h3>Trigger</h3>
+  <ul>
+    <li>Weekly cron, Friday mornings</li>
+  </ul>
+
+  <h3>Inputs</h3>
+  <ul>
+    <li><code>ashby_list_active_jobs()</code></li>
+    <li><code>ashby_pipeline_metrics(job_id, range)</code> — applications, screens, onsites, offers, stage durations</li>
+    <li><code>ashby_list_offers_pending()</code></li>
+    <li>Prior-week snapshot for delta computation</li>
+  </ul>
+
+  <h3>Output</h3>
+  <ul>
+    <li>Markdown summary per recruiter: open reqs, pipeline funnel, stage-conversion rates, offers out, deltas vs prior week, flagged stale candidates (no movement in &gt;14d), at-risk reqs</li>
+    <li>Posted to Slack channel per function; archived to a Notion page</li>
+  </ul>
+
+  <h3>HITL gate</h3>
+  <ul>
+    <li>None — low-risk read-only summary. Sampled review (5%) for quality.</li>
+  </ul>
+</section>
+
+<section id="templates">
+  <h2>Reusable scaffolds — the templates HRKX inherits</h2>
+  <p>"Multiply the People team's capability" is in the JD. Concretely you deliver, for each pattern above:</p>
+  <ul>
+    <li><strong>Runbook</strong> — what the agent does, what it doesn't, what to do when it fails, who owns it</li>
+    <li><strong>n8n template</strong> — exportable JSON the team can fork to spin up variants (e.g., a contractor-onboarding variant of the new-hire pattern)</li>
+    <li><strong>Eval set</strong> — the labeled examples used to validate the agent, owned by HRKX going forward</li>
+    <li><strong>Risk register entry</strong> — tier, owner, halt criteria, last review date</li>
+    <li><strong>Replay protocol</strong> — given a run_id, how to reproduce and inspect</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">In interview</span>
+    <p>When asked "how do you measure success in 6 months?" — your answer includes <em>"the HRKX team has independently spun up two variants of patterns I delivered, using my templates, without me writing code."</em> That's the multiplier metric.</p>
+  </div>
+</section>
+
+<details class="collapse-card">
+  <summary><strong>30-90 minute build idea: prototype the policy Q&amp;A agent</strong></summary>
+  <div class="collapse-card-body">
+    <p>Before the interview, ship a tiny version of pattern 3:</p>
+    <ol>
+      <li>Pick 5 fake policies (PTO, parental leave, RTO, expense, security) and write them as markdown.</li>
+      <li>Embed them with a small embedding model (or just keep them all in context — they fit).</li>
+      <li>Write a Python script that takes a question + a fake worker country, retrieves relevant policy chunks, calls Claude with a system prompt instructing citation, and returns structured output with citations.</li>
+      <li>Add a single negative test: ask about a topic not in the policies. Confirm the agent refuses / routes-to-human.</li>
+    </ol>
+    <p>One evening of work, and you have a concrete answer to "what have you built lately?"</p>
+  </div>
+</details>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Workday deep dive</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

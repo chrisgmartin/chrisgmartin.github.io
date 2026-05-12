@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Onboarding Platform Playbooks</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#vendor-abstraction">Vendor abstraction layer for IDV</a>
+    <a href="#rule-engine">Regional rule engine</a>
+    <a href="#firehose">Audit-event firehose</a>
+    <a href="#flow-builder">Self-serve flow builder</a>
+    <a href="#tier-upgrade">Tier-upgrade with grandfathering</a>
+    <a href="#sandbox">Sandbox / test mode</a>
+    <a href="#identity-resolution">Identity resolution</a>
+    <a href="#how-they-appear">How these show up in interviews</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Applied</span>
+  <h1>Applied Patterns — Onboarding Platform Playbooks</h1>
+  <p class="subtitle">Concrete platform pattern playbooks an interviewer might design-probe. Each one is the kind of thing a senior PM should be able to whiteboard with an eng partner — the surface area, the trade-offs, and the failure modes.</p>
+</header>
+
+<section id="vendor-abstraction">
+  <h2>Pattern 1 — Vendor abstraction layer for IDV providers</h2>
+  <p><strong>Problem:</strong> Today, calls to Persona (or whichever) are scattered across services. Swapping or running two vendors in parallel requires a release.</p>
+  <p><strong>Pattern:</strong> A platform-owned <code>IdentityVerificationProvider</code> interface with concrete adapters per vendor (PersonaAdapter, JumioAdapter, OnfidoAdapter). App code only talks to the interface.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># Conceptual interface — what the platform exposes upward
+class IdentityVerificationProvider:
+    def create_session(self, applicant: Applicant, flow: FlowConfig) -> SessionToken: ...
+    def get_decision(self, session: SessionToken) -> Decision: ...
+    def fetch_evidence(self, session: SessionToken) -> Evidence: ...
+    def cancel(self, session: SessionToken) -> None: ...
+
+# Decision is a normalized schema — every adapter maps the vendor's
+# native response into this shape, so the platform decision-engine
+# doesn't care which vendor responded.
+@dataclass
+class Decision:
+    outcome: Literal["approve", "refer", "reject"]
+    confidence: float           # 0-1, normalized across vendors
+    signals: dict               # vendor-native signal payload (audit only)
+    evidence_urls: list[str]    # links into the audit store
+    vendor: str
+    decision_id: str            # idempotency / replay key
+</code></pre></div>
+  <p><strong>Trade-offs to discuss:</strong></p>
+  <ul>
+    <li>Lowest-common-denominator risk: vendor-specific capabilities (e.g. Onfido's age estimation) don't fit the interface. Solution: extend the schema additively with optional fields, gated by capability flags.</li>
+    <li>Score normalization is non-trivial — you may need a small calibration model per vendor.</li>
+    <li>Evidence shape differs by vendor (Persona's JSON, Jumio's PDF). Store both raw and normalized.</li>
+  </ul>
+  <p><strong>What the platform unlocks:</strong> A/B test vendors against each other in the same flow. Renegotiate contracts with credible exit. Failover during outage. Compliance reviews the abstraction once, not per vendor.</p>
+</section>
+
+<section id="rule-engine">
+  <h2>Pattern 2 — Regional onboarding rule engine</h2>
+  <p><strong>Problem:</strong> Which checks run, in what order, at what tier, differs per jurisdiction. Encoding this in app code locks Compliance out of the loop.</p>
+  <p><strong>Pattern:</strong> A versioned, declarative policy document per (jurisdiction, segment, tier). Compliance edits the doc; the platform interprets it at runtime.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-json">// /policy/DE/consumer/tier-2.v3.json
+{
+  "policy_id": "de-consumer-t2-v3",
+  "effective_from": "2026-01-15",
+  "approved_by": "compliance-DE-lead",
+  "required_steps": [
+    {"step": "collect_personal_data", "fields": ["name", "dob", "address", "nationality"]},
+    {"step": "verify_document", "doc_types": ["passport", "national_id_de", "residence_permit"]},
+    {"step": "liveness_check", "level": "active"},
+    {"step": "sanctions_screen", "lists": ["OFAC", "EU", "UN", "DE_national"]},
+    {"step": "pep_screen", "threshold": "tier_1_and_above"},
+    {"step": "address_proof", "doc_types": ["utility_bill", "bank_statement"], "max_age_days": 90}
+  ],
+  "decision_rules": [
+    {"if": "sanctions.hit", "then": "block_and_escalate"},
+    {"if": "pep.match", "then": "refer_to_edd"},
+    {"if": "liveness.confidence < 0.9", "then": "retry_or_manual"}
+  ]
+}
+</code></pre></div>
+  <p><strong>Discussion points:</strong></p>
+  <ul>
+    <li>Versioning is mandatory — every applicant's record cites the policy version they were onboarded under. Regulator question "what did your KYC look like for customers onboarded in March 2025?" becomes a query.</li>
+    <li>The policy doc is the system of record. Compliance change → PR → CI validates schema → Compliance signs off → deploy. No code change.</li>
+    <li>Effective-dates allow scheduled rollouts of policy changes.</li>
+    <li>The policy DSL stays narrow on purpose. Don't recreate a Turing-complete rules engine — make it readable by a compliance lead.</li>
+  </ul>
+</section>
+
+<section id="firehose">
+  <h2>Pattern 3 — Audit-event firehose</h2>
+  <p><strong>Problem:</strong> Regulators ask "what happened to applicant X on date Y." Reconstructing this from logs, sessions, and vendor portals is a project. Audit defensibility must be a feature, not a salvage.</p>
+  <p><strong>Pattern:</strong> Every state transition emits a structured event to an append-only store. Events are immutable, versioned, and queryable.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-json">{
+  "event_id": "evt_01H9...",
+  "event_type": "verification.decision_made",
+  "schema_version": "v1",
+  "occurred_at": "2026-03-14T09:21:44.123Z",
+  "applicant_id": "appl_01H...",
+  "jurisdiction": "DE",
+  "policy_version": "de-consumer-t2-v3",
+  "actor": {"type": "system", "service": "decision-engine", "version": "2.4.1"},
+  "payload": {
+    "decision": "approve",
+    "confidence": 0.97,
+    "vendor": "persona",
+    "signals_summary": {...},
+    "evidence_refs": ["s3://audit/appl_01H.../persona-evidence.json"]
+  },
+  "correlation_id": "session_01H...",
+  "causation_id": "evt_01H7..."
+}
+</code></pre></div>
+  <p><strong>Discussion points:</strong></p>
+  <ul>
+    <li>Schema versioned per event type; new fields added additively. Old events stay valid.</li>
+    <li>Retention policy aligns to the strictest applicable regulatory window (typically 5-7 years).</li>
+    <li>PII in events is encrypted at rest with key-per-applicant — supports legitimate erasure where AML doesn't override.</li>
+    <li>Downstream consumers: ops console, compliance reports, ML risk-scoring, fraud team. All read; none mutate.</li>
+    <li>Causation_id chains let you replay a full applicant journey.</li>
+  </ul>
+</section>
+
+<section id="flow-builder">
+  <h2>Pattern 4 — Self-serve flow builder</h2>
+  <p><strong>Problem:</strong> Futures wants a tier-upgrade flow specific to derivatives suitability. Doing it requires platform-team eng. The team is a bottleneck.</p>
+  <p><strong>Pattern:</strong> Downstream teams configure flows by composing platform primitives, in a config repo owned by them. Platform CI validates that the composition is legal under platform constraints and applicable policy.</p>
+  <ul>
+    <li><strong>Primitives</strong>: <code>verify_id</code>, <code>screen</code>, <code>collect_consent</code>, <code>collect_suitability</code>, <code>set_tier</code>, <code>emit_audit_event</code>.</li>
+    <li><strong>Composition</strong>: a sequence of primitives with conditional branches.</li>
+    <li><strong>Validation</strong>: platform CI checks that the resulting flow satisfies the relevant jurisdictional policy (a flow that omits sanctions screening in DE fails CI).</li>
+    <li><strong>Governance</strong>: compliance review on the flow definition is fast because the surface is small and structured.</li>
+  </ul>
+  <p><strong>Phasing matters.</strong> Don't ship the flow builder until the primitives are stable. Premature builders create migration nightmares when primitives change.</p>
+  <div class="callout warning">
+    <span class="callout-label">The "let everyone build everything" trap</span>
+    <p>Self-serve doesn't mean ungoverned. The platform's job is to make the right thing the easy thing. Constrain the space to legal compositions; let the consumer team express intent within it.</p>
+  </div>
+</section>
+
+<section id="tier-upgrade">
+  <h2>Pattern 5 — Tier-upgrade with grandfathering</h2>
+  <p><strong>Problem:</strong> You've made tier 2 stricter (e.g. now requires source-of-funds). 800k existing tier-2 customers exist. Do they need to redo? Some, but not all.</p>
+  <p><strong>Pattern:</strong> The tier system tracks <em>policy version</em> per applicant. Upgrading the tier definition does not auto-retroactively change existing applicants. Compliance decides which cohort needs to re-verify, on what schedule, with what user experience.</p>
+  <ul>
+    <li>Every applicant carries <code>(tier, policy_version, last_verified_at)</code>.</li>
+    <li>A re-KYC campaign is a query: "applicants where policy_version &lt; X and tier ≥ 2."</li>
+    <li>The platform supports a "soft-block" — restrict capability without forcing redo, e.g. allow trading but block new deposits.</li>
+    <li>The platform supports a "step-up" — when an applicant tries to do something requiring the new tier, walk them through the delta only, not the full flow.</li>
+  </ul>
+  <p>This is one of the most operationally important platform patterns — gets used every time a regulator updates expectations.</p>
+</section>
+
+<section id="sandbox">
+  <h2>Pattern 6 — Sandbox / test mode for downstream teams</h2>
+  <p><strong>Problem:</strong> Downstream teams need to integrate without burning real vendor cost or polluting compliance logs.</p>
+  <p><strong>Pattern:</strong> A sandbox that exercises the same shapes (idempotency, errors, events, latency) without making real vendor calls. Deterministic test fixtures for common scenarios.</p>
+  <ul>
+    <li>Magic test inputs return canned outcomes: <code>name="Test Approved"</code> always approves; <code>name="Test Sanctions Match"</code> always blocks.</li>
+    <li>Latency simulation toggleable (real vendors are not instant; sandbox must let teams test loading states).</li>
+    <li>Sandbox events emit on a separate firehose, never co-mingled with production audit.</li>
+    <li>Each downstream team has a "scenario library" they can extend.</li>
+  </ul>
+  <p>The sandbox is a deliverable. If downstream teams can't integrate without your help, you have not yet shipped a platform.</p>
+</section>
+
+<section id="identity-resolution">
+  <h2>Pattern 7 — Identity resolution: applicant_id vs person_id</h2>
+  <p><strong>Problem:</strong> A user signs up, abandons, comes back six months later with a new email. Or onboards as consumer, then their company tries to KYB and the same person is a beneficial owner. Same human; different records.</p>
+  <p><strong>Pattern:</strong> Three-level identity hierarchy:</p>
+  <ul>
+    <li><strong>person_id</strong> — the resolved real-world person/entity. Stable. Backed by identity-resolution rules (verified gov-ID + DOB matches an existing person → merge).</li>
+    <li><strong>applicant_id</strong> — a particular onboarding attempt for a particular product / segment.</li>
+    <li><strong>user_id / account_id</strong> — application-level identity, tied to an account.</li>
+  </ul>
+  <p>Each level has its own lifecycle. Implications:</p>
+  <ul>
+    <li>Sanctions screening operates at person_id — you want one hit to surface across all the person's accounts.</li>
+    <li>Tier upgrade for one segment shouldn't force re-verification for another segment if the underlying person is already verified.</li>
+    <li>Identity-resolution disputes are expensive — design for false-merge avoidance (manual review required to merge confidently).</li>
+  </ul>
+</section>
+
+<section id="how-they-appear">
+  <h2>How these patterns show up in interviews</h2>
+  <p>You'll be asked questions like:</p>
+  <ul>
+    <li>"Design the platform that lets Futures launch a new tier in a new country in a week."</li>
+    <li>"Walk me through how you'd handle adding a new IDV vendor."</li>
+    <li>"A regulator asks how your KYC controls have changed over the last 12 months. What's your evidence?"</li>
+    <li>"Compliance wants to roll back a policy change to all customers verified after a date. How does that work?"</li>
+  </ul>
+  <p>Use the patterns above as composable building blocks. The strong answer always shows the architecture, the unit-of-change, the audit story, and the consumer-team experience.</p>
+  <div class="callout tip">
+    <span class="callout-label">A repeatable answer shape</span>
+    <p>For any platform design question: <em>(1) Name the customer (which internal team). (2) Sketch the primitive(s) — what's the API/config. (3) State what's versioned and how. (4) State the audit shape. (5) Name two failure modes and how the platform handles them. (6) State the metric you'd track to know it's working.</em></p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Previous</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

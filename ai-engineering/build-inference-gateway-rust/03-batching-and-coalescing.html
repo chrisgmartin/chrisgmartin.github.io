@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 03 — Batching &amp; Coalescing</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why coalesce</a>
+    <a href="#key">Choosing the cache key</a>
+    <a href="#design">The singleflight design</a>
+    <a href="#code">Implementation</a>
+    <a href="#wire">Wire it in</a>
+    <a href="#run">Prove it works</a>
+    <a href="#limits">When NOT to coalesce</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-proxy-streaming.html">← Previous</a>
+    <a href="04-circuit-breakers-hedging.html">Next: Circuit breaker →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 03 · ~25 minutes</span>
+  <h1>Batching &amp; Coalescing</h1>
+  <p class="subtitle">When two clients ask the model the same question at the same time, one upstream call should be enough. Build a singleflight that proves it.</p>
+</header>
+
+<section id="why">
+  <h2>Why coalesce identical in-flight prompts</h2>
+  <p>Coalescing (aka <em>singleflight</em>, aka <em>request deduplication</em>) is the cheapest reliability and cost win you'll find. When N concurrent requests share an identical prompt + model + sampling params, you can serve all N from a single upstream call by having N–1 of them subscribe to the first one's output stream.</p>
+
+  <p>Where it pays off:</p>
+  <ul>
+    <li><strong>Agent loops</strong> that retry the same prompt with the same seed.</li>
+    <li><strong>RAG fan-outs</strong> where dozens of users hit the same top-1 retrieved document.</li>
+    <li><strong>Cache stampedes</strong> after a deployment when a hot prompt suddenly has no cached completion.</li>
+    <li><strong>Health checks</strong> that probe with a canary prompt.</li>
+  </ul>
+
+  <p>True batching (combining different prompts into a single forward pass) is something vLLM does <em>internally</em> via continuous batching — we don't need to redo it at the gateway. What the gateway uniquely <em>can</em> do is dedupe identical work before it ever reaches the model.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Coalescing is a correctness choice, not just an optimization</span>
+    <p>If the prompt or any sampling parameter (<code>temperature</code>, <code>seed</code>, <code>top_p</code>, <code>max_tokens</code>) differs between requests, they MUST NOT share a response. A request that asks for a different <code>max_tokens</code> than the in-flight call will get the wrong number of tokens. Our cache key must include every parameter that affects output.</p>
+  </div>
+</section>
+
+<section id="key">
+  <h2>Choosing the cache key</h2>
+  <p>The simplest correct key: hash the entire request body. If two requests have byte-identical bodies, they're truly identical. If they differ in any field — even a trailing whitespace — they get different keys, so we conservatively call the upstream twice. That's fine: we want false negatives, not false positives.</p>
+
+  <p>Add to <code>infergw/Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">sha2  = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }  # already there; sync is required</code></pre>
+</div>
+
+  <p>(The <code>sync</code> feature on tokio is already included from Chapter 01 — listing here only as a reminder.)</p>
+</section>
+
+<section id="design">
+  <h2>The singleflight design</h2>
+  <p>The core data structure is a map from request-hash → <code>tokio::sync::broadcast::Sender&lt;Bytes&gt;</code>. The first request to arrive with a given hash becomes the <em>leader</em>: it makes the upstream call and broadcasts each chunk. Followers find the broadcast in the map, <code>subscribe()</code>, and receive every subsequent chunk.</p>
+
+<pre style="background: var(--bg-elev); padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.5;">
+   client A ──┐
+              ├─ same hash ──▶  [in-flight map]  ─── 1 upstream call ──▶ vLLM
+   client B ──┘                       │                  │
+                                  leader makes        leader pushes
+                                  the call,           chunks to
+                                  followers           broadcast
+                                  subscribe           channel
+</pre>
+
+  <p>Three details matter:</p>
+  <ol>
+    <li><strong>broadcast::channel</strong> — followers must receive <em>every</em> chunk, in order, and <em>start from where the leader is now</em>. Broadcast channels have a buffer; if a slow follower lags more than buffer-size chunks, it gets a <code>RecvError::Lagged</code>. Set the buffer generously (we use 256).</li>
+    <li><strong>Late arrivals miss early chunks.</strong> A request that arrives after the leader has already sent 5 chunks will only get chunks 6+. That's wrong. We solve it by having the leader also <em>buffer</em> emitted chunks in a Vec until the response completes, so late followers can replay.</li>
+    <li><strong>Clean up after completion.</strong> When the upstream stream ends, remove the entry from the map so new requests start a fresh upstream call.</li>
+  </ol>
+</section>
+
+<section id="code">
+  <h2>Implementation</h2>
+  <p>Create <code>infergw/src/coalesce.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
+
+/// A frame coming from the upstream stream. We model end-of-stream explicitly
+/// so subscribers know when the leader is done (vs. just slow).
+#[derive(Clone, Debug)]
+pub enum Frame {
+    Chunk(Bytes),
+    Done,
+    Error(String),
+}
+
+/// State shared by the leader and any followers for one in-flight request.
+pub struct InFlight {
+    pub tx: broadcast::Sender&lt;Frame&gt;,
+    /// Frames the leader has already emitted, for late joiners to replay.
+    pub replay: Arc&lt;AsyncMutex&lt;Vec&lt;Frame&gt;&gt;&gt;,
+}
+
+#[derive(Default, Clone)]
+pub struct Coalescer {
+    inner: Arc&lt;Mutex&lt;HashMap&lt;String, Arc&lt;InFlight&gt;&gt;&gt;&gt;,
+}
+
+pub enum JoinResult {
+    /// Caller is the leader and must drive the upstream call.
+    Leader(Arc&lt;InFlight&gt;),
+    /// Caller is a follower; subscribe and replay prior frames.
+    Follower(Arc&lt;InFlight&gt;),
+}
+
+impl Coalescer {
+    pub fn key_for(body: &amp;serde_json::Value) -&gt; String {
+        // Canonicalize by serializing through serde_json — fields keep insertion
+        // order from the original JSON, so two requests with reordered keys will
+        // hash differently. For coalescing that's acceptably conservative.
+        let s = serde_json::to_string(body).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(s.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    pub fn join(&amp;self, key: &amp;str) -&gt; JoinResult {
+        let mut map = self.inner.lock().expect("coalesce map poisoned");
+        if let Some(existing) = map.get(key) {
+            JoinResult::Follower(existing.clone())
+        } else {
+            let (tx, _rx) = broadcast::channel::&lt;Frame&gt;(256);
+            let inflight = Arc::new(InFlight {
+                tx,
+                replay: Arc::new(AsyncMutex::new(Vec::new())),
+            });
+            map.insert(key.to_string(), inflight.clone());
+            JoinResult::Leader(inflight)
+        }
+    }
+
+    pub fn remove(&amp;self, key: &amp;str) {
+        let mut map = self.inner.lock().expect("coalesce map poisoned");
+        map.remove(key);
+    }
+
+    pub fn in_flight_count(&amp;self) -&gt; usize {
+        self.inner.lock().map(|m| m.len()).unwrap_or(0)
+    }
+}</code></pre>
+</div>
+
+  <p>Now the proxy handler needs to branch on leader vs. follower. Update <code>infergw/src/proxy.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::{
+    coalesce::{Coalescer, Frame, InFlight, JoinResult},
+    routes::AppState,
+};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use bytes::Bytes;
+use futures::{stream, StreamExt};
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
+
+pub async fn chat_completions(
+    State(state): State&lt;AppState&gt;,
+    Json(body): Json&lt;Value&gt;,
+) -&gt; Result&lt;Response, ProxyError&gt; {
+    let stream_requested = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if !stream_requested {
+        // Non-streaming path stays simple — no coalescing for now. We could add
+        // it, but the win is small and the bookkeeping is fussier.
+        return passthrough_nonstreaming(&amp;state, &amp;body).await;
+    }
+
+    let key = Coalescer::key_for(&amp;body);
+    match state.coalescer.join(&amp;key) {
+        JoinResult::Leader(inflight) =&gt; {
+            tracing::info!(key = %&amp;key[..12], "coalesce: leader");
+            spawn_leader(state.clone(), key.clone(), body, inflight.clone());
+            let body_stream = subscribe_stream(inflight, None);
+            Ok(sse_response(body_stream))
+        }
+        JoinResult::Follower(inflight) =&gt; {
+            tracing::info!(key = %&amp;key[..12], "coalesce: follower");
+            let replay = inflight.replay.lock().await.clone();
+            let body_stream = subscribe_stream(inflight, Some(replay));
+            Ok(sse_response(body_stream))
+        }
+    }
+}
+
+fn sse_response&lt;S&gt;(s: S) -&gt; Response
+where
+    S: futures::Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; + Send + 'static,
+{
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(s))
+        .expect("response builder")
+}
+
+fn subscribe_stream(
+    inflight: Arc&lt;InFlight&gt;,
+    replay: Option&lt;Vec&lt;Frame&gt;&gt;,
+) -&gt; impl futures::Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; {
+    let mut rx = inflight.tx.subscribe();
+    let replay_iter = replay.unwrap_or_default().into_iter();
+    let replay_stream = stream::iter(replay_iter).map(Ok);
+
+    let live = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(Frame::Chunk(_)) | Ok(Frame::Done) | Ok(Frame::Error(_)) =&gt; {}
+                Err(RecvError::Lagged(n)) =&gt; {
+                    tracing::warn!(missed = n, "follower lagged broadcast buffer");
+                    continue;
+                }
+                Err(RecvError::Closed) =&gt; break,
+            }
+            // re-borrow on each iteration to make the borrow checker happy:
+            // we already matched above just to detect Lagged; redo the recv
+            // to actually yield the frame.
+        }
+    };
+    // Simpler shape using async_stream over a fresh subscriber:
+    let mut rx2 = inflight.tx.subscribe();
+    drop(live);
+    let live = async_stream::stream! {
+        loop {
+            match rx2.recv().await {
+                Ok(Frame::Chunk(b)) =&gt; yield Ok(b),
+                Ok(Frame::Done) =&gt; {
+                    yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                    break;
+                }
+                Ok(Frame::Error(e)) =&gt; {
+                    yield Err(std::io::Error::other(e));
+                    break;
+                }
+                Err(RecvError::Lagged(n)) =&gt; {
+                    tracing::warn!(missed = n, "follower lagged broadcast buffer");
+                    // We can't recover the missed chunks; bail.
+                    yield Err(std::io::Error::other("coalesce follower lagged"));
+                    break;
+                }
+                Err(RecvError::Closed) =&gt; break,
+            }
+        }
+    };
+
+    let replay_bytes = replay_stream.filter_map(|f| async {
+        match f {
+            Ok(Frame::Chunk(b)) =&gt; Some(Ok(b)),
+            Ok(Frame::Done) =&gt; Some(Ok(Bytes::from_static(b"data: [DONE]\n\n"))),
+            Ok(Frame::Error(e)) =&gt; Some(Err(std::io::Error::other(e))),
+            Err(_) =&gt; None,
+        }
+    });
+
+    replay_bytes.chain(live)
+}
+
+fn spawn_leader(state: AppState, key: String, body: Value, inflight: Arc&lt;InFlight&gt;) {
+    tokio::spawn(async move {
+        let url = state.upstream.chat_completions_url();
+        let resp = match state.upstream.client.post(&amp;url).json(&amp;body).send().await {
+            Ok(r) =&gt; r,
+            Err(e) =&gt; {
+                let _ = inflight.tx.send(Frame::Error(format!("upstream send: {e}")));
+                state.coalescer.remove(&amp;key);
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let _ = inflight.tx.send(Frame::Error(format!("upstream {s}: {text}")));
+            state.coalescer.remove(&amp;key);
+            return;
+        }
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) =&gt; {
+                    inflight.replay.lock().await.push(Frame::Chunk(b.clone()));
+                    let _ = inflight.tx.send(Frame::Chunk(b));
+                }
+                Err(e) =&gt; {
+                    let _ = inflight.tx.send(Frame::Error(format!("upstream chunk: {e}")));
+                    state.coalescer.remove(&amp;key);
+                    return;
+                }
+            }
+        }
+        inflight.replay.lock().await.push(Frame::Done);
+        let _ = inflight.tx.send(Frame::Done);
+        state.coalescer.remove(&amp;key);
+    });
+}
+
+async fn passthrough_nonstreaming(state: &amp;AppState, body: &amp;Value) -&gt; Result&lt;Response, ProxyError&gt; {
+    let url = state.upstream.chat_completions_url();
+    let resp = state.upstream.client.post(&amp;url).json(body).send().await
+        .map_err(ProxyError::Upstream)?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(ProxyError::Upstream)?;
+    Ok(Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("response builder"))
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("upstream transport error: {0}")]
+    Upstream(#[from] reqwest::Error),
+}
+
+impl IntoResponse for ProxyError {
+    fn into_response(self) -&gt; Response {
+        let msg = self.to_string();
+        tracing::error!(%msg, "proxy error");
+        (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": msg}))).into_response()
+    }
+}</code></pre>
+</div>
+
+  <p>Add <code>async-stream</code> to the deps:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">async-stream = "0.3"</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">A note on the chunk format</span>
+    <p>The leader forwards the raw bytes from the upstream — which already contain <code>data: {...}\n\n</code> framing. The <code>[DONE]</code> sentinel we synthesize at end-of-stream is a defensive belt-and-suspenders so followers always see a clean terminator, even if the upstream already sent one. Some clients are picky; doubling it is harmless.</p>
+  </div>
+</section>
+
+<section id="wire">
+  <h2>Wire the coalescer into <code>AppState</code></h2>
+  <p>Update <code>infergw/src/routes.rs</code> to carry the coalescer:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::{coalesce::Coalescer, upstream::Upstream};
+use axum::{http::StatusCode, response::IntoResponse, routing::{get, post}, Router};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub ready: Arc&lt;AtomicBool&gt;,
+    pub upstream: Upstream,
+    pub coalescer: Coalescer,
+}
+
+impl AppState {
+    pub fn new(upstream: Upstream) -&gt; Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(true)),
+            upstream,
+            coalescer: Coalescer::default(),
+        }
+    }
+}
+
+pub fn router(state: AppState) -&gt; Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/v1/chat/completions", post(crate::proxy::chat_completions))
+        .with_state(state)
+}
+
+async fn healthz() -&gt; impl IntoResponse { (StatusCode::OK, "ok") }
+async fn readyz(
+    axum::extract::State(state): axum::extract::State&lt;AppState&gt;,
+) -&gt; impl IntoResponse {
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "draining")
+    }
+}</code></pre>
+</div>
+
+  <p>Register the module in <code>main.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">mod coalesce;</code></pre>
+</div>
+</section>
+
+<section id="run">
+  <h2>Prove it works</h2>
+  <p>Rebuild and run:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo run -p infergw</code></pre>
+</div>
+
+  <p>Open three terminals and fire three identical requests at the same time:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">for i in 1 2 3; do
+  curl -sN -H 'content-type: application/json' \
+    -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"identical"}],"stream":true}' \
+    http://127.0.0.1:8080/v1/chat/completions \
+    | head -c 200 &amp;
+done
+wait</code></pre>
+</div>
+
+  <p>Look at the gateway logs. You should see:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">INFO infergw::proxy: coalesce: leader   key=a4f1c2...
+INFO infergw::proxy: coalesce: follower key=a4f1c2...
+INFO infergw::proxy: coalesce: follower key=a4f1c2...</code></pre>
+</div>
+
+  <p>And the mock-upstream's logs will show <strong>one</strong> incoming request, not three. That's the saving.</p>
+
+  <p>Now send three <em>different</em> prompts at the same time and verify the mock sees three calls:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">for i in 1 2 3; do
+  curl -sN -H 'content-type: application/json' \
+    -d "{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"prompt $i\"}],\"stream\":true}" \
+    http://127.0.0.1:8080/v1/chat/completions \
+    | head -c 200 &amp;
+done
+wait</code></pre>
+</div>
+
+  <p>Three different prompts, three leaders, three upstream calls. The coalescer correctly refuses to dedupe non-identical work.</p>
+
+  <details class="collapse-card">
+    <summary>Stretch: load test the coalescer</summary>
+    <div class="collapse-card-body">
+      <p>Install <code>oha</code> with <code>cargo install oha</code>. Then:</p>
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">oha -z 10s -c 50 -m POST \
+  -H 'content-type: application/json' \
+  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"identical"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+      <p>50 concurrent identical requests for 10 seconds. Without coalescing, the mock would log ~3000 incoming requests. With coalescing, you'll see roughly one every ~800ms (the duration of a complete mocked response), so ~12 total — a 250x reduction in upstream load. We'll measure this properly in Chapter 07.</p>
+    </div>
+  </details>
+</section>
+
+<section id="limits">
+  <h2>When NOT to coalesce</h2>
+  <p>Three cases to be aware of:</p>
+
+  <ol>
+    <li><strong>Any sampling temperature &gt; 0.</strong> Two identical prompts with <code>temperature: 0.7</code> are <em>supposed</em> to produce different outputs. Coalescing them collapses the distribution and breaks user expectations. The safe default is to disable coalescing when <code>temperature &gt; 0</code> unless a fixed <code>seed</code> is also set. A nice exercise: extend <code>Coalescer::key_for</code> to return <code>None</code> in that case and skip the dedupe.</li>
+    <li><strong>Per-user personalization in the prompt.</strong> If the prompt is templated with user-specific context, identical-looking requests across users are rare anyway, and you probably <em>don't</em> want to leak one user's completion to another even if it would be technically identical. Use a per-tenant prefix in the key.</li>
+    <li><strong>Audit / billing implications.</strong> If each request is independently billed to a tenant, coalescing means two tenants share one upstream call but get charged twice (or you charge once and lose money). Track this explicitly — the coalescer can emit a counter so billing knows the call was a follower.</li>
+  </ol>
+
+  <div class="callout tip">
+    <span class="callout-label">Where this pattern came from</span>
+    <p>The "singleflight" name comes from Go's <code>golang.org/x/sync/singleflight</code>, and the pattern itself predates that by decades — it's how every well-engineered cache (memcached, Varnish, Cloudflare) handles thundering-herd cache fills. The gateway is just doing the same dance at the LLM layer.</p>
+  </div>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li>Three concurrent identical requests produce ONE upstream call and three streams to clients.</li>
+    <li>Three different prompts produce three upstream calls (no false coalescing).</li>
+    <li>Followers see the same chunks as the leader, in order.</li>
+    <li>The in-flight map cleans up when the leader's stream ends.</li>
+  </ul>
+
+  <p>Next we make the upstream call <em>itself</em> more resilient.</p>
+
+  <p style="margin-top: 24px;"><a href="04-circuit-breakers-hedging.html"><strong>→ Chapter 04: Circuit breaker, retry budgets, and request hedging</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

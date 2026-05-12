@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#sources">HR data sources</a>
+    <a href="#batch-vs-stream">Batch ETL vs streaming</a>
+    <a href="#snapshots">Snapshots vs change log</a>
+    <a href="#warehouse">People analytics warehouse</a>
+    <a href="#prism">Prism reporting</a>
+    <a href="#cdc">Change data capture</a>
+    <a href="#scd">Slowly changing dimensions</a>
+    <a href="#privacy-in-pipelines">Privacy in pipelines</a>
+    <a href="#dq">Data quality &amp; tests</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines for HR</h1>
+  <p class="subtitle">Where People data lives, how it flows between systems, the snapshot-vs-change-log decision, and the design choices that make a warehouse useful for both analytics and agents.</p>
+</header>
+
+<section id="sources">
+  <h2>HR data sources — the landscape</h2>
+  <table>
+    <thead><tr><th>Source</th><th>What's in it</th><th>Egress pattern</th></tr></thead>
+    <tbody>
+      <tr><td>Workday (HRIS)</td><td>Workers, positions, sup orgs, comp, BPs, talent profiles</td><td>RaaS (custom reports), Core Connectors (standardized outbound), EIB outbound (scheduled), web services (transactional)</td></tr>
+      <tr><td>Ashby (ATS)</td><td>Candidates, applications, interviews, offers, jobs</td><td>REST API, webhooks for events</td></tr>
+      <tr><td>Payroll (Workday Payroll / ADP / Deel / Remote)</td><td>Payroll runs, earnings, deductions, tax</td><td>Reports, often read-only from People</td></tr>
+      <tr><td>Ticketing (Jira / Zendesk)</td><td>Employee questions, request workflows, knowledge base</td><td>REST APIs, webhooks</td></tr>
+      <tr><td>Surveys (Qualtrics)</td><td>eNPS, engagement, exit surveys, free-text</td><td>API exports, scheduled CSV drops</td></tr>
+      <tr><td>Equity (Carta)</td><td>Grants, vesting, exercises</td><td>API, less commonly schedule</td></tr>
+      <tr><td>IT / Identity (Okta)</td><td>Users, groups, app assignments</td><td>API, SCIM</td></tr>
+      <tr><td>Learning (LMS)</td><td>Compliance training completions</td><td>API, file drops</td></tr>
+    </tbody>
+  </table>
+
+  <p>Common pattern: extract from each source, land in a warehouse (BigQuery / Snowflake / Redshift / Workday Prism), build a curated People model with dbt or equivalent, expose for analytics and as agent tool inputs.</p>
+</section>
+
+<section id="batch-vs-stream">
+  <h2>Batch ETL vs streaming — when each fits</h2>
+  <p>HR is mostly batch. Events are not high-throughput; most workflows tolerate hours-of-latency. <strong>Default to batch.</strong></p>
+
+  <table>
+    <thead><tr><th>Workflow</th><th>Pattern</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Analytics, reporting</td><td>Daily batch</td><td>Reports are read-when-asked; freshness need is "yesterday"</td></tr>
+      <tr><td>Onboarding orchestration</td><td>Event-driven (webhook)</td><td>One event per hire; immediate kickoff</td></tr>
+      <tr><td>Survey synthesis</td><td>Triggered batch on survey close</td><td>One event per survey close; large batch processing</td></tr>
+      <tr><td>Policy Q&amp;A</td><td>Request-response</td><td>Latency-sensitive; user is waiting</td></tr>
+      <tr><td>Payroll feeds</td><td>Scheduled batch on payroll calendar</td><td>Calendar-locked; never ad-hoc</td></tr>
+      <tr><td>Termination cascade</td><td>Event-driven, with rate-limited fanout</td><td>One event triggers many side effects; needs HITL gates between</td></tr>
+    </tbody>
+  </table>
+
+  <p>When "streaming" comes up in interview, push back gently: <em>"For HR, I default to batch with event-driven kickoff. Continuous streaming is rarely the right answer here — the data isn't high-throughput, and the cost of latency in HR is rarely worth the complexity premium."</em></p>
+</section>
+
+<section id="snapshots">
+  <h2>Snapshots vs change log — the decision</h2>
+  <p>You can model worker history two ways. Both have a place.</p>
+
+  <h3>Daily snapshots</h3>
+  <p>Every day, take a full extract of "as of today" worker state. Append to a snapshot table partitioned by date.</p>
+  <ul>
+    <li>Pros: dead simple, dead reliable, point-in-time queries trivial (filter by snapshot_date)</li>
+    <li>Cons: doesn't capture intra-day changes; storage scales with population × time</li>
+  </ul>
+
+  <h3>Change log (event sourcing)</h3>
+  <p>Every change is an event row: <code>{worker_id, field, old_value, new_value, effective_date, change_date, change_kind}</code>. Reconstruct state at any moment by replaying events.</p>
+  <ul>
+    <li>Pros: full fidelity, including effective-date vs change-date distinction, intra-day capture</li>
+    <li>Cons: more complex queries; reconstructing "current state" is a query, not a scan</li>
+  </ul>
+
+  <h3>The pragmatic answer</h3>
+  <div class="callout tip">
+    <span class="callout-label">In interview</span>
+    <p><em>"I usually do both. Daily snapshots for analytics — they're cheap and queries are simple. A change log for compliance and replay — captures effective-vs-change-date semantics that snapshots blur. They serve different consumers."</em></p>
+  </div>
+
+  <h3>Effective date vs change date — why both matter</h3>
+  <p>Workday is effective-dated; a comp change recorded on 2026-05-01 may be effective 2026-06-01 or 2026-04-15 (retro). A snapshot taken on 2026-05-15 reflects the change-date view, not the effective-date view. For retro changes, the change log is the only honest source.</p>
+</section>
+
+<section id="warehouse">
+  <h2>People analytics warehouse design</h2>
+  <p>A reference layering (dbt-style):</p>
+  <ul>
+    <li><strong>raw</strong> — extracts as-is from each source, untransformed (workday_raw, ashby_raw, ...)</li>
+    <li><strong>staging</strong> — type-cleaned, renamed, light deduplication; one staging model per source table</li>
+    <li><strong>core</strong> — conformed business entities: <code>dim_worker</code>, <code>fact_worker_event</code>, <code>fact_payroll_run</code>, <code>dim_position</code>, <code>dim_supervisory_org</code></li>
+    <li><strong>marts</strong> — consumer-facing models: headcount-by-org-by-month, attrition cohort views, hiring funnel</li>
+  </ul>
+
+  <p>For agents, expose <strong>marts</strong> via RaaS or warehouse views — never raw. The agent reads the conformed model; updates to source-system shape only require changes in staging.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">A subtle interview point</span>
+    <p>Models that feed agents must be <em>append-mostly</em>. Late-arriving data is fine; backfills that mutate yesterday's outputs are a problem because they break replay. Mark your event tables with both <code>effective_date</code> (the business time) and <code>recorded_at</code> (the system time the row landed).</p>
+  </div>
+</section>
+
+<section id="prism">
+  <h2>Workday Prism — when it fits</h2>
+  <p><strong>Prism</strong> is Workday's data-lake extension: ingest external data, join with Workday, expose through Workday reports. The pitch: keep analytics inside the Workday security model.</p>
+  <ul>
+    <li>Pros: consumers stay in Workday; Workday security inherits; calculated fields work on combined data</li>
+    <li>Cons: less developer ergonomic than a real warehouse; tooling smaller</li>
+  </ul>
+
+  <p>Listed as a nice-to-have. If you haven't used it: <em>"I haven't built in Prism specifically. I've done the equivalent work in BigQuery + dbt. The model is the same — ingest, conform, expose. The trade-off is whether you want analytics to live inside Workday's security and report ecosystem or in a general warehouse with dbt-style modeling."</em></p>
+</section>
+
+<section id="cdc">
+  <h2>Change data capture from Workday</h2>
+  <p>Workday doesn't expose a generic CDC stream. Common patterns:</p>
+  <ul>
+    <li><strong>Scheduled outbound EIB</strong> with a "changed since last run" filter (via calc field on "last modified")</li>
+    <li><strong>Core Connector</strong> integration types that support incremental delivery</li>
+    <li><strong>Workday Studio</strong> with a watermark</li>
+    <li><strong>RaaS</strong> reports with a parameter for changes since timestamp</li>
+    <li><strong>Outbound webhooks via Workday's external integration framework</strong></li>
+  </ul>
+  <p>The interview-ready framing: <em>"There's no pure CDC from Workday. Pragmatically I'd use a scheduled RaaS or EIB with a 'modified since' filter, watermark-tracked in the warehouse. For low-latency triggers (a hire, a termination), webhooks from the BP completion fire the event-driven workflows."</em></p>
+</section>
+
+<section id="scd">
+  <h2>Slowly changing dimensions — the worker model</h2>
+  <p>The classic data warehousing problem applies hard in HR. SCD types you should know:</p>
+  <ul>
+    <li><strong>SCD Type 1</strong> — overwrite. Loses history. Wrong for HR.</li>
+    <li><strong>SCD Type 2</strong> — new row per change, with valid_from / valid_to. The standard for worker / position / sup-org.</li>
+    <li><strong>SCD Type 4 / 6</strong> — separate current vs history tables, or combined hybrid. Sometimes used for ergonomics.</li>
+  </ul>
+  <p>For point-in-time queries (headcount on 2025-12-31), SCD2 with effective-dating is the answer. Joining a payroll event to the worker dimension uses <code>WHERE worker.valid_from &lt;= event.effective_date AND (worker.valid_to IS NULL OR worker.valid_to &gt; event.effective_date)</code>.</p>
+</section>
+
+<section id="privacy-in-pipelines">
+  <h2>Privacy in pipelines</h2>
+  <ul>
+    <li><strong>Restricted columns separated</strong> — salary, equity, performance ratings live in tables with stricter access than the directory.</li>
+    <li><strong>Tokenization at ingest</strong> — government IDs, SSNs are tokenized at extract; the lookup table is in a separately-controlled service.</li>
+    <li><strong>Region-aware materialization</strong> — EU worker data materialized in EU; cross-region views require explicit DPA reference.</li>
+    <li><strong>Audit on read</strong> — queries against Restricted tables are logged with the calling user and purpose.</li>
+    <li><strong>DSAR pipelines</strong> — a request triggers a job that aggregates all data for a subject across the warehouse; the artifact is reviewable and exportable.</li>
+  </ul>
+</section>
+
+<section id="dq">
+  <h2>Data quality &amp; tests</h2>
+  <p>The minimum dbt-test (or equivalent) suite for People models:</p>
+  <ul>
+    <li><strong>worker_id is unique</strong> in dim_worker (current view)</li>
+    <li><strong>hire_date is not null and not future-dated</strong> beyond 90 days</li>
+    <li><strong>termination_date &gt;= hire_date</strong> when present</li>
+    <li><strong>country in approved list</strong></li>
+    <li><strong>fte in [0, 1.0]</strong> (or 1.5 for double-position-allowed tenants)</li>
+    <li><strong>position assignments don't overlap</strong> for the same worker</li>
+    <li><strong>compensation_amount in plausible band</strong> for role+country</li>
+    <li><strong>referential integrity</strong> for supervisor_id, position_id, sup_org_id</li>
+    <li><strong>row counts within ± X% of yesterday</strong> — anomaly detection on extract volume</li>
+  </ul>
+  <p>When a test fails: <em>halt the downstream pipeline</em>. A bad worker table breaks every agent that depends on it; better to lag a day than serve agents corrupt data.</p>
+</section>
+
+<section id="interview-frames">
+  <h2>Interview framings worth memorizing</h2>
+  <ul>
+    <li>"HR defaults to batch. Streaming is rarely warranted; the data isn't high-throughput and the latency requirements rarely justify the complexity."</li>
+    <li>"I run daily snapshots for analytics and a change log for compliance / replay. Different consumers, different fidelity."</li>
+    <li>"SCD Type 2 on worker / position / sup-org; without effective-dating, retro changes silently corrupt history."</li>
+    <li>"Restricted columns live in restricted tables. Agents read marts that are conformed and class-aware, never raw."</li>
+    <li>"Workday CDC is pragmatic — RaaS or EIB with a modified-since watermark for analytics; webhooks from BP completion for event-driven agent kickoffs."</li>
+    <li>"A failed dbt test on a worker table halts the downstream pipeline. Better to lag a day than serve agents corrupt data."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Coding problems</a> · <a href="13-deployment-and-ops.html">Next: Deployment &amp; ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

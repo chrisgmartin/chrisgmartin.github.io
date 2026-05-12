@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — Rust AI Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#rust-errors">Rust-style error handling</a>
+    <a href="#thiserror">thiserror vs anyhow</a>
+    <a href="#no-panic">Never panic in service code</a>
+    <a href="#timeouts">Timeouts and cancellation</a>
+    <a href="#structured-cancellation">Structured cancellation</a>
+    <a href="#retry-budgets">Retry budgets</a>
+    <a href="#circuit">Circuit breakers</a>
+    <a href="#bulkheads">Bulkheads</a>
+    <a href="#cascading">Preventing cascading failure</a>
+    <a href="#idempotency-keys">Idempotency keys for agent steps</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">Rust-style errors, timeouts and structured cancellation, retry budgets, circuit breakers, bulkheads, and the idempotency discipline that keeps agent retries from doing harm.</p>
+</header>
+
+<section id="rust-errors">
+  <h2>Rust-style error handling</h2>
+  <p>Rust's <code>Result&lt;T, E&gt;</code> + the <code>?</code> operator give you explicit, typed error propagation. The interview shorthand:</p>
+  <ul>
+    <li><strong>Errors are values.</strong> They appear in the type signature. Callers cannot ignore them by accident.</li>
+    <li><strong>Two error styles:</strong> <code>thiserror</code> for libraries (structured, named variants), <code>anyhow</code> for application code (single boxed error, easy chaining).</li>
+    <li><strong>Panics</strong> are for "the program is in an impossible state" — not for normal failure paths.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// Library-style: thiserror
+
+#[derive(thiserror::Error, Debug)]
+pub enum BackendError {
+    #[error("network: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("timeout after {0:?}")]
+    Timeout(std::time::Duration),
+    #[error("upstream {status}: {body}")]
+    Status { status: u16, body: String },
+    #[error("invalid response: {0}")]
+    Decode(#[from] serde_json::Error),
+}
+
+async fn call(client: &amp;reqwest::Client, url: &amp;str) -&gt; Result&lt;Resp, BackendError&gt; {
+    let resp = client.get(url).send().await?; // Network from
+    if !resp.status().is_success() {
+        return Err(BackendError::Status {
+            status: resp.status().as_u16(),
+            body: resp.text().await.unwrap_or_default(),
+        });
+    }
+    Ok(resp.json().await?) // Decode from
+}
+</code></pre></div>
+  <p>For service code, prefer <code>thiserror</code> — the caller needs to <em>match</em> on the error to make decisions (retry? circuit-break? log and continue?). An untyped <code>anyhow::Error</code> loses that.</p>
+</section>
+
+<section id="thiserror">
+  <h2>thiserror vs anyhow — when to use which</h2>
+  <table>
+    <thead><tr><th></th><th>thiserror</th><th>anyhow</th></tr></thead>
+    <tbody>
+      <tr><td>Use for</td><td>Library / crate APIs, anywhere callers branch on the error</td><td>Top-level application binaries, scripts, tests</td></tr>
+      <tr><td>Type</td><td>Custom enum per error domain</td><td>Single boxed <code>anyhow::Error</code></td></tr>
+      <tr><td>Strength</td><td>Pattern-matchable, structured</td><td>Easy chaining with <code>.context("doing X")</code></td></tr>
+      <tr><td>Weakness</td><td>Verbose; needs new variants for new error sources</td><td>Erases types; callers can't branch on cause</td></tr>
+    </tbody>
+  </table>
+  <p>Common pattern in a service: <code>thiserror</code> for the public service API, <code>anyhow</code> inside test code and CLI binaries.</p>
+</section>
+
+<section id="no-panic">
+  <h2>Never panic in service code</h2>
+  <p>A panic inside an async task aborts the task. In a multi-tenant service, that's <em>one user's</em> request failing — not the whole process — but it leaves the system in an unpredictable state (held locks, half-emitted events). Discipline:</p>
+  <ul>
+    <li><strong>No <code>.unwrap()</code></strong> in service code. Use <code>?</code> with an explicit error type, or <code>.expect("invariant: ...")</code> only for genuinely-impossible cases.</li>
+    <li><strong>No array indexing</strong> without bounds checks; use <code>.get()</code> + <code>?</code>.</li>
+    <li><strong>Validate inputs at the boundary.</strong> Once past the front door, types should make invalid states unrepresentable.</li>
+    <li><strong>Catch panics at the task boundary</strong> with <code>tokio::task::JoinHandle</code>; log them as critical alerts.</li>
+    <li><strong>Set <code>panic = "abort"</code></strong> in release profile if you'd rather crash the process than continue in an unknown state.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Clippy lints worth turning on</span>
+    <p><code>clippy::unwrap_used</code>, <code>clippy::expect_used</code>, <code>clippy::panic</code>, <code>clippy::todo</code>, <code>clippy::unimplemented</code>. Deny-list them in service crates; allow per-line where needed.</p>
+  </div>
+</section>
+
+<section id="timeouts">
+  <h2>Timeouts and cancellation in Tokio</h2>
+  <p>Cancellation in Rust is <strong>cooperative</strong> — a future can only be cancelled at an <code>.await</code> point. Dropping the future cancels it.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::time::Duration;
+use tokio::time::timeout;
+
+// timeout returns Err(Elapsed) if the inner future hasn't completed.
+// Dropping the inner future cancels it.
+match timeout(Duration::from_millis(500), call_backend()).await {
+    Ok(Ok(resp))   =&gt; serve(resp),
+    Ok(Err(e))     =&gt; log_and_fail(e),
+    Err(_elapsed)  =&gt; serve_timeout_error(),
+}
+</code></pre></div>
+  <p>Tower has a <code>Timeout</code> layer that wraps the service-level future:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tower::ServiceBuilder;
+use std::time::Duration;
+
+let svc = ServiceBuilder::new()
+    .timeout(Duration::from_secs(5))
+    .service(backend);
+</code></pre></div>
+  <p>For LLM streaming, "timeout" is more nuanced — you want a TTFT timeout (no token in 2s = bail) and a no-progress-for-X timeout (no token in 30s mid-stream = bail), not just a total-time timeout.</p>
+</section>
+
+<section id="structured-cancellation">
+  <h2>Structured cancellation</h2>
+  <p>"Structured" means: when a parent task is cancelled, all its child tasks are cancelled too. Achievable in Rust with explicit cancellation tokens.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio_util::sync::CancellationToken;
+
+async fn agent_run(token: CancellationToken) -&gt; Result&lt;(), Error&gt; {
+    let child = token.child_token();
+    let backend_call = tokio::spawn(call_backend(child.clone()));
+
+    tokio::select! {
+        _ = token.cancelled() =&gt; {
+            child.cancel();
+            backend_call.await.ok();
+            Err(Error::Cancelled)
+        }
+        r = backend_call =&gt; r.unwrap(),
+    }
+}
+
+async fn call_backend(token: CancellationToken) -&gt; Result&lt;Resp, Error&gt; {
+    tokio::select! {
+        _ = token.cancelled() =&gt; Err(Error::Cancelled),
+        r = actually_call() =&gt; r,
+    }
+}
+</code></pre></div>
+  <p>The pattern: pass a cancellation token down through every async function. Each layer races its work against <code>token.cancelled()</code>. Cancelling the parent token cascades.</p>
+  <p>For HTTP servers: when the client disconnects, the request future is dropped, which drops your nested calls, which cancels them. Tonic and hyper handle this natively if you don't <code>spawn</code> work that escapes the request future.</p>
+</section>
+
+<section id="retry-budgets">
+  <h2>Retry budgets</h2>
+  <p>Per-call retry is local — "I'll try this 3 times." Retry budget is global — "across the fleet, retries can be at most 10% of total traffic." Without the budget, a partial outage triggers fleet-wide retry, which amplifies load and prevents recovery.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">pub struct RetryBudget {
+    success_count: std::sync::atomic::AtomicU64,
+    retry_count: std::sync::atomic::AtomicU64,
+    max_ratio: f64, // e.g. 0.1
+}
+
+impl RetryBudget {
+    pub fn try_consume(&amp;self) -&gt; bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = self.success_count.load(Relaxed).max(1) as f64;
+        let r = self.retry_count.load(Relaxed) as f64;
+        if r / s &gt; self.max_ratio { return false; }
+        self.retry_count.fetch_add(1, Relaxed);
+        true
+    }
+}
+</code></pre></div>
+  <p>Combine with per-call retry: per-call decides "should I retry this specific call?", budget decides "is the fleet allowed to retry right now?"</p>
+</section>
+
+<section id="circuit">
+  <h2>Circuit breakers</h2>
+  <p>Already introduced in <a href="06-applied-patterns.html#gateway">06</a>. The pattern in three states:</p>
+  <ul>
+    <li><strong>Closed</strong> — calls pass through; failures counted.</li>
+    <li><strong>Open</strong> — failure threshold exceeded; calls fail fast without hitting backend.</li>
+    <li><strong>Half-open</strong> — after cool-down, a single probe is allowed. Success → closed. Failure → open.</li>
+  </ul>
+  <p>Tune carefully. Too sensitive: legitimate transient blips open the breaker for everyone. Too lax: doesn't actually protect under sustained partial outage.</p>
+  <div class="callout tip">
+    <span class="callout-label">When to use</span>
+    <p>Per-backend circuit breakers on calls to external services (model providers, partner APIs). The breaker is per-instance, not per-pool, so you can route around one bad node.</p>
+  </div>
+</section>
+
+<section id="bulkheads">
+  <h2>Bulkheads</h2>
+  <p>Borrowed from naval engineering: isolate failure domains so one flooded compartment doesn't sink the ship. In a service:</p>
+  <ul>
+    <li><strong>Separate thread pools / executors</strong> for unrelated workloads. A storm of slow agent runs shouldn't starve the inference-gateway path.</li>
+    <li><strong>Separate connection pools</strong> per backend. A saturated Postgres pool shouldn't block Redis calls.</li>
+    <li><strong>Per-tenant semaphores</strong>. One noisy tenant can't consume 100% of the gateway's concurrency budget.</li>
+    <li><strong>Per-model-pool concurrency limits</strong>. A spike in long-context requests doesn't starve short-context ones.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Semaphore;
+
+pub struct PerTenantLimiter {
+    sems: tokio::sync::RwLock&lt;HashMap&lt;TenantId, Arc&lt;Semaphore&gt;&gt;&gt;,
+    default_quota: usize,
+}
+
+impl PerTenantLimiter {
+    pub async fn acquire(&amp;self, t: TenantId) -&gt; tokio::sync::OwnedSemaphorePermit {
+        let sem = {
+            let r = self.sems.read().await;
+            if let Some(s) = r.get(&amp;t) { s.clone() } else { drop(r); self.create(t).await }
+        };
+        sem.acquire_owned().await.expect("never closed")
+    }
+    async fn create(&amp;self, t: TenantId) -&gt; Arc&lt;Semaphore&gt; {
+        let mut w = self.sems.write().await;
+        w.entry(t)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.default_quota)))
+            .clone()
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="cascading">
+  <h2>Preventing cascading failure</h2>
+  <p>Cascade pattern: backend A slows → callers queue up → caller threads/tasks exhaust → upstream service times out → its callers queue up → repeat. Fixes:</p>
+  <ul>
+    <li><strong>Fail fast under saturation.</strong> Tower's <code>LoadShed</code> + <code>ConcurrencyLimit</code>. Return 503 instead of queueing forever.</li>
+    <li><strong>Deadline propagation.</strong> If the upstream gave you 100ms, don't spend 5s on retries. The work is wasted.</li>
+    <li><strong>Bound queues.</strong> Bounded channels; bounded HTTP buffers.</li>
+    <li><strong>Throttle retries (retry budget).</strong></li>
+    <li><strong>Bulkheads</strong> so cascades stay contained to one workload.</li>
+    <li><strong>Backpressure</strong> from downstream → upstream → ingress, all the way out.</li>
+  </ul>
+</section>
+
+<section id="idempotency-keys">
+  <h2>Idempotency keys for agent steps</h2>
+  <p>The single most important pattern for agent infra. Every side-effecting tool call carries an idempotency key. Generated by the orchestrator at intent-time, persisted, scoped to the run.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct IdempotencyKey(pub uuid::Uuid);
+
+pub struct IdempotencyStore { /* Postgres or Redis */ }
+
+impl IdempotencyStore {
+    pub async fn run_once&lt;F, Fut, T&gt;(&amp;self, key: IdempotencyKey, f: F)
+        -&gt; Result&lt;T, IdemError&gt;
+    where
+        F: FnOnce() -&gt; Fut,
+        Fut: std::future::Future&lt;Output = Result&lt;T, IdemError&gt;&gt;,
+        T: serde::Serialize + serde::de::DeserializeOwned + Clone,
+    {
+        if let Some(prev) = self.lookup(key).await? {
+            return Ok(serde_json::from_value(prev)?);
+        }
+        // Mark in-progress, with a TTL on the lock
+        self.mark_in_progress(key).await?;
+        let out = f().await?;
+        self.record_result(key, serde_json::to_value(&amp;out)?).await?;
+        Ok(out)
+    }
+}
+</code></pre></div>
+  <p>Failure modes to mention in an interview:</p>
+  <ul>
+    <li><strong>Crash mid-call</strong> — next attempt sees "in progress"; wait or override with a grace period.</li>
+    <li><strong>Two-phase commit</strong> with the downstream — for fully end-to-end idempotency, the downstream API also takes the key.</li>
+    <li><strong>Key collision</strong> across runs — namespace by (run_id, step_id).</li>
+    <li><strong>Retention</strong> — TTLs balance memory vs the latest retry window your callers might use.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The interview synthesis</span>
+    <p>"Timeout + retry budget + idempotency key + circuit breaker + bounded queue. Those five primitives compose into every reasonable answer to 'how does this not fall over?' Memorize how to mix them; the specifics of the system don't change which ones you reach for."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation</a> · <a href="09-governance-and-audit.html">Next: Governance and audit →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

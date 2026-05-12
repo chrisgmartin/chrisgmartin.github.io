@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — Finance Data Flows</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#shape">The shape of financial data</a>
+    <a href="#sources">Sources</a>
+    <a href="#sub-vs-gl">Subledger vs. general ledger</a>
+    <a href="#batch-vs-stream">Batch ETL vs. streaming</a>
+    <a href="#recon-pipelines">Reconciliation pipelines</a>
+    <a href="#warehouse">Data warehouse for finance</a>
+    <a href="#extracts">Why finance lives in spreadsheets</a>
+    <a href="#ai-changes">What AI actually changes</a>
+    <a href="#crypto-specific">Crypto-specific pipelines</a>
+    <a href="#quality">Data quality &amp; lineage</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">How financial data flows from banks, custody, exchanges, and blockchains up into the GL. Where AI changes the picture, and where the picture is unchanged by AI.</p>
+</header>
+
+<section id="shape">
+  <h2>The shape of financial data</h2>
+  <p>Finance data is unusual compared to product data in three ways:</p>
+  <ul>
+    <li><strong>Immutable history</strong>. You never delete. Corrections are <em>reversing entries</em>, not updates.</li>
+    <li><strong>Period-bounded</strong>. Once a period closes, data in that period is frozen. Re-opening a period is a control event.</li>
+    <li><strong>Exact, not statistical</strong>. To-the-penny correctness matters; "approximately right" is wrong.</li>
+  </ul>
+  <p>These properties shape every pipeline. You can't "just rerun" without idempotency. You can't "fix" historical data without an audit trail of the fix.</p>
+</section>
+
+<section id="sources">
+  <h2>Sources</h2>
+  <table>
+    <thead><tr><th>Source</th><th>Data shape</th><th>Cadence</th><th>How it arrives</th></tr></thead>
+    <tbody>
+      <tr><td>Banks</td><td>Statement transactions, balances</td><td>End-of-day; intraday for some</td><td>SWIFT MT940 / BAI2 files; bank APIs via Kyriba aggregation</td></tr>
+      <tr><td>Custody (Fireblocks)</td><td>Vault balances, signed transactions</td><td>Real-time webhooks + REST polls</td><td>Webhook events + scheduled balance snapshots</td></tr>
+      <tr><td>Blockchains</td><td>Confirmed transactions, balances by address</td><td>Block-by-block (seconds-minutes)</td><td>Node RPC, indexers (Etherscan-style), Lukka feeds</td></tr>
+      <tr><td>Exchanges</td><td>Trade fills, fees, balances</td><td>Real-time WebSocket / end-of-day</td><td>Exchange APIs into Lukka</td></tr>
+      <tr><td>NetSuite</td><td>GL entries, subledger details, balances</td><td>Continuous; periods close monthly</td><td>SuiteTalk REST, SuiteQL, saved searches</td></tr>
+      <tr><td>BlackLine</td><td>Recon status, certifications, JE workflow</td><td>Per close cycle</td><td>BlackLine API, scheduled imports</td></tr>
+      <tr><td>Internal subledgers</td><td>Lukka outputs, custom AR/AP feeds</td><td>Daily / per close</td><td>API, batch files</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="sub-vs-gl">
+  <h2>Subledger vs. general ledger</h2>
+  <p>One of the most consistently misunderstood pieces for non-finance candidates. Worth ten seconds:</p>
+  <ul>
+    <li><strong>General Ledger (GL)</strong>: the summary book. Each account is a single line: "Cash USD: $4.2M." High-level.</li>
+    <li><strong>Subledger</strong>: the detail. "Cash USD" rolls up thousands of bank transactions. AR subledger holds open invoices per customer. AP subledger holds open bills per vendor. Fixed-assets subledger holds individual assets. Crypto subledger (Lukka) holds individual lots.</li>
+  </ul>
+  <p>The GL has to <em>tie</em> to the subledger. Reconciliation often means: "the GL says X for this account; the subledger detail sums to Y; show me X vs. Y with explanation." A common bug is the GL and subledger drifting apart because someone posted a top-side JE to the GL without flowing through the subledger.</p>
+</section>
+
+<section id="batch-vs-stream">
+  <h2>Batch ETL vs. streaming</h2>
+  <p>Most finance pipelines are batch — overnight loads, monthly closes. Streaming shows up for:</p>
+  <ul>
+    <li><strong>Treasury monitoring</strong>: intraday cash positions, threshold alerts.</li>
+    <li><strong>Custody event capture</strong>: Fireblocks webhooks for transaction completion.</li>
+    <li><strong>Fraud / anomaly</strong>: rare in core finance, more in compliance-adjacent.</li>
+  </ul>
+  <p>Trade-offs to articulate:</p>
+  <table>
+    <thead><tr><th></th><th>Batch</th><th>Streaming</th></tr></thead>
+    <tbody>
+      <tr><td>Latency</td><td>Hours-days</td><td>Seconds-minutes</td></tr>
+      <tr><td>Reconciliation</td><td>Easy — period boundaries are clean</td><td>Harder — what's the cutoff?</td></tr>
+      <tr><td>Replay</td><td>Trivial — rerun the batch</td><td>Requires event sourcing</td></tr>
+      <tr><td>Cost &amp; complexity</td><td>Low</td><td>Higher</td></tr>
+      <tr><td>SOX appetite</td><td>High — auditable boundaries</td><td>Moderate — needs careful design</td></tr>
+    </tbody>
+  </table>
+  <p>Senior answer: <em>"Default to batch for posting and close; reserve streaming for monitoring and alerting where latency matters."</em></p>
+</section>
+
+<section id="recon-pipelines">
+  <h2>Reconciliation pipelines — the canonical shape</h2>
+  <p>One pipeline per (account, source) pair. The shape:</p>
+  <pre>
+    [Extract GL detail]   [Extract source detail]
+            │                       │
+            └──────────┬────────────┘
+                       ▼
+                [Normalize: schema,
+                 amounts as Decimal,
+                 timezone, currency]
+                       ▼
+                [Deterministic match
+                 on (amount, date) ± tolerance]
+                       ▼
+                [Agent on residual: propose
+                 matches and reconciling items]
+                       ▼
+                [Human approval gate]
+                       ▼
+                [Post to BlackLine / stage JE in NetSuite]
+                       ▼
+                [Audit-log every step]
+  </pre>
+  <p>What goes in your pipeline orchestrator (n8n or Airflow):</p>
+  <ul>
+    <li>Schedule (typically end-of-month + ad hoc).</li>
+    <li>Source-system health checks before extracting.</li>
+    <li>Extract step with checkpoints.</li>
+    <li>Normalize step (deterministic, well-tested).</li>
+    <li>Match step (deterministic).</li>
+    <li>Agent step (LLM, on residual only).</li>
+    <li>Approval step (Slack/email HITL).</li>
+    <li>Post step (idempotent, with key).</li>
+    <li>Audit-log writes throughout.</li>
+  </ul>
+</section>
+
+<section id="warehouse">
+  <h2>Data warehouse patterns for finance</h2>
+  <p>A real finance warehouse (Snowflake, BigQuery, Redshift, or Databricks) tends to hold:</p>
+  <ul>
+    <li><strong>Raw zone</strong>: untransformed copies of source data (NetSuite saved searches, Lukka exports, bank files) — for replay and audit.</li>
+    <li><strong>Staging zone</strong>: cleaned, typed, deduped versions of raw.</li>
+    <li><strong>Mart zone</strong>: business-friendly aggregates (trial balance by period, recon status by account, treasury daily cash).</li>
+    <li><strong>Audit log</strong>: agent-action log, immutable, indexed.</li>
+  </ul>
+  <p>Patterns to call out:</p>
+  <ul>
+    <li><strong>Slowly Changing Dimensions (SCD Type 2)</strong> for the chart of accounts — account codes evolve; historical balances must tie to the structure that existed at the time.</li>
+    <li><strong>Snapshot fact tables</strong> for period-end balances so a re-run of any prior close produces identical numbers.</li>
+    <li><strong>dbt (or equivalent)</strong> for transformation lineage — auditors love lineage.</li>
+  </ul>
+</section>
+
+<section id="extracts">
+  <h2>Why finance teams live in spreadsheets (and what AI changes)</h2>
+  <p>Walk into almost any finance org and you'll find Excel exports glued together with manual logic. This is not because accountants are unsophisticated; it's because:</p>
+  <ul>
+    <li>The ERP doesn't expose the cross-system view they need.</li>
+    <li>Each close has unique adjustments that don't fit clean automation.</li>
+    <li>Spreadsheets give them <em>cell-level explainability</em> auditors accept.</li>
+    <li>IT bandwidth to build proper pipelines is finite; spreadsheets are zero-IT.</li>
+  </ul>
+  <p>What AI agents change is the third constraint. A correctly-built agent can produce explainable, citation-backed analysis at spreadsheet-level transparency without the manual labor. The trick is making the agent's output look as transparent as a spreadsheet: every number cites a source, every assumption is named.</p>
+  <div class="callout insight">
+    <span class="callout-label">The framing finance leaders accept</span>
+    <p><em>"The agent doesn't replace your spreadsheets. It produces the same shape of analysis but with every cell auto-cited to a source system, and with a queryable history of why it picked the number it did."</em></p>
+  </div>
+</section>
+
+<section id="ai-changes">
+  <h2>What AI actually changes in finance pipelines</h2>
+  <p>Be specific. The wins:</p>
+  <ul>
+    <li><strong>The unstructured tail</strong>: invoice OCR, contract terms extraction, vendor terms ingestion. AI does what regex + RPA couldn't.</li>
+    <li><strong>Long-tail recon items</strong>: fuzzy matching the 5% that deterministic rules can't handle.</li>
+    <li><strong>Narrative generation</strong>: variance commentary, audit-prep summaries.</li>
+    <li><strong>Cross-system summarization</strong>: pull from NetSuite + BlackLine + Kyriba into a CFO-readable brief.</li>
+    <li><strong>Anomaly explanation</strong>: not just "flag," but "here are the three transactions driving the flag."</li>
+    <li><strong>Onboarding new sources</strong>: parsing a new bank's statement format, a new exchange's CSV.</li>
+  </ul>
+  <p>What AI <em>doesn't</em> change:</p>
+  <ul>
+    <li>Money math (use Decimal; don't ask the LLM to add).</li>
+    <li>Deterministic matches (use code; faster, auditable).</li>
+    <li>Period mechanics (close-period rules are deterministic policy).</li>
+    <li>Audit trail (it's a database problem, not an AI problem).</li>
+  </ul>
+</section>
+
+<section id="crypto-specific">
+  <h2>Crypto-specific pipelines</h2>
+  <p>This is where the company is unusual. Crypto-native pipelines:</p>
+  <ul>
+    <li><strong>On-chain ingestion</strong>: full-node or indexer feed per chain; capture confirmed transactions for owned addresses.</li>
+    <li><strong>Address book</strong>: every owned address tagged with entity, purpose, account; new addresses go through a discovery/classification step.</li>
+    <li><strong>Cost basis &amp; lot tracking</strong>: every disposal needs a lot selection; Lukka handles this.</li>
+    <li><strong>Fair value snapshots</strong>: principal-market FV at the timestamp required by FASB ASU 2023-08.</li>
+    <li><strong>Cross-source reconciliation</strong>: exchange records vs. on-chain reality (for transfers in/out); custody records vs. on-chain.</li>
+    <li><strong>Event classification</strong>: airdrop vs. staking reward vs. fork — accounting treatment differs.</li>
+  </ul>
+  <p>For your interview, you don't need to be a blockchain engineer. You need to know that Lukka does this work, and that the agentic layer reconciles Lukka's outputs to NetSuite — not the raw blockchain feed.</p>
+</section>
+
+<section id="quality">
+  <h2>Data quality &amp; lineage</h2>
+  <p>Data quality in finance is non-negotiable. A practical program:</p>
+  <ul>
+    <li><strong>Schema tests</strong> on every load: every field has expected type, range, non-null where required.</li>
+    <li><strong>Reconciliation tests</strong>: source row count matches loaded count; sum of amounts matches.</li>
+    <li><strong>Freshness checks</strong>: every source has a "last updated" SLA; alert when stale.</li>
+    <li><strong>Lineage</strong> tooling (dbt docs, OpenLineage, Marquez) so you can show an auditor: "this $4.2M cash balance comes from these 47 bank transactions, ingested at 02:14 from this file, processed by this dbt model version."</li>
+    <li><strong>Replay</strong>: anything can be reproduced from the raw zone deterministically.</li>
+  </ul>
+  <p>That last bullet is the foundation for audit-prep being cheap. If you can replay any close from raw inputs, the auditor's "show me how this number was produced" is a 30-second answer.</p>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Coding problems</a> · <a href="13-deployment-and-ops.html">Next: Deployment &amp; ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

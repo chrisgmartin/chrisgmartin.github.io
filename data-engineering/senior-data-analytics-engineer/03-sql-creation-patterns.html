@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Creation Patterns</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#approach">The interview approach</a>
+    <a href="#windows">Window functions</a>
+    <a href="#cohort">Cohort retention</a>
+    <a href="#funnel">Funnels with time constraints</a>
+    <a href="#session">Sessionization</a>
+    <a href="#gaps">Gaps &amp; islands</a>
+    <a href="#pivot">Pivots</a>
+    <a href="#hierarchy">Hierarchical queries</a>
+    <a href="#composition">CTE composition</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-sql-debugging.html">Next: SQL debugging →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · SQL</span>
+  <h1>SQL Creation Patterns</h1>
+  <p class="subtitle">The composable patterns you reach for to answer business questions in SQL. Window functions, cohorts, funnels, sessionization, gaps-and-islands, pivots, hierarchical queries — and how to chain them cleanly.</p>
+</header>
+
+<section id="approach">
+  <h2>The interview approach</h2>
+  <p>When the interviewer gives you a schema and a question, the senior move is to <strong>narrate before you type</strong>:</p>
+  <ol>
+    <li>Restate the question in one sentence.</li>
+    <li>Ask one or two clarifying questions: definition of "active," time-zone handling, dedupe rules, what "first" means when there are ties.</li>
+    <li>Name the SQL pattern you're going to use: "I'll write a CTE per step, with a window function for ranking."</li>
+    <li>Write it. Talk through each clause.</li>
+    <li>Trace 2–3 example rows through the output by hand. Catches off-by-ones immediately.</li>
+  </ol>
+  <p>The patterns below are the building blocks. Most prompts are a composition of two or three of them.</p>
+</section>
+
+<section id="windows">
+  <h2>Window functions</h2>
+  <p>Four families. Memorize them.</p>
+
+  <h3>Ranking</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>row_number vs rank vs dense_rank</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  customer_id, gpu_id, started_at,
+  ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY started_at) AS rn,
+  RANK()       OVER (PARTITION BY customer_id ORDER BY started_at) AS rk,
+  DENSE_RANK() OVER (PARTITION BY customer_id ORDER BY started_at) AS drk
+FROM gpu_sessions;
+
+-- ROW_NUMBER: unique 1..N per partition, ties broken arbitrarily
+-- RANK:       ties share rank, next skips (1,2,2,4)
+-- DENSE_RANK: ties share rank, no skip (1,2,2,3)
+--
+-- "Most recent session per customer" → ROW_NUMBER + WHERE rn=1
+-- "Top 3 distinct revenue tiers per region" → DENSE_RANK + WHERE drk &lt;= 3</code></pre>
+  </div>
+
+  <h3>Offset (lag / lead)</h3>
+  <p>Compare a row to the previous or next in its partition.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>time between sessions per customer</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  customer_id,
+  started_at,
+  LAG(started_at) OVER (PARTITION BY customer_id ORDER BY started_at) AS prev_start,
+  EXTRACT(EPOCH FROM started_at -
+    LAG(started_at) OVER (PARTITION BY customer_id ORDER BY started_at)) / 3600 AS hours_since_prev
+FROM gpu_sessions;</code></pre>
+  </div>
+
+  <h3>Aggregate windows</h3>
+  <p>Running totals, moving averages, share-of-total.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>7-day rolling GPU-hours</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT
+    DATE_TRUNC('day', started_at) AS day,
+    SUM(EXTRACT(EPOCH FROM ended_at - started_at) / 3600) AS gpu_hours
+  FROM gpu_sessions
+  GROUP BY 1
+)
+SELECT
+  day,
+  gpu_hours,
+  AVG(gpu_hours) OVER (
+    ORDER BY day
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS gpu_hours_7d_avg
+FROM daily
+ORDER BY day;</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">Frame trap</span>
+    <p>Use <code>ROWS BETWEEN</code> for time-based moving averages, not <code>RANGE</code>. <code>RANGE</code> with date gaps does the wrong thing. Classic interviewer gotcha.</p>
+  </div>
+
+  <h3>First / last value</h3>
+  <p>Carry a value from a partition's first or last row into every row.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>first plan per customer, carried forward</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  customer_id, changed_at, plan,
+  FIRST_VALUE(plan) OVER (
+    PARTITION BY customer_id
+    ORDER BY changed_at
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS first_plan
+FROM plan_changes;</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">LAST_VALUE trap</span>
+    <p>The default frame ends at CURRENT ROW, so <code>LAST_VALUE</code> without an explicit frame returns the current row, not the partition's last. Always write <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code>.</p>
+  </div>
+</section>
+
+<section id="cohort">
+  <h2>Cohort retention</h2>
+  <p>"Of customers who signed up in week N, how many came back in week N+k?" — the analytical staple.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>weekly retention triangle</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH cohorts AS (
+  SELECT customer_id, DATE_TRUNC('week', signed_up_at) AS cohort_week
+  FROM customers
+),
+activity AS (
+  SELECT DISTINCT
+    customer_id,
+    DATE_TRUNC('week', event_at) AS activity_week
+  FROM gpu_sessions
+)
+SELECT
+  c.cohort_week,
+  DATE_PART('week', a.activity_week - c.cohort_week)::INT AS weeks_since_signup,
+  COUNT(DISTINCT c.customer_id) AS retained,
+  COUNT(DISTINCT c.customer_id) * 1.0 /
+    NULLIF(
+      MAX(CASE WHEN DATE_PART('week', a.activity_week - c.cohort_week) = 0
+               THEN COUNT(DISTINCT c.customer_id) END)
+      OVER (PARTITION BY c.cohort_week), 0
+    ) AS retention_rate
+FROM cohorts c
+LEFT JOIN activity a
+  ON c.customer_id = a.customer_id
+ AND a.activity_week &gt;= c.cohort_week
+GROUP BY 1, 2
+ORDER BY 1, 2;</code></pre>
+  </div>
+  <p>For an interview, the simpler version (compute cohort size separately, join in the denominator) often reads cleaner. The above shows the window-function flex if asked.</p>
+</section>
+
+<section id="funnel">
+  <h2>Funnels with time constraints</h2>
+  <p>"Of customers who signed up, how many launched a GPU within 7 days? Of those, how many launched a second within 30 days?" The wrong answer is multiple self-joins. The right answer is one CTE per step:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>3-step funnel with time windows</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH signup AS (
+  SELECT customer_id, MIN(signed_up_at) AS signup_at
+  FROM customers
+  GROUP BY customer_id
+),
+first_launch AS (
+  SELECT s.customer_id, s.signup_at, MIN(g.started_at) AS first_launch_at
+  FROM signup s
+  JOIN gpu_sessions g
+    ON g.customer_id = s.customer_id
+   AND g.started_at BETWEEN s.signup_at AND s.signup_at + INTERVAL '7 days'
+  GROUP BY 1, 2
+),
+second_launch AS (
+  SELECT f.customer_id, f.signup_at, f.first_launch_at, MIN(g.started_at) AS second_launch_at
+  FROM first_launch f
+  JOIN gpu_sessions g
+    ON g.customer_id = f.customer_id
+   AND g.started_at &gt; f.first_launch_at
+   AND g.started_at &lt;= f.first_launch_at + INTERVAL '30 days'
+  GROUP BY 1, 2, 3
+)
+SELECT
+  (SELECT COUNT(*) FROM signup)          AS signups,
+  (SELECT COUNT(*) FROM first_launch)    AS launched_within_7d,
+  (SELECT COUNT(*) FROM second_launch)   AS second_launched_within_30d;</code></pre>
+  </div>
+  <p>The trick is the time bounds <strong>inside the JOIN</strong>, not as a WHERE filter — that prevents the LEFT-JOIN-NULL trap if you ever switch from INNER to LEFT.</p>
+</section>
+
+<section id="session">
+  <h2>Sessionization</h2>
+  <p>Group consecutive events into sessions where a gap of &gt; N minutes starts a new session.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>30-minute gap sessionization</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH flagged AS (
+  SELECT
+    customer_id,
+    event_at,
+    CASE
+      WHEN LAG(event_at) OVER (PARTITION BY customer_id ORDER BY event_at) IS NULL
+        OR EXTRACT(EPOCH FROM event_at -
+             LAG(event_at) OVER (PARTITION BY customer_id ORDER BY event_at)) / 60 &gt; 30
+      THEN 1 ELSE 0
+    END AS is_new_session
+  FROM events
+),
+sessioned AS (
+  SELECT
+    customer_id,
+    event_at,
+    SUM(is_new_session) OVER (PARTITION BY customer_id ORDER BY event_at) AS session_id
+  FROM flagged
+)
+SELECT
+  customer_id, session_id,
+  MIN(event_at) AS session_start,
+  MAX(event_at) AS session_end,
+  COUNT(*)      AS event_count
+FROM sessioned
+GROUP BY 1, 2;</code></pre>
+  </div>
+</section>
+
+<section id="gaps">
+  <h2>Gaps &amp; islands</h2>
+  <p>The "tabibitosan" trick — subtract a row's rank from its date; consecutive runs share the same key.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>longest consecutive-day GPU-active streak</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT DISTINCT customer_id, DATE_TRUNC('day', event_at)::DATE AS d
+  FROM gpu_sessions
+),
+keyed AS (
+  SELECT
+    customer_id, d,
+    d - (ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY d))::INT AS run_key
+  FROM daily
+)
+SELECT
+  customer_id,
+  MIN(d) AS streak_start,
+  MAX(d) AS streak_end,
+  COUNT(*) AS streak_days
+FROM keyed
+GROUP BY customer_id, run_key
+ORDER BY customer_id, streak_start;</code></pre>
+  </div>
+  <p>Read carefully: <code>date − row_number</code> is constant within a run of consecutive dates because both increase by 1 per row.</p>
+</section>
+
+<section id="pivot">
+  <h2>Pivots</h2>
+  <p>Long-to-wide. Most dialects don't have a clean PIVOT; use <code>SUM(CASE WHEN…)</code>.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>per-customer GPU-hours by tier</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  customer_id,
+  SUM(CASE WHEN tier = 'a100' THEN gpu_hours END) AS a100_hours,
+  SUM(CASE WHEN tier = 'h100' THEN gpu_hours END) AS h100_hours,
+  SUM(CASE WHEN tier = 'rtx-4090' THEN gpu_hours END) AS rtx4090_hours,
+  SUM(gpu_hours) AS total_hours
+FROM session_summary
+GROUP BY customer_id;</code></pre>
+  </div>
+</section>
+
+<section id="hierarchy">
+  <h2>Hierarchical queries</h2>
+  <p>Recursive CTEs for org-tree / cost-rollup / referral-chain questions. Less common in screens but worth knowing the shape:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>referral chain depth</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH RECURSIVE chain AS (
+  SELECT customer_id, referred_by, 1 AS depth
+  FROM customers
+  WHERE referred_by IS NULL
+  UNION ALL
+  SELECT c.customer_id, c.referred_by, p.depth + 1
+  FROM customers c
+  JOIN chain p ON p.customer_id = c.referred_by
+)
+SELECT depth, COUNT(*) AS customers
+FROM chain
+GROUP BY depth
+ORDER BY depth;</code></pre>
+  </div>
+</section>
+
+<section id="composition">
+  <h2>CTE composition discipline</h2>
+  <p>For anything beyond two steps, write one CTE per logical operation and name them like prose. The reviewer reads top-to-bottom:</p>
+  <ul>
+    <li><code>active_customers</code> — filter customers who've been active in the last 30 days</li>
+    <li><code>gpu_hours_per_customer</code> — aggregate</li>
+    <li><code>tier_ranked</code> — rank within tier</li>
+    <li><code>final_output</code> — select fields to return</li>
+  </ul>
+  <p>The interviewer reads the CTE names as an outline of your thinking. Bad names ("t1", "subquery", "stuff") read junior even when the SQL is correct.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">The composition signal</span>
+    <p>If your query is over ~30 lines and lives in a single deeply-nested subquery, refactor to CTEs even mid-interview. Say "let me restructure this for clarity" — interviewers love that move.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

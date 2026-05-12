@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Debugging</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#protocol">Debugging protocol</a>
+    <a href="#null">1 · NULL traps</a>
+    <a href="#leftjoin">2 · Hidden inner joins</a>
+    <a href="#duplicates">3 · Row duplication</a>
+    <a href="#granularity">4 · Wrong granularity</a>
+    <a href="#frames">5 · Window frame defaults</a>
+    <a href="#dates">6 · Date math &amp; time zones</a>
+    <a href="#slow">7 · Slow queries</a>
+    <a href="#groupby">8 · GROUP BY surprises</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-sql-creation-patterns.html">← Previous</a>
+    <a href="05-sql-problems.html">Next: Drill →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · SQL</span>
+  <h1>SQL Debugging</h1>
+  <p class="subtitle">Eight categories of broken SQL, with worked fixes. The screen will hand you a query and a wrong result — these are the patterns to scan for first.</p>
+</header>
+
+<section id="protocol">
+  <h2>The debugging protocol</h2>
+  <p>When handed a broken query, work through it in this order. <em>Out loud.</em> The interviewer is judging the process as much as the answer.</p>
+  <ol>
+    <li><strong>Restate what the query is trying to do</strong> in one sentence. Often the bug is "it isn't doing what we think it's doing."</li>
+    <li><strong>Sanity-check the row count.</strong> Run the input tables' counts. Run the output count. Does it make sense? Funnel queries should not grow rows; aggregations should not have nulls in non-nullable groups.</li>
+    <li><strong>Walk the joins.</strong> For each join, what's the cardinality? If both sides are 1-to-many, you're multiplying rows.</li>
+    <li><strong>Walk the filters.</strong> Are any WHERE clauses on a LEFT JOIN that secretly turn it into an inner join? Are NULLs being excluded silently?</li>
+    <li><strong>Walk the aggregates.</strong> COUNT(*) vs COUNT(col)? COUNT(DISTINCT) when ties are intentional?</li>
+    <li><strong>Walk the windows.</strong> Frame defaults? Partitioning? Order ties?</li>
+    <li><strong>Trace one row through</strong> by hand. The bug usually reveals itself at a specific step.</li>
+  </ol>
+</section>
+
+<section id="null">
+  <h2>1 · NULL traps</h2>
+
+  <h3>NOT IN with subquery NULLs</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>silently empty result</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- ✗ Returns zero rows if ANY customer in the inner query has referred_by IS NULL
+SELECT * FROM customers
+WHERE customer_id NOT IN (
+  SELECT referred_by FROM customers
+);
+
+-- ✓ Fix: use NOT EXISTS
+SELECT c.* FROM customers c
+WHERE NOT EXISTS (
+  SELECT 1 FROM customers c2
+  WHERE c2.referred_by = c.customer_id
+);</code></pre>
+  </div>
+  <p><strong>Why it breaks:</strong> if the subquery returns any NULL, every <code>NOT IN</code> comparison evaluates to UNKNOWN, which filters all rows. <strong>NOT EXISTS</strong> handles NULLs correctly.</p>
+
+  <h3>Inequality filters silently dropping NULL rows</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>non-NULL bias</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- ✗ Drops rows where tier IS NULL — possibly your "unknown tier" cohort
+SELECT * FROM session_summary WHERE tier != 'h100';
+
+-- ✓ Fix: be explicit
+SELECT * FROM session_summary WHERE tier IS DISTINCT FROM 'h100';
+-- or
+SELECT * FROM session_summary WHERE COALESCE(tier, '') != 'h100';</code></pre>
+  </div>
+
+  <h3>COUNT(col) vs COUNT(*)</h3>
+  <ul>
+    <li><code>COUNT(*)</code> counts rows (including NULLs in any column).</li>
+    <li><code>COUNT(col)</code> counts non-NULL values of <code>col</code>.</li>
+    <li><code>COUNT(DISTINCT col)</code> ignores NULLs.</li>
+  </ul>
+  <p>Choosing the wrong one is silent — no error, wrong answer.</p>
+</section>
+
+<section id="leftjoin">
+  <h2>2 · The "LEFT JOIN turned INNER" trap</h2>
+  <p>This one comes up almost every interview.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>filter in WHERE silently drops LEFT JOIN nulls</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Intent: every customer with their latest GPU session, even if they have none
+-- ✗ The WHERE clause filters out NULL right-side rows → behaves like INNER JOIN
+SELECT c.customer_id, g.session_id, g.tier
+FROM customers c
+LEFT JOIN gpu_sessions g ON g.customer_id = c.customer_id
+WHERE g.tier = 'h100';
+
+-- ✓ Fix: move the predicate into the ON clause
+SELECT c.customer_id, g.session_id, g.tier
+FROM customers c
+LEFT JOIN gpu_sessions g
+  ON g.customer_id = c.customer_id
+ AND g.tier = 'h100';</code></pre>
+  </div>
+  <p><strong>Tell:</strong> if the LEFT JOIN is supposed to preserve "customers with no sessions," the rule of thumb is — predicates on the right table go in <code>ON</code>, predicates on the left table go in <code>WHERE</code>.</p>
+</section>
+
+<section id="duplicates">
+  <h2>3 · Row duplication from many-to-many joins</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>silent row explosion</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Intent: total revenue per customer
+-- Schema: customers (1) → orders (N), each order can have many discount codes (N)
+-- ✗ Joining orders to discounts duplicates rows; SUM(amount) over-counts
+SELECT c.customer_id, SUM(o.amount) AS revenue
+FROM customers c
+LEFT JOIN orders o      ON o.customer_id = c.customer_id
+LEFT JOIN discounts d   ON d.order_id    = o.order_id
+GROUP BY c.customer_id;
+
+-- ✓ Fix: aggregate discounts separately, then join
+WITH order_discounts AS (
+  SELECT order_id, COUNT(*) AS n_discounts FROM discounts GROUP BY order_id
+)
+SELECT c.customer_id, SUM(o.amount) AS revenue
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.customer_id
+LEFT JOIN order_discounts od ON od.order_id = o.order_id
+GROUP BY c.customer_id;</code></pre>
+  </div>
+  <p><strong>Diagnostic:</strong> compute row count of the joined result. If it exceeds the left table's row count and you didn't expect that, you've joined a many.</p>
+</section>
+
+<section id="granularity">
+  <h2>4 · Wrong granularity</h2>
+  <p>The query returns the right shape but the values are at the wrong unit. Common: aggregating over the wrong key.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>session-level when prompt asked customer-level</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Intent: average revenue per customer
+-- ✗ Averages session revenue across sessions, not per customer
+SELECT AVG(revenue_per_session) FROM gpu_sessions;
+
+-- ✓ Fix: aggregate to customer level first
+WITH per_customer AS (
+  SELECT customer_id, SUM(revenue_per_session) AS revenue
+  FROM gpu_sessions GROUP BY customer_id
+)
+SELECT AVG(revenue) FROM per_customer;</code></pre>
+  </div>
+  <p>"Average" is the worst offender here — pay attention to "average <em>per what</em>."</p>
+</section>
+
+<section id="frames">
+  <h2>5 · Window frame defaults</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>last_value returns current row</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- ✗ Returns the current row's plan, not the customer's last plan
+SELECT
+  customer_id, changed_at, plan,
+  LAST_VALUE(plan) OVER (PARTITION BY customer_id ORDER BY changed_at) AS last_plan
+FROM plan_changes;
+
+-- ✓ Fix: explicit frame
+SELECT
+  customer_id, changed_at, plan,
+  LAST_VALUE(plan) OVER (
+    PARTITION BY customer_id
+    ORDER BY changed_at
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS last_plan
+FROM plan_changes;</code></pre>
+  </div>
+  <p>The default frame when ORDER BY is specified is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. Aggregate windows over time work fine; <code>LAST_VALUE</code> and unbounded windows do not.</p>
+
+  <h3>ROWS vs RANGE</h3>
+  <p>Rolling N-day averages over data with gaps: use <code>ROWS BETWEEN N PRECEDING AND CURRENT ROW</code>. <code>RANGE</code> treats logical ranges (multiple rows with the same timestamp grouped), which silently misbehaves on gaps.</p>
+</section>
+
+<section id="dates">
+  <h2>6 · Date math &amp; time zones</h2>
+
+  <h3>Off-by-one in date math</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>boundary inclusion ambiguity</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- ✗ Inclusive vs exclusive end? Depends on dialect
+SELECT * FROM gpu_sessions
+WHERE started_at BETWEEN '2026-03-01' AND '2026-03-31';
+
+-- ✓ Fix: explicit, half-open
+SELECT * FROM gpu_sessions
+WHERE started_at &gt;= '2026-03-01'
+  AND started_at &lt;  '2026-04-01';</code></pre>
+  </div>
+  <p><code>BETWEEN</code> is inclusive of both ends. With timestamps, <code>'2026-03-31'</code> means <code>2026-03-31 00:00:00</code>, which excludes the last day. Always use half-open intervals on timestamps.</p>
+
+  <h3>Time zone mismatch</h3>
+  <p>If <code>started_at</code> is in UTC but you bucket by <code>DATE_TRUNC('day', started_at)</code>, your "Monday" might include a few hours of West Coast Sunday. Convert at the query layer:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>customer-local day buckets</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">DATE_TRUNC('day', started_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles')</code></pre>
+  </div>
+</section>
+
+<section id="slow">
+  <h2>7 · Slow queries</h2>
+  <p>Senior DAE work includes "this query is too slow." Six things to check, in order:</p>
+  <ol>
+    <li><strong>Read the EXPLAIN plan.</strong> Look for sequential scans on tables that should be indexed, hash joins with billions of rows, sort spills.</li>
+    <li><strong>Partition pruning.</strong> For date-partitioned tables, ensure your date filter is on the partition column directly, not wrapped in a function (<code>WHERE DATE(started_at) = '2026-03-15'</code> typically defeats pruning; <code>WHERE started_at &gt;= '2026-03-15' AND started_at &lt; '2026-03-16'</code> works).</li>
+    <li><strong>Join order &amp; cardinality.</strong> If the optimizer is joining big-to-big before filtering, statistics may be stale. Run ANALYZE; consider explicit hints.</li>
+    <li><strong>Skew.</strong> One value of the join/group key has 10× the rows of others — that single partition takes forever. Check the histogram, mitigate with salting or pre-aggregation.</li>
+    <li><strong>Function on indexed column.</strong> <code>WHERE LOWER(email) = ...</code> can't use a plain index on <code>email</code>. Either index the function or rewrite.</li>
+    <li><strong>Materialize the bottleneck CTE.</strong> Most warehouses re-evaluate CTEs at every reference. If a CTE is expensive and reused, materialize to a temp table.</li>
+  </ol>
+</section>
+
+<section id="groupby">
+  <h2>8 · GROUP BY surprises</h2>
+
+  <h3>Missing aggregation</h3>
+  <p>Selecting columns not in GROUP BY and not aggregated. Postgres rejects, MySQL silently picks an arbitrary value, BigQuery errors. Bug, not feature.</p>
+
+  <h3>NULLs in GROUP BY</h3>
+  <p>NULL is its own group. <code>SELECT tier, COUNT(*) FROM session_summary GROUP BY tier;</code> will include a "NULL" group. Surprised people forget about it.</p>
+
+  <h3>GROUP BY 1, 2 ordinal references</h3>
+  <p>Convenient, but if you reorder SELECT, the GROUP BY silently changes. Prefer explicit column names in anything that ships.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

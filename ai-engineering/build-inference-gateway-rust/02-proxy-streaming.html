@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 02 — Proxy &amp; Streaming</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#deps">New dependencies</a>
+    <a href="#shared-client">Shared reqwest client</a>
+    <a href="#proxy">Proxy handler</a>
+    <a href="#wire">Wire into the router</a>
+    <a href="#run">Run it</a>
+    <a href="#parsing">Reading the bytes</a>
+    <a href="#failure">Failure modes</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-skeleton.html">← Previous</a>
+    <a href="03-batching-and-coalescing.html">Next: Coalescing →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 02 · ~30 minutes</span>
+  <h1>Proxy &amp; Streaming</h1>
+  <p class="subtitle">Forward chat-completion requests to the upstream and stream the SSE response back chunk-by-chunk, with proper backpressure and no buffering.</p>
+</header>
+
+<section id="deps">
+  <h2>New dependencies</h2>
+  <p>Append to <code>infergw/Cargo.toml</code> under <code>[dependencies]</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+bytes   = "1"</code></pre>
+</div>
+
+  <div class="callout tip">
+    <span class="callout-label">Why rustls and not native-tls</span>
+    <p>Rustls links a pure-Rust TLS stack into the binary. No OpenSSL on the host, no version drift, no surprises when you move to distroless in Chapter 06. The image stays small and the build is reproducible.</p>
+  </div>
+</section>
+
+<section id="shared-client">
+  <h2>One shared reqwest client</h2>
+  <p><code>reqwest::Client</code> is internally an <code>Arc</code> over a connection pool. Build one at startup, clone freely. Building one per request is the most common rookie mistake — you'll burn through ports and lose all keep-alive benefits.</p>
+
+  <p>Create <code>infergw/src/upstream.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::time::Duration;
+
+#[derive(Clone)]
+pub struct Upstream {
+    pub client: reqwest::Client,
+    pub base_url: String,
+}
+
+impl Upstream {
+    pub fn new(base_url: String, timeout: Duration) -&gt; anyhow::Result&lt;Self&gt; {
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(32)
+            // We don't set .timeout(), because that would cap the *whole* SSE
+            // stream — we only want a connect timeout for streaming requests.
+            .connect_timeout(timeout)
+            .http2_prior_knowledge()    // vLLM supports HTTP/2; if your upstream
+            .http2_adaptive_window(true) // doesn't, remove these two lines.
+            .build()?;
+        Ok(Self { client, base_url })
+    }
+
+    pub fn chat_completions_url(&amp;self) -&gt; String {
+        format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+}</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">A subtle <code>reqwest</code> footgun</span>
+    <p><code>Client::builder().timeout(d)</code> applies to the <em>entire</em> response, including the body. For a streaming SSE response that can run for many seconds, that timeout will kill the stream mid-flight. Use <code>connect_timeout</code> for streaming requests, and reserve full request timeouts for non-streaming calls.</p>
+  </div>
+
+  <p>Wire it into <code>AppState</code>. Replace <code>infergw/src/routes.rs</code> with:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::upstream::Upstream;
+use axum::{http::StatusCode, response::IntoResponse, routing::{get, post}, Router};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub ready: Arc&lt;AtomicBool&gt;,
+    pub upstream: Upstream,
+}
+
+impl AppState {
+    pub fn new(upstream: Upstream) -&gt; Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(true)),
+            upstream,
+        }
+    }
+}
+
+pub fn router(state: AppState) -&gt; Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/v1/chat/completions", post(crate::proxy::chat_completions))
+        .with_state(state)
+}
+
+async fn healthz() -&gt; impl IntoResponse { (StatusCode::OK, "ok") }
+
+async fn readyz(
+    axum::extract::State(state): axum::extract::State&lt;AppState&gt;,
+) -&gt; impl IntoResponse {
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "draining")
+    }
+}</code></pre>
+</div>
+</section>
+
+<section id="proxy">
+  <h2>The proxy handler</h2>
+  <p>This is the meat of the chapter. The pattern: take the incoming JSON body, forward it to the upstream, get back a byte stream, wrap that in an axum SSE response, hand it to the client. Backpressure is automatic — if the client is slow, the upstream read pauses.</p>
+
+  <p>Create <code>infergw/src/proxy.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::routes::AppState;
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use bytes::Bytes;
+use futures::StreamExt;
+use serde_json::Value;
+
+pub async fn chat_completions(
+    State(state): State&lt;AppState&gt;,
+    Json(body): Json&lt;Value&gt;,
+) -&gt; Result&lt;Response, ProxyError&gt; {
+    let url = state.upstream.chat_completions_url();
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let resp = state
+        .upstream
+        .client
+        .post(&amp;url)
+        .json(&amp;body)
+        .send()
+        .await
+        .map_err(ProxyError::Upstream)?;
+
+    let upstream_status = resp.status();
+    if !upstream_status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!(%upstream_status, body = %text, "upstream non-2xx");
+        return Err(ProxyError::UpstreamStatus(upstream_status, text));
+    }
+
+    if stream_requested {
+        // Forward as SSE byte stream. We don't reparse the SSE framing here;
+        // we trust the upstream and let bytes pass through. (Chapter 05 will
+        // tap into this stream for token-count metrics.)
+        let upstream_body = resp.bytes_stream().map(|chunk| {
+            chunk.map_err(std::io::Error::other)
+        });
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no") // nginx: do not buffer
+            .body(Body::from_stream(upstream_body))
+            .expect("response builder");
+
+        Ok(response)
+    } else {
+        // Non-streaming: collect and return JSON verbatim.
+        let bytes: Bytes = resp.bytes().await.map_err(ProxyError::Upstream)?;
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .expect("response builder");
+        Ok(response)
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("upstream transport error: {0}")]
+    Upstream(#[from] reqwest::Error),
+    #[error("upstream returned {0}: {1}")]
+    UpstreamStatus(StatusCode, String),
+}
+
+impl IntoResponse for ProxyError {
+    fn into_response(self) -&gt; Response {
+        let (status, msg) = match &amp;self {
+            ProxyError::Upstream(e) if e.is_connect() =&gt; (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream unreachable: {e}"),
+            ),
+            ProxyError::Upstream(e) if e.is_timeout() =&gt; (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("upstream timeout: {e}"),
+            ),
+            ProxyError::Upstream(e) =&gt; (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream error: {e}"),
+            ),
+            ProxyError::UpstreamStatus(s, body) =&gt; (*s, body.clone()),
+        };
+        tracing::error!(?status, %msg, "proxy error");
+        (status, Json(serde_json::json!({"error": msg}))).into_response()
+    }
+}</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">The three things that make this work</span>
+    <p><strong>1. <code>resp.bytes_stream()</code></strong> returns a <code>Stream&lt;Item = Result&lt;Bytes, reqwest::Error&gt;&gt;</code> — chunks arrive as the upstream sends them. No buffering.</p>
+    <p><strong>2. <code>Body::from_stream(...)</code></strong> hands that stream to axum, which writes each chunk to the client socket as soon as it lands.</p>
+    <p><strong>3. <code>x-accel-buffering: no</code> and <code>Cache-Control: no-cache</code></strong> are belt-and-suspenders against nginx / CDNs / proxies that would otherwise buffer the response and ruin streaming. Nobody enjoys debugging "why are my tokens arriving in one burst at the end."</p>
+  </div>
+</section>
+
+<section id="wire">
+  <h2>Wire it into <code>main.rs</code></h2>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">mod config;
+mod proxy;
+mod routes;
+mod shutdown;
+mod telemetry;
+mod upstream;
+
+use std::time::Duration;
+use tower_http::trace::TraceLayer;
+
+#[tokio::main]
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
+    telemetry::init_tracing();
+    let cfg = config::Config::from_env()?;
+    tracing::info!(?cfg, "starting infergw");
+
+    let upstream = upstream::Upstream::new(
+        cfg.upstream_url.clone(),
+        Duration::from_millis(cfg.upstream_timeout_ms),
+    )?;
+    let state = routes::AppState::new(upstream);
+    let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(&amp;cfg.bind_addr).await?;
+    tracing::info!(addr = %cfg.bind_addr, "listening");
+
+    let grace = Duration::from_millis(cfg.shutdown_grace_ms);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown::shutdown_signal(state, grace))
+        .await?;
+
+    Ok(())
+}</code></pre>
+</div>
+
+  <p>And make sure the mock from Chapter 00 used HTTP/1.1, not HTTP/2 — the <code>.http2_prior_knowledge()</code> call assumes the upstream supports it. The Chapter 00 mock served HTTP/1.1. To match, comment those two lines out in <code>upstream.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">// .http2_prior_knowledge()
+// .http2_adaptive_window(true)</code></pre>
+</div>
+
+  <p>Real vLLM speaks HTTP/2; flip them back on when you switch to a real upstream.</p>
+</section>
+
+<section id="run">
+  <h2>Run it</h2>
+  <p>Make sure the mock from Chapter 00 is still running on <code>:9000</code>. Then start the gateway:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo run -p infergw</code></pre>
+</div>
+
+  <p>From a third terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -N -H 'content-type: application/json' \
+  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hi there"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+
+  <p>You should see exactly the same 19 chunks plus <code>[DONE]</code> as in Chapter 00 — except now they're flowing through your gateway. Watch them arrive one at a time, 40ms apart. That's the streaming working end-to-end.</p>
+
+  <p>The gateway logs will show:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">INFO tower_http::trace::on_request: started processing request method=POST uri=/v1/chat/completions
+INFO tower_http::trace::on_response: finished processing request latency=816 ms status=200</code></pre>
+</div>
+</section>
+
+<section id="parsing">
+  <h2>Reading the bytes (optional but eye-opening)</h2>
+  <p>If you want to see exactly what crosses the wire, pipe through <code>xxd</code> or just slow it down with awk:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -sN -H 'content-type: application/json' \
+  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hi"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions \
+  | awk '{ print systime() " | " $0; fflush(); }'</code></pre>
+</div>
+
+  <p>Each printed line shows the unix timestamp when that chunk arrived at your terminal. Subtract consecutive timestamps and you'll see ~40ms gaps — proof that no layer in between is buffering.</p>
+</section>
+
+<section id="failure">
+  <h2>Failure modes worth touching</h2>
+
+  <details class="collapse-card">
+    <summary>What happens if the upstream is down?</summary>
+    <div class="collapse-card-body">
+      <p>Stop the mock-upstream (Ctrl-C in its terminal). Now re-run the curl against the gateway:</p>
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -i -H 'content-type: application/json' \
+  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hi"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+      <p>You'll get a <code>502 Bad Gateway</code> with a structured error body: <code>{"error":"upstream unreachable: ..."}</code>. That's <code>ProxyError::Upstream</code> doing its job. Chapter 04 will turn this into a circuit-breaker trip instead.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>What if the client disconnects mid-stream?</summary>
+    <div class="collapse-card-body">
+      <p>Start a curl, then Ctrl-C it after the first chunk lands. Look at the gateway's logs: the upstream stream is dropped because the response body is dropped — <code>reqwest</code> sees the receiver is gone and closes the connection. No leak, no wasted upstream tokens past that point. This is one of the things you get for free with proper streaming; the alternative (buffer everything, then write to client) keeps the upstream churning even after the client is gone.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>What about non-streaming requests?</summary>
+    <div class="collapse-card-body">
+      <p>Drop <code>"stream": true</code> from the body and re-curl. You get a single JSON document. The mock doesn't currently return a non-streaming form — extending it is a 10-minute exercise if you want to handle that path. (For OpenAI / a real vLLM, this Just Works because they handle both modes.)</p>
+    </div>
+  </details>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li><code>POST /v1/chat/completions</code> with <code>"stream":true</code> proxies through the gateway and streams chunks to the client.</li>
+    <li>Upstream-down returns a structured <code>502</code>.</li>
+    <li>Client disconnect cleans up the upstream side.</li>
+    <li>No buffering anywhere — chunks land at the client roughly when the upstream emits them.</li>
+  </ul>
+
+  <p>This is already a useful gateway. The next four chapters are about making it reliable.</p>
+
+  <p style="margin-top: 24px;"><a href="03-batching-and-coalescing.html"><strong>→ Chapter 03: Batching &amp; coalescing</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

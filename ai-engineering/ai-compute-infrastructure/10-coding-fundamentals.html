@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#language-choice">Picking a language for the live round</a>
+    <a href="#python">Python — the lingua franca</a>
+    <a href="#systems-langs">Systems languages — C++, Rust, Go</a>
+    <a href="#async">Async patterns</a>
+    <a href="#dsa">DSA patterns that show up</a>
+    <a href="#big-o">Big-O sanity</a>
+    <a href="#code-style">Code-style signals senior interviewers watch for</a>
+    <a href="#what-to-rehearse">What to rehearse this week</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">Language choice, the DSA patterns that actually appear in infra rounds, async basics for the right kind of "I/O-bound" problem, and the code-style signals senior reviewers look for.</p>
+</header>
+
+<section id="language-choice">
+  <h2>Picking a language for the live round</h2>
+  <p>The JD names Python first and lists C++, Rust, Go, CUDA as nice-to-haves. For the coding round, the default is <strong>Python</strong> unless you're explicitly told otherwise. Reasons:</p>
+  <ul>
+    <li>Most infra tooling tasks at the company will be Python or Go.</li>
+    <li>Interviewers grade on clarity and reasoning; Python lets you express the algorithm without language ceremony.</li>
+    <li>If you're strongest in another language, say so explicitly and use it — the worst outcome is fumbling syntax in Python because you're a Go native.</li>
+  </ul>
+  <p>For deep-system questions (kernel bypass, lock-free queues), C++ or Rust may come out naturally. Don't force it; let it come.</p>
+</section>
+
+<section id="python">
+  <h2>Python — the lingua franca</h2>
+  <p>For this role, "Python" in practice means:</p>
+  <ul>
+    <li>Standard library fluency — <code>collections</code>, <code>heapq</code>, <code>itertools</code>, <code>asyncio</code>, <code>concurrent.futures</code>, <code>contextlib</code>, <code>dataclasses</code>.</li>
+    <li>HTTP clients — <code>httpx</code> for async, <code>requests</code> for sync.</li>
+    <li>Numerical — <code>numpy</code> at a comfort level. Maybe <code>pandas</code>.</li>
+    <li>Async — <code>asyncio</code> for I/O concurrency.</li>
+    <li>Subprocess and OS — <code>subprocess</code>, <code>os</code>, <code>pathlib</code>.</li>
+    <li>Type hints — use them by default for senior code reviews.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># The shape of senior Python you should produce by reflex
+from __future__ import annotations
+from dataclasses import dataclass
+from collections import deque
+from typing import Iterable
+
+@dataclass(slots=True)
+class Request:
+    id: str
+    prompt_tokens: int
+    deadline_ms: int
+
+class TokenRateLimiter:
+    """Token-bucket rate limiter; thread-safe outer use assumed monotonic."""
+    def __init__(self, capacity: int, refill_per_sec: float) -> None:
+        self.capacity = capacity
+        self.refill = refill_per_sec
+        self._tokens = float(capacity)
+        self._last_ts = 0.0
+
+    def allow(self, now: float, cost: int = 1) -> bool:
+        self._tokens = min(
+            self.capacity,
+            self._tokens + (now - self._last_ts) * self.refill,
+        )
+        self._last_ts = now
+        if self._tokens >= cost:
+            self._tokens -= cost
+            return True
+        return False
+</code></pre></div>
+  <p>Notice: type hints, <code>dataclass(slots=True)</code> for performance + clarity, <code>from __future__ import annotations</code>, one clear public method.</p>
+</section>
+
+<section id="systems-langs">
+  <h2>Systems languages — C++, Rust, Go</h2>
+  <p>You won't be asked to write 200 lines of C++ in a 45-minute round, but you should be able to discuss <em>why</em> these languages show up in GPU infrastructure.</p>
+  <table>
+    <thead><tr><th>Language</th><th>Where it lives in this stack</th></tr></thead>
+    <tbody>
+      <tr><td><strong>C++</strong></td><td>CUDA kernels, custom inference servers, Triton backends, integration with cuDNN/NCCL/TRT, anything inside vLLM's hot path</td></tr>
+      <tr><td><strong>CUDA</strong></td><td>The kernel language for NVIDIA GPUs. Knowing how a kernel launches, what shared memory and registers are, is a senior signal even if you don't write CUDA daily.</td></tr>
+      <tr><td><strong>Rust</strong></td><td>New control-plane services, network proxies, observability collectors. Increasingly used in adjacent infra (Tokio for async, Axum for services). Some inference layers (text-generation-inference) are Rust.</td></tr>
+      <tr><td><strong>Go</strong></td><td>Kubernetes ecosystem — operators, CRD controllers, kubelet extensions, networking plugins. If you write a custom scheduler extender, you'll write Go.</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// A minimal Rust sketch — async queue worker for a request pool.
+// You wouldn't be asked to write this from scratch in an interview,
+// but you should be able to discuss the shape.
+use tokio::sync::Semaphore;
+use std::sync::Arc;
+
+async fn run_worker(
+    queue: Arc<async_channel::Receiver<Request>>,
+    limit: Arc<Semaphore>,
+    backend: Arc<dyn Backend>,
+) {
+    while let Ok(req) = queue.recv().await {
+        let permit = limit.clone().acquire_owned().await.unwrap();
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            let _p = permit;
+            backend.handle(req).await;
+        });
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="async">
+  <h2>Async patterns — when they matter, when they don't</h2>
+  <p>Async <strong>is the right tool</strong> when:</p>
+  <ul>
+    <li>You're orchestrating many concurrent I/O operations (HTTP fan-out, multiple downstream services, streaming).</li>
+    <li>You're building a gateway, router, or sidecar that holds many open connections.</li>
+    <li>You're consuming a high-rate event stream.</li>
+  </ul>
+  <p>Async <strong>is not the right tool</strong> when:</p>
+  <ul>
+    <li>Your work is CPU-bound. Async doesn't help; use processes or threads with the GIL released by the underlying lib.</li>
+    <li>You need parallelism on multi-core, not concurrency.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># The shape of async you might be asked to write —
+# fan out N inference calls with a concurrency cap.
+import asyncio
+import httpx
+
+async def fan_out(prompts: list[str], url: str, max_in_flight: int = 16):
+    sem = asyncio.Semaphore(max_in_flight)
+    results: list[str | None] = [None] * len(prompts)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async def one(i: int, prompt: str) -> None:
+            async with sem:
+                try:
+                    r = await client.post(url, json={"prompt": prompt})
+                    results[i] = r.json()["text"]
+                except httpx.HTTPError:
+                    results[i] = None
+        await asyncio.gather(*[one(i, p) for i, p in enumerate(prompts)])
+    return results
+</code></pre></div>
+</section>
+
+<section id="dsa">
+  <h2>DSA patterns that show up in this role's coding rounds</h2>
+  <p>You're unlikely to get a hard graph theory problem. You <em>are</em> likely to get something that looks like systems-with-numbers.</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>Why it matters here</th><th>Typical problem framing</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hash map / hash set</strong></td><td>Idempotency keys, dedupe, prefix-cache index, request-by-ID</td><td>"De-dup these requests"; "implement a small LRU"</td></tr>
+      <tr><td><strong>Sliding window</strong></td><td>Latency percentiles over time, rate limiters, queue depth tracking</td><td>"Compute p99 over the last N seconds"</td></tr>
+      <tr><td><strong>Heap / priority queue</strong></td><td>Priority scheduling, soonest-deadline jobs, top-k</td><td>"Pull the next inference job from a multi-priority queue"</td></tr>
+      <tr><td><strong>Deque</strong></td><td>Bounded FIFO queues, monotonic queue for max-in-window</td><td>"Bounded batch buffer with timeout"</td></tr>
+      <tr><td><strong>Prefix sum / counters</strong></td><td>Token counting, rolling sums, budget tracking</td><td>"Total tokens served in the last minute"</td></tr>
+      <tr><td><strong>Two pointers</strong></td><td>Window over sorted streams, merge intervals</td><td>"Merge overlapping reservation windows"</td></tr>
+      <tr><td><strong>Greedy / bin-packing</strong></td><td>Pack jobs onto GPUs, fit requests in a batch</td><td>"Place these jobs onto N nodes"</td></tr>
+      <tr><td><strong>Simple graph</strong></td><td>Topological ordering for pipeline stages, dependency DAG</td><td>"Order these training steps"</td></tr>
+      <tr><td><strong>Reservoir sampling</strong></td><td>Sampling logs at fixed rate without buffering everything</td><td>"Pick a uniform sample from a stream"</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="big-o">
+  <h2>Big-O sanity</h2>
+  <p>Senior interviewers don't ask you to recite complexities; they expect you to reach for the right structure without thinking. Refreshers worth being cold on:</p>
+  <table>
+    <thead><tr><th>Structure</th><th>Lookup</th><th>Insert</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Python <code>dict</code> / <code>set</code></td><td>O(1) avg</td><td>O(1) avg</td><td>Hash collisions in worst case; rare</td></tr>
+      <tr><td>Python <code>list</code></td><td>O(1) index</td><td>O(1) append, O(n) middle</td><td><code>pop(0)</code> is O(n); use deque</td></tr>
+      <tr><td><code>collections.deque</code></td><td>O(1) ends</td><td>O(1) ends</td><td>O(n) middle; great for queues</td></tr>
+      <tr><td><code>heapq</code></td><td>O(1) min</td><td>O(log n)</td><td>Min-heap; negate for max</td></tr>
+      <tr><td>Sorted list / <code>SortedContainers</code></td><td>O(log n)</td><td>O(log n)</td><td>Convenient but third-party</td></tr>
+    </tbody>
+  </table>
+  <p>For a coding round, talk out loud about the complexity of your choice <em>before</em> you write the code. "I'll use a heap because I need fast min and insertion is logarithmic" closes 80% of the "why this structure?" follow-up.</p>
+</section>
+
+<section id="code-style">
+  <h2>Code-style signals senior interviewers watch for</h2>
+  <ul>
+    <li><strong>Start with the signature and the data model.</strong> A class with fields. Method signatures. Then bodies. Top-down beats bottom-up under pressure.</li>
+    <li><strong>Names that read like the problem.</strong> Not <code>i, j, x</code>. Use <code>request</code>, <code>deadline_ms</code>, <code>queue</code>.</li>
+    <li><strong>Edge cases first.</strong> Empty input, single-element, capacity zero, time going backward.</li>
+    <li><strong>One function, one responsibility.</strong> When you start to feel the function ballooning, extract.</li>
+    <li><strong>Type hints in Python.</strong> Free documentation.</li>
+    <li><strong>Test as you go.</strong> A small assert at the bottom that exercises the happy path is worth more than racing to "done."</li>
+    <li><strong>Explain trade-offs out loud.</strong> "I could use a sorted list here, but lookups would be log; for 100k entries that's negligible, so I'd take the simpler code."</li>
+    <li><strong>Recover from mistakes calmly.</strong> If you spot a bug, say "wait, that's wrong; here's the fix." Don't try to silently rewrite.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">The default opening move</span>
+    <p>When given a problem, take 60 seconds to: (1) restate it, (2) clarify one assumption, (3) name the data structure, (4) name the complexity target. <em>Then</em> code. The setup is what separates the senior take from the junior take.</p>
+  </div>
+</section>
+
+<section id="what-to-rehearse">
+  <h2>What to rehearse this week</h2>
+  <p>For this role, drill these eight kinds of problem until they're reflexive. Chapter 11 has worked examples of each:</p>
+  <ol>
+    <li>Token-bucket rate limiter.</li>
+    <li>Sliding-window percentile (p95/p99) over a stream.</li>
+    <li>Priority queue with multiple classes &amp; preemption.</li>
+    <li>Bounded batch buffer (merge requests up to N or time T).</li>
+    <li>Bin-packing — place items of varying memory on bins of fixed capacity.</li>
+    <li>Connection pool with timeout &amp; fairness.</li>
+    <li>LRU cache (and a brief discussion of how this maps to KV-cache eviction).</li>
+    <li>Topological order over a small DAG (pipeline stages).</li>
+  </ol>
+  <p>Each takes 25-35 minutes. Do them on a timer. Once you've solved each once, do them again from scratch a day later. The second pass is what builds the under-pressure version.</p>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Previous</a> · <a href="11-coding-problems.html">Next: Coding problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 08 — Where to Next</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what-you-built">What you built</a>
+    <a href="#stretches">Stretch ideas</a>
+    <a href="#interview">Talking about this in an interview</a>
+    <a href="#reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-load-test-and-tuning.html">← Previous</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 08 · ~5 minutes</span>
+  <h1>Where to Next</h1>
+  <p class="subtitle">You have a working gateway. Here are the directions that turn it into something you'd actually put in production — pick whichever interests you most.</p>
+</header>
+
+<section id="what-you-built">
+  <h2>What you built</h2>
+  <p>Three hours ago you had an empty directory. Now you have:</p>
+  <ul>
+    <li>A Rust HTTP gateway that proxies OpenAI-compatible chat-completion requests with SSE streaming.</li>
+    <li>In-flight request coalescing that turns N concurrent identical requests into one upstream call.</li>
+    <li>A circuit breaker, retry budget primitives, and request hedging.</li>
+    <li>Prometheus metrics, OpenTelemetry traces, structured JSON logs.</li>
+    <li>A multi-stage Docker build that produces a ~35 MB distroless image.</li>
+    <li>A Kubernetes Deployment manifest with proper probes and graceful shutdown.</li>
+    <li>A load-tested baseline of the gateway's behavior under concurrency.</li>
+  </ul>
+
+  <p>That's a real piece of infrastructure. Not a toy.</p>
+</section>
+
+<section id="stretches">
+  <h2>Stretch ideas</h2>
+  <p>Each of these is its own evening's work. Pick by interest, not order.</p>
+
+  <details class="collapse-card">
+    <summary>1 · Auth and per-tenant rate limiting</summary>
+    <div class="collapse-card-body">
+      <p>Add a tower middleware that extracts a tenant from a bearer token (JWT validation with <code>jsonwebtoken</code>) and tags every metric / log / span with <code>tenant_id</code>. Then add a token-bucket rate limiter (<code>tower::limit</code> or <code>governor</code>) keyed by tenant.</p>
+      <p>The harder part is doing this <em>without</em> making the hot path slow. Validate JWTs against a cached JWK set, not a per-request HTTPS call. Rate-limit before doing any upstream-touching work.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>2 · Multi-upstream load balancing with KV-cache awareness</summary>
+    <div class="collapse-card-body">
+      <p>Currently the gateway points at a single upstream. Real deployments have N replicas. Pick a load-balancing policy: round-robin is fine, but for LLMs you can do meaningfully better by routing requests with shared prefixes to the same replica so vLLM's prefix cache hits warm.</p>
+      <p>Sketch: hash a prefix of the prompt (say, first 200 tokens), use that hash to select a replica from the pool with bounded-load consistent hashing. Per-upstream breakers (the stretch idea from Chapter 04) is the table stakes here.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>3 · Model routing and fallback</summary>
+    <div class="collapse-card-body">
+      <p>Accept arbitrary <code>model</code> values from clients. Route to different upstreams based on the model: <code>llama-3-70b</code> goes to your big-model fleet, <code>llama-3-8b</code> goes to your small-model fleet. On a per-model breaker trip, optionally fall back to a different model (<code>gpt-4o</code> → <code>gpt-4o-mini</code>) with a header indicating the substitution happened.</p>
+      <p>This is where the architecture earns its keep — the routing logic is in the gateway, the model servers stay simple.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>4 · Token counting and budget enforcement</summary>
+    <div class="collapse-card-body">
+      <p>Pre-flight: estimate input tokens with a fast tokenizer (<code>tiktoken-rs</code>). Compare against a per-tenant token budget. Reject upfront if it would blow the budget. Post-flight: parse the SSE stream as it passes through and count actual output tokens against the same budget.</p>
+      <p>The tokenizer is the hard part — keeping it in sync with the model's actual tokenization. The right answer for production is to have the model server return token counts and trust them, but doing it client-side once is illuminating.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>5 · Structured-output validation</summary>
+    <div class="collapse-card-body">
+      <p>If clients request a response_format with a JSON schema, validate the streamed output as it's produced — bail and re-prompt the upstream if the partial response is provably invalid (e.g. it's generated <code>{"name": "alice", "name":</code> and you can already see "name" is repeated). This is finicky but it's exactly the kind of work a gateway is uniquely positioned to do.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>6 · Replay-able request log</summary>
+    <div class="collapse-card-body">
+      <p>For every request, write <code>{tenant, model, prompt, params, completion, latency, hedged?, coalesced?}</code> to an append-only log (start with a local file, evolve to S3 / Kafka). Two payoffs: (a) when something goes wrong, you can replay exactly what happened; (b) you can mine the log to discover patterns (top prompts, slowest prompts, prompts that triggered hedging) and feed those back into routing / caching decisions.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>7 · A proper request cache</summary>
+    <div class="collapse-card-body">
+      <p>Coalescing handles in-flight duplicates. A cache handles <em>recent</em> duplicates. With temperature=0, identical prompts produce identical outputs — cache the completion for ~5 minutes in Redis (or even an in-process <code>moka</code> cache). The hit rate on agent workloads with retries and replays is often 20%+ — a huge cost / latency win. The interactions with billing, abuse, and tenant isolation are the design work.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>8 · WebSocket / bidirectional streaming</summary>
+    <div class="collapse-card-body">
+      <p>OpenAI's Realtime API uses WebSockets, not SSE. Adding a <code>/v1/realtime</code> endpoint that proxies WS-to-WS lets your gateway handle voice agents and low-latency interactive use cases. Reach for <code>tokio-tungstenite</code>. The bidirectional flow control story is a chapter on its own — frames in both directions, with the same backpressure properties you got for free with SSE.</p>
+    </div>
+  </details>
+</section>
+
+<section id="interview">
+  <h2>Talking about this in an interview</h2>
+  <p>If "have you built ML infrastructure?" comes up, this guide gives you a 90-second answer that's specific and defensible:</p>
+
+  <div class="callout insight">
+    <span class="callout-label">A sample answer</span>
+    <p>"I built an inference gateway in Rust — axum and tokio on the front, reqwest streaming to a vLLM-compatible upstream. A few things became real by doing it: streaming SSE end-to-end requires being deliberate about NOT setting a full-request timeout, otherwise it kills the stream; in-flight request coalescing on identical prompts is the single highest-impact optimization for agent workloads, often 100x+ savings on duplicate work; circuit breakers and hedging interact in ways you have to think about — you never hedge through an open breaker. The observability layer is what made tuning feasible — Prometheus histograms with the right buckets for LLM-shaped latencies, OTLP traces so I could see which span was eating the tail. Shipped as a ~35 MB distroless container with a graceful-shutdown handshake against the K8s readiness probe."</p>
+  </div>
+
+  <p>Three things make that answer land: <em>specific numbers</em> (35 MB, 100x), <em>specific tradeoffs</em> (don't hedge through open breakers, full-request timeout kills streams), <em>a coherent shape</em> (front, middle, back, observability, deploy). All three come from having actually built it, not having read about it.</p>
+</section>
+
+<section id="reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener"><strong>The Tail at Scale</strong></a> — Dean &amp; Barroso, 2013. The paper that put hedging on the map. Short and worth the time.</li>
+    <li><a href="https://blog.cloudflare.com/circuit-breakers-and-load-shedding/" target="_blank" rel="noopener"><strong>Circuit breakers and load shedding</strong></a> — Cloudflare engineering blog. Practical patterns at scale.</li>
+    <li><a href="https://tokio.rs/blog/2024-01-17-running-tasks-with-tokio" target="_blank" rel="noopener"><strong>tokio.rs tutorials</strong></a> — the missing manual for async Rust runtime behavior.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener"><strong>vLLM docs</strong></a> — continuous batching, PagedAttention, prefix caching. The companion <a href="../paged-attention-deep-dive/index.html">PagedAttention deep-dive</a> in this site goes one level below.</li>
+    <li><a href="https://opentelemetry.io/docs/languages/rust/" target="_blank" rel="noopener"><strong>OpenTelemetry Rust</strong></a> — the docs are dense; the examples are the fastest path in.</li>
+    <li><a href="https://kubernetes.io/blog/2023/05/24/gracefully-shutdown-deployments/" target="_blank" rel="noopener"><strong>K8s graceful shutdown</strong></a> — the official write-up of the SIGTERM / readiness / preStop dance.</li>
+  </ul>
+
+  <p style="margin-top: 32px;">Thanks for building this with me. The repo you've got at the end is yours — extend it, deploy it, break it, learn from it. The point was never the gateway itself; it was the muscle memory of "I can build infrastructure like this when the situation calls for it."</p>
+
+  <p style="margin-top: 16px;"><a href="index.html"><strong>↺ Back to the guide index</strong></a> · <a href="../index.html">Other AI Engineering guides</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

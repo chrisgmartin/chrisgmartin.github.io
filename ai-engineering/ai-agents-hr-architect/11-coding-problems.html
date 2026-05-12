@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems — HR Architect Drill</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body data-practice-key="hr-coding-problems-practiced">
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Problems</h2>
+    <ol class="step-list">
+      <li><a href="#p1">Dedup workers across systems</a></li>
+      <li><a href="#p2">Headcount on a date</a></li>
+      <li><a href="#p3">Attrition rate</a></li>
+      <li><a href="#p4">Payroll-period boundary</a></li>
+      <li><a href="#p5">EIB flat-file transform</a></li>
+      <li><a href="#p6">Idempotency key — hire/rehire</a></li>
+      <li><a href="#p7">Tenure-aware leave accrual</a></li>
+      <li><a href="#p8">Org reorg cascade</a></li>
+      <li><a href="#p9">Overlapping leave windows</a></li>
+      <li><a href="#p10">Active-day count over a range</a></li>
+    </ol>
+
+    <h2>Reference</h2>
+    <a href="#approach-template">Approach template</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Drill — Solutions Hidden by Default</span>
+  <h1>HR Architect Coding Problems</h1>
+  <p class="subtitle">Ten problems tailored to this role. Date math, identity dedup, idempotency under retry, EIB-shaped transforms — the patterns that show up in production HR work.</p>
+  <div class="meta-row">
+    <span>🎯 10 problems</span>
+    <span>🐍 Python</span>
+    <span>⏱ ~20-25 min each</span>
+    <span>🔁 Progress saved locally</span>
+  </div>
+</header>
+
+<div class="drill-bar">
+  <label>
+    <input type="checkbox" id="drillToggle">
+    <span class="toggle"></span>
+    <span><strong>Drill mode</strong> — hide all solutions until you click</span>
+  </label>
+  <span class="progress" id="practiceProgress">0 / 10 practiced</span>
+</div>
+
+<section id="approach-template">
+  <h2>How to approach each problem out loud</h2>
+  <ol>
+    <li><strong>Restate:</strong> "Just to confirm — you want me to..."</li>
+    <li><strong>Constraints:</strong> input size, duplicates, missing fields, time-zone, effective dates?</li>
+    <li><strong>Example:</strong> walk a small case</li>
+    <li><strong>Brute force:</strong> mention it</li>
+    <li><strong>Pattern:</strong> hash map? sort + sweep? two-pointer? date arithmetic?</li>
+    <li><strong>Complexity:</strong> state it</li>
+    <li><strong>Code with narration</strong></li>
+    <li><strong>Test:</strong> walk through your example</li>
+    <li><strong>Tradeoffs:</strong> edges, what you'd add for production</li>
+  </ol>
+</section>
+
+<section id="p1">
+  <h2><span class="step-num">1</span>Deduplicate workers across systems
+    <button class="practice-check" data-id="p1">practiced</button>
+  </h2>
+  <p><span class="tag string">Identity</span><span class="tag pointers">Hash map</span></p>
+  <p><strong>Prompt:</strong> You're given lists of workers from Workday, Ashby, and Okta. Each has <code>name</code> and <code>email</code>. Some workers appear in multiple systems. Some have multiple emails (work, personal). Some emails are typo'd. Produce a single list with one row per logical worker. Decide on a deterministic tiebreak.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+      <h3>Approach</h3>
+      <p>Normalize emails (lowercase, strip), build a union-find by email. For typos, accept that perfect identity dedup needs a stronger key (govt ID hash). Document the limit.</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from collections import defaultdict
+
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+    def find(self, x):
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+def dedup_workers(*sources: list[dict]) -> list[dict]:
+    uf = UnionFind()
+    record_by_email: dict[str, list[dict]] = defaultdict(list)
+    # Step 1: normalize and index
+    for source in sources:
+        for w in source:
+            for raw_email in (w.get("emails") or [w.get("email")]):
+                if not raw_email:
+                    continue
+                e = raw_email.strip().lower()
+                record_by_email[e].append(w)
+                uf.union(e, e)  # ensures presence
+    # Step 2: connect any two emails that appear on the same record
+    for source in sources:
+        for w in source:
+            emails = [e.strip().lower() for e in (w.get("emails") or [w["email"]]) if e]
+            for e in emails[1:]:
+                uf.union(emails[0], e)
+    # Step 3: group by root
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for email, records in record_by_email.items():
+        groups[uf.find(email)].extend(records)
+    # Step 4: collapse each group deterministically (prefer Workday source)
+    result = []
+    for root, records in groups.items():
+        records.sort(key=lambda r: (r.get("source") != "workday", r.get("worker_id") or ""))
+        canonical = records[0]
+        canonical["aliases"] = sorted({r.get("source") for r in records})
+        result.append(canonical)
+    return result</code></pre>
+</div>
+
+      <h3>Drill notes</h3>
+      <ul>
+        <li>Complexity: O(N·α(N)) for the union-find passes.</li>
+        <li>Edge: workers with no email → can't join; surface to a manual list.</li>
+        <li>Production: stronger identity key (govt-ID hash, DOB hash) needed to dedup across email-style aliases.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="p2">
+  <h2><span class="step-num">2</span>Headcount on a date
+    <button class="practice-check" data-id="p2">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Filter</span></p>
+  <p><strong>Prompt:</strong> Given a list of workers with <code>hire_date</code> and optional <code>termination_date</code>, return headcount as of a target date. Handle the inclusive-end convention.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date
+
+def headcount_on(workers: list[dict], as_of: date, term_inclusive: bool = True) -> int:
+    """Count workers active on `as_of`.
+
+    term_inclusive=True means termination_date == as_of still counts as active
+    (the standard convention: last day worked is paid).
+    """
+    n = 0
+    for w in workers:
+        hd = w["hire_date"]
+        td = w.get("termination_date")
+        if hd &gt; as_of:
+            continue
+        if td is None:
+            n += 1
+        elif term_inclusive and td &gt;= as_of:
+            n += 1
+        elif not term_inclusive and td &gt; as_of:
+            n += 1
+    return n</code></pre>
+</div>
+
+      <p>Complexity: O(n). State the inclusive-end choice explicitly in your answer.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p3">
+  <h2><span class="step-num">3</span>Attrition rate
+    <button class="practice-check" data-id="p3">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Arithmetic</span></p>
+  <p><strong>Prompt:</strong> Given workers and a year, compute annualized attrition rate. Define your denominator (average of start and end headcount).</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date
+
+def attrition_rate(workers: list[dict], year: int) -> dict:
+    start = date(year, 1, 1)
+    end = date(year, 12, 31)
+    start_hc = headcount_on(workers, start)
+    end_hc = headcount_on(workers, end)
+    terms = sum(
+        1 for w in workers
+        if w.get("termination_date")
+        and start &lt;= w["termination_date"] &lt;= end
+    )
+    avg_hc = (start_hc + end_hc) / 2
+    return {
+        "terminations": terms,
+        "start_headcount": start_hc,
+        "end_headcount": end_hc,
+        "avg_headcount": avg_hc,
+        "attrition_rate": terms / avg_hc if avg_hc else None,
+    }</code></pre>
+</div>
+
+      <p>Discuss alternative denominators (start-only, including new hires). Senior signal: <em>"There's no universal definition — I'd confirm convention with People Analytics before reporting."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="p4">
+  <h2><span class="step-num">4</span>Payroll-period boundary detection
+    <button class="practice-check" data-id="p4">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Date math</span></p>
+  <p><strong>Prompt:</strong> Given a country's payroll cycle (monthly with cutoff 5 business days before end of month), a proposed effective date, and today's date, return: which payroll cycle this lands in, and whether we're inside the lock window.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date, timedelta
+from calendar import monthrange
+
+def is_business_day(d: date) -> bool:
+    return d.weekday() &lt; 5  # 0=Mon, 4=Fri (no holiday calendar here; in prod, use one)
+
+def shift_business_days(d: date, days_back: int) -> date:
+    """Return the date that is `days_back` business days before d."""
+    cur = d
+    n = days_back
+    while n &gt; 0:
+        cur -= timedelta(days=1)
+        if is_business_day(cur):
+            n -= 1
+    return cur
+
+def payroll_window(today: date, effective: date,
+                   country: str = "US",
+                   lock_business_days_before_eom: int = 5) -> dict:
+    """For a monthly payroll cycle with cutoff `lock_business_days_before_eom`
+    business days before the end of the month."""
+    target_month = effective.month
+    target_year = effective.year
+    last_day = date(target_year, target_month, monthrange(target_year, target_month)[1])
+    cutoff = shift_business_days(last_day, lock_business_days_before_eom)
+    locked = today &gt; cutoff
+    cycle = f"{target_year}-{target_month:02d}"
+    return {
+        "cycle": cycle,
+        "cutoff": cutoff,
+        "locked": locked,
+        "days_to_cutoff": (cutoff - today).days,
+    }</code></pre>
+</div>
+
+      <p>Discuss: production version uses a real holiday calendar per country; this is the skeleton.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p5">
+  <h2><span class="step-num">5</span>Workday-EIB-style flat-file transformation
+    <button class="practice-check" data-id="p5">practiced</button>
+  </h2>
+  <p><span class="tag string">Transform</span></p>
+  <p><strong>Prompt:</strong> Given a list of proposed job-change dicts, emit an EIB-ready CSV with exact column order, mandatory fields, ISO-date strings, and one comment column that concatenates rationale and source-run-id for traceability.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import csv, io
+from datetime import date
+
+EIB_COLUMNS = [
+    "Employee_ID", "Effective_Date", "New_Position_ID",
+    "New_Job_Profile", "New_Supervisor_ID", "New_Location",
+    "New_FTE", "Reason_Code", "Business_Process_Comment",
+]
+REQUIRED = {"Employee_ID", "Effective_Date", "Reason_Code"}
+
+def to_eib_csv(proposals: list[dict], run_id: str) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=EIB_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for p in proposals:
+        row = {
+            "Employee_ID": p["employee_id"],
+            "Effective_Date": p["effective_date"].isoformat()
+                if isinstance(p["effective_date"], date) else p["effective_date"],
+            "New_Position_ID": p.get("new_position_id", ""),
+            "New_Job_Profile": p.get("new_job_profile", ""),
+            "New_Supervisor_ID": p.get("new_supervisor_id", ""),
+            "New_Location": p.get("new_location", ""),
+            "New_FTE": f"{p['new_fte']:.4f}" if p.get("new_fte") is not None else "",
+            "Reason_Code": p["reason_code"],
+            "Business_Process_Comment": f"{p.get('rationale','')} [run:{run_id} proposal:{p['proposal_id']}]",
+        }
+        missing = [k for k in REQUIRED if not row[k]]
+        if missing:
+            raise ValueError(f"Missing required EIB fields {missing} for {p}")
+        writer.writerow(row)
+    return buf.getvalue()</code></pre>
+</div>
+
+      <p>Discuss: header text and column order are part of the Workday EIB template contract — drifting from either breaks the upload. Production: snapshot-test the output against a canonical EIB header.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p6">
+  <h2><span class="step-num">6</span>Idempotency-key design for hire-rehire scenarios
+    <button class="practice-check" data-id="p6">practiced</button>
+  </h2>
+  <p><span class="tag string">Idempotency</span></p>
+  <p><strong>Prompt:</strong> Design an idempotency-key scheme for "hire" proposals such that (a) retries of the same logical hire collapse to one effect, (b) a rehire of the same person 3 years later does <em>not</em> collapse with the original.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+      <p>The key encodes the <em>intent of this hire event</em>, not just the person:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import hashlib
+
+def hire_idempotency_key(applicant_id: str,
+                         hire_date: str,
+                         position_id: str,
+                         intent_window_days: int = 7) -> str:
+    """A hire proposal is the same logical event when:
+       - same applicant
+       - same intended position
+       - hire_date within `intent_window_days` of original
+
+    Implementation: bucket the hire_date into `intent_window_days` periods so
+    near-equal dates collide but distant dates don't.
+    """
+    from datetime import date
+    hd = date.fromisoformat(hire_date)
+    bucket = hd.toordinal() // intent_window_days
+    raw = f"hire:{applicant_id}:{position_id}:bucket={bucket}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]</code></pre>
+</div>
+
+      <p>Why this works:</p>
+      <ul>
+        <li>Two retries of "hire applicant ASH-1 to position P-99 effective 2026-06-01" produce the same key.</li>
+        <li>A retry with hire_date shifted by 2 days (operator edit) still produces the same key — the intent didn't change.</li>
+        <li>A rehire 3 years later — same applicant, possibly same position — produces a different bucket, different key. No collision.</li>
+        <li>A rehire to a <em>different</em> position is trivially a different key.</li>
+      </ul>
+      <div class="callout insight">
+        <span class="callout-label">Senior signal</span>
+        <p>Articulating the <em>business intent</em> the key represents (not just "hash the request") is what distinguishes this answer. Mention the failure modes of naïve hashing (any field change creates a new key, defeating retry safety) and over-collapsing (rehire silently no-ops).</p>
+      </div>
+    </div>
+  </details>
+</section>
+
+<section id="p7">
+  <h2><span class="step-num">7</span>Tenure-aware leave accrual
+    <button class="practice-check" data-id="p7">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Date math</span></p>
+  <p><strong>Prompt:</strong> Compute accrued PTO days for a worker from hire date through today, given:
+    1.25 days/month for first year, 1.5 days/month thereafter, with a 30-day cap. Pro-rate the month they were hired in.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date
+from calendar import monthrange
+
+def accrued_pto(hire_date: date, as_of: date,
+                rate_first_year: float = 1.25,
+                rate_after: float = 1.5,
+                cap_days: float = 30.0) -> float:
+    if as_of &lt; hire_date:
+        return 0.0
+    total = 0.0
+    # First (possibly partial) month
+    first_month_days = monthrange(hire_date.year, hire_date.month)[1]
+    days_in_first = first_month_days - hire_date.day + 1
+    fraction = days_in_first / first_month_days
+    rate = rate_first_year  # they're definitely &lt; 1y at hire
+    total += rate * fraction
+
+    cur = date(hire_date.year, hire_date.month, 1)
+    # Advance to next month
+    cur = (date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1))
+    while cur &lt;= as_of:
+        # Is this month &lt; 12 months of tenure?
+        anniv = date(hire_date.year + 1, hire_date.month, hire_date.day)
+        rate = rate_first_year if cur &lt; anniv else rate_after
+        # Was this month complete by as_of?
+        last_day = date(cur.year, cur.month, monthrange(cur.year, cur.month)[1])
+        if as_of &gt;= last_day:
+            total += rate
+        else:
+            partial = (as_of.day) / monthrange(cur.year, cur.month)[1]
+            total += rate * partial
+        # Next month
+        cur = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
+    return min(total, cap_days)</code></pre>
+</div>
+
+      <p>Discuss: real plans have many wrinkles (carryover, jurisdictional minimums, accrual on unpaid leave). State you're solving the named version; production: configurable plan model.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p8">
+  <h2><span class="step-num">8</span>Org reorg cascade
+    <button class="practice-check" data-id="p8">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Graph</span></p>
+  <p><strong>Prompt:</strong> A supervisory org tree is a forest of parent → children. Given a worker's old manager and new manager, compute every worker whose "skip-level chain" changed.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from collections import deque
+
+def descendants(children: dict[str, list[str]], root: str) -> set[str]:
+    """All workers under `root` inclusive, BFS."""
+    seen = {root}
+    q = deque([root])
+    while q:
+        cur = q.popleft()
+        for c in children.get(cur, []):
+            if c not in seen:
+                seen.add(c)
+                q.append(c)
+    return seen
+
+def affected_by_reorg(children: dict[str, list[str]],
+                      moving_worker: str) -> set[str]:
+    """Every worker whose skip-level chain changed when `moving_worker` (and
+    everyone reporting under them) moves. That's the subtree rooted at the
+    moving worker."""
+    return descendants(children, moving_worker)</code></pre>
+</div>
+
+      <p>Discuss: the "skip-level chain changed" set is the moved subtree, since their direct chain to root changes. If the question is about <em>who reports to whom changes</em>, it's the same subtree minus the moving worker (whose <em>direct</em> manager changes, plus everyone whose skip-level shifts).</p>
+    </div>
+  </details>
+</section>
+
+<section id="p9">
+  <h2><span class="step-num">9</span>Overlapping leave windows
+    <button class="practice-check" data-id="p9">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Sort + sweep</span></p>
+  <p><strong>Prompt:</strong> Given a list of leave records per worker (start, end, type), detect any overlaps for the same worker. Return overlapping pairs.</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from collections import defaultdict
+
+def detect_leave_overlaps(leaves: list[dict]) -> list[tuple[dict, dict]]:
+    by_worker = defaultdict(list)
+    for l in leaves:
+        by_worker[l["worker_id"]].append(l)
+    overlaps = []
+    for worker_id, lst in by_worker.items():
+        lst.sort(key=lambda x: (x["start"], x["end"]))
+        for i in range(1, len(lst)):
+            # Overlap if current.start &lt;= prev.end
+            if lst[i]["start"] &lt;= lst[i-1]["end"]:
+                overlaps.append((lst[i-1], lst[i]))
+    return overlaps</code></pre>
+</div>
+
+      <p>Complexity: O(n log n) per worker for sort. Edge: same-day adjacent windows — clarify inclusive/exclusive end-date convention.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p10">
+  <h2><span class="step-num">10</span>Active-day count over a range
+    <button class="practice-check" data-id="p10">practiced</button>
+  </h2>
+  <p><span class="tag pointers">Interval</span></p>
+  <p><strong>Prompt:</strong> Given a worker's hire and termination dates, count how many days they were active within a given date range [range_start, range_end].</p>
+
+  <details class="reveal">
+    <summary>Show solution</summary>
+    <div class="reveal-body">
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date
+
+def active_days_in_range(hire: date, term: date | None,
+                         range_start: date, range_end: date) -> int:
+    if range_end &lt; range_start:
+        return 0
+    start = max(hire, range_start)
+    end = min(term, range_end) if term else range_end
+    if end &lt; start:
+        return 0
+    return (end - start).days + 1  # inclusive both ends</code></pre>
+</div>
+
+      <p>Useful for FTE-weighted headcount, payroll period proration, and accrual calculations.</p>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Coding fundamentals</a> · <a href="12-data-pipelines.html">Next: Data &amp; pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

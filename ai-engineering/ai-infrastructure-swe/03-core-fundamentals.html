@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — Rust + Distributed Systems</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#ownership">Ownership &amp; borrowing</a>
+    <a href="#lifetimes">Lifetimes</a>
+    <a href="#shared-state">Arc, Mutex, RwLock</a>
+    <a href="#channels">Channels</a>
+    <a href="#tokio-basics">Tokio async basics</a>
+    <a href="#actor">The actor pattern</a>
+    <a href="#cap">CAP and consistency</a>
+    <a href="#idempotency">Idempotency</a>
+    <a href="#retries">Retries and backoff</a>
+    <a href="#timeouts">Timeouts and deadlines</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The Rust + distributed-systems foundation everything else builds on. If you only know two things cold for this interview, make it these.</p>
+</header>
+
+<section id="ownership">
+  <h2>Ownership and borrowing</h2>
+  <p>Rust's core idea: every value has a single owner; references are either one mutable <code>&amp;mut T</code> <em>or</em> any number of shared <code>&amp;T</code> at a time, never both. The compiler enforces this. The consequence: no data races at compile time, no use-after-free, no double-free.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">fn consume(s: String) {
+    println!("{}", s);
+} // s dropped here
+
+fn borrow(s: &amp;str) {
+    println!("{}", s);
+}
+
+let owned = String::from("hello");
+borrow(&amp;owned);   // OK — shared borrow
+consume(owned);   // moves ownership
+// borrow(&amp;owned); // compile error — owned is gone
+</code></pre></div>
+  <p>The interview answer when asked "what's special about Rust": ownership + borrowing give you memory safety <em>without</em> a garbage collector. That's the whole pitch for the language in latency-sensitive infra.</p>
+</section>
+
+<section id="lifetimes">
+  <h2>Lifetimes</h2>
+  <p>A lifetime is the compiler's way of asking "does this reference live long enough?" Most of the time they're inferred. They show up explicitly when a return value's reference depends on input lifetimes:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// The returned slice can't outlive the input slice.
+fn first_word&lt;'a&gt;(s: &amp;'a str) -&gt; &amp;'a str {
+    s.split_whitespace().next().unwrap_or("")
+}
+</code></pre></div>
+  <p>For interviews: know that <code>'static</code> means "lives for the whole program," know elision rules exist (you don't need to memorize them), and know that lifetimes are <em>not</em> runtime — they're compile-time annotations the borrow checker uses.</p>
+</section>
+
+<section id="shared-state">
+  <h2>Arc, Mutex, RwLock — sharing state across tasks</h2>
+  <p>Tokio tasks run on a shared pool of threads, so shared state must be thread-safe. The standard kit:</p>
+  <table>
+    <thead><tr><th>Type</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>Arc&lt;T&gt;</code></td><td>You need shared ownership of immutable data across tasks/threads.</td></tr>
+      <tr><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></td><td>Shared, mutable state with one writer at a time. Use <code>tokio::sync::Mutex</code> if you'll hold the guard across <code>.await</code>; <code>std::sync::Mutex</code> if not.</td></tr>
+      <tr><td><code>Arc&lt;RwLock&lt;T&gt;&gt;</code></td><td>Many readers, occasional writers. Use only when read contention dominates.</td></tr>
+      <tr><td><code>Arc&lt;AtomicU64&gt;</code> etc.</td><td>Simple counters, flags. Lock-free.</td></tr>
+      <tr><td><code>dashmap::DashMap</code></td><td>Concurrent hashmap; sharded locking.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">The classic footgun</span>
+    <p>Holding a <code>std::sync::Mutex</code> guard across a <code>.await</code> blocks the executor thread. Use <code>tokio::sync::Mutex</code> if the critical section must await — but better, restructure to avoid holding the lock across awaits. This is asked in interviews constantly.</p>
+  </div>
+</section>
+
+<section id="channels">
+  <h2>Channels</h2>
+  <p>Channels are how Rust tasks communicate without sharing state. Four flavors you'll see:</p>
+  <table>
+    <thead><tr><th>Channel</th><th>Senders</th><th>Receivers</th><th>Bounded?</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>tokio::sync::mpsc</code></td><td>Many</td><td>One</td><td>Yes (recommended)</td><td>Worker pool inbox, request queue</td></tr>
+      <tr><td><code>tokio::sync::oneshot</code></td><td>One</td><td>One</td><td>1</td><td>Reply channel for a single request</td></tr>
+      <tr><td><code>tokio::sync::broadcast</code></td><td>Many</td><td>Many (each gets a copy)</td><td>Yes</td><td>Fan-out events, shutdown signals</td></tr>
+      <tr><td><code>tokio::sync::watch</code></td><td>One</td><td>Many (latest value only)</td><td>1 latest</td><td>Config updates, leader-election state</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Bounded vs unbounded:</strong> always prefer bounded. Unbounded channels are infinite buffers — under load they become unbounded memory growth. Bounded channels apply backpressure (sender awaits when full), which is what you want.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::sync::mpsc;
+
+let (tx, mut rx) = mpsc::channel::&lt;Request&gt;(1024); // bounded
+
+// producer
+tokio::spawn(async move {
+    for req in incoming {
+        tx.send(req).await.expect("receiver dropped"); // awaits when full
+    }
+});
+
+// consumer
+while let Some(req) = rx.recv().await {
+    handle(req).await;
+}
+</code></pre></div>
+</section>
+
+<section id="tokio-basics">
+  <h2>Tokio async basics</h2>
+  <p>You will be expected to talk about this fluently. The minimum:</p>
+  <ul>
+    <li><strong>Future</strong> — a value that, when polled, eventually produces a result. Rust futures are <em>lazy</em>: nothing happens until something polls them (or they're spawned on a runtime).</li>
+    <li><strong>async fn</strong> — desugars to a function returning <code>impl Future&lt;Output = T&gt;</code>. The compiler generates a state machine.</li>
+    <li><strong>.await</strong> — yields control if the future isn't ready, lets the executor run other tasks.</li>
+    <li><strong>Task</strong> — a future the runtime owns and polls. Created with <code>tokio::spawn</code>. Cheap (~hundreds of bytes), can have millions concurrent.</li>
+    <li><strong>Executor</strong> — the thing that polls futures. Tokio's default is a multi-threaded work-stealing executor.</li>
+  </ul>
+  <p>The core insight: async Rust gives you concurrency without paying per-task threads. Idle tasks don't occupy a thread, so you can have hundreds of thousands of in-flight requests waiting on I/O on a small thread pool. Critical for an inference gateway where most tasks spend their life waiting on a model server.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">#[tokio::main]
+async fn main() {
+    let handle = tokio::spawn(async {
+        do_some_io().await
+    });
+    let result = handle.await.unwrap();
+    println!("{:?}", result);
+}
+</code></pre></div>
+  <p>See <a href="04-deep-dive-primary.html">04-deep-dive-primary</a> for the work-stealing internals, blocking vs cooperative, and backpressure patterns.</p>
+</section>
+
+<section id="actor">
+  <h2>The actor pattern</h2>
+  <p>An actor is a task that owns some state and processes messages from a channel. Used heavily in Rust services to avoid shared-mutable state.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::sync::{mpsc, oneshot};
+
+enum CacheMsg {
+    Get { key: String, reply: oneshot::Sender&lt;Option&lt;String&gt;&gt; },
+    Put { key: String, value: String },
+}
+
+async fn cache_actor(mut rx: mpsc::Receiver&lt;CacheMsg&gt;) {
+    let mut store = std::collections::HashMap::new();
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            CacheMsg::Get { key, reply } =&gt; {
+                let _ = reply.send(store.get(&amp;key).cloned());
+            }
+            CacheMsg::Put { key, value } =&gt; {
+                store.insert(key, value);
+            }
+        }
+    }
+}
+</code></pre></div>
+  <p>Why this matters: in agent orchestration you'll often want per-run state (the plan, the partial outputs, the cancellation flag) owned by exactly one task. The actor pattern is the idiomatic way.</p>
+</section>
+
+<section id="cap">
+  <h2>CAP and consistency models</h2>
+  <p>The interview-grade version, in 90 seconds:</p>
+  <ul>
+    <li><strong>CAP</strong> — in a network partition, you choose either consistency (CP) or availability (AP). You cannot have both. Most production systems are AP with eventual consistency for most state and CP for a small set of critical writes.</li>
+    <li><strong>Strong consistency</strong> — every read returns the latest committed write. Postgres single-leader, Spanner. Expensive.</li>
+    <li><strong>Eventual consistency</strong> — reads may be stale, will converge. DynamoDB, Cassandra defaults. Cheap, scalable.</li>
+    <li><strong>Read-your-writes</strong> — a user's own writes are visible to their subsequent reads, even if others see stale.</li>
+    <li><strong>Linearizable</strong> — global real-time order. Hard.</li>
+  </ul>
+  <p>For AI infra: your run state (which step is the agent on?) wants strong consistency — Postgres or Raft-backed KV. Your eval/audit log is append-only and tolerates eventual consistency. Your inference response cache tolerates staleness.</p>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency</h2>
+  <p>An operation is idempotent if doing it twice has the same effect as doing it once. In a distributed system, where retries are inevitable and you can't tell "did the network swallow my reply, or did the operation fail?" — idempotency is what saves you.</p>
+  <p>The pattern: the caller generates a unique key, sends it with the request, the server records "I already did this key → here's the result," and on retry returns the recorded result instead of re-executing.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// Pseudocode
+async fn submit(req: ToolCall, idem_key: Uuid) -&gt; Result&lt;Response&gt; {
+    if let Some(cached) = store.get(&amp;idem_key).await? {
+        return Ok(cached);
+    }
+    let result = execute(req).await?;
+    store.put(&amp;idem_key, &amp;result, TTL).await?;
+    Ok(result)
+}
+</code></pre></div>
+  <p>For agent infra: every side-effecting tool call gets an idempotency key. Plan-step retries do not duplicate side effects.</p>
+</section>
+
+<section id="retries">
+  <h2>Retries and backoff</h2>
+  <p>Naive retry — "if it failed, try again immediately" — causes <strong>retry storms</strong>. The whole fleet retries at the same time after a partial outage, and the recovering service falls over again. The mitigations:</p>
+  <ul>
+    <li><strong>Exponential backoff</strong> — 100ms, 200ms, 400ms, 800ms... cap at some max.</li>
+    <li><strong>Jitter</strong> — randomize within the backoff window. Decorrelates retries across the fleet.</li>
+    <li><strong>Retry budget</strong> — limit total retries as a fraction of total requests (e.g., ≤10%). Stops retry from amplifying load.</li>
+    <li><strong>Retry only safe-to-retry errors</strong> — 5xx and network errors generally; never blindly retry 4xx.</li>
+    <li><strong>Idempotency keys</strong> — see above; required for write retries.</li>
+    <li><strong>Circuit breaker</strong> — see <a href="08-error-handling.html">08-error-handling</a>. After enough failures, stop trying for a while.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use rand::Rng;
+use std::time::Duration;
+use tokio::time::sleep;
+
+async fn with_backoff&lt;F, Fut, T, E&gt;(mut op: F, max_attempts: u32) -&gt; Result&lt;T, E&gt;
+where
+    F: FnMut() -&gt; Fut,
+    Fut: std::future::Future&lt;Output = Result&lt;T, E&gt;&gt;,
+{
+    let mut delay_ms = 100u64;
+    for attempt in 1..=max_attempts {
+        match op().await {
+            Ok(v) =&gt; return Ok(v),
+            Err(e) if attempt == max_attempts =&gt; return Err(e),
+            Err(_) =&gt; {
+                let jitter: u64 = rand::thread_rng().gen_range(0..delay_ms);
+                sleep(Duration::from_millis(delay_ms + jitter)).await;
+                delay_ms = (delay_ms * 2).min(10_000);
+            }
+        }
+    }
+    unreachable!()
+}
+</code></pre></div>
+</section>
+
+<section id="timeouts">
+  <h2>Timeouts and deadlines</h2>
+  <p>Every network call needs a timeout. Every nested call needs a <em>deadline</em>, not just a local timeout. The difference matters:</p>
+  <ul>
+    <li><strong>Timeout</strong> — "I'll wait up to N ms for this call." Local to one call.</li>
+    <li><strong>Deadline</strong> — "the whole request must finish by wall-clock time T." Propagated through every downstream call. If a downstream call has 50ms budget left, that's what it gets, not the default 5s.</li>
+  </ul>
+  <p>gRPC supports deadlines natively (and tonic forwards them). Without deadline propagation, a slow upstream cascades into wasted downstream work — the user already gave up but the inference call is still running.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::time::Duration;
+use tokio::time::timeout;
+
+let result = timeout(Duration::from_millis(500), call_model(req)).await;
+match result {
+    Ok(Ok(resp)) =&gt; { /* success */ }
+    Ok(Err(e))   =&gt; { /* call failed */ }
+    Err(_elapsed) =&gt; { /* timed out */ }
+}
+</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Interview line</span>
+    <p>"Timeout, retry, idempotency, backpressure — those are the four primitives. Every distributed-systems failure question reduces to combining them correctly for the specific call."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Positioning</a> · <a href="04-deep-dive-primary.html">Next: High-perf Rust services →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

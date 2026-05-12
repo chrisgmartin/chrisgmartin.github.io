@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 05 — Observability</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what">What to measure</a>
+    <a href="#prom">Prometheus metrics</a>
+    <a href="#instrument">Instrument the proxy</a>
+    <a href="#otel">OpenTelemetry traces</a>
+    <a href="#compose">Local stack with Docker</a>
+    <a href="#look">Look at it</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-circuit-breakers-hedging.html">← Previous</a>
+    <a href="06-docker-and-deploy.html">Next: Docker &amp; deploy →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 05 · ~25 minutes</span>
+  <h1>Observability</h1>
+  <p class="subtitle">Prometheus counters, latency histograms, OTLP traces — wired into a local Grafana + Jaeger stack so you can actually see the numbers move.</p>
+</header>
+
+<section id="what">
+  <h2>What to measure</h2>
+  <p>The minimum useful set for an inference gateway:</p>
+  <ul>
+    <li><strong>infergw_requests_total{route, status}</strong> — request counter, partitioned by route and HTTP status class.</li>
+    <li><strong>infergw_request_duration_seconds{route}</strong> — histogram, so you can derive p50/p95/p99.</li>
+    <li><strong>infergw_upstream_errors_total{reason}</strong> — every time the upstream call fails, partition by reason (connect, timeout, status, chunk).</li>
+    <li><strong>infergw_coalesce_followers_total</strong> — how often coalescing actually saved a call.</li>
+    <li><strong>infergw_breaker_state</strong> — gauge, 0=closed, 1=half-open, 2=open. So you can alert on prolonged open state.</li>
+    <li><strong>infergw_hedges_fired_total</strong> — how often the backup request actually fired.</li>
+    <li><strong>infergw_inflight</strong> — gauge of currently-active requests, the closest thing to queue depth.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Why these and not more</span>
+    <p>Every metric costs cardinality, scrape time, and brainspace at 3 AM. Start with the seven above and add one only when you can name the specific question it answers. The metric you'll wish you had during an incident is almost always one of these — request counts by status, latency distribution, upstream error class, breaker state.</p>
+  </div>
+</section>
+
+<section id="prom">
+  <h2>Prometheus metrics</h2>
+  <p>The Rust ecosystem has two main choices: the <code>prometheus</code> crate (battle-tested, slightly verbose) and the <code>metrics</code> + <code>metrics-exporter-prometheus</code> facade (more ergonomic, slightly newer). We'll use the latter.</p>
+
+  <p>Add to <code>infergw/Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">metrics                     = "0.23"
+metrics-exporter-prometheus = "0.15"</code></pre>
+</div>
+
+  <p>Create <code>infergw/src/metrics.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+pub fn install() -&gt; anyhow::Result&lt;PrometheusHandle&gt; {
+    let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Prefix("infergw_request_duration".into()),
+            &amp;[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+        )?
+        .install_recorder()?;
+
+    // Pre-declare gauges so they show up at zero before the first event.
+    metrics::describe_counter!("infergw_requests_total",         "request counter");
+    metrics::describe_histogram!("infergw_request_duration_seconds", "request duration");
+    metrics::describe_counter!("infergw_upstream_errors_total",  "upstream errors");
+    metrics::describe_counter!("infergw_coalesce_followers_total","coalesced followers");
+    metrics::describe_gauge!("infergw_breaker_state",            "0=closed 1=half 2=open");
+    metrics::describe_counter!("infergw_hedges_fired_total",     "hedge backups fired");
+    metrics::describe_gauge!("infergw_inflight",                 "in-flight requests");
+
+    Ok(handle)
+}</code></pre>
+</div>
+
+  <p>Custom histogram buckets matter: the default Prometheus buckets are tuned for HTTP at human timescales (0.005 → 10 seconds). LLM streaming responses easily run 5–30 seconds, so the bucket at 10 seconds is your "tail" boundary. Add 30s on the high end and you'll catch the truly slow ones.</p>
+
+  <p>Wire a <code>/metrics</code> route. Update <code>infergw/src/routes.rs</code> to take a handle:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use metrics_exporter_prometheus::PrometheusHandle;
+
+#[derive(Clone)]
+pub struct AppState {
+    // ... existing fields
+    pub metrics_handle: PrometheusHandle,
+}
+
+impl AppState {
+    pub fn new(upstream: Upstream, hedge_after_ms: u64, metrics_handle: PrometheusHandle) -&gt; Self {
+        Self {
+            // ... existing init
+            metrics_handle,
+        }
+    }
+}
+
+pub fn router(state: AppState) -&gt; Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_endpoint))
+        .route("/v1/chat/completions", post(crate::proxy::chat_completions))
+        .with_state(state)
+}
+
+async fn metrics_endpoint(
+    axum::extract::State(state): axum::extract::State&lt;AppState&gt;,
+) -&gt; impl IntoResponse {
+    state.metrics_handle.render()
+}</code></pre>
+</div>
+
+  <p>And wire in <code>main.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">mod metrics;
+// ...
+let handle = metrics::install()?;
+let state = routes::AppState::new(upstream, cfg.hedge_after_ms, handle);</code></pre>
+</div>
+</section>
+
+<section id="instrument">
+  <h2>Instrument the proxy</h2>
+  <p>Sprinkle the events at the right spots. In <code>proxy.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::time::Instant;
+
+pub async fn chat_completions(
+    State(state): State&lt;AppState&gt;,
+    Json(body): Json&lt;Value&gt;,
+) -&gt; Result&lt;Response, ProxyError&gt; {
+    let started = Instant::now();
+    metrics::gauge!("infergw_inflight").increment(1.0);
+
+    let result = chat_completions_inner(state.clone(), body).await;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    metrics::histogram!("infergw_request_duration_seconds",
+        "route" =&gt; "chat_completions").record(elapsed);
+    let status = if result.is_ok() { "2xx" } else { "5xx" };
+    metrics::counter!("infergw_requests_total",
+        "route" =&gt; "chat_completions",
+        "status" =&gt; status).increment(1);
+    metrics::gauge!("infergw_inflight").decrement(1.0);
+
+    // Update breaker state gauge.
+    let bs = match state.breaker.state() {
+        crate::breaker::State::Closed   =&gt; 0.0,
+        crate::breaker::State::HalfOpen =&gt; 1.0,
+        crate::breaker::State::Open     =&gt; 2.0,
+    };
+    metrics::gauge!("infergw_breaker_state").set(bs);
+
+    result
+}
+
+async fn chat_completions_inner(state: AppState, body: Value)
+    -&gt; Result&lt;Response, ProxyError&gt; {
+    // ... existing logic from Chapter 03/04, with a few targeted counter bumps
+    // (left as edits to the existing function rather than a full rewrite).
+}</code></pre>
+</div>
+
+  <p>In the leader's failure path, increment by reason:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">// inside spawn_leader, on Err branches:
+metrics::counter!("infergw_upstream_errors_total",
+    "reason" =&gt; "send_failed").increment(1);
+// or "status_non_2xx", "chunk_error", "breaker_open", "hedge_failed"</code></pre>
+</div>
+
+  <p>In the coalescer's follower branch:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">JoinResult::Follower(inflight) =&gt; {
+    metrics::counter!("infergw_coalesce_followers_total").increment(1);
+    // ... existing follower setup
+}</code></pre>
+</div>
+
+  <p>In the hedge module, increment when the backup actually fires:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">if winner_tx.lock().await.is_some() {
+    metrics::counter!("infergw_hedges_fired_total").increment(1);
+    tracing::info!("hedge: firing backup request");
+    // ...
+}</code></pre>
+</div>
+
+  <p>Now verify it works:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo run -p infergw
+# In another terminal:
+curl -s http://127.0.0.1:8080/metrics | grep -E '^infergw_' | head -30</code></pre>
+</div>
+
+  <p>You should see all your metric families listed with HELP / TYPE comments and current values. Fire a few requests and re-scrape — the counters go up.</p>
+</section>
+
+<section id="otel">
+  <h2>OpenTelemetry traces</h2>
+  <p>Metrics tell you <em>what</em> happened in aggregate. Traces tell you <em>why</em> a particular request was slow — by stitching together the time spent in each stage. We'll emit OTLP over gRPC to a Jaeger-compatible collector.</p>
+
+  <p>Add to <code>infergw/Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">opentelemetry            = { version = "0.24", features = ["trace"] }
+opentelemetry_sdk        = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp       = { version = "0.17", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry    = "0.25"</code></pre>
+</div>
+
+  <p>Update <code>infergw/src/telemetry.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{trace as sdktrace, Resource};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+pub fn init_tracing() -&gt; anyhow::Result&lt;()&gt; {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("infergw=info,tower_http=info"));
+
+    let json_mode = std::env::var("INFERGW_LOG_JSON")
+        .ok().map(|v| v == "1").unwrap_or(false);
+
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let registry = tracing_subscriber::registry().with(filter);
+
+    if let Some(endpoint) = otlp_endpoint {
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(endpoint);
+        let provider = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(exporter)
+            .with_trace_config(
+                sdktrace::Config::default().with_resource(Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "infergw"),
+                ])),
+            )
+            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+        let tracer = provider.tracer("infergw");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        if json_mode {
+            registry.with(otel_layer).with(fmt::layer().json()).init();
+        } else {
+            registry.with(otel_layer).with(fmt::layer().compact()).init();
+        }
+    } else if json_mode {
+        registry.with(fmt::layer().json()).init();
+    } else {
+        registry.with(fmt::layer().compact()).init();
+    }
+    Ok(())
+}
+
+pub fn shutdown() {
+    opentelemetry::global::shutdown_tracer_provider();
+}</code></pre>
+</div>
+
+  <p>And call <code>telemetry::shutdown()</code> at the end of <code>main</code> so the OTLP exporter flushes pending spans before exit.</p>
+
+  <p>Now decorate the handler with a span. In <code>proxy.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use tracing::Instrument;
+
+pub async fn chat_completions(
+    State(state): State&lt;AppState&gt;,
+    Json(body): Json&lt;Value&gt;,
+) -&gt; Result&lt;Response, ProxyError&gt; {
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let span = tracing::info_span!("chat_completions", model = %model);
+    chat_completions_inner_instrumented(state, body).instrument(span).await
+}</code></pre>
+</div>
+
+  <p>Inside the function, additional spans for upstream calls and coalescer joins:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">let _span_guard = tracing::info_span!("upstream_call", url = %url).entered();</code></pre>
+</div>
+
+  <p>Span guards work great in synchronous sections; in async, prefer <code>.instrument(span)</code>. The pattern's worth getting right — wrong instrumentation in async produces traces that are technically valid but useless.</p>
+</section>
+
+<section id="compose">
+  <h2>Local stack with Docker Compose</h2>
+  <p>Save this as <code>infergw-workspace/observability/docker-compose.yml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-yaml">services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  grafana:
+    image: grafana/grafana:10.4.3
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    ports:
+      - "3000:3000"</code></pre>
+</div>
+
+  <p>And <code>infergw-workspace/observability/prometheus.yml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-yaml">global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: infergw
+    static_configs:
+      - targets: ['host.docker.internal:8080']  # macOS/Win
+        # on Linux: use the host's LAN IP, or run infergw in a container too</code></pre>
+</div>
+
+  <p>Bring it up:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cd observability
+docker compose up -d</code></pre>
+</div>
+
+  <p>Then run the gateway with OTLP enabled:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+  cargo run -p infergw</code></pre>
+</div>
+</section>
+
+<section id="look">
+  <h2>Look at it</h2>
+  <p>Fire some traffic:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">for i in $(seq 1 20); do
+  curl -sN -o /dev/null \
+    -H 'content-type: application/json' \
+    -d "{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"req $i\"}],\"stream\":true}" \
+    http://127.0.0.1:8080/v1/chat/completions
+done</code></pre>
+</div>
+
+  <p>Now visit:</p>
+  <ul>
+    <li><strong>Prometheus:</strong> <code>http://localhost:9090</code> → try <code>rate(infergw_requests_total[1m])</code> or <code>histogram_quantile(0.95, sum by (le) (rate(infergw_request_duration_seconds_bucket[1m])))</code>.</li>
+    <li><strong>Jaeger:</strong> <code>http://localhost:16686</code> → pick service "infergw", click "Find Traces". Each request appears as a span with nested upstream_call children. Click in for the timeline.</li>
+    <li><strong>Grafana:</strong> <code>http://localhost:3000</code> → add Prometheus (<code>http://prometheus:9090</code>) as a data source, then build a quick dashboard from the queries above.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">A starter PromQL set</span>
+    <p>Memorize these four queries and you'll cover 80% of incident response:</p>
+    <ul>
+      <li><code>sum(rate(infergw_requests_total[1m])) by (status)</code> — RPS by status class</li>
+      <li><code>histogram_quantile(0.99, sum by (le) (rate(infergw_request_duration_seconds_bucket[5m])))</code> — p99 latency</li>
+      <li><code>sum(rate(infergw_upstream_errors_total[1m])) by (reason)</code> — what's failing upstream</li>
+      <li><code>max_over_time(infergw_breaker_state[5m])</code> — has the breaker been open at all recently?</li>
+    </ul>
+  </div>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li><code>GET /metrics</code> returns Prometheus-format text, all seven metric families populated.</li>
+    <li>Prometheus scrapes the gateway every 5s and renders charts.</li>
+    <li>Jaeger receives traces and shows per-request span trees with upstream timing.</li>
+    <li>Counters move when you fire requests; the breaker gauge flips from 0 → 2 → 0 if you exercise it.</li>
+  </ul>
+
+  <p>You can now actually see what your gateway is doing in real time. That's the productivity unlock that makes the next chapter — making it deployable — worthwhile.</p>
+
+  <p style="margin-top: 24px;"><a href="06-docker-and-deploy.html"><strong>→ Chapter 06: Multi-stage Dockerfile and Kubernetes Deployment</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

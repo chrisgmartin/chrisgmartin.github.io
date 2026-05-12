@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#event-model">The payments event model</a>
+    <a href="#tokenization">Tokenization layer</a>
+    <a href="#auth-settle-events">Auth and settlement events</a>
+    <a href="#sources-of-truth">Sources of truth</a>
+    <a href="#recon">Daily reconciliation</a>
+    <a href="#crossborder">Cross-border reconciliation</a>
+    <a href="#messy">Why payments data is messy</a>
+    <a href="#warehouse">Warehouse vs operational stores</a>
+    <a href="#pm-asks">What a PM asks of the pipeline</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">A PM-eye view of payments data — events, tokenization, reconciliation, ledgers. You don't build this; you must understand it well enough to spec instrumentation and to read what comes out the other end.</p>
+</header>
+
+<section id="event-model">
+  <h2>The payments event model</h2>
+  <p>Payments are best modeled as an append-only event stream around a stable identity — the <strong>payment intent</strong>. Common events per intent:</p>
+  <table>
+    <thead><tr><th>Event</th><th>When emitted</th></tr></thead>
+    <tbody>
+      <tr><td><code>payment_intent.created</code></td><td>User initiates a deposit</td></tr>
+      <tr><td><code>payment_intent.requires_action</code></td><td>3DS challenge required</td></tr>
+      <tr><td><code>auth.attempted</code></td><td>Request sent to PSP</td></tr>
+      <tr><td><code>auth.approved</code> / <code>auth.declined</code></td><td>PSP responds</td></tr>
+      <tr><td><code>auth.cascaded</code></td><td>Failover to alternate PSP</td></tr>
+      <tr><td><code>capture.requested</code> / <code>capture.completed</code></td><td>If auth/capture is split</td></tr>
+      <tr><td><code>settlement.scheduled</code> / <code>settlement.completed</code></td><td>Funds moved by acquirer</td></tr>
+      <tr><td><code>refund.requested</code> / <code>refund.completed</code></td><td>Refund flow</td></tr>
+      <tr><td><code>dispute.opened</code> / <code>dispute.evidence_submitted</code> / <code>dispute.resolved</code></td><td>Chargeback lifecycle</td></tr>
+      <tr><td><code>ledger.posted</code></td><td>Internal ledger entry written</td></tr>
+    </tbody>
+  </table>
+  <p>Every event carries the stable <code>payment_intent_id</code> plus a monotonic sequence. Downstream consumers reconstruct state by replaying events.</p>
+</section>
+
+<section id="tokenization">
+  <h2>Tokenization — where raw card data ends and tokens begin</h2>
+  <p>From a data-pipeline perspective:</p>
+  <ul>
+    <li>Raw PAN enters at the edge (iframe / SDK / hosted-fields).</li>
+    <li>Vault receives it; returns a vault token (internal).</li>
+    <li>Vault token may map to a scheme-issued <strong>network token</strong> (VTS/MDES) used downstream.</li>
+    <li>Everything after the vault uses tokens, never PAN. PCI scope is the vault and its callers, only.</li>
+    <li>Analytics data should never have PAN. BIN is fine (first 6-8 digits); full PAN never lands in your warehouse.</li>
+  </ul>
+</section>
+
+<section id="auth-settle-events">
+  <h2>Auth and settlement events — they live in different streams</h2>
+  <p>Two distinct sources:</p>
+  <ul>
+    <li><strong>Authorization stream</strong> — synchronous, from PSP API responses. Real-time, per attempt.</li>
+    <li><strong>Settlement stream</strong> — asynchronous, from PSP daily files / SFTP / API pulls. Per batch.</li>
+  </ul>
+  <p>These do not arrive at the same time. Authorization is realtime. Settlement files often arrive T+1 morning. Reconciliation joins the two streams on intent ID and amount. Mismatches indicate problems.</p>
+</section>
+
+<section id="sources-of-truth">
+  <h2>Sources of truth — there are several</h2>
+  <table>
+    <thead><tr><th>Source</th><th>What it knows</th><th>Latency</th></tr></thead>
+    <tbody>
+      <tr><td>PSP API responses</td><td>Auth attempt outcome</td><td>Realtime</td></tr>
+      <tr><td>PSP settlement report</td><td>Funds actually moved</td><td>T+1 typical</td></tr>
+      <tr><td>Acquirer settlement file</td><td>Funds reaching the acquirer</td><td>T+1</td></tr>
+      <tr><td>Bank statement</td><td>Funds in your nostro</td><td>T+1 / EOD</td></tr>
+      <tr><td>Internal ledger</td><td>Customer balance state</td><td>Realtime (post-event)</td></tr>
+      <tr><td>Card scheme reports</td><td>Dispute / chargeback events</td><td>Days-weeks</td></tr>
+    </tbody>
+  </table>
+  <p>When sources disagree, your job is to define which wins for which question:</p>
+  <ul>
+    <li>"Was the customer credited?" → internal ledger.</li>
+    <li>"Did the acquirer get paid?" → settlement report.</li>
+    <li>"Did the funds hit our bank?" → bank statement.</li>
+    <li>"Is the customer about to chargeback?" → scheme report.</li>
+  </ul>
+</section>
+
+<section id="recon">
+  <h2>Daily reconciliation cycle</h2>
+  <p>Every morning, the recon job runs:</p>
+  <ol>
+    <li>Pull yesterday's PSP settlement files (SFTP, API, or via aggregator).</li>
+    <li>Parse and normalize into the canonical settlement event schema.</li>
+    <li>Join to internal auth events on intent_id + amount.</li>
+    <li>Compute three buckets: matched, mismatched, missing.</li>
+    <li>Surface to finance / treasury for human review.</li>
+    <li>Auto-resolve patterns we know (FX rounding deltas, fee adjustments).</li>
+    <li>Open tickets for genuine mismatches.</li>
+  </ol>
+  <p>PM lever: tighten the matching rules; reduce the manual queue; report weekly on "% of settlement auto-matched."</p>
+</section>
+
+<section id="crossborder">
+  <h2>Cross-border reconciliation — the harder version</h2>
+  <p>Same flow, plus:</p>
+  <ul>
+    <li>FX conversion at one or more legs — your quoted rate vs PSP's actual rate.</li>
+    <li>Currency-of-record at multiple ledgers — customer-currency, settlement-currency, base-currency.</li>
+    <li>Timezone misalignment — your "yesterday" and the partner's "yesterday" may differ.</li>
+    <li>Multiple correspondent banks for SWIFT corridors — each takes a cut.</li>
+  </ul>
+  <p>Senior pattern: <strong>shadow ledger in your base currency</strong>. Reconcile actual vs expected daily, route deltas to a "FX P&amp;L" account.</p>
+</section>
+
+<section id="messy">
+  <h2>Why payments data is messy</h2>
+  <p>Tell-tale signs you should be prepared to discuss:</p>
+  <ul>
+    <li><strong>Schema drift</strong> — each PSP has its own fields, casing, decline-code dictionary. Normalization is constant.</li>
+    <li><strong>Late events</strong> — settlements arrive T+N. Disputes arrive weeks later. Your "today's numbers" mutate.</li>
+    <li><strong>Idempotency artifacts</strong> — same event delivered twice; consumers must dedupe.</li>
+    <li><strong>Out-of-order events</strong> — webhook delivery is not ordered; you can see <code>captured</code> before <code>authorized</code>.</li>
+    <li><strong>Currency rounding</strong> — minor units differ (JPY has no decimals; BHD has 3).</li>
+    <li><strong>Partial refunds and disputes</strong> — multi-row events against one txn.</li>
+    <li><strong>Versioning</strong> — your decline-family taxonomy will evolve; analytics must handle historical breaks.</li>
+  </ul>
+</section>
+
+<section id="warehouse">
+  <h2>Warehouse vs operational stores</h2>
+  <p>Two different data surfaces:</p>
+  <ul>
+    <li><strong>Operational</strong> — Postgres / Cassandra-like. Realtime; low latency; supports the auth path. Per-record reads.</li>
+    <li><strong>Warehouse</strong> — Snowflake / BigQuery / Redshift. Batch loaded from operational + event stream. Analytics queries.</li>
+  </ul>
+  <p>For a PM: most of your analysis lives in the warehouse. Cohort cuts, AAR investigations, vendor scorecards. The operational store is for the real-time path. Don't confuse them in interview.</p>
+</section>
+
+<section id="pm-asks">
+  <h2>What a PM asks of the data pipeline</h2>
+  <ul>
+    <li>Every auth attempt logged with the canonical field set (see <a href="07-evaluation-quality.html">07</a>).</li>
+    <li>One stable identity (<code>payment_intent_id</code>) across attempts, captures, refunds, disputes.</li>
+    <li>Late-arriving events handled — yesterday's numbers can update, but with audit.</li>
+    <li>Settlement events joined to auth events automatically; mismatches alerted.</li>
+    <li>Dispute events linked to the underlying intent for representment context.</li>
+    <li>Warehouse refresh SLA — analytics should be at most a few hours stale, in most cases.</li>
+    <li>PII handled — no PAN in warehouse; BIN OK; tokenized identifiers only.</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Practice problems</a> · <a href="13-deployment-and-ops.html">Next: Launch &amp; ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

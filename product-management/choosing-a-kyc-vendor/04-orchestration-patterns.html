@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orchestration Patterns — Choosing a KYC Vendor</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout layout-wide">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#abstraction">Build an abstraction layer first</a>
+    <a href="#single">Single vendor</a>
+    <a href="#waterfall">Waterfall / cascade</a>
+    <a href="#ab">A/B / cohort</a>
+    <a href="#geo">Geo-routing</a>
+    <a href="#decision">Decision-engine</a>
+    <a href="#choose">How to choose</a>
+    <a href="#observability">Observability invariants</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-due-diligence.html">← Previous: Due Diligence</a>
+    <a href="05-pilot-and-rollout.html">Next: Pilot &amp; Rollout →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 04 · Working artifact</span>
+  <h1>Orchestration Patterns</h1>
+  <p class="subtitle">Five architectural patterns for routing verification traffic to one or more vendors — single, waterfall, A/B, geo-routed, and decision-engine. With trade-offs, when to pick each, and config-shape examples you can adapt.</p>
+</header>
+
+<section id="abstraction">
+  <h2>Build an abstraction layer first — before any pattern</h2>
+  <p>Whichever pattern you adopt, do not let vendor SDKs leak into your product domain. The single most reused piece of advice in this whole playbook: <strong>wrap the vendor in your own interface from day one</strong>, even if you only have one vendor.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+class Decision(str, Enum):
+    APPROVED       = "approved"
+    DECLINED       = "declined"
+    MANUAL_REVIEW  = "manual_review"
+    INDETERMINATE  = "indeterminate"   # rare; vendor failure / error
+
+@dataclass(frozen=True)
+class VerificationRequest:
+    user_id: str
+    jurisdiction: str            # ISO 3166-1 alpha-2
+    tier: str                    # "lite" | "full" | "kyb"
+    requested_modules: list[str] # ["doc", "biometric", "sanctions", "pep", "kyb"]
+    locale: str
+    return_url: str
+    idempotency_key: str
+
+@dataclass(frozen=True)
+class VerificationResult:
+    decision: Decision
+    confidence: float                          # 0.0–1.0
+    vendor: str
+    vendor_reference: str                      # vendor's case ID for audit
+    reasons: list[str]                         # vendor-mapped to your taxonomy
+    raw_response: dict                         # for audit; never surfaced to UI
+    latency_ms: int
+    cost_cents: int                            # for unit economics tracking
+    expires_at: Optional[str] = None           # for re-verification
+
+class IDVProvider:
+    """Vendor-agnostic interface. Every vendor adapter implements this."""
+    name: str
+    def start(self, req: VerificationRequest) -> str: ...           # returns session_id / URL
+    def status(self, session_id: str) -> VerificationResult: ...
+    def webhook(self, payload: dict, signature: str) -> VerificationResult: ...</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why this matters more than your vendor choice</span>
+    <p>The abstraction layer is what makes every other pattern in this chapter cheap. With it, swapping vendor B for vendor C is a 1-week engineering project. Without it, every pattern below becomes a 3-month rebuild. Build the abstraction even if you currently have only one vendor.</p>
+  </div>
+</section>
+
+<section id="single">
+  <h2>Pattern 1 — Single vendor</h2>
+  <p>One provider. Simplest. Sufficient for many companies.</p>
+
+  <div class="flow">      ┌────────────┐
+user ─►│ Your app   │─► Vendor A ─► Decision
+      └────────────┘</div>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>Cheapest to integrate and operate.</li>
+    <li>Best volume tier from a single vendor (better unit economics in pure terms).</li>
+    <li>Compliance posture is simple to explain to regulators.</li>
+    <li>One support escalation path during incidents.</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>No redundancy. Vendor outage = signup outage.</li>
+    <li>No negotiating leverage at renewal — they know you're locked in.</li>
+    <li>No A/B comparison to benchmark performance.</li>
+    <li>Geographic gaps in vendor's coverage become your gaps.</li>
+  </ul>
+
+  <h3>Pick this when</h3>
+  <p>Pre-product-market-fit; single jurisdiction; volume below ~250K checks/year. Plan to revisit at 500K+.</p>
+</section>
+
+<section id="waterfall">
+  <h2>Pattern 2 — Waterfall (cascade)</h2>
+  <p>Primary vendor handles everything. On rejection or indeterminate result, secondary vendor gets a second look. Reduces false-reject rate at the cost of unit economics and complexity.</p>
+
+  <div class="flow">      ┌────────────┐                    ┌────────────┐
+user ─►│ Your app   │── Vendor A ──reject──►│ Vendor B   │── decide
+      └────────────┘                    └────────────┘
+                  └─ approve ──────────────────► Decision
+                  └─ approve ──────────────────► Decision</div>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>Higher overall completion rate; recovers users vendor A would reject.</li>
+    <li>Some redundancy: if vendor A is degraded, you have an option.</li>
+    <li>Cleaner regulator story than parallel/A/B ("we use vendor A; we use B as backup").</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>You pay vendor A <em>and</em> vendor B for users that fall through.</li>
+    <li>Latency stacks: the worst case is vendor A timeout + vendor B full flow.</li>
+    <li>Vendor B is now in your data path — full DD applies to both vendors.</li>
+    <li>Decision provenance can confuse auditors: clearly tag which vendor's evidence the final decision rests on.</li>
+  </ul>
+
+  <h3>Config example</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml">orchestration:
+  pattern: waterfall
+  steps:
+    - vendor: vendor_a
+      stop_on: [approved]
+      fallback_on: [declined, indeterminate]
+      timeout_ms: 30000
+    - vendor: vendor_b
+      stop_on: [approved, declined]
+      fallback_on: [indeterminate]
+      timeout_ms: 30000
+  on_terminal_indeterminate: manual_review
+  audit:
+    record_all_vendor_responses: true
+    final_decision_provenance: "last_terminal_vendor"</code></pre></div>
+
+  <h3>Pick this when</h3>
+  <p>You have a measurable false-reject problem (≥3%) on your primary vendor. Or you operate in a jurisdiction where one vendor doesn't cover a meaningful sub-population (e.g., asylum-seeker documents). Don't adopt this <em>before</em> you've measured the false-reject; you'll just pay more.</p>
+</section>
+
+<section id="ab">
+  <h2>Pattern 3 — A/B (cohort split)</h2>
+  <p>Each user is assigned to a vendor based on a stable hash. You measure both in production and use the data to make a final call — or to keep both active as a benchmarking arrangement.</p>
+
+  <div class="flow">user ─► hash(user_id) % 100
+            │
+            ├─ 0–49  ──► Vendor A ──► Decision
+            └─ 50–99 ──► Vendor B ──► Decision</div>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>Real, head-to-head measurement on your population.</li>
+    <li>Ongoing negotiating leverage — both vendors know they're being compared.</li>
+    <li>Risk diversification: one vendor's outage takes 50% of users, not 100%.</li>
+    <li>Easy fallback if a vendor degrades — flip the % to 0 in seconds.</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>Worst volume tier — you split commitments across two vendors.</li>
+    <li>Inconsistent user experience (if you upsell to the same user later, the cohort lock-in matters).</li>
+    <li>More engineering: two integrations, two webhooks, two on-call escalation paths.</li>
+    <li>Regulator may ask "why two vendors" — answer should be measurement / redundancy, not "we couldn't decide."</li>
+  </ul>
+
+  <h3>Config example</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml">orchestration:
+  pattern: ab
+  assignment:
+    key: user_id
+    sticky: true
+    splits:
+      - vendor: vendor_a
+        weight: 50
+      - vendor: vendor_b
+        weight: 50
+  emergency_override:
+    enabled: true
+    fallback_vendor: vendor_a
+    trigger:
+      vendor_b_error_rate_5m: ">= 0.05"</code></pre></div>
+
+  <h3>Pick this when</h3>
+  <p>You're at a scale where 5–10% volume per arm produces stat-sig results in a 4-week window (~50K+ checks per arm). You want measurement-driven choice or ongoing pricing leverage from two real options.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Sample-size sanity check</span>
+    <p>To detect a 1-point completion-rate difference (e.g., 86% vs 87%) with p=0.05 and 80% power, you need ~25K verifications per arm. For a 0.5-point false-reject difference (e.g., 2.0% vs 2.5%), it's closer to ~50K per arm. Plan A/B duration around these, not vibes.</p>
+  </div>
+</section>
+
+<section id="geo">
+  <h2>Pattern 4 — Geo-routing</h2>
+  <p>Different vendors for different countries. Common when no single vendor wins on coverage everywhere — typically with an EM-focused vendor in LATAM / MENA / CIS and an incumbent in NA / EU.</p>
+
+  <div class="flow">user ─► country=US        ──► Vendor A
+        country=MX|BR|CO  ──► Vendor D
+        country=DE|AT|CH  ──► Vendor IDnow-style
+        country=*         ──► Vendor A (default)</div>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>Best per-country coverage and completion rates.</li>
+    <li>Can negotiate vendor-specific deals (volume tier + market focus).</li>
+    <li>Aligns with regulator preferences in regulated jurisdictions.</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>Operational complexity: every new vendor is a new full DD + integration.</li>
+    <li>You may end up with 4+ vendors, which is painful at audit time.</li>
+    <li>Edge cases at borders (a German user signing up from a US IP).</li>
+    <li>Aggregate reporting requires normalization across vendors.</li>
+  </ul>
+
+  <h3>Config example</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-json">{
+  "orchestration": {
+    "pattern": "geo_routing",
+    "rules": [
+      { "match": { "country": ["DE", "AT", "CH"] },        "vendor": "vendor_idnow" },
+      { "match": { "country": ["MX", "BR", "CO", "AR"] }, "vendor": "vendor_incode" },
+      { "match": { "country": ["IN"] },                    "vendor": "vendor_sumsub" },
+      { "match": { "country": ["US", "CA"] },              "vendor": "vendor_persona" },
+      { "match": { "country": "*" },                       "vendor": "vendor_persona" }
+    ],
+    "country_resolution": {
+      "primary":  "user_declared",
+      "verify_against": ["ip_geolocation", "document_country"],
+      "on_mismatch": "manual_review"
+    }
+  }
+}</code></pre></div>
+
+  <h3>Pick this when</h3>
+  <p>You serve 3+ jurisdictions with materially different document landscapes (e.g., DE/AT/CH video-ident plus EM countries) and your top vendor's coverage matrix has obvious gaps.</p>
+</section>
+
+<section id="decision">
+  <h2>Pattern 5 — Decision-engine (weighted scoring)</h2>
+  <p>Each verification produces a score from multiple signals (vendor decision, vendor confidence, sanctions hit, internal risk model, device signals, behavioral analytics). A decision engine combines them into the final approve/decline/review verdict — sometimes using multiple vendors in parallel for the same user.</p>
+
+  <div class="flow">user ─► parallel:
+          ├─► Vendor A (doc + biometric)
+          ├─► Vendor B (sanctions / PEP)
+          ├─► Internal fraud model (device + behavioral)
+          └─► Internal sanctions cache
+        ─► Decision engine (weighted) ─► Decision</div>
+
+  <h3>Pros</h3>
+  <ul>
+    <li>Highest accuracy in mature operations; combines best-of-breed signals.</li>
+    <li>Granular control: tune weights per cohort / jurisdiction / risk tier.</li>
+    <li>Future-proof: adding a new signal is a weight change, not an architectural shift.</li>
+    <li>Internal rules engine becomes the source of truth — vendors are subordinated.</li>
+  </ul>
+
+  <h3>Cons</h3>
+  <ul>
+    <li>Highest complexity; requires a real risk / decisioning function to operate.</li>
+    <li>Requires more vendor unit-economics: most signals are billed independently.</li>
+    <li>Hardest to explain to regulators ("show me your decision logic"). You'll need versioned rules, model cards, full audit trails.</li>
+    <li>Decision-engine ownership becomes a long-lived team commitment.</li>
+  </ul>
+
+  <h3>Config example (Python-shape)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">def decide(signals: dict, tier: str) -> Decision:
+    """
+    signals: {
+      'vendor_a_decision':   'approved',
+      'vendor_a_confidence': 0.92,
+      'sanctions_hit':       False,
+      'pep_match':           False,
+      'fraud_score':         0.13,     # internal fraud model 0–1
+      'device_risk':         'low',
+      'doc_country_matches_ip': True,
+    }
+    """
+    if signals['sanctions_hit']:
+        return Decision.MANUAL_REVIEW  # mandatory human review on hits
+
+    if signals['vendor_a_decision'] == 'declined':
+        # Vendor A is authoritative on doc/biometric rejection
+        return Decision.DECLINED
+
+    # Composite score: 0–100, higher = more confident approval
+    score = 0
+    score += int(signals['vendor_a_confidence'] * 50)            # max 50
+    score += 20 if signals['device_risk'] == 'low' else 0
+    score += 15 if signals['doc_country_matches_ip'] else 0
+    score -= int(signals['fraud_score'] * 30)                    # penalty
+    if signals['pep_match']:
+        score -= 25
+
+    thresholds = {
+        'lite': {'approve': 60, 'review': 35},
+        'full': {'approve': 75, 'review': 55},
+        'kyb':  {'approve': 80, 'review': 60},
+    }[tier]
+
+    if score >= thresholds['approve']:
+        return Decision.APPROVED
+    if score >= thresholds['review']:
+        return Decision.MANUAL_REVIEW
+    return Decision.DECLINED</code></pre></div>
+
+  <h3>Pick this when</h3>
+  <p>You're at $XX M+ revenue, have a dedicated risk function, run multiple jurisdictions, and your false-reject economics justify the engineering investment. Don't start here.</p>
+</section>
+
+<section id="choose">
+  <h2>How to choose</h2>
+
+  <div style="overflow-x:auto"><table>
+    <thead>
+      <tr><th>Pattern</th><th>Eng cost</th><th>Vendor cost</th><th>Resilience</th><th>Leverage</th><th>When to choose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Single</td><td>Low</td><td>Best</td><td>Low</td><td>None</td><td>Pre-PMF; &lt;250K/yr; one jurisdiction</td></tr>
+      <tr><td>Waterfall</td><td>Medium</td><td>Worse (pay both)</td><td>Medium</td><td>Medium</td><td>Have measured false-reject &gt;3%</td></tr>
+      <tr><td>A/B</td><td>Medium-High</td><td>Worse (split tier)</td><td>High</td><td>High (ongoing)</td><td>Volume supports stat-sig comparisons (≥50K/arm/month)</td></tr>
+      <tr><td>Geo-routing</td><td>High</td><td>Mixed</td><td>Medium-High</td><td>Medium</td><td>3+ jurisdictions with no single coverage winner</td></tr>
+      <tr><td>Decision-engine</td><td>Very High</td><td>Highest</td><td>Very High</td><td>Very High</td><td>Mature risk function, &gt;$XXM revenue</td></tr>
+    </tbody>
+  </table></div>
+
+  <details class="collapse-card">
+    <summary><strong>Typical evolution path</strong></summary>
+    <div class="collapse-card-body">
+      <p>Most companies pass through these in order:</p>
+      <ol>
+        <li><strong>Year 0–1:</strong> Single vendor. Build the abstraction layer. Measure baseline.</li>
+        <li><strong>Year 1–2:</strong> Add a second vendor for either waterfall (if false-reject is the problem) or geo (if coverage is the problem). Many teams stop here.</li>
+        <li><strong>Year 2–3:</strong> A/B on top of geo, to keep both shortlist vendors honest and competitive.</li>
+        <li><strong>Year 3+:</strong> Build the decision engine. Vendors become signal providers, not decision-makers.</li>
+      </ol>
+      <p>Trying to start at step 4 has burned a lot of teams. The decision-engine without baseline data isn't measurably better than single-vendor.</p>
+    </div>
+  </details>
+</section>
+
+<section id="observability">
+  <h2>Observability invariants — same for every pattern</h2>
+  <p>Whichever pattern you adopt, these dashboards and audit invariants must exist before you flip the switch. They're what you use to debug, what regulators ask for, and what tells you when to switch vendors.</p>
+
+  <h3>Per-verification audit record</h3>
+  <p>Every verification — successful, failed, abandoned, retried — must produce one canonical event with the schema below. Stored append-only, retained per regulatory floor.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-json">{
+  "verification_id":     "ver_01HZX...",
+  "user_id":             "usr_01HZX...",
+  "tier":                "full",
+  "jurisdiction":        "DE",
+  "orchestration_pattern": "geo_routing",
+  "vendor_calls": [
+    {
+      "vendor":            "vendor_idnow",
+      "vendor_reference":  "idnow-12345",
+      "started_at":        "2026-05-12T13:14:00Z",
+      "completed_at":      "2026-05-12T13:14:42Z",
+      "latency_ms":        42000,
+      "decision":          "approved",
+      "confidence":        0.94,
+      "cost_cents":        185,
+      "raw_response_ref":  "s3://audit-raw/ver_01HZX/idnow-12345.json"
+    }
+  ],
+  "internal_signals": {
+    "fraud_score":          0.07,
+    "device_risk":          "low",
+    "sanctions_hit":        false
+  },
+  "final_decision":      "approved",
+  "final_decision_by":   "decision_engine_v3.2.1",
+  "decided_at":          "2026-05-12T13:14:43Z",
+  "audit_signature":     "sha256:..."
+}</code></pre></div>
+
+  <h3>Dashboards (minimum set)</h3>
+  <ul>
+    <li><strong>Funnel:</strong> started → submitted → decided → approved, by vendor, by country.</li>
+    <li><strong>Decision mix:</strong> approve / decline / manual-review / indeterminate, by vendor.</li>
+    <li><strong>Latency:</strong> p50 / p95 / p99 time-to-decision, by vendor, by decision type.</li>
+    <li><strong>Error rate:</strong> vendor 5xx / timeout / contract violation, by vendor, last 24h.</li>
+    <li><strong>Unit cost:</strong> blended cost-per-decision, by vendor, by decision type.</li>
+    <li><strong>Manual-review queue:</strong> depth, age, throughput, by vendor.</li>
+    <li><strong>Dispute rate:</strong> users who claim they were wrongly declined, by vendor.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">If you don't have these dashboards before launch, you don't have launch</span>
+    <p>The number-one cause of "we don't know why our completion rate dropped" is missing dashboards. Build them in the integration phase, not after the incident.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

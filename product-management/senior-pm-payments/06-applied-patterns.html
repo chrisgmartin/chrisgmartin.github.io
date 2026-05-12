@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#ab-rail">A/B testing a new rail</a>
+    <a href="#smart-routing">Smart-routing rules in production</a>
+    <a href="#stepup">3DS step-up policy</a>
+    <a href="#retry">Retry-after-soft-decline</a>
+    <a href="#bin-ux">BIN-aware UX</a>
+    <a href="#vault">Vault &amp; network tokens</a>
+    <a href="#mandate">Recurring mandate UX</a>
+    <a href="#disputes">Dispute workflow</a>
+    <a href="#crossborder">Cross-border FX UX</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">The recurring production patterns Payments PMs actually use day-to-day. Each one shows up by name in interview design rounds — recognize them and you'll out-frame most candidates.</p>
+</header>
+
+<section id="ab-rail">
+  <h2>A/B testing a new rail in a single region</h2>
+  <p>Scenario: Brazil deposits today are 80% card, 20% PIX. You want to push PIX to the front of the UI and prove it lifts conversion <strong>net</strong>.</p>
+  <h3>Design</h3>
+  <ul>
+    <li><strong>Unit of randomization</strong>: customer (not session). Same customer must see the same variant.</li>
+    <li><strong>Segments</strong>: new customers vs returning; first deposit vs repeat. Pre-register the segment cuts.</li>
+    <li><strong>Treatment</strong>: PIX rendered first; card collapsible below.</li>
+    <li><strong>Control</strong>: card rendered first; PIX below.</li>
+    <li><strong>Primary metric</strong>: completed-deposit conversion per intent.</li>
+    <li><strong>Guardrail metrics</strong>: net-revenue per cohort (PIX is cheaper but tipping may shift to lower-value buyers); fraud rate; support contacts.</li>
+    <li><strong>Powering</strong>: detect a 1% absolute conversion lift at p&lt;.05 with 80% power → estimate sample size from baseline variance.</li>
+    <li><strong>Run window</strong>: at least 2 full weekly cycles to capture day-of-week effects.</li>
+  </ul>
+  <h3>Traps</h3>
+  <ul>
+    <li>PIX has no chargebacks — your fraud-loss metric will look better artificially; don't credit PIX for that.</li>
+    <li>If you only look at conversion, you'll miss cost: PIX is much cheaper. <strong>Combine into cost-adjusted revenue.</strong></li>
+    <li>Power skew — PIX adoption can cannibalize card; ensure you're measuring the correct counterfactual.</li>
+  </ul>
+</section>
+
+<section id="smart-routing">
+  <h2>Smart-routing rules in production</h2>
+  <p>You don't write the model; you own the rules. Common rule shapes:</p>
+  <table>
+    <thead><tr><th>Rule shape</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>BIN affinity</td><td>"If issuer country = BR and BIN range in [Itaú list], prefer Stone over Adyen."</td></tr>
+      <tr><td>Time-of-day</td><td>"During Adyen scheduled maintenance window (Sat 02:00-04:00 CET), shift 100% to Worldpay."</td></tr>
+      <tr><td>Amount-banded</td><td>"For amounts &gt; $1000, prefer the acquirer with higher historical AAR on high-value."</td></tr>
+      <tr><td>Currency-locked</td><td>"GBP txns must route via FCA-licensed acquirer."</td></tr>
+      <tr><td>Risk-tiered</td><td>"If fraud-score &gt; 70, force 3DS step-up regardless of exemption eligibility."</td></tr>
+    </tbody>
+  </table>
+  <p>Govern the rules — every rule must have an owner, a hypothesis, an expiry date. Stale routing rules accumulate and silently tank AAR.</p>
+</section>
+
+<section id="stepup">
+  <h2>3DS step-up policy</h2>
+  <p>3DS is a knob, not a binary. The policy you ship is per-segment:</p>
+  <table>
+    <thead><tr><th>Segment</th><th>Default 3DS posture</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>EU consumer card txn</td><td>SCA mandatory; attempt frictionless first</td><td>PSD2 requirement</td></tr>
+      <tr><td>EU low-value (&lt;€30) repeat</td><td>Attempt SCA exemption (LVE)</td><td>Reduces drop-off</td></tr>
+      <tr><td>EU TRA exemption-eligible</td><td>Attempt TRA exemption if acquirer fraud rate qualifies</td><td>Lifts AAR; preserves liability with acquirer</td></tr>
+      <tr><td>UK consumer</td><td>Similar SCA logic under UK rules</td><td>Aligned to PSD2</td></tr>
+      <tr><td>US consumer</td><td>3DS only when fraud-score elevated</td><td>3DS adds friction; US issuers vary on support</td></tr>
+      <tr><td>High-risk (e.g. new device + high amount)</td><td>Force 3DS regardless</td><td>Prevent first-party fraud</td></tr>
+    </tbody>
+  </table>
+  <p>The PM lever: tune exemption logic. A move from "3DS always" to "3DS smart" can lift conversion 2-5pp in EU.</p>
+</section>
+
+<section id="retry">
+  <h2>Retry-after-soft-decline</h2>
+  <p>Soft decline doesn't mean "no" forever. Common patterns:</p>
+  <ul>
+    <li><strong>Hold &amp; immediate retry</strong> — for transient network/timeout codes. Same PSP. Same auth.</li>
+    <li><strong>Cascade</strong> — try alternate PSP/acquirer. Use network token if you have one to preserve issuer trust.</li>
+    <li><strong>Step-up retry</strong> — if soft decline suggests risk, retry with 3DS challenge. Liability shifts to issuer on success.</li>
+    <li><strong>Delayed retry</strong> — common for "insufficient funds" — try again in N hours; e-comm world calls this "smart retry."</li>
+    <li><strong>Rail switch</strong> — if card keeps declining, prompt user to try Open Banking / PIX / UPI instead.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Scheme rule reminder</span>
+    <p>Visa and Mastercard <em>limit</em> the number of retries on certain decline codes (e.g. R-codes, do-not-honor) before assessing fees. Your retry policy must encode these limits per scheme.</p>
+  </div>
+</section>
+
+<section id="bin-ux">
+  <h2>BIN-aware UX</h2>
+  <p>The BIN tells you the issuer, country, card type (debit/credit/prepaid), and sometimes commercial vs consumer. Once you have it (often after the first 6-8 digits typed), you can:</p>
+  <ul>
+    <li>Hide unsupported acceptance (e.g. don't show "Pay with card" if BIN known to block crypto MCC).</li>
+    <li>Pre-warn the user: <em>"Your bank may require a 3DS confirmation."</em></li>
+    <li>Pre-route to the acquirer most likely to approve this BIN.</li>
+    <li>Localize: detect IN issuer → show INR pricing, NPCI compliance notices.</li>
+    <li>Suggest a rail switch: <em>"PIX usually approves faster for your bank."</em></li>
+  </ul>
+  <p>Network tokens — issued by Visa/MC tied to a real PAN — give you lifecycle-managed credentials. Lift AAR ~1-3pp and reduce reissuance friction. Treat as default for any card-on-file flow.</p>
+</section>
+
+<section id="vault">
+  <h2>Vault &amp; network token strategy</h2>
+  <p>Two layers:</p>
+  <ul>
+    <li><strong>Vault (PCI tokenization)</strong> — replaces raw PAN with an internal token; reduces PCI scope. Vendor (VGS, Basis Theory) or self-hosted.</li>
+    <li><strong>Network tokens</strong> — scheme-issued tokens (VTS / MDES) that the issuer recognizes natively. Get lifecycle updates when the underlying card is reissued.</li>
+  </ul>
+  <p>Use both. Vault for storage and PSP-agnostic routing; network tokens for actual auth. The combo lifts AAR, lowers PCI burden, and survives card-reissuance.</p>
+</section>
+
+<section id="mandate">
+  <h2>Recurring-payment mandate UX</h2>
+  <p>You need recurring debits for any subscription-style flow (Krak savings, dollar-cost-average crypto buys, etc.). Each rail has its own mandate model:</p>
+  <table>
+    <thead><tr><th>Rail</th><th>Mandate construct</th></tr></thead>
+    <tbody>
+      <tr><td>Card</td><td>Card-on-file with stored credential indicator + COF agreement</td></tr>
+      <tr><td>SEPA</td><td>SEPA Direct Debit mandate; B2C vs B2B different</td></tr>
+      <tr><td>UPI</td><td>UPI AutoPay mandate, PIN-confirmed, with explicit cap</td></tr>
+      <tr><td>PIX</td><td>PIX Automático (rolling out 2025+) — pre-authorized recurring</td></tr>
+      <tr><td>Bacs Direct Debit (UK)</td><td>Bacs scheme mandate</td></tr>
+    </tbody>
+  </table>
+  <p>UX rule: <strong>show the user the mandate cap and the cancellation path on the same screen they consent</strong>. Regulator audits get into this.</p>
+</section>
+
+<section id="disputes">
+  <h2>Dispute workflow — productizing the response</h2>
+  <p>Disputes touch payments, fraud, customer support, finance. PM ownership often unclear; make it clear.</p>
+  <ol>
+    <li>Issuer files dispute → notification ingested via PSP webhook.</li>
+    <li>Auto-classify: friendly fraud vs true fraud vs merchant-error.</li>
+    <li>Auto-assemble evidence pack — KYC artifacts, txn metadata, device fingerprint, login session, network token, 3DS result.</li>
+    <li>Decision: defend (if evidence supports) or accept (if loss is cheaper than fight).</li>
+    <li>Submit representment via PSP / acquirer.</li>
+    <li>Track ratio; manage to scheme thresholds (VDMP &lt;0.9%).</li>
+  </ol>
+  <p>Automating evidence-pack assembly is a high-ROI PM project. Even partial automation cuts dispute-team headcount needs by 30-50%.</p>
+</section>
+
+<section id="crossborder">
+  <h2>Cross-border FX UX</h2>
+  <p>Customer in Brazil deposits BRL → The company needs USD-equivalent crypto. Where does FX happen?</p>
+  <ul>
+    <li><strong>At PSP</strong> — partner does the FX, you receive USD. Spreads usually fat (1-3%).</li>
+    <li><strong>At your bank</strong> — receive BRL on Brazilian rails, convert via FX partner.</li>
+    <li><strong>At settlement layer</strong> — via stablecoin (USDC) intermediating.</li>
+  </ul>
+  <p>UX requirements:</p>
+  <ul>
+    <li><strong>Quote-then-lock</strong> — show a quote with a locked window (typically 30s-2min); honor it.</li>
+    <li><strong>Total-cost disclosure</strong> — fee + FX spread, plainly stated, before user confirms.</li>
+    <li><strong>Receipt</strong> — what they paid, what they got, what spread was applied.</li>
+  </ul>
+  <p>Regulator scrutiny on FX transparency is growing (EU, UK). Bake transparency in early.</p>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Vendor orchestration</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

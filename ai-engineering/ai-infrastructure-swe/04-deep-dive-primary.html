@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — High-Performance Rust Services</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#tokio-runtime">Tokio runtime model</a>
+    <a href="#work-stealing">Work-stealing executor</a>
+    <a href="#blocking">Blocking vs cooperative</a>
+    <a href="#backpressure">Backpressure</a>
+    <a href="#tower">tower middleware</a>
+    <a href="#tonic">tonic and gRPC</a>
+    <a href="#hyper-axum">hyper and axum</a>
+    <a href="#alloc">Allocators</a>
+    <a href="#hot-path">Hot-path discipline</a>
+    <a href="#zero-copy">Zero-copy with bytes</a>
+    <a href="#profiling">Profiling Rust services</a>
+    <a href="#perf-checklist">Perf checklist</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Primary</span>
+  <h1>High-Performance Rust Services</h1>
+  <p class="subtitle">Tokio internals, tower, tonic, allocators, and the hot-path discipline that separates a Rust service that works from one that holds p99 under load.</p>
+</header>
+
+<section id="tokio-runtime">
+  <h2>The Tokio runtime model</h2>
+  <p>Tokio's default runtime is a <strong>multi-threaded work-stealing executor</strong>. Conceptually:</p>
+  <ul>
+    <li>A small pool of OS threads (default: number of CPU cores).</li>
+    <li>Each thread has its own local task queue.</li>
+    <li>Tasks are futures the runtime polls. Each task is a state machine that yields at <code>.await</code> points.</li>
+    <li>When a task yields (e.g., waiting on a socket), the thread picks up another task. Idle tasks don't occupy a thread.</li>
+    <li>If one thread runs out of work, it <em>steals</em> from another thread's queue.</li>
+  </ul>
+  <p>The result: a handful of OS threads can run hundreds of thousands of in-flight tasks, as long as most tasks are blocked on I/O most of the time. This is the right model for an inference gateway where most tasks are waiting on a model server.</p>
+  <div class="callout insight">
+    <span class="callout-label">The mental picture</span>
+    <p>"Tokio gives me cheap tasks (~hundreds of bytes each) and a scheduler that keeps the CPU pegged at user-code or hot I/O, never idle. My job is to not screw it up by blocking a worker thread."</p>
+  </div>
+</section>
+
+<section id="work-stealing">
+  <h2>Work-stealing in practice</h2>
+  <p>Work-stealing means cores stay busy under uneven load. But it also means:</p>
+  <ul>
+    <li><strong>Tasks can move between threads at .await points.</strong> So state captured by an <code>async</code> block must be <code>Send</code>.</li>
+    <li><strong>Tasks that never yield don't get stolen.</strong> A CPU-bound loop without an <code>.await</code> hogs its worker thread. Other tasks queued behind it on that local queue starve until a steal happens.</li>
+    <li><strong><code>tokio::task::yield_now()</code></strong> exists for the rare case you have a long compute and want to give the runtime a checkpoint.</li>
+  </ul>
+  <p>For gateway code: avoid CPU-heavy work inside async tasks. If you must (tokenization, hashing, serialization of large payloads), see the next section.</p>
+</section>
+
+<section id="blocking">
+  <h2>Blocking vs cooperative tasks</h2>
+  <p>The single most common Tokio mistake: calling something that blocks the thread inside an async task. Examples:</p>
+  <ul>
+    <li><code>std::thread::sleep</code> — blocks the worker thread. Use <code>tokio::time::sleep</code>.</li>
+    <li>Synchronous file I/O (<code>std::fs::read</code>). Use <code>tokio::fs</code>.</li>
+    <li>Calling a <code>reqwest::blocking</code> client. Use the async one.</li>
+    <li>CPU-bound work like crypto / compression / tokenization in a loop without yielding.</li>
+    <li>Holding a <code>std::sync::Mutex</code> guard across <code>.await</code> — see <a href="03-core-fundamentals.html#shared-state">03</a>.</li>
+  </ul>
+  <p>The escape hatch for CPU-bound work:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">let tokens = tokio::task::spawn_blocking(move || {
+    // synchronous, CPU-heavy work runs on a dedicated blocking pool
+    expensive_tokenize(&amp;text)
+}).await?;
+</code></pre></div>
+  <p><code>spawn_blocking</code> moves the work to a separate thread pool (default capacity: 512 threads, configurable) so it can't starve the async workers. Use it for genuinely synchronous work; don't use it as a hammer.</p>
+</section>
+
+<section id="backpressure">
+  <h2>Backpressure</h2>
+  <p>Backpressure is how a downstream tells the upstream "slow down, I'm full." Without it, a fast producer fills queues until OOM.</p>
+  <p>In async Rust the primary tool is the <strong>bounded channel</strong>. A bounded <code>mpsc::Sender</code>'s <code>send()</code> awaits when the channel is full. That await propagates back: the caller awaits, can't accept more requests, the HTTP layer rejects new connections or returns 503.</p>
+  <p>Other backpressure tools:</p>
+  <ul>
+    <li><strong>tower's <code>Buffer</code> + <code>ConcurrencyLimit</code></strong> — bound the in-flight requests per service.</li>
+    <li><strong>tower's <code>RateLimit</code></strong> — bound requests per unit time.</li>
+    <li><strong>tower's <code>LoadShed</code></strong> — return errors immediately when the service is at capacity (vs blocking the caller).</li>
+    <li><strong>Semaphore</strong> (<code>tokio::sync::Semaphore</code>) — bound concurrent operations explicitly.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+let permits = Arc::new(Semaphore::new(100)); // 100 concurrent model calls
+
+let p = permits.clone();
+tokio::spawn(async move {
+    let _permit = p.acquire().await.unwrap();
+    call_model(req).await
+});
+</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">Bounded vs unbounded</span>
+    <p>If you ever reach for <code>mpsc::unbounded_channel</code> in a production gateway, you're almost certainly building an OOM. The point of bounded channels is to surface "we are over capacity" as an early, recoverable signal, not as a 2am page.</p>
+  </div>
+</section>
+
+<section id="tower">
+  <h2>tower middleware</h2>
+  <p>tower defines a <code>Service&lt;Request&gt;</code> trait — a function-like type that maps requests to futures of responses. Every layer is composable. The shape:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tower::{ServiceBuilder, Service};
+use std::time::Duration;
+
+let svc = ServiceBuilder::new()
+    .timeout(Duration::from_secs(5))
+    .concurrency_limit(1000)
+    .rate_limit(10_000, Duration::from_secs(1))
+    .buffer(100)
+    .layer(TracingLayer::new())
+    .layer(AuthLayer::new())
+    .service(inference_handler);
+</code></pre></div>
+  <p>Layers you'll see on a production gateway:</p>
+  <ul>
+    <li><strong>Timeout</strong> — every request must finish within N seconds.</li>
+    <li><strong>ConcurrencyLimit / LoadShed</strong> — bound in-flight requests.</li>
+    <li><strong>RateLimit</strong> — bound rate.</li>
+    <li><strong>Retry</strong> — retry with a policy.</li>
+    <li><strong>Trace</strong> — open a span per request.</li>
+    <li><strong>Auth</strong> — validate JWT, fish out claims.</li>
+    <li><strong>Compression</strong> — gzip/brotli.</li>
+    <li><strong>Custom: idempotency, request hedging, cost accounting.</strong></li>
+  </ul>
+</section>
+
+<section id="tonic">
+  <h2>tonic — Rust gRPC</h2>
+  <p>tonic is the standard gRPC implementation for Rust. Built on hyper + tower. You define services in <code>.proto</code>, <code>tonic-build</code> generates Rust traits, you implement them.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tonic::{Request, Response, Status};
+
+#[tonic::async_trait]
+impl Inference for InferenceService {
+    async fn generate(
+        &amp;self,
+        req: Request&lt;GenerateReq&gt;,
+    ) -&gt; Result&lt;Response&lt;GenerateResp&gt;, Status&gt; {
+        let req = req.into_inner();
+        let out = self.backend.call(&amp;req).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(out))
+    }
+
+    type GenerateStreamStream =
+        std::pin::Pin&lt;Box&lt;dyn Stream&lt;Item = Result&lt;Token, Status&gt;&gt; + Send&gt;&gt;;
+
+    async fn generate_stream(
+        &amp;self,
+        req: Request&lt;GenerateReq&gt;,
+    ) -&gt; Result&lt;Response&lt;Self::GenerateStreamStream&gt;, Status&gt; {
+        // bidirectional streaming for token-by-token output
+        // ...
+        unimplemented!()
+    }
+}
+</code></pre></div>
+  <p>Key tonic features:</p>
+  <ul>
+    <li><strong>Unary, server-streaming, client-streaming, bidi.</strong> Use server-streaming for token-by-token LLM output.</li>
+    <li><strong>Interceptors</strong> — middleware analog. Add auth, tracing.</li>
+    <li><strong>Deadline propagation</strong> — gRPC deadlines flow through the metadata. Honor them.</li>
+    <li><strong>Status codes</strong> — gRPC-native error model (<code>UNAVAILABLE</code>, <code>DEADLINE_EXCEEDED</code>, etc.).</li>
+  </ul>
+</section>
+
+<section id="hyper-axum">
+  <h2>hyper and axum</h2>
+  <p><strong>hyper</strong> is the low-level HTTP implementation. You almost never write hyper directly in app code.</p>
+  <p><strong>axum</strong> is a popular tower-based web framework on top of hyper. Ergonomic handlers, extractors, layered middleware. For non-gRPC public-facing endpoints (REST, SSE streaming), axum is a strong default.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use axum::{Router, routing::post, Json};
+
+async fn complete(Json(req): Json&lt;CompleteReq&gt;) -&gt; Json&lt;CompleteResp&gt; {
+    Json(call_model(req).await.unwrap())
+}
+
+let app = Router::new()
+    .route("/v1/complete", post(complete))
+    .layer(tower_http::trace::TraceLayer::new_for_http())
+    .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(30)));
+
+axum::Server::bind(&amp;"0.0.0.0:8080".parse().unwrap())
+    .serve(app.into_make_service())
+    .await
+    .unwrap();
+</code></pre></div>
+</section>
+
+<section id="alloc">
+  <h2>Allocators — jemalloc, mimalloc</h2>
+  <p>Rust uses the system allocator by default. For long-running, allocation-heavy services, switching to <strong>jemalloc</strong> or <strong>mimalloc</strong> often wins 10-30% on throughput and meaningfully on tail latency. Both handle high-concurrency, multi-threaded allocation patterns better than glibc malloc.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// Cargo.toml: tikv-jemallocator = "0.5"
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+</code></pre></div>
+  <p>For interview purposes: know the two names, know that <code>#[global_allocator]</code> lets you swap allocators, know that the gain is real but situational — benchmark before claiming a number.</p>
+</section>
+
+<section id="hot-path">
+  <h2>Hot-path discipline — avoiding allocations</h2>
+  <p>The fast path through the gateway gets executed once per request — millions of times per minute. Every allocation in there costs CPU and produces tail-latency jitter (allocator contention, page faults, etc.). Disciplines:</p>
+  <ul>
+    <li><strong>Pre-allocate buffers</strong> and reuse them via a pool (<code>bytes::BytesMut</code>, object pools).</li>
+    <li><strong>Avoid <code>format!</code></strong> in hot paths — it allocates. Use <code>write!</code> into a pre-sized buffer.</li>
+    <li><strong>Avoid <code>.to_string()</code></strong> and <code>.clone()</code> on the request path; pass <code>&amp;str</code> / <code>&amp;[u8]</code> where you can.</li>
+    <li><strong>Use <code>Cow&lt;str&gt;</code></strong> when sometimes-borrowed, sometimes-owned.</li>
+    <li><strong>Use <code>SmallVec</code> / <code>tinyvec</code></strong> when most cases fit on the stack.</li>
+    <li><strong>Use <code>bytes::Bytes</code></strong> — cheaply cloneable, ref-counted byte buffer; the standard "share a chunk of network data without copying."</li>
+  </ul>
+</section>
+
+<section id="zero-copy">
+  <h2>Zero-copy with the bytes crate</h2>
+  <p>An LLM token response can be hundreds of KB. Copying it three times through your service (deserialize → process → reserialize) adds real cost. The <code>bytes</code> crate gives you:</p>
+  <ul>
+    <li><code>Bytes</code> — a cheaply cloneable, ref-counted, immutable byte slice. Multiple <code>Bytes</code> can point into the same underlying buffer.</li>
+    <li><code>BytesMut</code> — a writable buffer that can be split into <code>Bytes</code> handles.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use bytes::{Bytes, BytesMut, BufMut};
+
+let mut buf = BytesMut::with_capacity(4096);
+buf.put_slice(b"header");
+buf.put_slice(&amp;payload);
+let frame: Bytes = buf.freeze(); // immutable, cheaply cloneable
+
+let copy1 = frame.clone(); // refcount++, no data copy
+let copy2 = frame.clone(); // refcount++, no data copy
+</code></pre></div>
+  <p>hyper, tonic, and most of the Rust networking ecosystem already use <code>Bytes</code> under the hood. Stay in that type as long as possible.</p>
+</section>
+
+<section id="profiling">
+  <h2>Profiling Rust services</h2>
+  <p>Tools you should know by name and rough purpose:</p>
+  <table>
+    <thead><tr><th>Tool</th><th>What it shows</th></tr></thead>
+    <tbody>
+      <tr><td><code>perf</code> (Linux)</td><td>CPU samples — where time is spent. The foundational tool.</td></tr>
+      <tr><td><code>flamegraph</code> (cargo-flamegraph)</td><td>Visualize <code>perf</code> output as a flamegraph. First thing to reach for.</td></tr>
+      <tr><td><code>tokio-console</code></td><td>Live view of all tasks, their state, where they're blocked. Catches "task is stuck on await" issues.</td></tr>
+      <tr><td><code>cargo-flamegraph</code></td><td>One command to flamegraph a Rust binary.</td></tr>
+      <tr><td><code>criterion</code></td><td>Microbenchmark framework. Compare versions.</td></tr>
+      <tr><td><code>heaptrack</code> / <code>dhat</code></td><td>Heap allocation profiling.</td></tr>
+      <tr><td><code>pprof-rs</code></td><td>In-process sampling, pprof-format output.</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Flamegraph a release build under load
+cargo flamegraph --release --bin gateway
+
+# tokio-console: enable in Cargo.toml + RUSTFLAGS="--cfg tokio_unstable"
+TOKIO_CONSOLE_BIND=0.0.0.0:6669 ./target/release/gateway &amp;
+tokio-console http://127.0.0.1:6669
+</code></pre></div>
+
+  <details class="collapse-card">
+    <summary><strong>Optional: PGO (Profile-Guided Optimization)</strong></summary>
+    <div class="collapse-card-body">
+      <p>Rust supports PGO via <code>rustc -Cprofile-generate</code> / <code>-Cprofile-use</code>. You build instrumented, run representative traffic, collect profiles, rebuild with the profiles. Typical wins: 5-15% on throughput. Tooling: <code>cargo-pgo</code>. Worth doing for the gateway; not worth doing for everything.</p>
+    </div>
+  </details>
+</section>
+
+<section id="perf-checklist">
+  <h2>The senior-Rust perf checklist</h2>
+  <p>Items to mentally run through when an interviewer asks "how would you optimize this service?":</p>
+  <ol>
+    <li><strong>Measure first.</strong> Flamegraph under representative load. No guessing.</li>
+    <li><strong>Find blocking calls.</strong> tokio-console. Anything blocked on a thread is suspect.</li>
+    <li><strong>Look for hot allocations.</strong> Heap profile. Eliminate per-request <code>String</code> / <code>Vec</code> growth.</li>
+    <li><strong>Check serialization.</strong> JSON is expensive; if internal RPCs are JSON, move them to protobuf / bincode.</li>
+    <li><strong>Check the channel queue depth.</strong> Are bounded channels saturating? That's a capacity tell.</li>
+    <li><strong>Inspect locks.</strong> Hot mutexes are tail-latency killers; consider <code>parking_lot</code>, <code>RwLock</code>, sharding, or actor patterns.</li>
+    <li><strong>Try jemalloc/mimalloc.</strong> Measure, don't claim.</li>
+    <li><strong>Look at the codegen.</strong> <code>cargo asm</code>, check <code>#[inline]</code> opportunities only after a profile says it matters.</li>
+    <li><strong>Last: consider PGO and LTO.</strong> Release builds with <code>lto = "fat"</code> and <code>codegen-units = 1</code>.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Interview phrase</span>
+    <p>"My discipline is profile-then-fix. The first answer is never 'rewrite,' it's 'show me the flamegraph.'"</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: ML inference and orchestration →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

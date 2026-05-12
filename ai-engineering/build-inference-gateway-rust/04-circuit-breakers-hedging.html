@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 04 — Circuit Breaker, Retries, and Hedging</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#three-patterns">Three patterns, one goal</a>
+    <a href="#circuit">Circuit breaker</a>
+    <a href="#retry">Retry budget</a>
+    <a href="#hedge">Hedging</a>
+    <a href="#wire">Wire it in</a>
+    <a href="#test">Make the mock misbehave</a>
+    <a href="#tradeoffs">Tradeoffs</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-batching-and-coalescing.html">← Previous</a>
+    <a href="05-observability.html">Next: Observability →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 04 · ~30 minutes</span>
+  <h1>Circuit Breaker, Retry Budget, and Hedging</h1>
+  <p class="subtitle">Three patterns that, layered correctly, turn an upstream that flaps into a gateway that doesn't. We build them small and from scratch — the production primitives are an evening's work, not a framework.</p>
+</header>
+
+<section id="three-patterns">
+  <h2>Three patterns, one goal</h2>
+  <p>The goal is to absorb upstream misbehavior without amplifying it. Each pattern handles a different failure shape:</p>
+
+  <ul>
+    <li><strong>Circuit breaker</strong> — when the upstream is clearly broken (high error rate over a window), stop calling it for a cooldown period. Saves the client from waiting, saves the upstream from being hammered while it recovers.</li>
+    <li><strong>Retry budget</strong> — transient failures should be retried, but only as a small fraction of overall traffic. Naive "retry 3 times" turns one bad deploy into a 3x traffic spike, which guarantees the bad deploy stays bad.</li>
+    <li><strong>Hedging</strong> — for high-tail-latency requests, fire a second copy after the p95 mark and use whichever returns first. Trades a few percent extra upstream load for a meaningfully better tail.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Why we don't reach for tower-retry / tower-balance here</span>
+    <p>The <code>tower</code> ecosystem has retry and load-balance layers, and they're well-engineered. We're rolling our own because: (a) writing it out makes the semantics legible — every "retry" library hides decisions that bite later; (b) hedging for streaming responses is custom enough that off-the-shelf layers don't quite fit; (c) ~150 lines of focused code is easier to reason about than 3 generic libraries composed.</p>
+  </div>
+</section>
+
+<section id="circuit">
+  <h2>Circuit breaker</h2>
+  <p>Classic three states:</p>
+  <ul>
+    <li><strong>Closed</strong> — calls go through. Track error count over a rolling window.</li>
+    <li><strong>Open</strong> — calls fail fast with <code>503</code>. After a cooldown, transition to half-open.</li>
+    <li><strong>Half-open</strong> — let exactly one probe through. If it succeeds, go back to closed. If it fails, back to open with a fresh cooldown.</li>
+  </ul>
+
+  <p>Create <code>infergw/src/breaker.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State { Closed, Open, HalfOpen }
+
+pub struct CircuitBreaker {
+    inner: Mutex&lt;Inner&gt;,
+    window: Duration,
+    failure_threshold: u32,
+    cooldown: Duration,
+}
+
+struct Inner {
+    state: State,
+    failures: Vec&lt;Instant&gt;,
+    opened_at: Option&lt;Instant&gt;,
+    half_open_probe_in_flight: bool,
+}
+
+impl CircuitBreaker {
+    pub fn new(window: Duration, failure_threshold: u32, cooldown: Duration) -&gt; Self {
+        Self {
+            window,
+            failure_threshold,
+            cooldown,
+            inner: Mutex::new(Inner {
+                state: State::Closed,
+                failures: Vec::with_capacity(64),
+                opened_at: None,
+                half_open_probe_in_flight: false,
+            }),
+        }
+    }
+
+    /// Returns Ok(()) if the call is allowed; Err(state) if short-circuited.
+    pub fn try_acquire(&amp;self) -&gt; Result&lt;Permit, State&gt; {
+        let mut g = self.inner.lock().expect("breaker poisoned");
+        let now = Instant::now();
+        match g.state {
+            State::Closed =&gt; Ok(Permit { closed_path: true }),
+            State::Open =&gt; {
+                if g.opened_at.map(|t| now.duration_since(t) &gt;= self.cooldown).unwrap_or(false) {
+                    g.state = State::HalfOpen;
+                    g.half_open_probe_in_flight = true;
+                    Ok(Permit { closed_path: false })
+                } else {
+                    Err(State::Open)
+                }
+            }
+            State::HalfOpen =&gt; {
+                if g.half_open_probe_in_flight {
+                    Err(State::HalfOpen)
+                } else {
+                    g.half_open_probe_in_flight = true;
+                    Ok(Permit { closed_path: false })
+                }
+            }
+        }
+    }
+
+    pub fn record_success(&amp;self) {
+        let mut g = self.inner.lock().expect("breaker poisoned");
+        match g.state {
+            State::HalfOpen =&gt; {
+                g.state = State::Closed;
+                g.failures.clear();
+                g.opened_at = None;
+                g.half_open_probe_in_flight = false;
+                tracing::info!("circuit breaker: closed (probe ok)");
+            }
+            _ =&gt; {}
+        }
+    }
+
+    pub fn record_failure(&amp;self) {
+        let mut g = self.inner.lock().expect("breaker poisoned");
+        let now = Instant::now();
+        // Prune failures outside the rolling window.
+        let cutoff = now - self.window;
+        g.failures.retain(|t| *t &gt;= cutoff);
+        g.failures.push(now);
+
+        match g.state {
+            State::Closed if g.failures.len() &gt;= self.failure_threshold as usize =&gt; {
+                g.state = State::Open;
+                g.opened_at = Some(now);
+                tracing::warn!(
+                    failures = g.failures.len(),
+                    cooldown_ms = self.cooldown.as_millis() as u64,
+                    "circuit breaker: open"
+                );
+            }
+            State::HalfOpen =&gt; {
+                g.state = State::Open;
+                g.opened_at = Some(now);
+                g.half_open_probe_in_flight = false;
+                tracing::warn!("circuit breaker: re-opened (probe failed)");
+            }
+            _ =&gt; {}
+        }
+    }
+
+    pub fn state(&amp;self) -&gt; State {
+        self.inner.lock().expect("breaker poisoned").state
+    }
+}
+
+/// RAII-ish marker. Drop doesn't auto-record — caller must explicitly call
+/// record_success or record_failure based on the outcome of the request.
+pub struct Permit { pub closed_path: bool }</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">Don't auto-record on Drop</span>
+    <p>A tempting shortcut is to record failure when the Permit drops without a success call. Don't do it. A client disconnect mid-stream is not an upstream failure, and you'd open the breaker on the wrong signal. Explicit recording forces you to define what counts as a failure in your context.</p>
+  </div>
+</section>
+
+<section id="retry">
+  <h2>Retry budget</h2>
+  <p>The pattern: maintain a token bucket of allowed retries. A retry costs one token. Tokens refill slowly (say, 10% of the success rate). Under steady state with low error rate, retries are essentially free. Under high error rate, the bucket empties and retries stop — preventing amplification.</p>
+
+  <p>Create <code>infergw/src/retry.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+pub struct RetryBudget {
+    inner: Mutex&lt;Inner&gt;,
+    max_tokens: f64,
+    refill_per_sec: f64,
+}
+
+struct Inner {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RetryBudget {
+    pub fn new(max_tokens: f64, refill_per_sec: f64) -&gt; Self {
+        Self {
+            max_tokens,
+            refill_per_sec,
+            inner: Mutex::new(Inner { tokens: max_tokens, last_refill: Instant::now() }),
+        }
+    }
+
+    pub fn try_consume(&amp;self) -&gt; bool {
+        let mut g = self.inner.lock().expect("retry budget poisoned");
+        let now = Instant::now();
+        let elapsed = now.duration_since(g.last_refill).as_secs_f64();
+        g.tokens = (g.tokens + elapsed * self.refill_per_sec).min(self.max_tokens);
+        g.last_refill = now;
+
+        if g.tokens &gt;= 1.0 {
+            g.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remaining(&amp;self) -&gt; f64 {
+        self.inner.lock().expect("retry budget poisoned").tokens
+    }
+}
+
+/// Exponential backoff with full jitter, capped.
+pub fn backoff(attempt: u32, base: Duration, max: Duration) -&gt; Duration {
+    use rand::Rng;
+    let exp = base.saturating_mul(1u32 &lt;&lt; attempt.min(10));
+    let cap = exp.min(max);
+    let jitter_ms = rand::thread_rng().gen_range(0..=cap.as_millis() as u64);
+    Duration::from_millis(jitter_ms)
+}</code></pre>
+</div>
+
+  <p>Add <code>rand = "0.8"</code> to the dependencies.</p>
+
+  <p>The rule of thumb is: only retry idempotent failures (connection refused, 5xx, timeouts on connect), never retry an already-streaming response (you'd duplicate tokens to the client), and never retry 4xx. Streaming complicates this — once a single byte of the response body has been written to the client, retry is off the table. We codify that explicitly in the proxy.</p>
+</section>
+
+<section id="hedge">
+  <h2>Hedging</h2>
+  <p>The idea is simple: if a request hasn't responded with its <em>first</em> chunk by some threshold (we'll use a configurable p95 estimate), fire a second copy in parallel. Whichever returns the first chunk first wins; cancel the other.</p>
+
+  <p>For streaming responses, the subtlety is "first byte" — once the first chunk arrives from <em>either</em> upstream call, commit to that one. Cancel the other immediately so we don't pay for the entire second response.</p>
+
+  <p>Create <code>infergw/src/hedge.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use std::{pin::Pin, time::Duration};
+use tokio::sync::oneshot;
+
+type ByteStream = Pin&lt;Box&lt;dyn Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; + Send&gt;&gt;;
+
+/// Fire a primary request immediately. If `hedge_after` elapses with no first
+/// chunk yet, fire a backup. Return the stream from whichever yields a first
+/// chunk first; the loser is cancelled by dropping its future.
+pub async fn hedged&lt;F&gt;(
+    spawn_request: F,
+    hedge_after: Duration,
+) -&gt; Result&lt;ByteStream, std::io::Error&gt;
+where
+    F: Fn() -&gt; ByteStream + Send + Sync + 'static,
+{
+    let primary = spawn_request();
+    let (winner_tx, winner_rx) = oneshot::channel::&lt;(Bytes, ByteStream)&gt;();
+
+    let winner_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(winner_tx)));
+    let tx_a = winner_tx.clone();
+    let tx_b = winner_tx.clone();
+
+    tokio::spawn(async move {
+        race(primary, tx_a).await;
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(hedge_after).await;
+        // Only fire the hedge if no one has won yet.
+        if winner_tx.lock().await.is_some() {
+            tracing::info!("hedge: firing backup request");
+            let backup = spawn_request();
+            race(backup, tx_b).await;
+        }
+    });
+
+    match winner_rx.await {
+        Ok((first_chunk, rest)) =&gt; {
+            let prepend = futures::stream::iter(std::iter::once(Ok(first_chunk)));
+            Ok(Box::pin(prepend.chain(rest)) as ByteStream)
+        }
+        Err(_) =&gt; Err(std::io::Error::other("both hedged requests failed")),
+    }
+}
+
+async fn race(mut s: ByteStream, tx: std::sync::Arc&lt;tokio::sync::Mutex&lt;Option&lt;oneshot::Sender&lt;(Bytes, ByteStream)&gt;&gt;&gt;&gt;) {
+    if let Some(Ok(first)) = s.next().await {
+        let mut guard = tx.lock().await;
+        if let Some(sender) = guard.take() {
+            let _ = sender.send((first, s));
+        }
+        // If guard was None, someone else already won — drop our stream, cancelling.
+    }
+}</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why hedging is so effective</span>
+    <p>In a fleet of upstreams, individual workers occasionally pause for GC, model paging, KV-cache eviction, or just an unlucky load spike. Per-worker tail latency is bursty. Firing a hedge after p95 means: if the primary was about to be slow, the hedge has a high chance of hitting a fresh worker. Studies inside Google ("Tail at Scale") show 30-50% p99 reductions for ~5% extra load.</p>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">When hedging is bad</span>
+    <p>Hedging is bad when the upstream is already overloaded — you're adding load while it's struggling. The circuit breaker prevents the worst version (if upstream is dying, breaker opens and no hedge fires), but you should still gate hedging behind a "only when upstream is healthy" check. We do that below.</p>
+  </div>
+</section>
+
+<section id="wire">
+  <h2>Wire it all into the proxy</h2>
+  <p>Update <code>AppState</code> to carry the breaker and budget:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::{breaker::CircuitBreaker, coalesce::Coalescer, retry::RetryBudget, upstream::Upstream};
+use std::sync::Arc;
+// ... existing imports
+
+#[derive(Clone)]
+pub struct AppState {
+    pub ready: Arc&lt;std::sync::atomic::AtomicBool&gt;,
+    pub upstream: Upstream,
+    pub coalescer: Coalescer,
+    pub breaker: Arc&lt;CircuitBreaker&gt;,
+    pub retry_budget: Arc&lt;RetryBudget&gt;,
+    pub hedge_after_ms: u64,
+}
+
+impl AppState {
+    pub fn new(upstream: Upstream, hedge_after_ms: u64) -&gt; Self {
+        use std::time::Duration;
+        Self {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            upstream,
+            coalescer: Coalescer::default(),
+            breaker: Arc::new(CircuitBreaker::new(
+                Duration::from_secs(30),
+                10,
+                Duration::from_secs(10),
+            )),
+            retry_budget: Arc::new(RetryBudget::new(10.0, 0.5)),
+            hedge_after_ms,
+        }
+    }
+}</code></pre>
+</div>
+
+  <p>Add a config field for hedging:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">// in config.rs
+pub hedge_after_ms: u64,
+// in from_env():
+hedge_after_ms: env::var("INFERGW_HEDGE_AFTER_MS")
+    .ok().and_then(|s| s.parse().ok()).unwrap_or(800),</code></pre>
+</div>
+
+  <p>Update the leader spawner in <code>proxy.rs</code> to consult the breaker and (optionally) hedge. Replace <code>spawn_leader</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use crate::breaker::State as BreakerState;
+
+fn spawn_leader(state: AppState, key: String, body: Value, inflight: Arc&lt;InFlight&gt;) {
+    tokio::spawn(async move {
+        // 1) Check the breaker before making any call.
+        let permit = match state.breaker.try_acquire() {
+            Ok(p) =&gt; p,
+            Err(s) =&gt; {
+                tracing::warn!(?s, "breaker short-circuited request");
+                let _ = inflight.tx.send(Frame::Error(format!("circuit {s:?}")));
+                state.coalescer.remove(&amp;key);
+                return;
+            }
+        };
+
+        // 2) Decide whether to hedge: only when breaker is fully closed,
+        //    and only for streaming requests (which we're already in).
+        let allow_hedge = permit.closed_path
+            &amp;&amp; state.breaker.state() == BreakerState::Closed
+            &amp;&amp; state.hedge_after_ms &gt; 0;
+
+        let outcome = if allow_hedge {
+            do_hedged_upstream(&amp;state, &amp;body).await
+        } else {
+            do_single_upstream(&amp;state, &amp;body).await
+        };
+
+        match outcome {
+            Ok(mut stream) =&gt; {
+                state.breaker.record_success();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(b) =&gt; {
+                            inflight.replay.lock().await.push(Frame::Chunk(b.clone()));
+                            let _ = inflight.tx.send(Frame::Chunk(b));
+                        }
+                        Err(e) =&gt; {
+                            let _ = inflight.tx.send(Frame::Error(format!("chunk: {e}")));
+                            break;
+                        }
+                    }
+                }
+                inflight.replay.lock().await.push(Frame::Done);
+                let _ = inflight.tx.send(Frame::Done);
+            }
+            Err(e) =&gt; {
+                state.breaker.record_failure();
+                let _ = inflight.tx.send(Frame::Error(format!("upstream: {e}")));
+            }
+        }
+        state.coalescer.remove(&amp;key);
+    });
+}
+
+async fn do_single_upstream(
+    state: &amp;AppState,
+    body: &amp;Value,
+) -&gt; Result&lt;Pin&lt;Box&lt;dyn futures::Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; + Send&gt;&gt;, String&gt; {
+    let url = state.upstream.chat_completions_url();
+    let resp = state.upstream.client.post(&amp;url).json(body).send().await
+        .map_err(|e| format!("send: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("upstream status {}", resp.status()));
+    }
+    let s = resp.bytes_stream().map(|c| c.map_err(std::io::Error::other));
+    Ok(Box::pin(s))
+}
+
+async fn do_hedged_upstream(
+    state: &amp;AppState,
+    body: &amp;Value,
+) -&gt; Result&lt;Pin&lt;Box&lt;dyn futures::Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; + Send&gt;&gt;, String&gt; {
+    use std::time::Duration;
+    let state2 = state.clone();
+    let body2 = body.clone();
+    let spawn_one = move || -&gt; Pin&lt;Box&lt;dyn futures::Stream&lt;Item = Result&lt;Bytes, std::io::Error&gt;&gt; + Send&gt;&gt; {
+        let state = state2.clone();
+        let body = body2.clone();
+        Box::pin(async_stream::stream! {
+            match do_single_upstream(&amp;state, &amp;body).await {
+                Ok(mut s) =&gt; {
+                    while let Some(item) = s.next().await { yield item; }
+                }
+                Err(e) =&gt; { yield Err(std::io::Error::other(e)); }
+            }
+        })
+    };
+    crate::hedge::hedged(spawn_one, Duration::from_millis(state.hedge_after_ms))
+        .await
+        .map_err(|e| e.to_string())
+}</code></pre>
+</div>
+
+  <p>Add <code>std::pin::Pin</code> to the imports and register the new modules in <code>main.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">mod breaker;
+mod hedge;
+mod retry;</code></pre>
+</div>
+
+  <p>And in <code>main()</code> pass the config through:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">let state = routes::AppState::new(upstream, cfg.hedge_after_ms);</code></pre>
+</div>
+</section>
+
+<section id="test">
+  <h2>Make the mock misbehave</h2>
+  <p>Let's prove the breaker trips and recovers. Add a controllable failure mode to the mock — edit <code>mock-upstream/src/main.rs</code> to fail when an env var asks:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">use std::sync::atomic::{AtomicUsize, Ordering};
+static REQS: AtomicUsize = AtomicUsize::new(0);
+
+async fn chat(/* same args */) -&gt; impl axum::response::IntoResponse {
+    let n = REQS.fetch_add(1, Ordering::Relaxed);
+    let fail_every: usize = std::env::var("FAIL_EVERY").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(0);
+    if fail_every &gt; 0 &amp;&amp; n % fail_every == 0 {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "synthetic failure").into_response();
+    }
+    // ... existing SSE response code, but call .into_response() at the end
+}</code></pre>
+</div>
+
+  <p>(You'll need to refactor the existing handler to return <code>Response</code> instead of <code>Sse&lt;...&gt;</code>; the body of the function is unchanged. The shape is: wrap the existing <code>Sse::new(stream).keep_alive(...)</code> in <code>.into_response()</code>.)</p>
+
+  <p>Run the mock with deterministic failures:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">FAIL_EVERY=1 cargo run -p mock-upstream</code></pre>
+</div>
+
+  <p>Now every request fails. Hit the gateway 12 times in a loop:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">for i in $(seq 1 12); do
+  curl -sN -o /dev/null -w "%{http_code}\n" \
+    -H 'content-type: application/json' \
+    -d '{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}' \
+    http://127.0.0.1:8080/v1/chat/completions
+done</code></pre>
+</div>
+
+  <p>You'll see the first ~10 succeed at the HTTP layer (200 with an error frame in the stream) — those failures accumulate. After 10 failures in the 30-second window, the breaker opens. Subsequent requests get an immediate error frame from the gateway without touching the upstream. Watch the gateway logs:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">WARN infergw::breaker: circuit breaker: open failures=10 cooldown_ms=10000
+WARN infergw::proxy: breaker short-circuited request s=Open</code></pre>
+</div>
+
+  <p>Now stop the mock failures: <code>Ctrl-C</code> the mock and restart it with <code>cargo run -p mock-upstream</code> (no <code>FAIL_EVERY</code>). After the 10-second cooldown, the next request becomes the half-open probe, succeeds, and the breaker closes.</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">INFO infergw::breaker: circuit breaker: closed (probe ok)</code></pre>
+</div>
+</section>
+
+<section id="tradeoffs">
+  <h2>Tradeoffs to internalize</h2>
+  <ul>
+    <li><strong>Breaker threshold</strong> — too low and you flap on minor blips; too high and the upstream gets pummeled before you back off. 10 failures in 30s is a starting point. Tune from real prod metrics.</li>
+    <li><strong>Retry budget</strong> — capped retries prevent amplification, but they also mean a small fraction of requests will see un-retried failures during incidents. That's the correct tradeoff: better that 1% of requests fail than that 100% fail because you DDoS'd your own backend with retries.</li>
+    <li><strong>Hedging cost</strong> — at <code>hedge_after=p95</code>, you fire a hedge on ~5% of requests. Token cost matters when the upstream is a paid API: count carefully, gate by tier, or skip hedging for low-tier users.</li>
+    <li><strong>Order matters</strong> — apply breaker first (cheap, refuses fast), then retry budget, then hedging. Don't hedge through an open breaker.</li>
+  </ul>
+
+  <details class="collapse-card">
+    <summary>Stretch: per-upstream breakers</summary>
+    <div class="collapse-card-body">
+      <p>In a real fleet, you'd have multiple upstream addresses (one per vLLM replica). Keep a <code>HashMap&lt;String, CircuitBreaker&gt;</code> keyed by upstream address. When you pick an upstream for a request, consult its individual breaker. A single sick replica trips its own breaker without taking the rest of the fleet down — and load-balancing naturally routes around it. This is one of the things <code>tower::balance</code> does, well, when you commit to using it.</p>
+    </div>
+  </details>
+
+  <details class="collapse-card">
+    <summary>Stretch: tie hedging to a real latency histogram</summary>
+    <div class="collapse-card-body">
+      <p>Right now <code>hedge_after_ms</code> is configured statically. Chapter 05 wires real latency histograms; once those exist, you can read p95 dynamically and set <code>hedge_after</code> from observed behavior, not a guess. Be careful: feedback loops where bad latency triggers more hedging which causes more latency are a thing. Cap the fraction of requests that can hedge (e.g. 10%) regardless of what the histogram says.</p>
+    </div>
+  </details>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li>Circuit breaker opens after 10 failures in 30s, transitions to half-open after 10s cooldown, closes on probe success.</li>
+    <li>Hedging fires a backup request after the configured threshold (default 800ms).</li>
+    <li>Retry budget exists and is wired through <code>AppState</code> (full retry-on-connect-error implementation is left as an exercise — the primitives are all there).</li>
+    <li>The mock can be made to fail deterministically with <code>FAIL_EVERY</code>.</li>
+  </ul>
+
+  <p>Reliability layer done. Time to see what's actually happening.</p>
+
+  <p style="margin-top: 24px;"><a href="05-observability.html"><strong>→ Chapter 05: Prometheus metrics and OpenTelemetry traces</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

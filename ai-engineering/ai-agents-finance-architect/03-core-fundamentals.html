@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — AI Agents Architect (Finance)</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#llm-basics">LLM orchestration basics</a>
+    <a href="#agent-primitives">Agentic system primitives</a>
+    <a href="#prompts">Prompts in production</a>
+    <a href="#tools">Tool use &amp; function calling</a>
+    <a href="#structured">Structured output</a>
+    <a href="#caching">Prompt caching</a>
+    <a href="#retries">Retries &amp; idempotency</a>
+    <a href="#latency">Latency vs. cost tradeoffs</a>
+    <a href="#context">Context engineering</a>
+    <a href="#finance-overlay">Finance overlay on every primitive</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The base layer everything else builds on. LLM orchestration, agentic primitives, prompts/tools/structured output, retries, idempotency, latency vs. cost — with the finance overlay running through each.</p>
+</header>
+
+<section id="llm-basics">
+  <h2>LLM orchestration basics</h2>
+  <p>A modern LLM is a stateless function: input tokens → output tokens. Everything else — memory, tools, loops, multi-agent coordination — is <strong>orchestration</strong> you build around that function. The vocabulary:</p>
+  <ul>
+    <li><strong>Inference call</strong>: one round-trip to the model.</li>
+    <li><strong>Turn</strong>: one user message + one assistant response.</li>
+    <li><strong>Conversation / thread</strong>: a sequence of turns sharing context.</li>
+    <li><strong>System prompt</strong>: the instructions that frame every call.</li>
+    <li><strong>Tools / functions</strong>: declared callables the model can request.</li>
+    <li><strong>Agent loop</strong>: an automated loop where the model decides actions and the harness executes them until a stop condition.</li>
+  </ul>
+  <p>In your interview, when asked "how does an agent work," answer at this level first, then add concrete pieces. Don't dive into MCP transports before establishing the loop.</p>
+</section>
+
+<section id="agent-primitives">
+  <h2>Agentic system primitives</h2>
+  <p>An agent is a loop with five primitives:</p>
+  <ol>
+    <li><strong>Goal</strong> — what the agent is trying to accomplish ("reconcile the May Coinbase Custody balance to the GL").</li>
+    <li><strong>Context</strong> — system prompt, knowledge, conversation history, tool definitions.</li>
+    <li><strong>Tools</strong> — the verbs the agent can take (fetch balance, query GL, post comment).</li>
+    <li><strong>Loop</strong> — model proposes an action → harness executes → result fed back → repeat.</li>
+    <li><strong>Stop condition</strong> — task complete, max steps reached, error budget exceeded, human gate hit.</li>
+  </ol>
+  <p>The most common <strong>finance failure mode</strong> is a missing or weak stop condition. An agent that's "trying hard" to reconcile a balance that's structurally unreconcilable will burn tokens and hallucinate matches. Always design the bail-out gate first.</p>
+</section>
+
+<section id="prompts">
+  <h2>Prompts in production</h2>
+  <p>Three layers in production prompts:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>What it contains</th><th>Cache?</th></tr></thead>
+    <tbody>
+      <tr><td>System</td><td>Role, controls policy, controls boundaries, output schema, escalation rules.</td><td>Yes — long-lived.</td></tr>
+      <tr><td>Context / Knowledge</td><td>Chart of accounts, journal posting rules, this entity's policy, GL schema, controls catalog.</td><td>Yes — refreshes monthly/quarterly.</td></tr>
+      <tr><td>Task</td><td>The specific recon, the specific date range, the inputs.</td><td>No — varies per call.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>What good system prompts contain in finance</h3>
+  <ul>
+    <li><strong>Identity &amp; scope</strong>: "You are a reconciliation assistant. You do not post journal entries. You produce proposed entries that a human approver reviews."</li>
+    <li><strong>Bail conditions</strong>: "If confidence &lt; 0.85, or if the variance exceeds $X, halt and flag for human."</li>
+    <li><strong>Output schema</strong>: exact JSON shape the downstream system expects.</li>
+    <li><strong>Citations requirement</strong>: every numerical claim must reference a source document/system.</li>
+    <li><strong>Anti-fabrication rule</strong>: "If a value is not present in the inputs, do not invent it. Return null and a flag."</li>
+  </ul>
+</section>
+
+<section id="tools">
+  <h2>Tool use &amp; function calling</h2>
+  <p>Tools are how the model takes actions. You declare a tool by name, description, and JSON schema; the model decides to call it; your code executes; you return the result in the conversation. A minimal example for finance:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">tools = [
+    {
+        "name": "fetch_gl_balance",
+        "description": "Fetch the General Ledger balance for an account on a date.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "account_code": {"type": "string", "description": "e.g. 1010-Cash-USD"},
+                "as_of_date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
+                "entity_id": {"type": "string"}
+            },
+            "required": ["account_code", "as_of_date", "entity_id"]
+        }
+    },
+    {
+        "name": "fetch_bank_balance",
+        "description": "Fetch balance from a banking API for an account on a date.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bank_account_id": {"type": "string"},
+                "as_of_date": {"type": "string"}
+            },
+            "required": ["bank_account_id", "as_of_date"]
+        }
+    },
+    {
+        "name": "propose_reconciling_item",
+        "description": "Propose a reconciling item for human approval. Does not post.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "string", "description": "Decimal as string, never float"},
+                "description": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["amount", "description", "evidence"]
+        }
+    }
+]
+</code></pre></div>
+
+  <p>Notice: there is no "post to NetSuite" tool exposed to the agent at this tier. Posting is a separate human-gated step. <strong>The tool catalog encodes the risk tier.</strong></p>
+
+  <h3>Tool design rules for finance</h3>
+  <ul>
+    <li><strong>Read tools never mutate.</strong> If a tool's name doesn't start with <code>fetch_</code> / <code>get_</code> / <code>list_</code>, it should require human approval.</li>
+    <li><strong>Write tools write to staging</strong> — propose-and-approve, not commit.</li>
+    <li><strong>Money is decimal</strong> in every schema. Never floats.</li>
+    <li><strong>Every tool call is logged</strong> with inputs, outputs, latency, model version, prompt hash, caller identity.</li>
+  </ul>
+</section>
+
+<section id="structured">
+  <h2>Structured output</h2>
+  <p>For any finance step that hands off to a downstream system, demand a structured output and validate it before acting. Two patterns:</p>
+  <ol>
+    <li><strong>JSON schema in the prompt</strong> + post-call validation with Pydantic.</li>
+    <li><strong>Tool-call as output</strong>: ask the model to "call" a tool whose only purpose is to emit the structured answer.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from decimal import Decimal
+from pydantic import BaseModel, field_validator
+from typing import Literal
+
+class ReconciliationResult(BaseModel):
+    status: Literal["matched", "partial", "unmatched"]
+    gl_balance: Decimal
+    bank_balance: Decimal
+    variance: Decimal
+    confidence: float  # 0..1
+    proposed_items: list[dict] = []
+    needs_human: bool
+
+    @field_validator("confidence")
+    @classmethod
+    def in_range(cls, v):
+        if not 0.0 &lt;= v &lt;= 1.0:
+            raise ValueError("confidence must be in [0,1]")
+        return v
+</code></pre></div>
+  <p>If validation fails, you do <em>not</em> pass the output to the next step. You retry with a corrective prompt or escalate.</p>
+</section>
+
+<section id="caching">
+  <h2>Prompt caching</h2>
+  <p>Anthropic's prompt caching gives ~90% discount and ~85% latency reduction on cached tokens. In finance the wins are large because most calls reuse the same preamble:</p>
+  <ul>
+    <li>Chart of accounts (~5K-50K tokens depending on entity).</li>
+    <li>Controls catalog &amp; policy.</li>
+    <li>Journal posting rules.</li>
+    <li>Recent N periods of trial balance (for comparatives).</li>
+  </ul>
+  <p>Pattern: put the long stable preamble in a cached block; put the per-call inputs after the cache breakpoint. A monthly close that calls Claude 5,000 times can cost 1/8 of an uncached design.</p>
+  <div class="callout tip">
+    <span class="callout-label">Interview-friendly framing</span>
+    <p><em>"For close season I'd cache the chart of accounts, controls catalog, and posting rules. Each recon call reuses ~30K stable tokens plus ~2K variable input. Conservative napkin: that's an order-of-magnitude cost reduction without changing the model."</em></p>
+  </div>
+</section>
+
+<section id="retries">
+  <h2>Retries &amp; idempotency</h2>
+  <p>Two classes of failure to design for:</p>
+  <ol>
+    <li><strong>Transient</strong> — API timeout, 429 rate limit, transient 5xx. Retry with exponential backoff and jitter.</li>
+    <li><strong>Semantic</strong> — model produced output that fails validation. Retry with a corrective system message ("your last output failed validation because X — fix and resubmit"). Cap at 2-3 attempts then escalate.</li>
+  </ol>
+  <p><strong>Idempotency keys</strong> are non-negotiable on any tool that mutates state. The pattern:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import hashlib
+
+def idempotency_key(entity_id: str, period: str, account: str, action: str) -> str:
+    # Deterministic, stable across retries of the same logical operation.
+    raw = f"{entity_id}|{period}|{account}|{action}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+</code></pre></div>
+  <p>The downstream system (NetSuite, BlackLine) must reject duplicate idempotency keys. Without this, an agent retry can double-post a journal entry — and at close, doubled JEs are the kind of bug that ends careers.</p>
+</section>
+
+<section id="latency">
+  <h2>Latency vs. cost tradeoffs</h2>
+  <p>You'll be asked some version of "when do you use Opus vs. Sonnet vs. Haiku?" An interview-ready framing:</p>
+  <table>
+    <thead><tr><th>Workload</th><th>Model</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>High-volume classification (categorize 500K transactions)</td><td>Haiku</td><td>Cheap, fast; quality threshold is "right category 99%+" not "explain your reasoning"</td></tr>
+      <tr><td>Per-recon assistant (mid-complexity)</td><td>Sonnet</td><td>The default for production finance work — strong reasoning at sane cost</td></tr>
+      <tr><td>Quarter-end audit-prep narrative</td><td>Opus</td><td>Few calls, high stakes, deep reasoning needed, cost is a rounding error</td></tr>
+      <tr><td>Realtime treasury alert summary</td><td>Haiku</td><td>Latency matters; problem space is narrow</td></tr>
+    </tbody>
+  </table>
+  <p>The shape: <strong>pick the cheapest model that meets the eval bar.</strong> Don't reach for Opus by default. Don't reach for Haiku to save pennies on a tier-3 control.</p>
+</section>
+
+<section id="context">
+  <h2>Context engineering</h2>
+  <p>A long context window is not the same as <em>useful</em> context. Two principles:</p>
+  <ul>
+    <li><strong>Recency &amp; relevance bias.</strong> Models attend better to information at the start and end of context. Put the most important policy at the top of the system prompt; put the task at the bottom of the user turn.</li>
+    <li><strong>Retrieve, don't dump.</strong> 1M-token contexts let you stuff everything in, but retrieval (RAG over the chart of accounts, prior recons, policies) usually produces better answers at a fraction of the cost.</li>
+  </ul>
+  <p>For close, a good default is: cache the long preamble + retrieve the 5-10 most relevant prior recons + include only the current period's transactions in the per-call input.</p>
+</section>
+
+<section id="finance-overlay">
+  <h2>The finance overlay on every primitive</h2>
+  <p>If you take one thing from this chapter into your interview, take this. Every fundamental above has a finance-specific overlay:</p>
+  <table>
+    <thead><tr><th>Primitive</th><th>Generic answer</th><th>Finance overlay</th></tr></thead>
+    <tbody>
+      <tr><td>Stop condition</td><td>"Max steps or task done"</td><td>"+ confidence threshold, + variance threshold, + human gate on high-risk classes"</td></tr>
+      <tr><td>Tool schema</td><td>"JSON schema with required fields"</td><td>"+ Decimal for money, + entity_id always, + idempotency_key on any mutation"</td></tr>
+      <tr><td>Retry</td><td>"Exponential backoff"</td><td>"+ idempotency, + never silently retry a write, + escalate on second semantic failure"</td></tr>
+      <tr><td>Logging</td><td>"Log inputs and outputs"</td><td>"+ model version, + prompt hash, + caller, + decisions taken, + 7-year retention"</td></tr>
+      <tr><td>Model selection</td><td>"Pick by capability"</td><td>"+ document the model in the SOX control narrative; switching models is a change-managed event"</td></tr>
+    </tbody>
+  </table>
+  <p>That last row is subtle and high-signal in interviews. <strong>Swapping Sonnet for Sonnet-newer in a Tier 3 workflow is a SOX change.</strong> You don't just deploy it on Tuesday because the new model came out. That sentence alone tells a senior interviewer you've thought about regulated AI for real.</p>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Positioning</a> · <a href="04-deep-dive-primary.html">Next: Agentic workflow architecture →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why HR is unforgiving</a>
+    <a href="#failure-classes">Five classes of failure</a>
+    <a href="#wrong-worker">Wrong worker affected</a>
+    <a href="#payroll-misalign">Payroll-calendar misalignment</a>
+    <a href="#broken-workday">Broken Workday integration</a>
+    <a href="#eib-partial">EIB partial failure</a>
+    <a href="#pii-leak">PII leak</a>
+    <a href="#fail-safe">Fail-safe defaults</a>
+    <a href="#never-near-cutoff">Never near payroll cutoff</a>
+    <a href="#incident">Incident playbook</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Failure modes</span>
+  <h1>Error Handling for HR Agents</h1>
+  <p class="subtitle">What goes wrong, how it goes wrong, and the fail-safe defaults that keep an agent from quietly causing payroll, legal, or trust damage.</p>
+</header>
+
+<section id="why">
+  <h2>Why HR is unforgiving</h2>
+  <p>An error in a search-ranking model returns a worse result and the user reformulates. An error in an HR agent:</p>
+  <ul>
+    <li>Changes the wrong person's record</li>
+    <li>Triggers an off-cycle payroll adjustment</li>
+    <li>Sends a benefits-eligibility email to a recently terminated employee</li>
+    <li>Surfaces another employee's salary in a Slack thread</li>
+    <li>Pushes an EU employee's PII to a US endpoint without a DPA</li>
+  </ul>
+  <p>None of these recover by themselves. Every one creates work for HRKX, Payroll, IT, or Legal. The right mental model is closer to <em>"this is a system that touches money and identity"</em> than to <em>"this is a chatbot."</em></p>
+</section>
+
+<section id="failure-classes">
+  <h2>Five classes of failure to design against</h2>
+  <ol>
+    <li><strong>Wrong worker affected</strong> — agent took the right action on the wrong identity</li>
+    <li><strong>Payroll-calendar misalignment</strong> — right action, wrong timing window</li>
+    <li><strong>Broken Workday integration</strong> — transport / auth / schema failure mid-run</li>
+    <li><strong>EIB partial failure</strong> — bulk operation succeeded for some rows, failed for others</li>
+    <li><strong>PII leak</strong> — data crossed a boundary it shouldn't have (logs, summaries, third-party APIs)</li>
+  </ol>
+  <p>Each has a specific design response, below. In interview, when asked "how do you handle errors," step through this list.</p>
+</section>
+
+<section id="wrong-worker">
+  <h2>Wrong worker affected — the cardinal HR failure</h2>
+  <p>How it happens:</p>
+  <ul>
+    <li>Two workers with the same name; agent picked the wrong one</li>
+    <li>Rehire detection failed; agent created a duplicate</li>
+    <li>Email-to-ID lookup hit a stale record</li>
+    <li>Slack-user-id to worker-id mapping was wrong because someone changed their Slack handle</li>
+  </ul>
+
+  <h3>Design responses</h3>
+  <ul>
+    <li><strong>Always anchor on Workday's stable identifier</strong> — Worker ID, not name, not email-as-string, not Slack handle. All other identifiers are lookups <em>to</em> the Worker ID, never replacements.</li>
+    <li><strong>Surface identity in the HITL preview</strong> — "You are about to change FTE for Jane Doe, W-12345, hired 2024-03-01, currently in Wallet Eng / EMEA." The approver catches the wrong-Jane case in 5 seconds.</li>
+    <li><strong>Rehire detection on every hire-shaped action</strong> — match by email hash + DOB hash + government ID hash; if any high-confidence match, halt and route.</li>
+    <li><strong>Confirmation echo</strong> — Slack agent always echoes "Got it — looking up @yourname (Jane Doe, W-12345). Confirm?" for any action-shaped query.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The HITL preview is your last line of defense</span>
+    <p>Design the approval UI so the right answer is fast and the wrong answer is impossible to miss. A diff view, identity context, effective date, jurisdiction, and the reason code — all visible without scrolling.</p>
+  </div>
+</section>
+
+<section id="payroll-misalign">
+  <h2>Payroll-calendar misalignment</h2>
+  <p>The agent does the right thing at the wrong time. Examples:</p>
+  <ul>
+    <li>Comp change committed at T-2 days before US payroll cutoff doesn't make this cycle, lands in next — wage is wrong for one pay period.</li>
+    <li>Termination effective today, but payroll already locked — the worker is paid for a day they shouldn't be, or worse, their final-pay calc is off.</li>
+    <li>Retro change committed creates a retro-pay event that surprises Payroll.</li>
+  </ul>
+
+  <h3>Design responses</h3>
+  <ul>
+    <li><strong>Payroll calendar is a tool input, not an afterthought</strong> — every proposed write tool requires <code>effective_date</code> and checks it against <code>get_payroll_lock_windows(country)</code>.</li>
+    <li><strong>Lock-window behavior is explicit refusal + escalation</strong> — not silent queue, not "try anyway."</li>
+    <li><strong>Multi-country awareness</strong> — UK lock and US lock are different. The agent reasons per the worker's payroll country, not a global default.</li>
+    <li><strong>Retro changes always tier up</strong> — past effective dates require Payroll Ops co-approval, regardless of magnitude.</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">def check_payroll_window(effective_date: date, country: str) -> dict:
+    """Return safe / caution / locked for this date + country combo."""
+    lock = payroll_calendar.get_lock_window(country, effective_date)
+    days_to_cutoff = (lock["cutoff"] - date.today()).days
+    if effective_date &lt; date.today():
+        return {"status": "retro", "tier_up": True, "rationale": "retro change requires Payroll co-approval"}
+    if days_to_cutoff &lt; 0:
+        return {"status": "locked", "halt": True, "rationale": f"payroll locked since {lock['cutoff']}"}
+    if days_to_cutoff &lt;= 3:
+        return {"status": "caution", "tier_up": True, "rationale": f"{days_to_cutoff} days to cutoff"}
+    return {"status": "safe"}</code></pre>
+</div>
+</section>
+
+<section id="broken-workday">
+  <h2>Broken Workday integration</h2>
+  <p>How it happens:</p>
+  <ul>
+    <li>Workday API returns 5xx mid-run</li>
+    <li>Auth token expired (Workday tokens are aggressive about session timeouts)</li>
+    <li>Schema mismatch — the field your code expects was renamed in a tenant change</li>
+    <li>RaaS report returned different columns than yesterday because someone edited the report</li>
+  </ul>
+
+  <h3>Design responses</h3>
+  <ul>
+    <li><strong>Pin to specific RaaS report IDs and versions</strong>, not free-text URLs</li>
+    <li><strong>Validate response schema on every read</strong> — fail fast if the schema diverged</li>
+    <li><strong>Retry transient 5xx with backoff</strong>, but cap attempts; surface persistent failures as a halt</li>
+    <li><strong>Token refresh is a first-class concern</strong> — not "retry once and hope"</li>
+    <li><strong>Circuit-breaker on Workday API</strong> — if 5 consecutive failures, halt all Workday-touching agents until ops acknowledges</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Why the circuit breaker matters</span>
+    <p>During a Workday tenant maintenance window or a transient outage, you do not want 14 agents quietly piling up queued retries that all fire at once when the tenant returns. A circuit breaker keeps the blast radius small.</p>
+  </div>
+</section>
+
+<section id="eib-partial">
+  <h2>EIB partial failure</h2>
+  <p>You upload 50 rows. 47 succeed. 3 fail with per-row errors. This is the normal case, not the exception.</p>
+
+  <h3>Design responses</h3>
+  <ul>
+    <li><strong>Track proposed-action IDs end-to-end</strong> — each EIB row carries the proposal_id; the EIB run summary correlates back</li>
+    <li><strong>Surface failures per row</strong> with the Workday error reason and the original proposal</li>
+    <li><strong>Re-run only failures</strong>, not the whole batch — using the same idempotency keys</li>
+    <li><strong>HRKX-readable failure dashboard</strong> — not "see the EIB run summary in Workday"</li>
+    <li><strong>Never auto-retry payroll-affecting failures</strong> — failures route to a human, who decides whether to reattempt or cancel</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">def process_eib_results(eib_run_id: str, proposals: list[dict]):
+    """Reconcile an EIB run with the original proposals."""
+    summary = workday.get_eib_run_summary(eib_run_id)
+    for row in summary["rows"]:
+        proposal = find_proposal_by_id(proposals, row["external_ref"])
+        if row["status"] == "SUCCESS":
+            mark_proposal_committed(proposal["id"], result=row)
+        else:
+            mark_proposal_failed(proposal["id"], reason=row["error"])
+            # NOT auto-retry. Route to ops.
+            notify_ops_channel(
+                kind="eib_row_failure",
+                proposal=proposal,
+                reason=row["error"],
+                workday_run_id=eib_run_id,
+            )</code></pre>
+</div>
+</section>
+
+<section id="pii-leak">
+  <h2>PII leak</h2>
+  <p>The quietest, most consequential failure class. Vectors:</p>
+  <ul>
+    <li>Logs contain raw PII (SSN, salary, home address)</li>
+    <li>An LLM call sent EU employee data to a US-hosted endpoint without DPA coverage</li>
+    <li>A Slack post named another employee in front of an audience that shouldn't see it</li>
+    <li>An error message included raw worker data in a downstream alert</li>
+    <li>An MCP server's "list" tool returned more than the agent's caller was authorized for</li>
+  </ul>
+
+  <h3>Design responses</h3>
+  <ul>
+    <li><strong>Log redaction at write time, not read time</strong> — never write raw SSN, raw salary above a threshold, or any document marked Restricted to logs</li>
+    <li><strong>Authorization at MCP boundary</strong> — the MCP server enforces who can read what, not the agent</li>
+    <li><strong>Data residency aware tooling</strong> — EU PII goes to EU model endpoints; the integration layer enforces this, not the prompt</li>
+    <li><strong>Error messages strip sensitive context</strong> — alerts say "proposal P-123 failed for worker_id_hash:abc123," not "Jane Doe's SSN didn't validate"</li>
+    <li><strong>Output redaction step before any human-visible surface</strong> — even drafts route through a PII-redaction pass for cross-employee references</li>
+  </ul>
+</section>
+
+<section id="fail-safe">
+  <h2>Fail-safe defaults — the operating principles</h2>
+  <p>Make these defaults explicit in your interview. They are the difference between a senior architect and a "shipping" mindset that's wrong for HR.</p>
+  <table>
+    <thead><tr><th>Default</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>On any uncertainty, halt and escalate. Never auto-commit.</td><td>HR errors don't bounce back; they accrue silently.</td></tr>
+      <tr><td>Default model temperature for payroll-adjacent tasks: 0.</td><td>Determinism aids audit and reproducibility.</td></tr>
+      <tr><td>Default retry policy for committing tools: zero auto-retries; human decides.</td><td>Partial-effect retries cause duplicate state.</td></tr>
+      <tr><td>Default behavior near payroll cutoff: refuse, route, never queue silently.</td><td>"It'll process next cycle" is rarely the right answer.</td></tr>
+      <tr><td>Default for non-deterministic tool failures: circuit-break, page on-call.</td><td>Cascading retries are worse than backpressure.</td></tr>
+      <tr><td>Default for an output that fails schema validation: do not present to a human approver.</td><td>The HITL UI's promise is "this is a valid proposal." Don't break it.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="never-near-cutoff">
+  <h2>Never auto-trigger near a payroll cutoff</h2>
+  <p>This deserves its own section. In interviews, when given an aggressive design prompt ("automate this end-to-end"), reach for this principle unprompted:</p>
+  <div class="callout warn">
+    <span class="callout-label">The rule</span>
+    <p>Any agent action that has any chance of touching payroll data, comp, FTE, leaves, or worker type — and is within the lock window of the worker's payroll country — defaults to <strong>halt + escalate</strong>. Not "process at lower priority." Not "queue for after cutoff." Halt. Escalate. Wait for human direction.</p>
+  </div>
+  <p>The exception list is short and explicit, and is owned by the Process Owner, not the agent. Examples:</p>
+  <ul>
+    <li>HRBP and Payroll co-approval explicitly waives the lock window for this single proposal</li>
+    <li>The action is reversible and Payroll has pre-authorized its automation (rare)</li>
+  </ul>
+</section>
+
+<section id="incident">
+  <h2>Incident playbook — when something does go wrong</h2>
+  <p>You will be asked some version of "tell me about an incident." Have a real story. The structure that works:</p>
+  <ol>
+    <li><strong>Detect</strong> — what alert fired, who saw it, how fast</li>
+    <li><strong>Contain</strong> — what you turned off, what you paused, what you rolled back</li>
+    <li><strong>Communicate</strong> — who you told, in what order (HRBP, Payroll, Legal if PII)</li>
+    <li><strong>Diagnose</strong> — root cause analysis</li>
+    <li><strong>Fix</strong> — patch and verify</li>
+    <li><strong>Prevent</strong> — code change, eval addition, runbook update</li>
+    <li><strong>Postmortem</strong> — blameless writeup, action items tracked</li>
+  </ol>
+  <p>For an HR-specific incident, the communication step is loud — Payroll, HRBP, and possibly Legal must hear from you before they hear from an affected employee. The first 30 minutes are about <em>not making it worse</em>: halt all running agents, freeze any in-flight writes, preserve audit logs untouched.</p>
+</section>
+
+<section id="interview-frames">
+  <h2>Interview framings worth memorizing</h2>
+  <ul>
+    <li>"The cardinal HR failure is wrong-worker. I anchor on Workday Worker ID, surface full identity context in HITL previews, and run rehire-detection on every hire-shaped action."</li>
+    <li>"My agent default near payroll cutoff is halt + escalate. Not retry. Not queue. The cost of a late change is paid in payroll exceptions; the cost of one missed automation is one missed automation."</li>
+    <li>"EIB partial failure is the normal case. Per-row reconciliation, per-row idempotency keys, no auto-retry on payroll-affecting failures."</li>
+    <li>"PII leakage is zero-tolerance in tests and zero-retry in production. Redaction happens at log write time, authorization at MCP boundary, residency at the integration layer."</li>
+    <li>"On any uncertainty, the agent's right move is halt. Errors here don't bounce back — they accrue."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; audit →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

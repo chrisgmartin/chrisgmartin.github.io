@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#python-for-hr">Python for HR data</a>
+    <a href="#pandas">pandas — the daily driver</a>
+    <a href="#joining">Joining cross-system data</a>
+    <a href="#dates">Dates &amp; effective-dating</a>
+    <a href="#async">Async API patterns</a>
+    <a href="#dsa">DSA basics for this role</a>
+    <a href="#sql">SQL for HR analytics</a>
+    <a href="#sql-cohort">Cohort &amp; retention</a>
+    <a href="#sql-headcount">Headcount on a date</a>
+    <a href="#sql-attrition">Attrition rate</a>
+    <a href="#testing">Testing data code</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">Python for People data, the SQL that HR analytics actually runs, the DSA basics you should be cold on, and the testing posture that keeps payroll-affecting code honest.</p>
+</header>
+
+<section id="python-for-hr">
+  <h2>Python for HR data — the working language</h2>
+  <p>Expect to write Python on a shared editor in at least one round. The vocabulary the interviewer expects:</p>
+  <ul>
+    <li><strong>pandas</strong> — worker records, comp data, attrition computation, EIB CSV shaping</li>
+    <li><strong>pydantic</strong> — typed schemas for proposed actions, tool inputs, audit entries</li>
+    <li><strong>httpx / requests</strong> — Workday SOAP/REST, Ashby REST</li>
+    <li><strong>asyncio / async httpx</strong> — concurrent fetches across systems</li>
+    <li><strong>SQLAlchemy / psycopg</strong> — for the audit and proposals store</li>
+    <li><strong>pytest</strong> — non-negotiable for any HR-touching code</li>
+  </ul>
+</section>
+
+<section id="pandas">
+  <h2>pandas — the daily driver</h2>
+  <p>Be fluent in:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import pandas as pd
+
+# Read a Workday RaaS extract as JSON
+workers = pd.read_json("workers_raas.json")
+
+# Filter to active employees in EMEA hired in last 90 days
+recent_emea = workers[
+    (workers["status"] == "Active")
+    &amp; (workers["region"] == "EMEA")
+    &amp; (workers["hire_date"] &gt; pd.Timestamp.today() - pd.Timedelta(days=90))
+]
+
+# Group by country, count headcount
+by_country = (
+    recent_emea
+    .groupby("country", as_index=False)
+    .agg(headcount=("worker_id", "count"),
+         avg_fte=("fte", "mean"))
+    .sort_values("headcount", ascending=False)
+)
+
+# Merge with Ashby offer data on candidate_id
+offers = pd.read_json("ashby_offers.json")
+merged = workers.merge(offers, left_on="ashby_candidate_id",
+                       right_on="candidate_id", how="left",
+                       validate="one_to_one")  # explicit cardinality</code></pre>
+</div>
+
+  <div class="callout tip">
+    <span class="callout-label">The senior tell</span>
+    <p>Always pass <code>validate="one_to_one"</code> / <code>"one_to_many"</code> to <code>merge</code> when the cardinality is known. It crashes loudly if your assumption is wrong — which is what you want when you're joining people data.</p>
+  </div>
+</section>
+
+<section id="joining">
+  <h2>Joining cross-system data — the HR-specific traps</h2>
+  <p>HR data joins are stickier than they look. The traps:</p>
+  <ul>
+    <li><strong>Identity instability</strong> — emails change, Slack handles change, names change. Join on Worker ID where possible.</li>
+    <li><strong>Effective-dating asymmetry</strong> — your Workday extract is "as of now"; your Ashby snapshot may be "as of event time." A naive join can mismatch.</li>
+    <li><strong>Multi-record workers</strong> — Workers with multiple positions, multiple historical hires (rehires). Naive joins explode rows.</li>
+    <li><strong>Termed workers</strong> — Active vs all-workers extracts differ. Decide which population you're operating on, every time.</li>
+    <li><strong>Time zones</strong> — hire dates and termination dates are typically dates (no time) in Workday. Don't accidentally convert to a timezone-aware datetime that shifts by a day.</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">def join_workers_to_offers(workers: pd.DataFrame,
+                           offers: pd.DataFrame) -> pd.DataFrame:
+    """Join Workday workers to Ashby offers on the canonical link.
+
+    Defensive: explicit cardinality, NaN handling, dropped column conflicts.
+    """
+    # Ensure types and identity columns are clean
+    workers = workers.copy()
+    workers["worker_id"] = workers["worker_id"].astype("string").str.strip()
+    workers["ashby_candidate_id"] = workers["ashby_candidate_id"].astype("string")
+
+    offers = offers.copy()
+    offers["candidate_id"] = offers["candidate_id"].astype("string").str.strip()
+
+    # If an offer accepts but the worker isn't yet hired, candidate_id may not match
+    merged = workers.merge(
+        offers,
+        left_on="ashby_candidate_id",
+        right_on="candidate_id",
+        how="left",
+        suffixes=("_workday", "_ashby"),
+        validate="one_to_one",  # one worker, one accepted offer
+        indicator=True,
+    )
+    # Sanity: workers without an offer match
+    missing_offer = merged[merged["_merge"] == "left_only"]
+    if len(missing_offer) &gt; 0:
+        logger.warning(f"{len(missing_offer)} workers without matching Ashby offer")
+    return merged.drop(columns=["_merge"])</code></pre>
+</div>
+</section>
+
+<section id="dates">
+  <h2>Dates &amp; effective-dating</h2>
+  <p>The most-debugged code in HR pipelines is date code. Two principles:</p>
+  <ol>
+    <li>Use <code>date</code> objects (not <code>datetime</code>) for things that are dates. Workday hire date is a date. A 23:00 hire on 2026-03-01 in UTC is not "shifted by a day" in EMEA — it's just 2026-03-01 everywhere.</li>
+    <li>"Effective as of" reads need an explicit date parameter — never default silently to today.</li>
+  </ol>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">from datetime import date, timedelta
+
+def tenure_in_months(hire_date: date, as_of: date) -> int:
+    """Whole months of tenure, from hire_date to as_of."""
+    if as_of &lt; hire_date:
+        return 0
+    months = (as_of.year - hire_date.year) * 12 + (as_of.month - hire_date.month)
+    if as_of.day &lt; hire_date.day:
+        months -= 1
+    return max(0, months)
+
+def next_payroll_cutoff(country: str, after: date) -> date:
+    """Find the next payroll cutoff strictly after `after` for the country."""
+    # In production: query the payroll-calendar service.
+    # Pattern matters more than the calendar specifics.
+    cutoffs = payroll_calendar.list_cutoffs(country)
+    return next(c for c in cutoffs if c &gt; after)</code></pre>
+</div>
+</section>
+
+<section id="async">
+  <h2>Async API patterns</h2>
+  <p>Fetching from Workday + Ashby + Jira in a single agent run is the common case. Run reads concurrently:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import asyncio
+import httpx
+
+async def gather_worker_context(worker_id: str) -> dict:
+    """Fetch worker context from multiple systems concurrently."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        workday_task = workday_get_worker(client, worker_id)
+        ashby_task = ashby_get_application_by_worker(client, worker_id)
+        jira_task = jira_open_tickets_by_reporter(client, worker_id)
+        okta_task = okta_get_user_groups(client, worker_id)
+        results = await asyncio.gather(
+            workday_task, ashby_task, jira_task, okta_task,
+            return_exceptions=True,
+        )
+    keys = ["workday", "ashby", "jira", "okta"]
+    out = {}
+    for key, res in zip(keys, results):
+        if isinstance(res, Exception):
+            out[key] = {"error": str(res)}
+        else:
+            out[key] = res
+    return out</code></pre>
+</div>
+
+  <p>Note the <code>return_exceptions=True</code> — one slow system shouldn't tank the whole context-gather. The agent reasons about which results are present and which are missing.</p>
+</section>
+
+<section id="dsa">
+  <h2>DSA basics for this role</h2>
+  <p>Expect at least one DSA-style problem. The HR-adjacent ones cluster in:</p>
+  <ul>
+    <li><strong>Hash maps</strong> — deduplication, counting, "have I seen this worker before"</li>
+    <li><strong>Sorting + sweep</strong> — interval problems (date ranges, payroll periods, leave overlaps)</li>
+    <li><strong>Two-pointer / sliding window</strong> — running aggregates over a date range</li>
+    <li><strong>Set operations</strong> — "who's in set A and not B" (workers in HRIS vs Ashby)</li>
+    <li><strong>Date math</strong> — tenure, cohorting, period boundaries</li>
+  </ul>
+  <p>See <a href="11-coding-problems.html">11-coding-problems</a> for worked examples.</p>
+
+  <h3>Complexity literacy</h3>
+  <p>State Big-O clearly. <em>"This is O(n log n) because of the sort; could be O(n) with a hash map if we don't need ordering."</em> Don't say "fast" or "slow" — say the complexity.</p>
+</section>
+
+<section id="sql">
+  <h2>SQL for HR analytics — the dialect you'll write</h2>
+  <p>People analytics is mostly SQL on a warehouse (BigQuery, Snowflake, Redshift, or in some shops Workday Prism). Three queries every candidate should be able to write from scratch.</p>
+</section>
+
+<section id="sql-cohort">
+  <h2>Cohort retention</h2>
+  <p>"Of workers hired in Q1 2024, what fraction were still active at 6 months, 12 months, 18 months?"</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-sql">WITH cohort AS (
+    SELECT
+        worker_id,
+        hire_date,
+        termination_date
+    FROM workers
+    WHERE hire_date BETWEEN DATE '2024-01-01' AND DATE '2024-03-31'
+),
+retention AS (
+    SELECT
+        worker_id,
+        CASE WHEN termination_date IS NULL
+             OR termination_date &gt; hire_date + INTERVAL '6 months'
+             THEN 1 ELSE 0 END AS retained_6m,
+        CASE WHEN termination_date IS NULL
+             OR termination_date &gt; hire_date + INTERVAL '12 months'
+             THEN 1 ELSE 0 END AS retained_12m,
+        CASE WHEN termination_date IS NULL
+             OR termination_date &gt; hire_date + INTERVAL '18 months'
+             THEN 1 ELSE 0 END AS retained_18m
+    FROM cohort
+)
+SELECT
+    COUNT(*) AS cohort_size,
+    AVG(retained_6m)::float AS pct_6m,
+    AVG(retained_12m)::float AS pct_12m,
+    AVG(retained_18m)::float AS pct_18m
+FROM retention;</code></pre>
+</div>
+</section>
+
+<section id="sql-headcount">
+  <h2>Headcount on a date</h2>
+  <p>"What was headcount in EMEA on 2025-12-31?"</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-sql">SELECT
+    region,
+    COUNT(*) AS headcount
+FROM workers
+WHERE hire_date &lt;= DATE '2025-12-31'
+  AND (termination_date IS NULL OR termination_date &gt; DATE '2025-12-31')
+  AND region = 'EMEA'
+GROUP BY region;</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">The classic mistake</span>
+    <p>Treating <code>termination_date</code> as inclusive vs. exclusive of the last day of employment varies by org. Always confirm convention; usually <em>"last day worked"</em> means they were on the payroll <em>through</em> that date, so <code>termination_date &gt;= as_of</code> would still count them. Mismatched conventions cost real headcount.</p>
+  </div>
+</section>
+
+<section id="sql-attrition">
+  <h2>Attrition rate</h2>
+  <p>"What was the annualized attrition rate for engineering in 2025?"</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-sql">WITH start_pop AS (
+    SELECT COUNT(*) AS n
+    FROM workers
+    WHERE function = 'Engineering'
+      AND hire_date &lt;= DATE '2025-01-01'
+      AND (termination_date IS NULL OR termination_date &gt; DATE '2025-01-01')
+),
+end_pop AS (
+    SELECT COUNT(*) AS n
+    FROM workers
+    WHERE function = 'Engineering'
+      AND hire_date &lt;= DATE '2025-12-31'
+      AND (termination_date IS NULL OR termination_date &gt; DATE '2025-12-31')
+),
+terms AS (
+    SELECT COUNT(*) AS n
+    FROM workers
+    WHERE function = 'Engineering'
+      AND termination_date BETWEEN DATE '2025-01-01' AND DATE '2025-12-31'
+)
+SELECT
+    terms.n AS terminations,
+    start_pop.n AS start_headcount,
+    end_pop.n AS end_headcount,
+    (terms.n::float / ((start_pop.n + end_pop.n) / 2.0)) AS attrition_rate
+FROM start_pop, end_pop, terms;</code></pre>
+</div>
+
+  <p>Note: there are several attrition conventions (avg of start+end, start only, denominator includes new hires). State which you're using.</p>
+</section>
+
+<section id="testing">
+  <h2>Testing data code</h2>
+  <p>The minimum bar for any HR-touching Python:</p>
+  <ul>
+    <li><strong>Unit tests with fixtures</strong> — small, named worker fixtures covering active, terminated, rehired, multi-position, EOR</li>
+    <li><strong>Edge-case tests as named tests</strong> — <code>test_rehire_continuous_service_date</code>, <code>test_termination_on_payroll_cutoff</code></li>
+    <li><strong>Snapshot tests for EIB output shape</strong> — exact column order, exact header strings</li>
+    <li><strong>Schema validation tests</strong> — every proposed-action payload validates against its Pydantic model</li>
+    <li><strong>Property-based tests for idempotency</strong> — running the same logical action N times produces 1 committed effect</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">def test_idempotent_hire_proposal(db):
+    payload = {"applicant_id": "ASH-1", "hire_date": "2026-06-01",
+               "position_id": "P-99"}
+    p1 = propose_hire(payload, db)
+    p2 = propose_hire(payload, db)  # retry
+    assert p1["proposal_id"] == p2["proposal_id"]
+    assert db.count_proposals_by_idempotency_key(p1["idempotency_key"]) == 1
+
+def test_termination_on_payroll_lock_halts(db):
+    payload = {"worker_id": "W-12345", "effective_date": str(date.today()),
+               "country": "US", "reason_code": "VOLUNTARY"}
+    with mocked_payroll_lock(country="US", locked_until=date.today() + timedelta(days=1)):
+        result = propose_termination(payload, db)
+    assert result["status"] == "halted"
+    assert "payroll" in result["rationale"].lower()</code></pre>
+</div>
+</section>
+
+<section id="interview-frames">
+  <h2>Interview framings worth memorizing</h2>
+  <ul>
+    <li>"For pandas joins on people data I always pass <code>validate=</code> to assert cardinality. Silent fan-out is the most common data bug in HR."</li>
+    <li>"Anything that reads worker state takes an effective_date parameter. Workday is effective-dated; treating it as 'now' is the path to subtle bugs."</li>
+    <li>"My async pattern is gather-with-exceptions — one slow system shouldn't block agent reasoning. Missing context is a state the agent must reason about."</li>
+    <li>"Three SQL queries I'd expect on the loop are cohort retention, headcount on a date, and attrition rate. The trick in all three is the convention you adopt for termination_date inclusivity."</li>
+    <li>"Idempotency keys are tested with property-based tests — same logical action, any number of retries, exactly one committed effect."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance</a> · <a href="11-coding-problems.html">Next: Coding problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation &amp; Quality — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what-we-mean">What "quality" means for infra</a>
+    <a href="#metrics">The core metrics</a>
+    <a href="#ttft">Time-to-first-token</a>
+    <a href="#throughput">Throughput &amp; goodput</a>
+    <a href="#latency">Latency percentiles</a>
+    <a href="#gpu-util">GPU utilization — read it right</a>
+    <a href="#memory">Memory profiling</a>
+    <a href="#cost">Cost per million tokens</a>
+    <a href="#benchmarking">Benchmarking methodology</a>
+    <a href="#regression">Perf regression tests in CI</a>
+    <a href="#dashboards">The dashboards that matter</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-applied-patterns.html">← Previous</a>
+    <a href="08-error-handling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Critical</span>
+  <h1>Evaluation &amp; Quality</h1>
+  <p class="subtitle">How you measure that the infrastructure is doing its job. Performance benchmarking, GPU utilization done right, memory profiling, cost per million tokens, and regression tests that catch a slow kernel before it ships.</p>
+</header>
+
+<section id="what-we-mean">
+  <h2>What "quality" means for infrastructure</h2>
+  <p>For a model team, quality means accuracy and safety. For this team, quality means: the system delivers expected performance, under expected load, within expected cost, with expected reliability. Each of those words is a metric. Each metric is something you measure, set targets for, and regress against.</p>
+  <p>Infrastructure quality has four dimensions:</p>
+  <ul>
+    <li><strong>Performance</strong> — latency, throughput, TTFT.</li>
+    <li><strong>Efficiency</strong> — GPU utilization, memory utilization, cost per request.</li>
+    <li><strong>Reliability</strong> — availability, error rate, MTTR.</li>
+    <li><strong>Predictability</strong> — tail variance, behavior under load.</li>
+  </ul>
+</section>
+
+<section id="metrics">
+  <h2>The core metrics — for an LLM serving role</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Definition</th><th>Where to measure</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TTFT</strong> (time-to-first-token)</td><td>From request received to first response token emitted</td><td>Server-side trace; the client experiences this as "responsiveness"</td></tr>
+      <tr><td><strong>ITL</strong> (inter-token latency)</td><td>Time between successive emitted tokens</td><td>Server-side; experienced as "fluency"</td></tr>
+      <tr><td><strong>E2E latency</strong></td><td>Full request time to completion</td><td>Edge / client-side</td></tr>
+      <tr><td><strong>Tokens/sec/GPU</strong></td><td>Aggregate decode tokens emitted per second per GPU</td><td>Server metric; the headline "throughput" number</td></tr>
+      <tr><td><strong>Requests/sec</strong> (RPS)</td><td>Completed requests per second per replica</td><td>Server; useful for non-LLM models too</td></tr>
+      <tr><td><strong>SM-active %</strong></td><td>Fraction of time SMs executed instructions</td><td>DCGM <code>DCGM_FI_PROF_SM_ACTIVE</code></td></tr>
+      <tr><td><strong>SM-occupancy %</strong></td><td>Average warps active per cycle</td><td>DCGM <code>DCGM_FI_PROF_SM_OCCUPANCY</code> — finer-grained</td></tr>
+      <tr><td><strong>HBM memory used</strong></td><td>Bytes of HBM allocated and in use</td><td>DCGM; the cap on concurrency</td></tr>
+      <tr><td><strong>HBM bandwidth %</strong></td><td>Fraction of peak memory bandwidth</td><td>DCGM <code>DCGM_FI_PROF_DRAM_ACTIVE</code> — decode is BW-bound</td></tr>
+      <tr><td><strong>KV-cache hit rate</strong></td><td>Prefix-cached tokens / total prompt tokens</td><td>vLLM metrics; huge cost lever</td></tr>
+      <tr><td><strong>Cost / million tokens</strong></td><td>($/GPU-hour × hours) / millions of tokens served</td><td>Computed; the headline business metric</td></tr>
+      <tr><td><strong>Cost / request</strong></td><td>Same, normalized to request count</td><td>Better for non-LLM models</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="ttft">
+  <h2>TTFT — time-to-first-token</h2>
+  <p>The single most user-visible metric for chat/streaming workloads. A 200ms TTFT feels responsive; 2 seconds feels broken.</p>
+  <p>TTFT is dominated by <strong>prefill</strong> — processing the input prompt through every layer to produce the first output logit. Prefill is compute-bound (a big matmul over the whole prompt) and parallelizable. Things that affect TTFT:</p>
+  <ul>
+    <li><strong>Prompt length.</strong> Linear in tokens (with the matmul cost scaling).</li>
+    <li><strong>Concurrency.</strong> If 16 prefills are queued, the 16th waits behind them.</li>
+    <li><strong>Tensor parallel shape.</strong> More TP = faster prefill at the cost of communication.</li>
+    <li><strong>Prefix caching.</strong> Cached prompts skip prefill entirely for the cached portion.</li>
+    <li><strong>Chunked prefill.</strong> Interleave prefill with decode so big prompts don't starve other requests.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Senior signal</span>
+    <p>"What's your TTFT target for this product?" is a great clarifying question to lead a design round with. It tells you whether to optimize for prefill or decode, and whether chunked prefill is the right tool.</p>
+  </div>
+</section>
+
+<section id="throughput">
+  <h2>Throughput and "goodput"</h2>
+  <p>Throughput is tokens/second per GPU at the system level. <em>Goodput</em> is throughput on requests that <strong>met their SLO</strong>. A system that does 5000 tok/s/GPU with p99 of 8 seconds (when the SLO is 2 seconds) has zero goodput.</p>
+  <p>Always report both. The conversion from raw throughput to goodput exposes overload before it shows up in error rates.</p>
+</section>
+
+<section id="latency">
+  <h2>Latency percentiles — p50, p95, p99, p99.9</h2>
+  <p>Means and medians lie. Always quote a percentile.</p>
+  <ul>
+    <li><strong>p50</strong> — the typical experience. Useful for capacity sizing.</li>
+    <li><strong>p95</strong> — the "bad day" experience. Most SLOs sit here.</li>
+    <li><strong>p99</strong> — the tail. Where queueing under load, GC pauses, NUMA cross-talk show up.</li>
+    <li><strong>p99.9</strong> — the worst typical bucket. For high-volume services, the difference between p99 and p99.9 is "lots of users feel this."</li>
+  </ul>
+  <p>Compute percentiles over a moving window (5 or 10 minutes typical). Use HDR histograms or Prometheus histogram buckets, not averages.</p>
+</section>
+
+<section id="gpu-util">
+  <h2>GPU utilization — three numbers, all called "utilization," all different</h2>
+  <p>This single misunderstanding loses interviews. The naive question "what's your GPU utilization?" hides three distinct things.</p>
+  <table>
+    <thead><tr><th>What you call "utilization"</th><th>What it really is</th><th>What it tells you</th></tr></thead>
+    <tbody>
+      <tr><td><code>nvidia-smi</code> "GPU-Util"</td><td>% of time <em>any</em> kernel was running</td><td>Almost nothing useful. 100% could mean one tiny kernel looping.</td></tr>
+      <tr><td>SM-active (DCGM)</td><td>% of time SMs were executing instructions</td><td>Better. 80% means the cores are working.</td></tr>
+      <tr><td>SM-occupancy (DCGM)</td><td>Fraction of theoretical max warps issued</td><td>Best. Tells you if you're saturating the SM, not just keeping it on.</td></tr>
+      <tr><td>Memory BW utilization (DCGM)</td><td>% of HBM bandwidth used</td><td>Key for decode — decode is bandwidth-bound, not compute-bound.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">Decode is memory-bound</span>
+    <p>For LLM decoding, you can sit at 30% SM-active and still be saturated — because you're memory-bandwidth-bound moving KV-cache and weights. The right number to push is <strong>memory bandwidth utilization</strong>, not SM-active. Many candidates miss this.</p>
+  </div>
+</section>
+
+<section id="memory">
+  <h2>Memory profiling</h2>
+  <p>HBM is the scarce resource. Three categories share it:</p>
+  <ul>
+    <li><strong>Model weights</strong> — fixed once loaded. 70B FP16 ≈ 140 GB; FP8 ≈ 70 GB; INT4 ≈ 35 GB.</li>
+    <li><strong>Activations</strong> — transient, per forward pass. Small in inference; massive in training without checkpointing.</li>
+    <li><strong>KV-cache</strong> — the headline variable. Grows with batch × context length.</li>
+  </ul>
+  <p>Tools:</p>
+  <ul>
+    <li><code>nvidia-smi</code> for coarse "used / total."</li>
+    <li>DCGM <code>DCGM_FI_DEV_FB_USED</code> / <code>DCGM_FI_DEV_FB_FREE</code> for time series.</li>
+    <li>PyTorch <code>torch.cuda.memory_summary()</code> — fragmentation details inside a process.</li>
+    <li><code>nsys profile</code> + <code>--cuda-memory-usage</code> — allocations as a timeline.</li>
+    <li>vLLM exports memory utilization &amp; KV-cache block usage as metrics.</li>
+  </ul>
+  <p>OOM debug rule: <em>where in the timeline did allocation spike?</em> First-step OOM usually means too-large weights or shape. Step-N OOM means activation/cache growth or fragmentation.</p>
+</section>
+
+<section id="cost">
+  <h2>Cost per million tokens — the headline business metric</h2>
+  <p>The number that matters to the CFO and lets you defend the in-house build vs an external API. The formula:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">def cost_per_million_tokens(gpu_hourly_cost_usd: float,
+                            tokens_per_second_per_gpu: float,
+                            num_gpus: int = 1) -> float:
+    """USD per million output tokens served."""
+    tokens_per_hour = tokens_per_second_per_gpu * 3600
+    fleet_cost_per_hour = gpu_hourly_cost_usd * num_gpus
+    fleet_tokens_per_hour = tokens_per_hour * num_gpus
+    return (fleet_cost_per_hour / fleet_tokens_per_hour) * 1_000_000
+
+# Example: H100 at $3.50/hr, vLLM Llama-3.1-70B TP=4 at ~7000 tok/s aggregate
+# fleet of 4 GPUs serving the tensor-parallel replica
+cost = cost_per_million_tokens(3.50, 7000 / 4, num_gpus=4)
+# ≈ $2.00 per million output tokens, vs ~$15 for hosted frontier APIs
+</code></pre></div>
+  <p>Caveats interviewers will probe:</p>
+  <ul>
+    <li><strong>Utilization assumption.</strong> 7000 tok/s only at saturation. Idle headroom raises effective cost.</li>
+    <li><strong>Reserved vs on-demand pricing.</strong> Use blended cost across the mix.</li>
+    <li><strong>Input tokens.</strong> Prefill costs compute too. Report input + output separately or assume a profile.</li>
+    <li><strong>Overheads.</strong> Control plane, gateway, observability, on-call all cost real money. Add 20-30% loaded overhead.</li>
+  </ul>
+</section>
+
+<section id="benchmarking">
+  <h2>Benchmarking methodology</h2>
+  <p>Bench numbers in a vacuum are dangerous. A defensible benchmark:</p>
+  <ol>
+    <li><strong>Pin everything.</strong> Driver version, CUDA version, runtime version, model checkpoint, GPU clocks (lock with <code>nvidia-smi -lgc</code>), batch sizes, concurrency.</li>
+    <li><strong>Warm up.</strong> Discard the first N seconds. JIT, KV-cache allocator, NCCL — all need warm.</li>
+    <li><strong>Realistic load shape.</strong> Open-loop (Poisson arrivals at target RPS) reveals tail; closed-loop (fixed concurrency) reveals max throughput. Run both, report both.</li>
+    <li><strong>Real prompt distribution.</strong> Don't bench with all 100-token prompts when production is 1500-token mean. Use a sampled production trace if possible.</li>
+    <li><strong>Long enough run.</strong> 60+ seconds at steady state. Five-second microbenches hide thermal throttling and cache warmup.</li>
+    <li><strong>Report ranges.</strong> 3-5 runs; show median and spread.</li>
+  </ol>
+  <p>The <code>vllm bench serve</code> command and Triton's <code>perf_analyzer</code> are starting points; for cross-stack comparison roll your own with the same harness in front of each.</p>
+</section>
+
+<section id="regression">
+  <h2>Perf regression tests in CI</h2>
+  <p>You will deploy new vLLM versions, new TensorRT engines, new drivers. Each can quietly slow you by 5-15%. Catch it before users do.</p>
+  <ul>
+    <li><strong>Nightly benchmark</strong> on a held-out test rig, fixed model, fixed prompts. Compare to last week's median.</li>
+    <li><strong>PR-level smoke bench</strong> for serving stack changes — 30 seconds at one batch size, fail if &gt;5% regression.</li>
+    <li><strong>Track quality alongside perf</strong> — a quantization change might gain 20% throughput and lose 4% accuracy. Both must show on the same dashboard.</li>
+    <li><strong>Alert on real-time drift</strong> — production p95 tokens/sec falling outside its baseline band is a page even before customers notice.</li>
+  </ul>
+</section>
+
+<section id="dashboards">
+  <h2>The dashboards that matter</h2>
+  <p>For an internal review or interview design discussion, you should be able to list the boards you'd build.</p>
+  <ul>
+    <li><strong>Fleet utilization</strong> — SM-active, memory used, power, per node, heatmapped.</li>
+    <li><strong>Per-service health</strong> — request rate, error rate, queue depth, p50/p95/p99 latency, TTFT, tok/s.</li>
+    <li><strong>Per-tenant cost</strong> — $ per day, $ per million tokens, broken out by namespace.</li>
+    <li><strong>Capacity pressure</strong> — pending pod count by priority class, time-to-bind p95, quota usage per team.</li>
+    <li><strong>Driver/hardware health</strong> — Xid counts, ECC error rates, fabric link state, temperature.</li>
+    <li><strong>KV-cache view</strong> — block allocation %, prefix cache hit rate, eviction rate.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Interview answer</span>
+    <p>"If I had one screen on the wall at the team desk: fleet SM-active heatmap on top, top-five services p95 latency below it, queue depth in front of each by priority, and a $/million-tokens trendline. If any one goes red, that's the whole team's afternoon."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="06-applied-patterns.html">← Previous</a> · <a href="08-error-handling.html">Next: Error handling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

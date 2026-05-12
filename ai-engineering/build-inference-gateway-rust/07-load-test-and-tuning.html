@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 07 — Load Test &amp; Tuning</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#install-oha">Install oha</a>
+    <a href="#baseline">Baseline run</a>
+    <a href="#tune">Tune tokio worker threads</a>
+    <a href="#tail">Read the tail</a>
+    <a href="#interpret">Interpret the metrics</a>
+    <a href="#coalesce-test">Prove the coalescer's win</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-docker-and-deploy.html">← Previous</a>
+    <a href="08-where-to-next.html">Next: Where to next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 07 · ~15 minutes</span>
+  <h1>Load Test &amp; Tuning</h1>
+  <p class="subtitle">Pour traffic in, read your own metrics, find the constraint, tune one knob at a time. The discipline that separates "it runs" from "I know what its limits are."</p>
+</header>
+
+<section id="install-oha">
+  <h2>Install <code>oha</code></h2>
+  <p><code>oha</code> is an HTTP load generator with a live TUI showing latency percentiles as they update. Easier than <code>vegeta</code> for ad-hoc work; install via cargo:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo install oha
+oha --version</code></pre>
+</div>
+
+  <p>If you'd rather use <code>vegeta</code> or <code>k6</code>, the patterns transfer — only the command lines change.</p>
+</section>
+
+<section id="baseline">
+  <h2>Baseline run</h2>
+  <p>Run the gateway, the mock, and the observability stack from Chapter 05. From a fourth terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">oha -z 30s -c 100 -m POST \
+  -H 'content-type: application/json' \
+  -d '{"model":"x","messages":[{"role":"user","content":"hello"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+
+  <p>Flags: <code>-z 30s</code> (run for 30 seconds), <code>-c 100</code> (100 concurrent workers). Watch <code>oha</code>'s live histogram update. After 30s you'll see a summary like:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">Summary:
+  Success rate: 100.00%
+  Total:        30.0202 secs
+  Slowest:      0.8741 secs
+  Fastest:      0.7610 secs
+  Average:      0.8077 secs
+  Requests/sec: 123.7
+
+Response time histogram:
+  0.761 [1]    |
+  0.772 [125]  |■■■■
+  0.784 [612]  |■■■■■■■■■■■■■■■■■■■
+  ...
+  0.874 [12]   |
+
+Latency distribution:
+  10%: 0.789 secs
+  25%: 0.795 secs
+  50%: 0.806 secs
+  75%: 0.819 secs
+  90%: 0.831 secs
+  95%: 0.839 secs
+  99%: 0.860 secs</code></pre>
+</div>
+
+  <p>That ~800ms is the mock's "response time" — 19 chunks throttled at 40ms each = 760ms minimum. Anything above that is your gateway's overhead plus jitter. If you're seeing &lt; 100ms of extra overhead, you're doing fine.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">What you're really measuring</span>
+    <p>Because the mock has a fixed-cost response (artificial throttling), this isn't a measurement of upstream throughput — it's a measurement of <em>how cleanly your gateway gets out of the way</em>. The interesting number is the gap between fastest and p99: that gap is gateway-introduced jitter, and you want it small.</p>
+  </div>
+</section>
+
+<section id="tune">
+  <h2>Tune <code>tokio</code> worker threads</h2>
+  <p>By default, <code>#[tokio::main]</code> uses one worker per CPU core. For a network-I/O service that's usually fine, but you can get measurable wins by under- or over-subscribing depending on workload shape.</p>
+
+  <p>Make the worker count configurable. Replace <code>#[tokio::main]</code> in <code>infergw/src/main.rs</code> with the manual builder form:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let workers = std::env::var("INFERGW_WORKER_THREADS")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or_else(num_cpus::get);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .thread_name("infergw-worker")
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -&gt; anyhow::Result&lt;()&gt; {
+    // ... existing body of the old main()
+    Ok(())
+}</code></pre>
+</div>
+
+  <p>Add <code>num_cpus = "1.16"</code> to <code>Cargo.toml</code>.</p>
+
+  <p>Now run the baseline test with different worker counts:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># Single thread — surprisingly competitive for pure I/O
+INFERGW_WORKER_THREADS=1 cargo run -p infergw --release
+
+# Then in another terminal, run the same oha command and note the p99.
+# Repeat with =2, =4, =8.</code></pre>
+</div>
+
+  <p>You'll find for this workload (mostly waiting on the mock) that 1–2 threads is plenty, and the marginal CPU gain past ~4 threads is approximately zero. The right answer for production: match worker count to expected CPU usage of the gateway itself, not to client concurrency. <code>tokio</code> happily multiplexes thousands of concurrent connections per thread.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Don't equate concurrency with threads</span>
+    <p>A common mental model from blocking servers (Apache, Tomcat) is "one thread per connection." That's wrong for async Rust. With <code>tokio</code>, one OS thread can drive hundreds of in-flight requests because each is suspended at an <code>await</code> while waiting on I/O. Worker threads exist to use CPU, not to hold connections.</p>
+  </div>
+</section>
+
+<section id="tail">
+  <h2>Read the tail honestly</h2>
+  <p>Latency averages lie. The real distribution looks like:</p>
+
+<pre style="background: var(--bg-elev); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.5;">
+  count
+   |
+   |   ███████
+   |   ███████
+   |   ███████
+   |   ████████
+   |   █████████
+   |   █████████████
+   |   ████████████████████████   ← long tail
+   +───────────────────────────────────▶  latency
+       p50  p75  p95  p99  p99.9
+</pre>
+
+  <p>Your average sits where the tall bars are. Your worst customer experience lives in the tail. Track p99 and p99.9, not mean. From Chapter 05:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -s 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=histogram_quantile(0.99, sum by (le) (rate(infergw_request_duration_seconds_bucket[1m])))' \
+  | jq '.data.result[0].value[1]'</code></pre>
+</div>
+
+  <p>That's your live p99. Use this during the load test to see how it moves with concurrency.</p>
+
+  <details class="collapse-card">
+    <summary>The "coordinated omission" trap</summary>
+    <div class="collapse-card-body">
+      <p>Many load testers (older <code>wrk</code>, naive curl-loops) suffer from coordinated omission: when the server is slow, the load tester pauses, so the slow requests aren't counted at their full lateness — they're counted from when the tester started timing them. <code>oha</code> handles this correctly by tracking expected-start-time, not actual-start-time, when computing latency. <code>wrk2</code> and <code>vegeta</code> also do this right. If you see p99 numbers that look "too good" under load, check whether your tool corrects for this.</p>
+    </div>
+  </details>
+</section>
+
+<section id="interpret">
+  <h2>Interpret the metrics during load</h2>
+  <p>While the load test is running, open Grafana / Prometheus and have these four panels in front of you:</p>
+
+  <ol>
+    <li><code>sum(rate(infergw_requests_total[1m])) by (status)</code> — Are 5xx-class responses appearing? They shouldn't be unless you've broken something.</li>
+    <li><code>histogram_quantile(0.99, sum by (le) (rate(infergw_request_duration_seconds_bucket[1m])))</code> — Watch this number when you bump concurrency. The point at which it starts climbing nonlinearly is your knee.</li>
+    <li><code>infergw_inflight</code> — How many requests are in flight at any moment. If this caps at some number while RPS plateaus, you've found a bottleneck — usually upstream connection pool or worker saturation.</li>
+    <li><code>rate(infergw_coalesce_followers_total[1m]) / rate(infergw_requests_total[1m])</code> — Coalescing ratio. If you're sending identical requests, this should approach (concurrency − 1) / concurrency.</li>
+  </ol>
+
+  <p>The shape of the load curve as you increase concurrency from <code>-c 10</code> to <code>-c 1000</code> tells the story: throughput rises linearly, plateaus, then latency starts increasing while throughput stays flat. That plateau-and-tail is your real capacity. The number where latency starts climbing is what you'd report as "this gateway handles X concurrent requests at acceptable p99."</p>
+</section>
+
+<section id="coalesce-test">
+  <h2>Prove the coalescer's win</h2>
+  <p>Two test cases:</p>
+
+  <p><strong>(A) Identical prompts — coalescing on:</strong></p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">oha -z 30s -c 200 -m POST \
+  -H 'content-type: application/json' \
+  -d '{"model":"x","messages":[{"role":"user","content":"identical"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+
+  <p>Count the upstream-side requests. The mock logs one INFO line per incoming request — <code>docker logs</code> if you ran it that way, or just count in the terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># In the mock's terminal, after the run:
+# (manually count, or)
+# Adjust the mock to count in a static and print on every request.</code></pre>
+</div>
+
+  <p><strong>(B) Distinct prompts — coalescing off in practice:</strong></p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># oha can't easily randomize the body per-request out-of-the-box.
+# Use a small bash loop with curl + xargs -P for parallelism:
+seq 1 1000 | xargs -P 200 -I{} curl -sN -o /dev/null \
+  -H 'content-type: application/json' \
+  -d "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"prompt {}\"}],\"stream\":true}" \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+
+  <p>(A) should show ~38 upstream calls in 30 seconds (one in-flight at a time, ~800ms each). (B) should show ~1000 — one per distinct prompt. That ratio (200x or so under the right concurrency) is the coalescer doing its job.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Use Prometheus to confirm</span>
+    <p>Easier than counting manually: in Prometheus, plot <code>increase(infergw_coalesce_followers_total[1m])</code>. During (A) this rises rapidly. During (B) it stays near zero. The metric you wrote in Chapter 05 IS the verification.</p>
+  </div>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li>You've driven sustained load through the gateway and watched real metrics move.</li>
+    <li>You know how p99 changes with concurrency and where the knee is.</li>
+    <li>Tokio worker thread count is configurable via env var; you've tried a few values.</li>
+    <li>The coalescer's effectiveness is now measurable, not just plausible.</li>
+  </ul>
+
+  <p>You're done with the build. One short chapter on where to take this next.</p>
+
+  <p style="margin-top: 24px;"><a href="08-where-to-next.html"><strong>→ Chapter 08: Where to next</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

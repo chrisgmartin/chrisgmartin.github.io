@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 00 — Prereqs &amp; Mock Upstream</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#install">Install checklist</a>
+    <a href="#layout">Project layout</a>
+    <a href="#mock">The mock upstream</a>
+    <a href="#run">Run it and curl it</a>
+    <a href="#what-sse">Why SSE looks like this</a>
+    <a href="#real-upstream">If you have a real upstream</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-skeleton.html">Next: Skeleton →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 00 · ~15 minutes</span>
+  <h1>Prereqs &amp; Mock Upstream</h1>
+  <p class="subtitle">Lay down the workspace and stand up a deterministic SSE-emitting fake vLLM so the rest of the guide can develop offline.</p>
+</header>
+
+<section id="install">
+  <h2>Install checklist</h2>
+  <p>Run each, confirm output, then move on. We'll add more later as needed.</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">rustc --version    # rustc 1.75.0 or newer
+cargo --version    # cargo 1.75.0 or newer
+docker --version   # Docker version 24.x or newer
+curl --version     # any reasonably modern curl
+jq --version       # 1.6 or newer</code></pre>
+</div>
+
+  <div class="callout tip">
+    <span class="callout-label">Missing rustup?</span>
+    <p>Install from <a href="https://rustup.rs" target="_blank" rel="noopener">rustup.rs</a> — one command, no admin needed. Then <code>rustup default stable</code>.</p>
+  </div>
+</section>
+
+<section id="layout">
+  <h2>Project layout</h2>
+  <p>We'll use a Cargo workspace so the gateway and the mock live side-by-side and can share a target directory. Pick a folder, then:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">mkdir -p infergw-workspace &amp;&amp; cd infergw-workspace
+mkdir -p mock-upstream/src infergw/src
+touch Cargo.toml mock-upstream/Cargo.toml infergw/Cargo.toml</code></pre>
+</div>
+
+  <p>Put this in the workspace root <code>Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">[workspace]
+resolver = "2"
+members  = ["infergw", "mock-upstream"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true</code></pre>
+</div>
+
+  <p>The release profile flags are worth scanning now and re-reading in Chapter 06 — they're what makes the final binary small and fast.</p>
+</section>
+
+<section id="mock">
+  <h2>The mock upstream</h2>
+  <p>vLLM exposes an OpenAI-compatible <code>POST /v1/chat/completions</code> endpoint that returns either a single JSON body or, when <code>"stream": true</code>, a Server-Sent Events stream. Our mock returns the streaming form: a series of chunks, then a final <code>data: [DONE]</code>.</p>
+
+  <p>Drop this into <code>mock-upstream/Cargo.toml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-toml">[package]
+name = "mock-upstream"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum         = "0.7"
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio-stream = "0.1"
+futures      = "0.3"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }</code></pre>
+</div>
+
+  <p>And <code>mock-upstream/src/main.rs</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-rust">//! Mock vLLM-compatible upstream. Returns a deterministic SSE stream so the
+//! gateway can be developed and tested without a GPU.
+
+use axum::{
+    extract::Json,
+    response::sse::{Event, Sse},
+    routing::{get, post},
+    Router,
+};
+use futures::stream::{self, Stream};
+use serde::Deserialize;
+use std::{convert::Infallible, time::Duration};
+use tokio_stream::StreamExt;
+
+#[derive(Deserialize, Debug)]
+struct ChatRequest {
+    model: String,
+    messages: Vec&lt;serde_json::Value&gt;,
+    #[serde(default)]
+    stream: bool,
+}
+
+async fn chat(
+    Json(req): Json&lt;ChatRequest&gt;,
+) -&gt; Sse&lt;impl Stream&lt;Item = Result&lt;Event, Infallible&gt;&gt;&gt; {
+    // Deterministic response: echo back token-by-token based on prompt length.
+    let prompt_len: usize = req
+        .messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(str::len)
+        .sum();
+
+    let tokens = [
+        "Hello", ",", " this", " is", " a", " mocked", " response", " for", " model", " '",
+        req.model.as_str(), "'", ".", " You", " sent", " ", &amp;prompt_len.to_string(), " chars", ".",
+    ];
+
+    let chunks: Vec&lt;String&gt; = tokens
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "choices": [{
+                    "delta": { "content": t },
+                    "index": 0,
+                    "finish_reason": serde_json::Value::Null,
+                }]
+            })
+            .to_string()
+        })
+        .collect();
+
+    // Append the OpenAI sentinel.
+    let mut frames: Vec&lt;String&gt; = chunks;
+    frames.push("[DONE]".to_string());
+
+    let stream = stream::iter(frames)
+        .throttle(Duration::from_millis(40))
+        .map(|payload| Ok(Event::default().data(payload)));
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+async fn healthz() -&gt; &amp;'static str { "ok" }
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "mock_upstream=info".into()),
+        )
+        .init();
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .route("/healthz", get(healthz));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:9000").await.unwrap();
+    tracing::info!("mock-upstream listening on http://127.0.0.1:9000");
+    axum::serve(listener, app).await.unwrap();
+}</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Three details worth noticing</span>
+    <p><strong>1. <code>tokio_stream::StreamExt::throttle</code></strong> spaces the chunks 40ms apart. Without this the whole response would arrive in one TCP packet and you wouldn't see streaming behavior — which is the whole point of testing this end-to-end.</p>
+    <p><strong>2. The <code>[DONE]</code> sentinel</strong> is part of the OpenAI SSE convention, not an HTTP thing. Your gateway will need to look for it and close the stream.</p>
+    <p><strong>3. Each frame is <code>Event::default().data(payload)</code></strong>, which wraps the JSON in <code>data: &lt;payload&gt;\n\n</code>. That double-newline is the SSE record separator — clients buffer until they see it.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Run it and curl it</h2>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cargo run -p mock-upstream</code></pre>
+</div>
+
+  <p>First build will take 30–90 seconds; subsequent builds are fast. You should see:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">INFO mock_upstream: mock-upstream listening on http://127.0.0.1:9000</code></pre>
+</div>
+
+  <p>From a second terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -N -H 'content-type: application/json' \
+  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hi there"}],"stream":true}' \
+  http://127.0.0.1:9000/v1/chat/completions</code></pre>
+</div>
+
+  <p>The <code>-N</code> flag is important — it disables curl's output buffering so you actually see the chunks land one at a time. Expected output (with about 40ms between each <code>data:</code> line):</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">data: {"choices":[{"delta":{"content":"Hello"},"index":0,"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":","},"index":0,"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":" this"},"index":0,"finish_reason":null}]}
+...
+data: [DONE]</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">Not seeing chunks land one at a time?</span>
+    <p>Without <code>-N</code>, curl waits for the full response before printing anything — your terminal will look frozen for ~800ms then dump everything. That looks like the stream is broken when it isn't. Always use <code>-N</code> when testing SSE.</p>
+  </div>
+</section>
+
+<section id="what-sse">
+  <h2>Why SSE looks like this</h2>
+  <p>Server-Sent Events is an old, plain-text protocol that predates WebSockets and is much simpler. Each event is:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">data: &lt;payload&gt;\n
+\n</code></pre>
+</div>
+
+  <p>The blank line is the record separator. Clients keep reading until the connection closes or they decide they're done. There's no schema — the <code>data:</code> payload can be anything, and OpenAI happened to pick stringified JSON with <code>[DONE]</code> as the sentinel.</p>
+
+  <p>This matters because the gateway can't just forward bytes verbatim if we want to do useful work like counting tokens or splicing frames. We'll need to <em>parse</em> the SSE framing on the way through. Chapter 02 handles that.</p>
+</section>
+
+<section id="real-upstream">
+  <h2>If you'd rather point at a real upstream</h2>
+  <p>If you already have a vLLM, Ollama, or OpenAI-compatible endpoint reachable from your laptop, you don't need the mock. Just remember the URL you'll use — somewhere like <code>http://localhost:8000/v1/chat/completions</code> for vLLM, or <code>https://api.openai.com/v1/chat/completions</code> with an <code>Authorization: Bearer ...</code> header for OpenAI. Every subsequent chapter notes where to swap the URL.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Why use the mock anyway?</span>
+    <p>Deterministic output, no API costs, no GPU, no network flakiness — easier to reason about correctness when the upstream is boring. Plus, in Chapter 04, we'll deliberately make the mock fail in interesting ways to exercise the circuit breaker. Try that against a real provider and they'll rate-limit you.</p>
+  </div>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <p>You should now have:</p>
+  <ul>
+    <li>A Cargo workspace at <code>infergw-workspace/</code> with <code>mock-upstream</code> compiling.</li>
+    <li>The mock server running on <code>127.0.0.1:9000</code>.</li>
+    <li>A curl that streams 19 chunks then <code>[DONE]</code>.</li>
+  </ul>
+
+  <p>Leave the mock running — Chapter 01 needs it on the other end of its (nonexistent yet) proxy.</p>
+
+  <p style="margin-top: 24px;"><a href="01-skeleton.html"><strong>→ Chapter 01: Skeleton — axum, tracing, graceful shutdown</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

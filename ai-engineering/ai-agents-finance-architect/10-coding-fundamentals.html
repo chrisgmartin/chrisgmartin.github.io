@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — Python for Finance Automation</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-python">Why Python is the lingua franca</a>
+    <a href="#decimal">Money in Python — Decimal, not float</a>
+    <a href="#pandas">Pandas patterns for finance</a>
+    <a href="#api-client">Robust API client patterns</a>
+    <a href="#retries">Retries with tenacity</a>
+    <a href="#async">Async &amp; concurrency</a>
+    <a href="#dsa">DSA patterns to know</a>
+    <a href="#big-o">Big-O sanity</a>
+    <a href="#testing">Testing finance code</a>
+    <a href="#interview-shape">Live-coding shape</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">Python for finance automation — Decimal arithmetic, pandas, retry libraries, async I/O. DSA patterns hand-picked for the role: hashing, two-pointer, prefix sum. Big-O sanity for live-coding rounds.</p>
+</header>
+
+<section id="why-python">
+  <h2>Why Python is the lingua franca</h2>
+  <p>Every piece of this role's stack expects Python:</p>
+  <ul>
+    <li>Anthropic SDK has a first-class Python client.</li>
+    <li>MCP has a Python SDK.</li>
+    <li>n8n integrates trivially with Python via HTTP / subprocess.</li>
+    <li>Pandas is the analyst's lingua franca; Finance team members may even read your dataframes.</li>
+    <li>Most finance vendor SDKs ship Python first.</li>
+  </ul>
+  <p>If your live-coding round goes JavaScript or TypeScript, fine — but be ready to defend Python idioms in design discussions.</p>
+</section>
+
+<section id="decimal">
+  <h2>Money in Python — Decimal, not float</h2>
+  <div class="callout warn">
+    <span class="callout-label">The single most important rule in this chapter</span>
+    <p><strong>Never represent money as a float.</strong> Use <code>decimal.Decimal</code>. Float arithmetic produces silent errors that <em>add up</em> over a million-transaction close.</p>
+  </div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">&gt;&gt;&gt; 0.1 + 0.2
+0.30000000000000004        # not 0.3
+
+&gt;&gt;&gt; from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+&gt;&gt;&gt; getcontext().prec = 28
+&gt;&gt;&gt; getcontext().rounding = ROUND_HALF_EVEN
+&gt;&gt;&gt; Decimal("0.1") + Decimal("0.2")
+Decimal('0.3')
+</code></pre></div>
+  <p>Rules:</p>
+  <ul>
+    <li>Always construct <code>Decimal</code> from a <strong>string</strong>, not from a float.</li>
+    <li>Pick rounding policy explicitly. ROUND_HALF_EVEN is the accounting default ("banker's rounding").</li>
+    <li>Pick precision wide enough (28+) so you never lose digits during multi-step math.</li>
+    <li>Persist money as a string in JSON / databases, or as a fixed-precision integer (cents) — never as a float.</li>
+  </ul>
+
+  <h3>Currency-aware money type</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">from decimal import Decimal
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Money:
+    amount: Decimal
+    currency: str  # ISO 4217: "USD", "EUR", "BTC"
+
+    def __add__(self, other: "Money") -&gt; "Money":
+        if self.currency != other.currency:
+            raise ValueError(f"Cannot add {self.currency} and {other.currency}")
+        return Money(self.amount + other.amount, self.currency)
+
+    def __repr__(self):
+        return f"{self.amount} {self.currency}"
+</code></pre></div>
+  <p>This eliminates whole classes of bugs at compile time. "Why can't I add EUR to USD?" is the right question for the type system to refuse.</p>
+</section>
+
+<section id="pandas">
+  <h2>Pandas patterns for finance</h2>
+  <p>You'll use pandas constantly for reconciliation, variance, and exploratory work. Patterns that come up:</p>
+
+  <h3>Joining two ledgers</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import pandas as pd
+from decimal import Decimal
+
+gl = pd.read_csv("gl.csv", dtype={"amount": str})
+bank = pd.read_csv("bank.csv", dtype={"amount": str})
+gl["amount"] = gl["amount"].map(Decimal)
+bank["amount"] = bank["amount"].map(Decimal)
+
+# Inner join on (amount, date) for exact matches
+matched = gl.merge(bank, on=["amount", "date"], how="inner",
+                   suffixes=("_gl", "_bank"), indicator=False)
+
+# Anti-joins for unmatched on either side
+gl_only = gl.merge(bank, on=["amount", "date"], how="left", indicator=True) \
+            .query('_merge == "left_only"').drop(columns="_merge")
+bank_only = bank.merge(gl, on=["amount", "date"], how="left", indicator=True) \
+              .query('_merge == "left_only"').drop(columns="_merge")
+</code></pre></div>
+
+  <h3>Period-over-period variance</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">tb = pd.read_csv("trial_balance_by_period.csv")  # account, period, balance
+pivot = tb.pivot(index="account", columns="period", values="balance")
+pivot["variance"] = pivot["2026-04"] - pivot["2026-03"]
+pivot["variance_pct"] = pivot["variance"] / pivot["2026-03"]
+flag = pivot[pivot["variance"].abs() &gt; Decimal("10000")]
+</code></pre></div>
+
+  <h3>Rolling windows for anomalies</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># Daily expense by account; flag where today &gt; 3 stdev above trailing 30 days
+df["roll_mean"] = df.groupby("account")["amount"].transform(
+    lambda s: s.rolling(30, min_periods=10).mean())
+df["roll_std"] = df.groupby("account")["amount"].transform(
+    lambda s: s.rolling(30, min_periods=10).std())
+df["zscore"] = (df["amount"] - df["roll_mean"]) / df["roll_std"]
+anomalies = df[df["zscore"].abs() &gt; 3]
+</code></pre></div>
+</section>
+
+<section id="api-client">
+  <h2>Robust API client patterns</h2>
+  <p>Integrations to NetSuite / BlackLine / Kyriba / Fireblocks / Lukka share the same shape. Build a base client that handles auth, retries, idempotency, logging — then specialize.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import httpx, hashlib, time, logging
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, \
+    retry_if_exception_type
+
+log = logging.getLogger(__name__)
+
+class FinanceAPIError(Exception): ...
+class TransientError(FinanceAPIError): ...
+class PermanentError(FinanceAPIError): ...
+
+class BaseClient:
+    def __init__(self, base_url, auth, timeout=30):
+        self._c = httpx.AsyncClient(base_url=base_url, auth=auth, timeout=timeout)
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential_jitter(initial=1, max=30),
+        retry=retry_if_exception_type(TransientError),
+        reraise=True,
+    )
+    async def request(self, method, path, *, idempotency_key=None, json=None):
+        headers = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        r = await self._c.request(method, path, json=json, headers=headers)
+        if r.status_code == 429 or 500 &lt;= r.status_code &lt; 600:
+            raise TransientError(f"{r.status_code} {r.text[:200]}")
+        if r.status_code &gt;= 400:
+            raise PermanentError(f"{r.status_code} {r.text[:200]}")
+        return r.json()
+</code></pre></div>
+  <p>Note: <strong>permanent errors do not retry.</strong> A 422 (validation) won't get better on retry; raise and let the caller handle.</p>
+</section>
+
+<section id="retries">
+  <h2>Retries with tenacity</h2>
+  <p>The <code>tenacity</code> library is the standard retry primitive. The patterns to memorize:</p>
+  <ul>
+    <li><strong>Exponential backoff with jitter</strong> — avoid thundering herd.</li>
+    <li><strong>Cap the wait</strong> — don't retry an hour later.</li>
+    <li><strong>Retry only specific exception classes</strong> — never blanket-catch.</li>
+    <li><strong>Reraise=True</strong> — so the last exception propagates.</li>
+    <li><strong>Stop after N</strong> — bounded; pair with a circuit breaker for unbounded systems.</li>
+  </ul>
+  <p>Critical: when calling <em>writes</em>, the retry must carry the idempotency key — otherwise you double-write.</p>
+</section>
+
+<section id="async">
+  <h2>Async &amp; concurrency</h2>
+  <p>A close runs many recons in parallel. <code>asyncio</code> + <code>httpx.AsyncClient</code> is the default.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import asyncio
+from contextlib import asynccontextmanager
+
+async def reconcile_all(accounts, period):
+    sem = asyncio.Semaphore(8)  # cap concurrency to avoid API rate limits
+
+    async def one(acct):
+        async with sem:
+            return acct, await reconcile_account(acct, period)
+
+    results = await asyncio.gather(*(one(a) for a in accounts),
+                                   return_exceptions=True)
+    return results
+</code></pre></div>
+  <p>Common pitfalls to mention in interviews:</p>
+  <ul>
+    <li><strong>Bound the concurrency</strong> with a semaphore; otherwise you'll get 429'd.</li>
+    <li><strong>return_exceptions=True</strong> so one failed recon doesn't kill the whole batch.</li>
+    <li><strong>Don't mix sync &amp; async clients</strong> in the same call site.</li>
+    <li><strong>Logging context</strong>: use <code>contextvars</code> to carry <code>run_id</code> across the call tree.</li>
+  </ul>
+</section>
+
+<section id="dsa">
+  <h2>DSA patterns hand-picked for this role</h2>
+  <p>Live-coding rounds for this role tend to be applied finance algorithms rather than abstract leetcode. The patterns that recur:</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>When you reach for it</th></tr></thead>
+    <tbody>
+      <tr><td>Hash table</td><td>Reconcile two ledgers; group by composite key; dedupe by idempotency key.</td></tr>
+      <tr><td>Two-pointer</td><td>Sorted time-series alignment; merging two sorted feeds.</td></tr>
+      <tr><td>Prefix sum</td><td>Running balance over a transaction stream; period totals from a daily series.</td></tr>
+      <tr><td>Sliding window</td><td>Rolling means, anomaly z-scores, treasury intraday monitoring.</td></tr>
+      <tr><td>Topological sort</td><td>Dependency-ordered execution of a close plan; resolving intercompany elimination order.</td></tr>
+      <tr><td>Bucketing / radix</td><td>Stratified sampling for SOX controls testing.</td></tr>
+      <tr><td>Counting / set ops</td><td>Set differences between source-system and GL sets.</td></tr>
+    </tbody>
+  </table>
+  <p>You don't need to memorize 200 leetcode problems. You need to <em>recognize</em> these patterns and reach for them naturally.</p>
+</section>
+
+<section id="big-o">
+  <h2>Big-O sanity</h2>
+  <p>The level of analysis expected: name complexity out loud, justify in one sentence, propose an improvement if there's an obvious one.</p>
+  <ul>
+    <li><strong>Reconciling two ledgers</strong>: naive O(n*m) double loop → O(n+m) with a hash table on the smaller side.</li>
+    <li><strong>Anomaly z-score over rolling 30 days</strong>: naive O(n*w) per account → O(n) with a streaming mean/variance.</li>
+    <li><strong>Sampling for SOX testing</strong>: reservoir sampling for one-pass O(n) on streaming.</li>
+    <li><strong>Topo sort of close plan</strong>: O(V+E) Kahn's algorithm.</li>
+  </ul>
+  <p>If you can name the complexity and the corresponding pattern in two sentences, the live-coding round is mostly already won.</p>
+</section>
+
+<section id="testing">
+  <h2>Testing finance code</h2>
+  <p>Tests aren't a nice-to-have here; they are SOX evidence.</p>
+  <ul>
+    <li><strong>Property-based testing</strong> (Hypothesis) for arithmetic: <em>"for any list of transactions, sum(transactions) == final_balance - opening_balance."</em></li>
+    <li><strong>Golden-file tests</strong> for end-to-end recons: same inputs in → same outputs out.</li>
+    <li><strong>Fixture rebuilds</strong>: regenerate fixtures from production samples (PII-redacted) periodically.</li>
+    <li><strong>Mock the LLM</strong> with deterministic stubs for unit tests; reserve real-API calls for integration tests.</li>
+    <li><strong>Time control</strong>: never call <code>datetime.now()</code> directly in business logic; inject a clock so tests are reproducible.</li>
+  </ul>
+</section>
+
+<section id="interview-shape">
+  <h2>Live-coding shape — the senior moves</h2>
+  <p>When given a problem in a 45-minute round:</p>
+  <ol>
+    <li><strong>Restate</strong> the problem in your words.</li>
+    <li><strong>Clarify</strong>: input size, sorted?, currencies?, duplicates?, what if empty?</li>
+    <li><strong>Walk one example</strong> on a shared doc.</li>
+    <li><strong>Name the brute force</strong> and its complexity.</li>
+    <li><strong>Name the pattern</strong> ("two ledgers — I'd reach for a hash on the smaller side").</li>
+    <li><strong>Code with narration.</strong> Keep talking.</li>
+    <li><strong>Edge cases</strong>: empty, duplicate, single, very large, currency mismatch.</li>
+    <li><strong>Finance-aware tests</strong>: prove with a Decimal example and a duplicate example.</li>
+  </ol>
+  <p>The very next chapter has 8 hand-picked problems with full solutions in drill mode.</p>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance</a> · <a href="11-coding-problems.html">Next: Coding problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

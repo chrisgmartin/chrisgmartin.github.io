@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agentic Workflow Architecture for HR — Deep Dive</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-deep-dive">Why this is the deep dive</a>
+    <a href="#shape">The shape of an HR agentic workflow</a>
+    <a href="#multi-agent">Multi-agent design for HR</a>
+    <a href="#n8n">Why n8n is well-suited here</a>
+    <a href="#tool-use">Tool use across HR systems</a>
+    <a href="#mcp">MCP for sharing HRIS access</a>
+    <a href="#hitl-patterns">HITL patterns in detail</a>
+    <a href="#worked-example">Worked example: leaver agent</a>
+    <a href="#anti-patterns">Anti-patterns</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Deep dive — primary</span>
+  <h1>Agentic Workflow Architecture for HR</h1>
+  <p class="subtitle">The most-probed technical area: how to design multi-agent systems that span HRIS, ATS, payroll, and ticketing, with the HITL gates and audit posture this domain demands.</p>
+</header>
+
+<section id="why-deep-dive">
+  <h2>Why this is <em>the</em> deep dive</h2>
+  <p>Every loop will have at least one round that boils down to: <em>"Design an end-to-end agentic workflow for [X]."</em> Where X is onboarding, offboarding, a Q&amp;A bot, survey synthesis, or a recruiting pipeline summary. The interviewer is testing whether you can:</p>
+  <ul>
+    <li>Decompose the workflow into the right granularity of agents and tools</li>
+    <li>Identify where the human gates go</li>
+    <li>Be explicit about the data flow and where PII crosses system boundaries</li>
+    <li>Reason about failure modes before being asked</li>
+    <li>Make the right n8n vs. Python vs. MCP allocation</li>
+  </ul>
+  <p>This chapter gives you the framework. <a href="06-applied-patterns.html">06-applied-patterns</a> applies it to specific workflows.</p>
+</section>
+
+<section id="shape">
+  <h2>The shape of an HR agentic workflow</h2>
+  <p>The reference architecture, top to bottom:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Responsibility</th><th>Typical tool</th></tr></thead>
+    <tbody>
+      <tr><td>Trigger</td><td>Webhook, schedule, manual kickoff</td><td>n8n trigger nodes, HRIS webhooks, Slack slash command</td></tr>
+      <tr><td>Context gather</td><td>Fetch the worker record, the ticket, the policy chunks</td><td>n8n HTTP nodes, MCP resources, RAG retriever</td></tr>
+      <tr><td>Agent reasoning</td><td>Plan, propose actions, draft output</td><td>Claude API via n8n's AI node or a Python service</td></tr>
+      <tr><td>Tool execution</td><td>Read systems (idempotent), draft side-effects (non-committing)</td><td>MCP servers, n8n function nodes, Python tool functions</td></tr>
+      <tr><td>HITL gate</td><td>Present proposed actions to a human; capture approval / reject</td><td>n8n Slack/email approval nodes, custom HITL UI</td></tr>
+      <tr><td>Commit</td><td>Execute the approved action (EIB upload, Slack send, Workday API call)</td><td>n8n + Python; always with idempotency keys</td></tr>
+      <tr><td>Audit log</td><td>Persist every step, prompt, tool call, decision, approver</td><td>Postgres or warehouse; durable, retained per policy</td></tr>
+      <tr><td>Observability</td><td>Metrics, traces, error rates</td><td>OpenTelemetry, your APM, structured logs</td></tr>
+    </tbody>
+  </table>
+  <p>If you can sketch this on a whiteboard from memory, you've cleared the bar. The rest is variant detail.</p>
+</section>
+
+<section id="multi-agent">
+  <h2>Multi-agent design for HR workflows</h2>
+  <p>"Multi-agent" doesn't mean "many models gossiping in a chatroom." It means specialized agents with narrow responsibilities, orchestrated by a top-level supervisor.</p>
+
+  <h3>Three composition patterns</h3>
+  <ul>
+    <li><strong>Supervisor + workers</strong> — a top-level agent decomposes the request and dispatches to specialized agents. Best for workflows with clear sub-tasks (e.g. onboarding: dispatch to <code>hire_drafter</code>, <code>provisioning_planner</code>, <code>welcome_scheduler</code>).</li>
+    <li><strong>Pipeline</strong> — agent A produces output that becomes agent B's input. Best for surveys (clusterer → sentiment scorer → narrative writer).</li>
+    <li><strong>Single agent + many tools</strong> — for simple workflows, one agent with a rich tool set beats decomposition. Don't over-engineer.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">The default heuristic</span>
+    <p>Start with <strong>single agent + many tools</strong>. Decompose only when (1) the system prompt is exceeding ~10K tokens and most of it isn't relevant per call, or (2) different sub-tasks need different models / different temperatures / different evals.</p>
+  </div>
+
+  <h3>When multi-agent helps</h3>
+  <ul>
+    <li><strong>Different risk tiers in one flow</strong> — onboarding has low-risk (draft welcome email) and high-risk (commit Workday hire). Different agents → different model selection, different HITL policies.</li>
+    <li><strong>Cost optimization</strong> — Haiku for triage, Sonnet for drafting, Opus only when needed. Multi-agent makes the cost shape legible.</li>
+    <li><strong>Eval isolation</strong> — testing the clusterer separately from the writer is much cleaner than testing the end-to-end blob.</li>
+  </ul>
+</section>
+
+<section id="n8n">
+  <h2>Why n8n is well-suited to HR specifically</h2>
+  <p>This will come up. The reasons are not generic "n8n is nice." They are HR-specific:</p>
+  <ul>
+    <li><strong>HRKX operators can read the flow.</strong> When you hand off to the People team, they can see what runs when, who approves, what the branches are. Code-first orchestration loses this.</li>
+    <li><strong>Built-in approval nodes.</strong> The HITL gate is the most-touched primitive in HR; n8n has Slack/email/webhook approval steps out of the box.</li>
+    <li><strong>Self-hostable.</strong> EU employee PII must often stay in EU infrastructure. Self-hosted n8n in your VPC is the simple answer.</li>
+    <li><strong>Native AI nodes.</strong> Claude, OpenAI, embedding, vector store — first-class. You don't fight the platform to drop in an agent.</li>
+    <li><strong>Connector breadth.</strong> Slack, Gmail, Google Workspace, Notion, Jira, HTTP — the actual day-2 tools HR teams already use.</li>
+    <li><strong>Error workflows.</strong> n8n's error workflow pattern lets you route failures to ops without per-node try/except.</li>
+  </ul>
+  <p>What n8n is <em>not</em> good for, and what you'd say in interview:</p>
+  <div class="callout warn">
+    <span class="callout-label">Honest framing</span>
+    <p><em>"I put orchestration, approvals, retries, and connector glue in n8n. I put any heavy AI logic — tool definitions, eval harness, structured-output validation, complex prompt construction — in Python and call it from n8n. That keeps the visual flow readable for HRKX while the AI behavior stays testable and version-controlled."</em></p>
+  </div>
+</section>
+
+<section id="tool-use">
+  <h2>Tool use across HR systems</h2>
+  <p>The HR systems landscape is fragmented. A typical agent reaches into:</p>
+  <table>
+    <thead><tr><th>System</th><th>Read patterns</th><th>Write patterns</th></tr></thead>
+    <tbody>
+      <tr><td>Workday</td><td>RaaS reports, web service (Get_Workers), Prism queries</td><td>EIB upload (batch) or web service (transactional) — both HITL-gated</td></tr>
+      <tr><td>Ashby (ATS)</td><td>REST API: candidates, applications, jobs, offers</td><td>Stage moves, scheduling — usually low-risk, but offer-letter writes are HITL</td></tr>
+      <tr><td>Payroll (Workday / ADP / Deel / Remote)</td><td>Usually read-only from agents</td><td><em>Generally avoided.</em> Payroll writes go through Payroll Ops</td></tr>
+      <tr><td>Ticketing (Jira / ServiceNow / Zendesk)</td><td>Tickets, comments, custom fields</td><td>Status changes, comments, assignments</td></tr>
+      <tr><td>Survey (Qualtrics)</td><td>Response export, free-text fields</td><td>Rarely write; sometimes survey-send</td></tr>
+      <tr><td>Equity (Carta / Shareworks)</td><td>Grants, vesting</td><td>Almost always no</td></tr>
+      <tr><td>IT provisioning (Okta / Jumpcloud)</td><td>Group membership, status</td><td>Often the agent <em>requests</em>; IT or Okta workflows execute</td></tr>
+    </tbody>
+  </table>
+  <p>Two design rules:</p>
+  <ol>
+    <li><strong>Separate read and write tools sharply.</strong> Reads are safe, idempotent, cacheable. Writes are HITL-gated and idempotency-keyed.</li>
+    <li><strong>Writes that touch payroll are not auto-write tools — they are propose-tools.</strong> The tool's effect is to add a row to a "proposed actions" table, which then surfaces in a HITL UI.</li>
+  </ol>
+</section>
+
+<section id="mcp">
+  <h2>MCP for sharing HRIS access patterns</h2>
+  <p>MCP (Model Context Protocol) is how you stop re-implementing Workday access in every agent. The pattern:</p>
+  <ul>
+    <li><strong>One canonical Workday MCP server</strong> — exposes <em>read</em> tools (<code>get_worker</code>, <code>list_supervisory_org</code>, <code>get_business_process_history</code>) and <em>resources</em> (the schema, the field dictionary).</li>
+    <li><strong>One canonical Workday-write MCP server</strong> — separate process, separate auth, separate audit. Exposes only "propose" tools that write to a staging table, never directly to Workday.</li>
+    <li><strong>Per-system MCP servers</strong> — Ashby, Qualtrics, the policy library, the ticketing system. Each agent picks which servers it connects to.</li>
+  </ul>
+  <p>Benefits in interview-speak:</p>
+  <ul>
+    <li>One audit-trail discipline across all agents (every MCP call is logged identically)</li>
+    <li>Access control at the MCP server, not per-agent (huge for compliance)</li>
+    <li>HRKX can extend agents by composing existing MCP servers, no Python required</li>
+    <li>Schema and resources are cached once — every agent inherits the prompt-cache savings</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Workday read MCP server — read-only, safe to expose broadly
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("workday-read")
+
+@mcp.tool()
+def get_worker(employee_id: str) -> dict:
+    """Fetch a worker record by Workday employee_id."""
+    return workday_client.get_worker(employee_id)
+
+@mcp.tool()
+def list_supervisory_org(org_id: str) -> list[dict]:
+    """List workers in a supervisory org."""
+    return workday_client.list_sup_org_members(org_id)
+
+@mcp.resource("workday://schema/worker")
+def worker_schema() -> str:
+    """The Workday worker object's field dictionary, for prompt context."""
+    return WORKER_SCHEMA_DOC
+
+if __name__ == "__main__":
+    mcp.run()</code></pre>
+</div>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Workday write MCP server — separate process, separate auth, HITL-gated
+@mcp.tool()
+def propose_job_change(employee_id: str, effective_date: str,
+                       new_job_profile: str | None = None,
+                       new_supervisor_id: str | None = None,
+                       new_fte: float | None = None,
+                       reason_code: str = "",
+                       rationale: str = "") -> dict:
+    """Propose a Workday job change. Does NOT commit. Writes to the
+    proposed_actions table and returns the proposal_id for HITL review."""
+    proposal = {
+        "kind": "job_change",
+        "employee_id": employee_id,
+        "effective_date": effective_date,
+        "fields": {k: v for k, v in {
+            "job_profile": new_job_profile,
+            "supervisor_id": new_supervisor_id,
+            "fte": new_fte,
+        }.items() if v is not None},
+        "reason_code": reason_code,
+        "rationale": rationale,
+        "idempotency_key": idem_key("job_change", employee_id, effective_date),
+    }
+    proposal_id = proposals_db.insert(proposal)
+    notify_hitl_channel(proposal_id)
+    return {"proposal_id": proposal_id, "status": "awaiting_approval"}</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">The split that matters</span>
+    <p>Read-MCP and write-MCP are <em>different processes</em>, with <em>different credentials</em>, in <em>different VPC subnets</em>. An agent that has only the read-MCP attached cannot accidentally propose a Workday change. This is the access-control story you want to be able to draw in interview.</p>
+  </div>
+</section>
+
+<section id="hitl-patterns">
+  <h2>HITL patterns in detail</h2>
+  <p>The HITL gate is a UX problem as much as an engineering one. Four patterns, in increasing strictness:</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>How it works</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td>Sampled review</td><td>Auto-commit; 5-10% sampled for human spot-check</td><td>Low-risk reads, non-PII summaries, ticket autoreplies on FAQ</td></tr>
+      <tr><td>Approve-or-edit</td><td>Slack/email card; human approves or edits + approves</td><td>Drafted policy answers, welcome emails, scheduled check-ins</td></tr>
+      <tr><td>Approve-with-diff</td><td>Human sees a structured diff of the proposed change before approving</td><td>Workday writes, EIB uploads, comp changes</td></tr>
+      <tr><td>Two-key approval</td><td>Two distinct approvers required (e.g. HRBP + Payroll Ops)</td><td>Severance, equity acceleration, anything cross-functional with money at stake</td></tr>
+    </tbody>
+  </table>
+  <p>The approval UI matters. A wall-of-text Slack message is useless. A structured card with "Worker: Jane Doe (W-12345). Current FTE: 1.0. Proposed FTE: 0.8. Effective: 2026-07-01. Reason: voluntary part-time. [Approve] [Reject] [Edit]" — that's the bar.</p>
+</section>
+
+<section id="worked-example">
+  <h2>Worked example: leaver checklist agent</h2>
+  <p>End-to-end, drawn from real interview answers that land well.</p>
+
+  <h3>Trigger</h3>
+  <p>HRBP marks a termination in Workday → Workday webhook → n8n trigger.</p>
+
+  <h3>Context gather (read-MCP)</h3>
+  <ul>
+    <li><code>get_worker</code>: identity, position, location, country, FTE</li>
+    <li><code>get_compensation</code>: salary, bonus eligibility, equity</li>
+    <li><code>get_country_severance_rules</code>: from policy library (MCP resource)</li>
+    <li><code>get_open_tasks</code>: Jira tickets, pending approvals</li>
+    <li><code>get_payroll_calendar</code>: current and next two cycles</li>
+  </ul>
+
+  <h3>Agent reasoning (Sonnet, with tools)</h3>
+  <p>System prompt frames: "you are drafting a leaver checklist; you propose actions, you do not commit; if the termination is within 5 business days of payroll cutoff, escalate."</p>
+
+  <h3>Proposed actions (write-MCP)</h3>
+  <ul>
+    <li><code>propose_workday_termination</code>: effective date, reason, last day worked</li>
+    <li><code>propose_okta_offboarding</code>: groups to remove on last day</li>
+    <li><code>propose_final_pay_calculation</code>: PTO payout, prorated bonus</li>
+    <li><code>propose_equity_treatment</code>: per plan rules</li>
+    <li><code>draft_offboarding_email</code> (non-write tool — returns text)</li>
+    <li><code>create_jira_ticket</code>: knowledge transfer plan</li>
+  </ul>
+
+  <h3>HITL gate (Slack card)</h3>
+  <p>HRBP approves the offboarding plan. Payroll Ops separately approves the final-pay calculation (two-key).</p>
+
+  <h3>Commit</h3>
+  <p>Approved proposals execute via n8n. Idempotency keys ensure retry safety. Audit log captures every step.</p>
+
+  <h3>What an interviewer is listening for</h3>
+  <ul>
+    <li>You named the payroll-cutoff escalation rule unprompted</li>
+    <li>You separated read and write MCP servers</li>
+    <li>You proposed two-key approval for payroll-affecting steps</li>
+    <li>You called out the audit log <em>and</em> idempotency without being asked</li>
+  </ul>
+</section>
+
+<section id="anti-patterns">
+  <h2>Anti-patterns to call out (and avoid)</h2>
+  <div class="callout danger">
+    <span class="callout-label">Anti-patterns</span>
+    <ul>
+      <li><strong>"The agent will write directly to Workday."</strong> Never propose this. Writes go through a proposed-actions queue with HITL.</li>
+      <li><strong>"The agent has access to the payroll system."</strong> No. Payroll reads are usually fine; payroll writes are off-limits.</li>
+      <li><strong>"Multi-agent because it's cool."</strong> If a single agent with 6 tools does the job, that's the right answer.</li>
+      <li><strong>"We log decisions but not prompts."</strong> Log everything: input, retrieved context, prompt, tool calls, tool results, output, approver, timestamp. Audit is a regulatory requirement, not a feature.</li>
+      <li><strong>"We retry payroll-touching writes automatically."</strong> Never. Idempotency keys help, but the retry policy is "fail closed, page a human."</li>
+    </ul>
+  </div>
+</section>
+
+<section id="interview-frames">
+  <h2>Framings worth memorizing</h2>
+  <ul>
+    <li>"I split read-MCP and write-MCP into separate processes with separate credentials. That gives me access control at the protocol boundary, not per-agent."</li>
+    <li>"For payroll-adjacent writes, my tool doesn't commit — it proposes. The orchestrator queues the proposal, the HITL UI presents the diff, the human approves, the commit happens through a separate worker that owns idempotency."</li>
+    <li>"n8n owns orchestration, branching, scheduling, approvals. Python owns heavy AI logic and the MCP servers. They meet at well-defined HTTP boundaries."</li>
+    <li>"My default architecture is single-agent + many tools. I decompose to multi-agent only when sub-tasks need different models or different evals."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: Workday deep dive →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

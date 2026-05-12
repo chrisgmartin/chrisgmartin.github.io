@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#multi-tenant">Multi-tenant inference cluster</a>
+    <a href="#online-vs-batch">Online vs batch serving</a>
+    <a href="#dynamic-batching">Dynamic batching tuning</a>
+    <a href="#autoscaling">Autoscaling signals</a>
+    <a href="#spot">Spot &amp; preemptible GPU strategy</a>
+    <a href="#warmup">Model warm-up &amp; lazy loading</a>
+    <a href="#ab-canary">A/B and canary rollouts</a>
+    <a href="#driver-rollouts">Driver / kernel upgrade rollouts</a>
+    <a href="#prototypes">Prototypes you can build this week</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">The patterns that show up in design-round questions. Multi-tenant clusters, dynamic batching tuning, autoscaling on the right signals, spot strategy, model warm-up, A/B and canary for kernel upgrades.</p>
+</header>
+
+<section id="multi-tenant">
+  <h2>Pattern: multi-tenant inference cluster</h2>
+  <p>The most-asked design question. Several teams want to serve LLMs from a shared GPU fleet. How do you build it?</p>
+  <p>The senior answer is layered. Don't jump to a YAML.</p>
+  <ol>
+    <li><strong>Identify the tiers.</strong> Online interactive (low p99, paying customer paths), online async (Slack bots, internal tools), batch (evals, offline scoring). Each gets a different SLO and different priority class.</li>
+    <li><strong>Pool the hardware</strong> by accelerator type (H100 vs A100 vs L40), not by team. Tenants are namespaces, not node pools.</li>
+    <li><strong>Quota by team with borrowing.</strong> Each team has a nominal quota; idle quota is borrowable up to a cohort cap.</li>
+    <li><strong>Isolation strategy per tier.</strong> Online interactive: full-GPU or MIG. Batch: time-sliced or MPS, fine to mix.</li>
+    <li><strong>Routing layer in front.</strong> An OpenAI-compatible gateway that routes by model name to the right backend pool. Caching here (prompt cache, response cache for deterministic queries).</li>
+    <li><strong>Observability per tenant.</strong> Cost dashboard, queue depth, p99 latency, GPU utilization — broken out by namespace.</li>
+    <li><strong>Failure mode handling.</strong> A team's runaway job can't starve the cluster. Per-namespace queue caps; per-request timeouts; per-deployment max replicas.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Diagram you should be able to draw</span>
+    <p>Gateway (auth, routing, rate limit) → router (model-name → backend service) → backend pools (vLLM, Triton) on K8s nodes by accelerator type → DCGM/Prometheus telemetry → cost &amp; quota dashboards. Talk through each block.</p>
+  </div>
+</section>
+
+<section id="online-vs-batch">
+  <h2>Pattern: online vs batch — they belong on different pools</h2>
+  <p>Trying to run interactive latency-sensitive serving and large batch evaluation jobs on the same GPUs at the same time is a classic mistake. They want opposite things:</p>
+  <table>
+    <thead><tr><th>Dimension</th><th>Online</th><th>Batch</th></tr></thead>
+    <tbody>
+      <tr><td>Batch size target</td><td>Small (1-16) for low TTFT</td><td>Maximum that fits memory</td></tr>
+      <tr><td>Concurrency</td><td>Bounded, throttle at edge</td><td>Saturate the GPU</td></tr>
+      <tr><td>Tail latency</td><td>Page-level concern</td><td>Don't care</td></tr>
+      <tr><td>Acceptable hardware</td><td>Reserved, high reliability</td><td>Spot, preemptible OK</td></tr>
+      <tr><td>Quantization</td><td>Conservative (FP8 max)</td><td>Aggressive (INT4 fine)</td></tr>
+      <tr><td>KV-cache</td><td>Long-lived, prefix-cached</td><td>Cycled fast</td></tr>
+    </tbody>
+  </table>
+  <p>Keep them physically separated unless capacity pressure forces a mix — and even then, run batch as <em>low-priority preemptible</em> on the online pool's idle headroom, not as a co-resident.</p>
+</section>
+
+<section id="dynamic-batching">
+  <h2>Pattern: dynamic batching tuning</h2>
+  <p>For non-LLM workloads (and pre-vLLM LLM workloads), <strong>dynamic batching</strong> means: hold incoming requests up to a deadline or batch size, then run them together.</p>
+  <p>Two knobs:</p>
+  <ul>
+    <li><strong>max_batch_size</strong> — the most requests one forward pass handles. Bigger = more throughput, more memory, more tail latency.</li>
+    <li><strong>max_queue_delay_microseconds</strong> — how long the first arrival waits for company. Bigger = better batching efficiency under load, worse latency under no load.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># Triton config.pbtxt excerpt
+dynamic_batching {
+  preferred_batch_size: [4, 8, 16]
+  max_queue_delay_microseconds: 2000
+  preserve_ordering: false
+}
+max_batch_size: 32
+instance_group [
+  { count: 2, kind: KIND_GPU }
+]
+</code></pre></div>
+  <p><strong>How to tune.</strong> Sweep with Triton's <code>model-analyzer</code> or a custom load generator. Look at the joint plot of p95 latency vs throughput as you vary max batch and delay. Pick the elbow.</p>
+  <div class="callout insight">
+    <span class="callout-label">vLLM doesn't need this</span>
+    <p>Continuous batching makes the static knobs redundant for LLMs. The vLLM equivalent is <code>max_num_seqs</code> and KV-cache utilization. Be ready to draw that contrast in interviews.</p>
+  </div>
+</section>
+
+<section id="autoscaling">
+  <h2>Pattern: autoscaling on the right signal</h2>
+  <p>K8s HPA on CPU utilization is wrong for GPU services — CPU is rarely the bottleneck, and GPU pods have CPU-light shapes. You need custom metrics. Three options, increasing in quality:</p>
+  <ol>
+    <li><strong>GPU utilization (SM-active%)</strong> — exposed via DCGM. Better than nothing but lags burst arrivals.</li>
+    <li><strong>Queue depth</strong> — pending requests in front of each replica. Faster signal, but you need a server that exposes it (vLLM does).</li>
+    <li><strong>Throughput vs SLO</strong> — observed p95 latency vs target. Most predictive but more wiring.</li>
+  </ol>
+  <p>In practice: <strong>scale-out on queue depth or latency p95, scale-in on sustained low GPU utilization with a long cooldown.</strong> Asymmetric thresholds avoid flapping.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># KEDA scaling on Prometheus queue depth metric
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama-scaler
+spec:
+  scaleTargetRef:
+    name: vllm-llama
+  minReplicaCount: 2
+  maxReplicaCount: 16
+  cooldownPeriod: 600           # slow scale-in for warm models
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: |
+          avg(vllm_num_requests_waiting{deployment="vllm-llama"})
+        threshold: "8"
+</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">Scaling-in is dangerous</span>
+    <p>Killing a vLLM replica throws away its KV-cache, including prefix-cached blocks. New replicas have cold caches and serve slower for a while. Long cooldowns and graceful drains (finish in-flight, refuse new) matter.</p>
+  </div>
+</section>
+
+<section id="spot">
+  <h2>Pattern: spot &amp; preemptible GPU strategy</h2>
+  <p>On-demand H100s are expensive. Spot/preemptible/savings plans can cut 40-70%. The architecture must absorb interruption.</p>
+  <ul>
+    <li><strong>Where spot works</strong> — batch training with checkpointing, batch inference, async evaluation, dev environments.</li>
+    <li><strong>Where spot doesn't</strong> — synchronous low-latency inference, anything with hard SLAs.</li>
+    <li><strong>The hedged strategy</strong> — a baseline of reserved capacity sized for the floor of demand; spot for the peaks; on-demand as the failover.</li>
+    <li><strong>Checkpointing</strong> for training — every N steps, async to durable storage; recover from latest.</li>
+    <li><strong>Graceful drain</strong> — preempt warning hooks (AWS gives 2 minutes), drain pods, save state, mark node unschedulable.</li>
+    <li><strong>Capacity-aware retry</strong> — when spot reclaims, try alternate AZs / instance families before giving up.</li>
+  </ul>
+  <p>Cloud accelerator pricing models you should name:</p>
+  <ul>
+    <li><strong>On-demand</strong> — pay-as-you-go.</li>
+    <li><strong>Spot / preemptible</strong> — interruptible, cheap.</li>
+    <li><strong>Capacity blocks (AWS)</strong> — pre-purchased GPU-hours in a future window, useful for training plans.</li>
+    <li><strong>Savings plans / committed use (AWS/GCP)</strong> — discount for committing usage over 1-3 years.</li>
+    <li><strong>Reserved instances</strong> — capacity reservation, often tied to a region/zone.</li>
+  </ul>
+</section>
+
+<section id="warmup">
+  <h2>Pattern: model warm-up &amp; lazy loading</h2>
+  <p>Cold start for a 70B model means: pull the weights from S3, decompress, load to GPU, compile/CUDA-init, warm the KV-cache allocator, run a few dummy forwards to JIT-compile kernels. End to end can be minutes. Three patterns to manage:</p>
+  <ul>
+    <li><strong>Bake weights into the image</strong> — fastest start, biggest image (50-200 GB). Works when you have a few models.</li>
+    <li><strong>Sidecar weight loader from local NVMe cache</strong> — image is slim, weights pulled once per node and shared across pod restarts. Best general-purpose pattern.</li>
+    <li><strong>Lazy / on-demand load</strong> — load model only when first request arrives. Saves GPU memory; adds cold latency to the first user.</li>
+  </ul>
+  <p>Then warm-up: send synthetic requests at startup before declaring ready. The pod's K8s readiness probe should not return 200 until warm-up completes.</p>
+</section>
+
+<section id="ab-canary">
+  <h2>Pattern: A/B model deployments &amp; canary rollouts</h2>
+  <p>Two distinct concerns:</p>
+  <h3>A/B between models</h3>
+  <p>Route a fraction of traffic to a candidate model, measure quality and latency, compare to the champion. Tooling: a routing layer (KServe, Istio, Envoy) with weighted routes. Logging side-by-side responses for offline eval.</p>
+  <h3>Canary for infrastructure changes</h3>
+  <p>Driver upgrade, kernel upgrade, CUDA upgrade, vLLM version bump. Roll one node, watch:</p>
+  <ul>
+    <li>Inference latency (p50/p95/p99).</li>
+    <li>Token throughput per GPU.</li>
+    <li>Error rate.</li>
+    <li>GPU temperature, power, ECC counts.</li>
+    <li>Dmesg Xid drip.</li>
+  </ul>
+  <p>If clean after 24 hours, expand to 10% of fleet. Then 50%. Then 100%. Automated rollback on regression.</p>
+</section>
+
+<section id="driver-rollouts">
+  <h2>Pattern: driver / kernel upgrade rollouts</h2>
+  <p>NVIDIA driver upgrades are <em>high blast radius</em>. A bad driver can poison every pod on a node.</p>
+  <ol>
+    <li><strong>Pin and version-control driver</strong>. The GPU Operator's driver container is your friend — it lives outside the host package manager.</li>
+    <li><strong>Drain</strong> the node (cordon, evict pods with PDBs respected).</li>
+    <li><strong>Roll the driver</strong>. Reboot if required (UVM module sometimes wants it).</li>
+    <li><strong>Smoke test</strong> with a known-good workload before re-admitting.</li>
+    <li><strong>Watch DCGM &amp; Xids</strong> for 24h before declaring the upgrade healthy.</li>
+    <li><strong>Stagger across availability zones</strong> so a bad driver doesn't take out the whole pool.</li>
+  </ol>
+  <div class="callout warn">
+    <span class="callout-label">CUDA + container toolkit + driver triangle</span>
+    <p>Driver, CUDA toolkit, and <code>nvidia-container-toolkit</code> must be compatible. Read the support matrix; pin them together. "It worked on the canary" means nothing if the canary used a different image.</p>
+  </div>
+</section>
+
+<section id="prototypes">
+  <h2>Prototypes you can build this week</h2>
+  <p>Real practice closes more gap than reading. Three 60-90 minute builds:</p>
+  <ol>
+    <li><strong>vLLM in a container.</strong> Run vLLM serving a 7B model on a single GPU (rent an H100 hour from RunPod/Lambda/Vast.ai for ~$3). Tune <code>--max-num-seqs</code> and <code>--gpu-memory-utilization</code>. Measure TTFT and throughput with <code>vllm benchmark_serving</code>. You'll have hands-on grounding for every chapter-04 question.</li>
+    <li><strong>DCGM exporter + Grafana.</strong> Deploy DCGM exporter, scrape with Prometheus, build a Grafana board showing SM utilization, memory used, power, temperature. You'll never feel lost on chapter-12 questions again.</li>
+    <li><strong>Kueue queue with two priorities.</strong> Spin up a tiny K8s (kind / minikube) with NVIDIA device plugin (or just CPU resources for the demo), install Kueue, configure two priority classes, submit jobs, watch preemption. Even on CPU, the model of the scheduler is the same.</li>
+  </ol>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Previous</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

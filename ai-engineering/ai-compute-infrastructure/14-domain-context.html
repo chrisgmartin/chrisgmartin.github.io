@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Domain Context — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#gpu-anatomy">GPU anatomy</a>
+    <a href="#precisions">Numeric precisions</a>
+    <a href="#interconnect">Interconnect &amp; fabric</a>
+    <a href="#form-factor">Form factors</a>
+    <a href="#nvidia-line">The NVIDIA accelerator line</a>
+    <a href="#other-accels">Non-NVIDIA accelerators</a>
+    <a href="#kv-specifics">KV-cache, prefix caching, page tables</a>
+    <a href="#checkpoint-formats">Checkpoint formats</a>
+    <a href="#pricing">Cloud accelerator pricing tiers</a>
+    <a href="#glossary">Quick glossary</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="13-deployment-and-ops.html">← Previous</a>
+    <a href="15-interview-questions.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · Reference</span>
+  <h1>Domain Context</h1>
+  <p class="subtitle">Vocabulary so you never sound lost. GPU internals, interconnects, precisions, the major accelerator lines, checkpoint formats, KV-cache plumbing, and cloud pricing tiers.</p>
+</header>
+
+<section id="gpu-anatomy">
+  <h2>GPU anatomy — the parts you should be able to name</h2>
+  <table>
+    <thead><tr><th>Part</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><strong>SM</strong> (Streaming Multiprocessor)</td><td>The execution unit. H100 has 132 SMs. Kernels are launched as grids of thread blocks; each block runs on one SM.</td></tr>
+      <tr><td><strong>CUDA core</strong></td><td>An FP32 ALU. Marketing number — "how many CUDA cores" is misleading; SM count and clock matter more.</td></tr>
+      <tr><td><strong>Tensor core</strong></td><td>Specialized matmul unit. Operates on small tiles (e.g. 16×16) in mixed precision. The reason GPUs are dominant for transformers.</td></tr>
+      <tr><td><strong>Warp</strong></td><td>Group of 32 threads executing in lockstep. SIMT execution model.</td></tr>
+      <tr><td><strong>Register file</strong></td><td>Per-SM fast storage. Allocation per thread limits warps in flight.</td></tr>
+      <tr><td><strong>Shared memory / L1</strong></td><td>Per-SM scratchpad, programmer-managed. ~228 KB on H100.</td></tr>
+      <tr><td><strong>L2 cache</strong></td><td>Per-GPU, shared across SMs. 50-60 MB on H100.</td></tr>
+      <tr><td><strong>HBM</strong> (High-Bandwidth Memory)</td><td>The big main memory. H100 SXM has 80 GB at ~3 TB/s; H200 has 141 GB at 4.8 TB/s.</td></tr>
+      <tr><td><strong>NVLink</strong></td><td>NVIDIA's GPU-GPU interconnect. H100 SXM has 18 NVLink-4 connections totaling 900 GB/s aggregate.</td></tr>
+      <tr><td><strong>NVSwitch</strong></td><td>Switch fabric inside multi-GPU nodes for all-to-all NVLink connectivity.</td></tr>
+      <tr><td><strong>Transformer Engine</strong></td><td>NVIDIA's mixed-precision (FP8/FP16/BF16) feature on Hopper+, integrated with cuDNN and frameworks.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="precisions">
+  <h2>Numeric precisions you'll discuss</h2>
+  <table>
+    <thead><tr><th>Format</th><th>Bits</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FP64</strong></td><td>64</td><td>Scientific HPC; rarely used in deep learning</td></tr>
+      <tr><td><strong>FP32</strong></td><td>32</td><td>Single precision; default in earlier ML</td></tr>
+      <tr><td><strong>TF32</strong></td><td>32 (19 effective)</td><td>NVIDIA Ampere+ "tensor-friendly FP32" — drop-in faster training</td></tr>
+      <tr><td><strong>FP16</strong></td><td>16</td><td>Mixed-precision training (historic), inference baseline</td></tr>
+      <tr><td><strong>BF16</strong></td><td>16</td><td>Wider exponent than FP16; preferred for training stability</td></tr>
+      <tr><td><strong>FP8</strong> (E4M3, E5M2)</td><td>8</td><td>Hopper+/Blackwell; serious throughput win, modest quality cost</td></tr>
+      <tr><td><strong>INT8</strong></td><td>8</td><td>Quantized inference (SmoothQuant, GPTQ, AWQ)</td></tr>
+      <tr><td><strong>INT4</strong></td><td>4</td><td>Aggressive inference quantization; meaningful quality cost</td></tr>
+      <tr><td><strong>NVFP4</strong> / FP4</td><td>4</td><td>Blackwell-era; bleeding edge</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">The interview answer</span>
+    <p>"Default to BF16 for training stability, FP8 for inference where the hardware supports it (Hopper+). Below FP8, evaluate the quality cost case-by-case; expect 1-4% degradation depending on the quantization technique and the model."</p>
+  </div>
+</section>
+
+<section id="interconnect">
+  <h2>Interconnect &amp; fabric</h2>
+  <ul>
+    <li><strong>PCIe Gen4 x16</strong> — ~32 GB/s. Common for A100 PCIe and lower-tier deployments.</li>
+    <li><strong>PCIe Gen5 x16</strong> — ~64 GB/s. H100 PCIe form factor and modern hosts.</li>
+    <li><strong>NVLink-4</strong> — used in H100 SXM, 900 GB/s aggregate per GPU.</li>
+    <li><strong>NVLink-5</strong> — Blackwell era, 1.8 TB/s aggregate per GPU.</li>
+    <li><strong>NVSwitch</strong> — full-bandwidth switching between GPUs in a chassis.</li>
+    <li><strong>InfiniBand HDR</strong> — 200 Gbps. Older fabric standard.</li>
+    <li><strong>InfiniBand NDR</strong> — 400 Gbps per port. Current default for big training.</li>
+    <li><strong>RoCE</strong> (RDMA over Converged Ethernet) — RDMA semantics on Ethernet; 200/400/800 Gbps available.</li>
+    <li><strong>GPUDirect RDMA</strong> — NIC writes directly to GPU memory, bypassing the host. Required for IB at full speed.</li>
+    <li><strong>NIXL / NCCL</strong> — software layers on top.</li>
+  </ul>
+</section>
+
+<section id="form-factor">
+  <h2>Form factors</h2>
+  <ul>
+    <li><strong>SXM</strong> — module form factor, higher power envelope (700W+ for H100 SXM5), full NVLink. Found in HGX/DGX systems.</li>
+    <li><strong>PCIe</strong> — card form factor, lower power (350W typical for H100 PCIe), NVLink bridges between pairs only. More flexible for standard server chassis.</li>
+    <li><strong>SXM beats PCIe</strong> for big-model training and tensor-parallel serving because of full NVLink. For inference of smaller models or workloads with little inter-GPU traffic, PCIe is fine.</li>
+  </ul>
+</section>
+
+<section id="nvidia-line">
+  <h2>The NVIDIA accelerator line — what's on the menu</h2>
+  <table>
+    <thead><tr><th>Generation</th><th>Architecture</th><th>Flagship</th><th>HBM</th><th>Highlights</th></tr></thead>
+    <tbody>
+      <tr><td>Ampere</td><td>GA100</td><td>A100 (40/80 GB)</td><td>HBM2e</td><td>TF32, MIG, NVLink-3. Still huge in production.</td></tr>
+      <tr><td>Hopper</td><td>GH100</td><td>H100 (80 GB)</td><td>HBM3</td><td>FP8, Transformer Engine, NVLink-4, DPX instructions.</td></tr>
+      <tr><td>Hopper-refresh</td><td>GH200</td><td>H200 (141 GB)</td><td>HBM3e</td><td>Bigger HBM &amp; bandwidth — wins on long-context inference.</td></tr>
+      <tr><td>Blackwell</td><td>GB100/GB200</td><td>B100, B200, GB200 NVL72</td><td>HBM3e</td><td>FP4, 2nd-gen Transformer Engine, NVLink-5. Multi-chip module.</td></tr>
+      <tr><td>Ada Lovelace</td><td>AD102</td><td>L40, L40S</td><td>GDDR6</td><td>Mid-tier inference; no HBM, but cheaper.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="other-accels">
+  <h2>Non-NVIDIA accelerators worth recognizing</h2>
+  <ul>
+    <li><strong>Google TPU v5p / v5e / v6 (Trillium)</strong> — pod-based systolic-array architecture. JAX/PyTorch XLA. Strong for big training.</li>
+    <li><strong>AWS Trainium / Trainium2</strong> — AWS's custom training chip. Neuron SDK. Price-competitive for AWS-native workloads.</li>
+    <li><strong>AWS Inferentia2</strong> — inference-only sibling.</li>
+    <li><strong>Intel Gaudi 2 / Gaudi 3</strong> — Habana labs. HPU. Competitive on certain LLM training workloads, with integrated networking.</li>
+    <li><strong>AMD MI300X / MI325X</strong> — large HBM (192-256 GB), ROCm software stack. Maturing; competitive for inference of big-context workloads.</li>
+    <li><strong>Apple Silicon / Cerebras / Groq / SambaNova</strong> — niche or specialized.</li>
+  </ul>
+  <p>You won't be deployed on all of them, but say their names confidently when asked.</p>
+</section>
+
+<section id="kv-specifics">
+  <h2>KV-cache, prefix caching, page tables</h2>
+  <p>The plumbing language specific to LLM serving:</p>
+  <ul>
+    <li><strong>KV-cache</strong> — per-layer K and V projections retained on GPU memory for an active sequence. The reason decode is fast.</li>
+    <li><strong>Paged attention</strong> — vLLM's idea of treating KV-cache as virtual memory: fixed-size <em>blocks</em> in HBM, with a <em>block table</em> (page table) per sequence mapping logical positions to physical blocks.</li>
+    <li><strong>Block size</strong> — typically 16 tokens; tunable. Smaller = less fragmentation, more table overhead.</li>
+    <li><strong>Prefix caching</strong> — when two requests share a prefix (e.g. the same system prompt), point both sequences' early block-table entries at the same physical blocks. Copy-on-write when they diverge.</li>
+    <li><strong>Chunked prefill</strong> — split a long prompt into chunks and process them across multiple iterations alongside ongoing decodes, so big prompts don't starve other requests.</li>
+    <li><strong>Swap to CPU / disk</strong> — vLLM can spill blocks to host memory when GPU memory is tight; trades latency for capacity.</li>
+    <li><strong>KV-cache quantization</strong> — store cache in FP8 / INT8 to double effective capacity at small quality cost.</li>
+  </ul>
+</section>
+
+<section id="checkpoint-formats">
+  <h2>Checkpoint formats</h2>
+  <ul>
+    <li><strong>safetensors</strong> — Hugging Face's safer alternative to <code>.pt</code>. No pickle deserialization; bounded memory mapping. The de facto serving format.</li>
+    <li><strong>pickle / .pt / .pth</strong> — original PyTorch format; opens arbitrary code execution surface. Avoid for untrusted inputs.</li>
+    <li><strong>GGUF</strong> — llama.cpp's quantized format. Common for CPU/edge inference, less so for cluster serving.</li>
+    <li><strong>TensorRT plan files</strong> — compiled engines, GPU-architecture-specific. Not portable.</li>
+    <li><strong>Sharded checkpoints</strong> — PyTorch DCP (Distributed Checkpoint), DeepSpeed shards, FSDP shards. One file per rank; metadata describes how to reassemble.</li>
+    <li><strong>Megatron checkpoint format</strong> — used by Megatron-LM with tensor + pipeline parallelism.</li>
+  </ul>
+</section>
+
+<section id="pricing">
+  <h2>Cloud accelerator pricing tiers</h2>
+  <p>You should be able to discuss these without specific numbers — the numbers change.</p>
+  <ul>
+    <li><strong>On-demand</strong> — pay-per-second, highest unit cost, no commitment.</li>
+    <li><strong>Spot / preemptible</strong> — significant discount (50-80%), interruptible.</li>
+    <li><strong>Savings plans (AWS) / committed-use discounts (GCP)</strong> — commit to N hours per month for 1-3 years for a discount. Applies across instance types in the same family.</li>
+    <li><strong>Reserved instances</strong> — capacity reservation tied to a specific region/AZ/family. Stronger capacity guarantee than savings plans.</li>
+    <li><strong>Capacity blocks (AWS)</strong> — pre-purchase GPU-hours in a future contiguous window. Designed for training runs.</li>
+    <li><strong>Dedicated hosts</strong> — entire physical server; useful for licensing or strict isolation.</li>
+    <li><strong>On-prem amortization</strong> — bought hardware spread across its useful life (typically 3-4 years for GPUs). Add power, cooling, datacenter, ops loaded cost. Compare to cloud blended cost.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Blended cost model</span>
+    <p>Real cost = (reserved capacity fixed cost / hours used) + (on-demand burst hours × $/hour) + (spot hours × spot rate) + observability overhead + control-plane overhead. The "$/GPU-hour" question is meaningless without that decomposition.</p>
+  </div>
+</section>
+
+<section id="glossary">
+  <h2>Quick glossary — the rest</h2>
+  <ul>
+    <li><strong>CUDA</strong> — NVIDIA's parallel compute platform and language.</li>
+    <li><strong>cuDNN</strong> — accelerated primitives for deep learning.</li>
+    <li><strong>NCCL</strong> — NVIDIA Collective Communications Library; all-reduce, broadcast, all-gather across GPUs.</li>
+    <li><strong>UCX / NVSHMEM</strong> — lower-level communication libraries.</li>
+    <li><strong>cuBLAS / cuBLASLt</strong> — matrix-multiply libraries.</li>
+    <li><strong>NVRTC</strong> — runtime CUDA compilation.</li>
+    <li><strong>DCGM</strong> — Data Center GPU Manager; telemetry, diagnostics, health.</li>
+    <li><strong>MIG</strong> — Multi-Instance GPU partitioning.</li>
+    <li><strong>MPS</strong> — Multi-Process Service for GPU sharing.</li>
+    <li><strong>UVM</strong> — Unified Virtual Memory between host and device.</li>
+    <li><strong>PTX / SASS</strong> — NVIDIA assembly languages (PTX virtual, SASS native).</li>
+    <li><strong>RDMA</strong> — Remote Direct Memory Access; bypass kernel for network transfers.</li>
+    <li><strong>RoCE</strong> — RDMA over Converged Ethernet.</li>
+    <li><strong>QSFP</strong> — connector form factor for high-speed networking.</li>
+    <li><strong>TFLOPS</strong> — Tera-FLOPS; vendor headline number, usually peak FP at a precision.</li>
+    <li><strong>Token</strong> — unit of LLM input/output; a piece of a word in the model's tokenizer.</li>
+    <li><strong>TTFT / TPOT / ITL</strong> — time-to-first-token, time-per-output-token, inter-token-latency.</li>
+    <li><strong>SGLang / TGI / LMDeploy</strong> — alternative LLM serving stacks worth knowing exist.</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="13-deployment-and-ops.html">← Previous</a> · <a href="15-interview-questions.html">Next: Practice questions →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

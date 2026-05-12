@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems Worked — Rust AI Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#p1-rate-limiter">P1 · Rate limiter (token bucket)</a>
+    <a href="#p2-async-lru">P2 · Async LRU cache</a>
+    <a href="#p3-grpc-aggregator">P3 · gRPC streaming aggregator</a>
+    <a href="#p4-dedup">P4 · Request dedup / coalescing</a>
+    <a href="#p5-worker-pool">P5 · Channel-based worker pool</a>
+    <a href="#p6-counter">P6 · Lock-free counter</a>
+    <a href="#p7-retry">P7 · Retry-with-backoff combinator</a>
+    <a href="#p8-cancel-cascade">P8 · Structured cancellation cascade</a>
+    <a href="#p9-bounded-channel">P9 · Bounded channel from scratch</a>
+    <a href="#p10-shutdown">P10 · Graceful shutdown</a>
+    <a href="#drill">How to drill</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding · Drill mode</span>
+  <h1>Coding Problems Worked</h1>
+  <p class="subtitle">10 problems with the shape interviewers actually ask for AI infra Rust roles. Multiple approaches per problem; drill on a timer.</p>
+</header>
+
+<section id="p1-rate-limiter">
+  <h2>P1 — Rate limiter (token bucket) in Rust</h2>
+  <p><strong>Prompt:</strong> Implement a token bucket rate limiter. <code>fn try_acquire(n: u32) -&gt; bool</code> returns true if N tokens are available (and consumes them), false otherwise. Bucket refills at <code>rate</code> tokens/sec up to <code>capacity</code>.</p>
+
+  <h3>Approach 1 — single-process, lazy refill</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::Mutex;
+use std::time::Instant;
+
+pub struct TokenBucket {
+    inner: Mutex&lt;Inner&gt;,
+    rate: f64,       // tokens per second
+    capacity: f64,
+}
+
+struct Inner {
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(rate: f64, capacity: f64) -&gt; Self {
+        Self {
+            inner: Mutex::new(Inner { tokens: capacity, last: Instant::now() }),
+            rate, capacity,
+        }
+    }
+
+    pub fn try_acquire(&amp;self, n: u32) -&gt; bool {
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = (now - g.last).as_secs_f64();
+        g.tokens = (g.tokens + elapsed * self.rate).min(self.capacity);
+        g.last = now;
+        let need = n as f64;
+        if g.tokens &gt;= need {
+            g.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+}
+</code></pre></div>
+  <p><strong>Tradeoffs:</strong> One <code>Mutex</code> per bucket. Fine for moderate contention; hot bucket → contention → bottleneck. Refill is lazy (computed on access), no background timer.</p>
+
+  <h3>Approach 2 — atomic, lock-free (advanced)</h3>
+  <p>Pack <code>(last_refill_nanos: u64, tokens_micro: u32)</code> into an <code>AtomicU64</code> and CAS-loop. Lock-free under contention. Worth mentioning, usually not worth implementing in 30 minutes.</p>
+
+  <h3>Approach 3 — distributed (Redis)</h3>
+  <p>Lua script that does the read-refill-decrement atomically in Redis. Use for cross-process or cross-pod rate limits. Latency cost (RTT per check) — cache the decision locally for short windows.</p>
+
+  <details class="collapse-card">
+    <summary><strong>Variations interviewers ask</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li>"Async version that <em>awaits</em> until tokens available" — uses <code>tokio::sync::Notify</code> or a sleep based on calculated wait time.</li>
+        <li>"Per-key rate limit" — sharded <code>DashMap</code>.</li>
+        <li>"Sliding window vs fixed window" — token bucket is conceptually sliding; fixed-window counters are simpler but burstier.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="p2-async-lru">
+  <h2>P2 — Async LRU cache</h2>
+  <p><strong>Prompt:</strong> Thread-safe async LRU cache with <code>get</code> and <code>put</code>. Bounded by capacity; least-recently-used evicted on insert when full.</p>
+
+  <h3>Approach — wrap a sync LRU in a Mutex</h3>
+  <p>The simplest correct answer:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::num::NonZeroUsize;
+use lru::LruCache;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+pub struct AsyncLru&lt;K: Eq + std::hash::Hash, V: Clone&gt; {
+    inner: Arc&lt;Mutex&lt;LruCache&lt;K, V&gt;&gt;&gt;,
+}
+
+impl&lt;K: Eq + std::hash::Hash, V: Clone&gt; AsyncLru&lt;K, V&gt; {
+    pub fn new(cap: usize) -&gt; Self {
+        Self { inner: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(cap).unwrap()))) }
+    }
+    pub async fn get(&amp;self, k: &amp;K) -&gt; Option&lt;V&gt; {
+        self.inner.lock().get(k).cloned()
+    }
+    pub async fn put(&amp;self, k: K, v: V) {
+        self.inner.lock().put(k, v);
+    }
+}
+</code></pre></div>
+  <p>Note: <code>parking_lot::Mutex</code> is sync (no <code>.await</code> in the critical section), which is what we want — the operation is microseconds.</p>
+
+  <h3>Senior variant — coalescing get_or_compute</h3>
+  <p>Three concurrent <code>get</code>s for the same missing key should produce one underlying compute, not three. Pattern: a <code>DashMap&lt;K, broadcast::Sender&lt;V&gt;&gt;</code> of in-flight computes.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::sync::broadcast;
+use dashmap::DashMap;
+
+pub async fn get_or_compute&lt;F, Fut, K, V&gt;(
+    cache: &amp;Arc&lt;Mutex&lt;LruCache&lt;K, V&gt;&gt;&gt;,
+    inflight: &amp;DashMap&lt;K, broadcast::Sender&lt;V&gt;&gt;,
+    key: K,
+    compute: F,
+) -&gt; V
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone,
+    F: FnOnce() -&gt; Fut,
+    Fut: std::future::Future&lt;Output = V&gt;,
+{
+    if let Some(v) = cache.lock().get(&amp;key).cloned() { return v; }
+    if let Some(tx) = inflight.get(&amp;key) {
+        let mut rx = tx.subscribe();
+        drop(tx);
+        return rx.recv().await.unwrap();
+    }
+    let (tx, _) = broadcast::channel(1);
+    inflight.insert(key.clone(), tx.clone());
+    let v = compute().await;
+    cache.lock().put(key.clone(), v.clone());
+    inflight.remove(&amp;key);
+    let _ = tx.send(v.clone());
+    v
+}
+</code></pre></div>
+</section>
+
+<section id="p3-grpc-aggregator">
+  <h2>P3 — gRPC streaming aggregator</h2>
+  <p><strong>Prompt:</strong> A gRPC bidi-streaming endpoint. Clients stream a sequence of numbers, the server emits running sum + count after each. Cancellation when client closes.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::wrappers::ReceiverStream;
+use futures::StreamExt;
+
+#[tonic::async_trait]
+impl Agg for AggService {
+    type StreamSumStream = ReceiverStream&lt;Result&lt;Update, Status&gt;&gt;;
+
+    async fn stream_sum(&amp;self, req: Request&lt;Streaming&lt;Num&gt;&gt;)
+        -&gt; Result&lt;Response&lt;Self::StreamSumStream&gt;, Status&gt;
+    {
+        let mut input = req.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            let mut sum: i64 = 0;
+            let mut count: u64 = 0;
+            while let Some(item) = input.next().await {
+                match item {
+                    Ok(n) =&gt; {
+                        sum += n.value as i64;
+                        count += 1;
+                        if tx.send(Ok(Update { sum, count })).await.is_err() {
+                            // client gone — drop the stream
+                            break;
+                        }
+                    }
+                    Err(e) =&gt; { let _ = tx.send(Err(e)).await; break; }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+</code></pre></div>
+  <p><strong>Things they probe:</strong> What happens if the client disconnects mid-stream? (The send fails; spawned task exits; <code>input.next()</code> would return None.) What about backpressure? (The bounded channel blocks the producer if the consumer is slow.) How do you cancel cleanly? (Drop the spawned task by dropping <code>tx</code>; the receiver task's <code>recv</code> returns None.)</p>
+</section>
+
+<section id="p4-dedup">
+  <h2>P4 — Request dedup / coalescing</h2>
+  <p><strong>Prompt:</strong> Given a function <code>fn compute(key: K) -&gt; V</code> that's expensive, build a wrapper such that concurrent calls for the same key produce one underlying compute, all callers receive the same result.</p>
+  <p>This is the <em>singleflight</em> pattern. The senior variant in P2's <code>get_or_compute</code> is the answer. Variations:</p>
+  <ul>
+    <li>"What if compute fails?" — propagate the error to all subscribers; don't cache the failure (or cache with shorter TTL).</li>
+    <li>"What if compute is cancelled by the original caller?" — pick: cancel all subscribers, or have a subscriber take over the work. Production choice is usually "let it complete" by spawning the compute as a detached task.</li>
+    <li>"How do you guard against unbounded inflight set growth?" — TTL + cap; expire stale entries.</li>
+  </ul>
+</section>
+
+<section id="p5-worker-pool">
+  <h2>P5 — Channel-based worker pool</h2>
+  <p><strong>Prompt:</strong> N workers, one input channel, graceful shutdown.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::sync::mpsc;
+use std::sync::Arc;
+
+pub struct Pool { tx: mpsc::Sender&lt;Job&gt; }
+
+pub struct Job(pub Box&lt;dyn FnOnce() -&gt; futures::future::BoxFuture&lt;'static, ()&gt; + Send&gt;);
+
+impl Pool {
+    pub fn new(workers: usize, cap: usize) -&gt; Self {
+        let (tx, rx) = mpsc::channel::&lt;Job&gt;(cap);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        for _ in 0..workers {
+            let rx = rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    let job_opt = { rx.lock().await.recv().await };
+                    match job_opt {
+                        Some(Job(f)) =&gt; f().await,
+                        None         =&gt; break,
+                    }
+                }
+            });
+        }
+        Self { tx }
+    }
+
+    pub async fn submit&lt;F, Fut&gt;(&amp;self, f: F) -&gt; Result&lt;(), &amp;'static str&gt;
+    where
+        F: FnOnce() -&gt; Fut + Send + 'static,
+        Fut: std::future::Future&lt;Output = ()&gt; + Send + 'static,
+    {
+        let job = Job(Box::new(move || Box::pin(f())));
+        self.tx.send(job).await.map_err(|_| "pool closed")
+    }
+    // Drop pool's tx -&gt; channel closes -&gt; workers exit -&gt; graceful shutdown
+}
+</code></pre></div>
+</section>
+
+<section id="p6-counter">
+  <h2>P6 — Lock-free counter</h2>
+  <p><strong>Prompt:</strong> Multi-thread counter, max throughput. Methods: <code>incr</code>, <code>get</code>.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::atomic::{AtomicU64, Ordering};
+
+pub struct Counter { n: AtomicU64 }
+
+impl Counter {
+    pub fn new() -&gt; Self { Self { n: AtomicU64::new(0) } }
+    pub fn incr(&amp;self) { self.n.fetch_add(1, Ordering::Relaxed); }
+    pub fn get(&amp;self) -&gt; u64 { self.n.load(Ordering::Relaxed) }
+}
+</code></pre></div>
+  <p><strong>Senior follow-up:</strong> "This contends under heavy load — every <code>fetch_add</code> is a cache-line bounce. How would you scale it?" Answer: <em>sharded counters</em>. One counter per CPU (or per thread), summed lazily on <code>get</code>.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">pub struct ShardedCounter { shards: Vec&lt;AtomicU64&gt; }
+
+impl ShardedCounter {
+    pub fn new(n: usize) -&gt; Self {
+        Self { shards: (0..n).map(|_| AtomicU64::new(0)).collect() }
+    }
+    pub fn incr(&amp;self) {
+        // pick a shard by thread id hash; cheap and contention-distributing
+        let idx = thread_local_index() % self.shards.len();
+        self.shards[idx].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn get(&amp;self) -&gt; u64 {
+        self.shards.iter().map(|s| s.load(Ordering::Relaxed)).sum()
+    }
+}
+fn thread_local_index() -&gt; usize { /* thread_local! cell with rand index */ 0 }
+</code></pre></div>
+  <p>Memory ordering note: <code>Relaxed</code> is correct for monotonic counters. Use <code>Acquire</code>/<code>Release</code> when the counter <em>synchronizes</em> with other data.</p>
+</section>
+
+<section id="p7-retry">
+  <h2>P7 — Retry-with-backoff combinator</h2>
+  <p><strong>Prompt:</strong> Higher-order async function: retry an operation up to N times with exponential backoff + jitter. Only retry errors deemed retryable.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use rand::Rng;
+use std::time::Duration;
+use tokio::time::sleep;
+
+pub trait Retryable { fn is_retryable(&amp;self) -&gt; bool; }
+
+pub async fn with_backoff&lt;F, Fut, T, E&gt;(
+    mut op: F,
+    max_attempts: u32,
+    base_ms: u64,
+    cap_ms: u64,
+) -&gt; Result&lt;T, E&gt;
+where
+    F: FnMut() -&gt; Fut,
+    Fut: std::future::Future&lt;Output = Result&lt;T, E&gt;&gt;,
+    E: Retryable,
+{
+    let mut delay = base_ms;
+    for attempt in 1..=max_attempts {
+        match op().await {
+            Ok(v) =&gt; return Ok(v),
+            Err(e) if attempt == max_attempts =&gt; return Err(e),
+            Err(e) if !e.is_retryable() =&gt; return Err(e),
+            Err(_) =&gt; {
+                let jitter: u64 = rand::thread_rng().gen_range(0..delay.max(1));
+                sleep(Duration::from_millis(delay + jitter)).await;
+                delay = (delay * 2).min(cap_ms);
+            }
+        }
+    }
+    unreachable!()
+}
+</code></pre></div>
+  <p><strong>Follow-ups:</strong> "What if the operation has side effects?" → caller passes an idempotency key. "What if we want a global retry budget?" → wrap with a budget check (see <a href="08-error-handling.html#retry-budgets">08</a>). "Full jitter vs decorrelated jitter?" → both reduce thundering-herd; decorrelated jitter is the AWS-recommended default.</p>
+</section>
+
+<section id="p8-cancel-cascade">
+  <h2>P8 — Structured cancellation cascade</h2>
+  <p><strong>Prompt:</strong> An agent run launches three sub-tasks (search, summarize, persist). If the run is cancelled, all three must stop and clean up. If any one fails, others stop too.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio_util::sync::CancellationToken;
+use tokio::task::JoinSet;
+
+pub async fn agent_run(token: CancellationToken) -&gt; Result&lt;Outcome, Error&gt; {
+    let mut set = JoinSet::new();
+
+    {
+        let t = token.child_token();
+        set.spawn(async move { search(t).await });
+    }
+    {
+        let t = token.child_token();
+        set.spawn(async move { summarize(t).await });
+    }
+    {
+        let t = token.child_token();
+        set.spawn(async move { persist(t).await });
+    }
+
+    let mut outcomes = Vec::new();
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(v)) =&gt; outcomes.push(v),
+            Ok(Err(e)) =&gt; {
+                token.cancel();
+                while let Some(_) = set.join_next().await {}
+                return Err(e);
+            }
+            Err(join_err) =&gt; {
+                token.cancel();
+                while let Some(_) = set.join_next().await {}
+                return Err(Error::Join(join_err));
+            }
+        }
+    }
+    Ok(assemble(outcomes))
+}
+</code></pre></div>
+  <p>Key points to articulate: child tokens are linked to the parent; cancelling the parent cascades; on any task failure we cancel and drain the rest.</p>
+</section>
+
+<section id="p9-bounded-channel">
+  <h2>P9 — Bounded channel from scratch</h2>
+  <p><strong>Prompt:</strong> Implement a bounded MPSC channel with <code>send</code> (awaits when full) and <code>recv</code> (awaits when empty). Don't use <code>tokio::sync::mpsc</code> directly.</p>
+  <p>Implementation sketch (real code is non-trivial): a <code>Mutex&lt;VecDeque&lt;T&gt;&gt;</code> + two <code>Notify</code> primitives (one for "not full", one for "not empty"). On send: lock, if full await <code>not_full</code>, push, notify <code>not_empty</code>, unlock. On recv: lock, if empty await <code>not_empty</code>, pop, notify <code>not_full</code>, unlock.</p>
+  <details class="collapse-card">
+    <summary><strong>Why this is asked</strong></summary>
+    <div class="collapse-card-body">
+      <p>Tests whether you understand the cooperative-cancellation pitfalls (you cannot hold a sync mutex across an await), the difference between <code>Notify</code> wakeups (one waiter) vs broadcast (all waiters), and the spurious-wakeup contract.</p>
+    </div>
+  </details>
+</section>
+
+<section id="p10-shutdown">
+  <h2>P10 — Graceful shutdown</h2>
+  <p><strong>Prompt:</strong> A Tokio HTTP server that, on SIGTERM, stops accepting new connections, finishes in-flight requests within 30 seconds, then exits.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+
+    let server = tokio::spawn(async move {
+        // axum's `with_graceful_shutdown` takes a future that resolves on shutdown
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        axum::Server::bind(&amp;"0.0.0.0:8080".parse().unwrap())
+            .serve(app.into_make_service())
+            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .await
+            .ok();
+    });
+
+    let mut term = signal(SignalKind::terminate())?;
+    let mut intr = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = term.recv() =&gt; tracing::info!("SIGTERM"),
+        _ = intr.recv() =&gt; tracing::info!("SIGINT"),
+    }
+    shutdown.cancel();
+
+    // Give in-flight requests 30s; force-exit otherwise.
+    match tokio::time::timeout(Duration::from_secs(30), server).await {
+        Ok(_) =&gt; {}
+        Err(_) =&gt; tracing::warn!("force-exit after timeout"),
+    }
+    Ok(())
+}
+</code></pre></div>
+  <p>Probes: SIGTERM vs SIGKILL; what about in-flight gRPC streams; how to drain Kafka consumers cleanly; what does k8s' <code>preStop</code> hook do (sleep so the load balancer notices the pod is going away before SIGTERM hits).</p>
+</section>
+
+<section id="drill">
+  <h2>How to drill</h2>
+  <ol>
+    <li>Set a 25-minute timer per problem. Code on paper or in a text editor without LSP.</li>
+    <li>State the approach in 60 seconds before coding. Make the tradeoffs explicit.</li>
+    <li>Once compiling (or "would compile" on paper), state two failure modes and one performance concern.</li>
+    <li>Re-do the problem the next day. The structure is what you're memorizing, not the syntax.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">The senior tell</span>
+    <p>Talking through the tradeoffs before coding wins more points than perfect syntax. "I'm choosing approach 1 because contention is low; if you tell me the bucket is hot I'd switch to sharded atomics" is what they want to hear.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Coding fundamentals</a> · <a href="12-data-pipelines.html">Next: Data and pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

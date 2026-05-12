@@ -1,4 +1,4 @@
-// Shared JS for Kraken interview-prep HTML guides
+// Shared JS for interview-prep HTML guides
 
 (function () {
   'use strict';
@@ -13,14 +13,21 @@
       name: 'AI Engineering',
       folder: 'ai-engineering',
       guides: [
-        { name: 'AI Agents in Compliance', folder: 'ai-engineer-compliance' }
+        { name: 'AI Agents in Compliance', folder: 'ai-engineer-compliance' },
+        { name: 'AI Agents Architect — Finance', folder: 'ai-agents-finance-architect' },
+        { name: 'AI Agents Architect — HR', folder: 'ai-agents-hr-architect' },
+        { name: 'Senior AI Compute Infrastructure Engineer', folder: 'ai-compute-infrastructure' },
+        { name: 'Senior SWE — AI Infrastructure (Rust)', folder: 'ai-infrastructure-swe' },
+        { name: 'Build an Inference Gateway in Rust', folder: 'build-inference-gateway-rust' },
+        { name: 'PagedAttention from First Principles', folder: 'paged-attention-deep-dive' }
       ]
     },
     {
       name: 'Data Engineering',
       folder: 'data-engineering',
       guides: [
-        { name: 'Data Analytics Engineering', folder: 'data-analytics-interview-prep' }
+        { name: 'Data Analytics Engineering', folder: 'data-analytics-interview-prep' },
+        { name: 'Senior Data Analytics Engineer', folder: 'senior-data-analytics-engineer' }
       ]
     },
     {
@@ -29,6 +36,16 @@
       guides: [
         { name: 'Product & Analytics Data Science', folder: 'product-analytics-ds' },
         { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' }
+      ]
+    },
+    {
+      name: 'Product Management',
+      folder: 'product-management',
+      guides: [
+        { name: 'Senior PM — Platform (Onboarding & KYC)', folder: 'senior-pm-platform' },
+        { name: 'Senior PM — Payments (Emerging Markets)', folder: 'senior-pm-payments' },
+        { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
+        { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
     }
   ];

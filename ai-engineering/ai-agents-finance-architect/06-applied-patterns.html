@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Production Agents in Finance</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>The agents</h2>
+    <a href="#shape">The standard agent shape</a>
+    <a href="#recon">Reconciliation agent</a>
+    <a href="#treasury">Treasury monitor</a>
+    <a href="#audit-prep">Audit-prep agent</a>
+    <a href="#controls">Controls-validation agent</a>
+    <a href="#close-checklist">Close-checklist orchestrator</a>
+    <a href="#variance">Variance commentary agent</a>
+
+    <h2>Reference</h2>
+    <a href="#composition">Composing agents</a>
+    <a href="#prototyping">Things to prototype before interview</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core · Applied</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">Concrete agentic patterns for production finance. Each agent specified as: inputs → tools → output → HITL gate → audit log. These are the patterns you should be able to draw end-to-end on a whiteboard.</p>
+</header>
+
+<section id="shape">
+  <h2>The standard agent shape</h2>
+  <p>Every agent in this chapter follows the same spec template. Use it in your interview answers — it signals platform thinking.</p>
+  <table>
+    <thead><tr><th>Field</th><th>What goes here</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>One-sentence objective.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Named human role (Controller, Treasurer, Internal Audit Lead).</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>1 (read), 2 (write to staging), 3 (write to prod with gate).</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Trigger + data dependencies.</td></tr>
+      <tr><td><strong>Tools</strong></td><td>Bounded list of MCP-backed tools.</td></tr>
+      <tr><td><strong>Output</strong></td><td>Structured object delivered downstream.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>What halts and asks a human, and when.</td></tr>
+      <tr><td><strong>Audit log fields</strong></td><td>The specific fields written per run.</td></tr>
+      <tr><td><strong>Bail conditions</strong></td><td>Stop conditions that escalate without finishing.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="recon">
+  <h2>1 — Reconciliation agent</h2>
+  <p>The workhorse. Reconciles a balance-sheet account between NetSuite (book) and a source system (bank, custody, exchange, intercompany).</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>Reconcile account X as of date D between NetSuite and source S; produce a matched/unmatched report and propose reconciling items.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Account recon owner (typically a Senior Accountant or Controller).</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 2 — proposes reconciling items to BlackLine; never auto-posts JEs.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>account_code, as_of_date, entity_id; chart-of-accounts context (cached); prior-period recon (retrieved); tolerance policy.</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>fetch_gl_balance</code>, <code>fetch_gl_detail</code>, <code>fetch_source_balance</code>, <code>fetch_source_detail</code>, <code>match_items</code> (deterministic), <code>propose_reconciling_item</code>, <code>flag_for_human</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td><code>ReconciliationResult{status, gl_balance, source_balance, variance, matched_items[], unmatched_items[], proposed_items[], confidence, needs_human}</code></td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>Any proposed JE → BlackLine workflow → Process Owner approves → posted to NetSuite. Variance &gt; threshold or confidence &lt; threshold → halt, escalate.</td></tr>
+      <tr><td><strong>Audit log</strong></td><td>run_id, model_version, prompt_hash, inputs_hash, tool_call_sequence, decisions, latency, cost, approver, approval_ts.</td></tr>
+      <tr><td><strong>Bail conditions</strong></td><td>Source-system unreachable; GL period closed; variance &gt; $X or &gt; Y% of account.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The core matching loop</h3>
+  <p>Matching is <em>deterministic</em>, not LLM-driven. The LLM's job is around the matching:</p>
+  <ol>
+    <li>Pull GL detail (all transactions in account for period).</li>
+    <li>Pull source detail (bank statement, custody ledger, exchange trade log).</li>
+    <li>Deterministic match: exact match on amount + date ± tolerance, then on reference id, then fuzzy on description.</li>
+    <li>LLM step on the unmatched residual: "given these N unmatched GL entries and M unmatched source items, propose plausible pairings, missing entries, or timing differences."</li>
+    <li>LLM proposes reconciling items with evidence citations.</li>
+    <li>Human reviews proposals in BlackLine; approved items become JEs.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Why the split</span>
+    <p>If you let the LLM "do the whole recon," it will confidently match transactions that don't actually match. Deterministic-first, LLM-on-the-residual is the senior pattern. State this explicitly in interviews.</p>
+  </div>
+</section>
+
+<section id="treasury">
+  <h2>2 — Treasury monitor</h2>
+  <p>A daily (or intraday) agent that watches cash and crypto positions, flags thresholds, drafts the treasurer's morning brief.</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>Produce the daily treasury brief; flag any threshold breach within 5 minutes.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Treasurer.</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 1 (monitoring). Never moves money. Sweep <em>proposals</em> are Tier 2 with explicit treasurer approval.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Kyriba balances, bank webhooks, Fireblocks vaults, FX rates, policy thresholds, historical sweep patterns.</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>fetch_cash_positions</code>, <code>fetch_crypto_balances</code>, <code>fetch_fx_rates</code>, <code>list_active_sweep_policies</code>, <code>propose_sweep</code>, <code>send_alert</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td>Markdown brief (delivered Slack/email) + structured alerts.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>Sweep proposals: treasurer approves in Slack (n8n approve node) → Kyriba executes.</td></tr>
+      <tr><td><strong>Audit log</strong></td><td>Same as standard + every alert sent with the threshold rule that fired.</td></tr>
+      <tr><td><strong>Bail</strong></td><td>Data source stale &gt; threshold; conflicting signals between Kyriba and bank webhook.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Why this is a great first ship</h3>
+  <p>Tier 1, high visibility, treasurer is the immediate user. If you ship one production agent in your first 90 days, this is the safest candidate. Show the treasurer their morning brief was 5 minutes faster and contained one anomaly callout they'd have missed — you've earned trust for the next, riskier build.</p>
+</section>
+
+<section id="audit-prep">
+  <h2>3 — Audit-prep agent</h2>
+  <p>External audit and quarterly internal audit eat finance time. This agent prepares evidence packages on request.</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>Given an audit request ("provide all journal entries posted in March &gt; $500K with supporting evidence"), assemble the evidence package.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Internal Audit Lead or Controller.</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 1 (read-only). Output reviewed by human before delivery to auditor.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Audit request (natural language); NetSuite, BlackLine, document repository.</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>search_journal_entries</code>, <code>fetch_je_detail</code>, <code>fetch_supporting_docs</code>, <code>fetch_approval_chain</code>, <code>fetch_recon_for_account</code>, <code>compile_package</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td>PDF/zip package + a structured manifest of what's included and the query that produced it.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>Controller reviews and approves the package before it leaves the company.</td></tr>
+      <tr><td><strong>Audit log</strong></td><td>Standard + the original request text + the search queries the agent ran.</td></tr>
+      <tr><td><strong>Bail</strong></td><td>Request ambiguous → ask clarifying questions back to requester; do not guess.</td></tr>
+    </tbody>
+  </table>
+  <p>The killer feature: the agent's own runs are themselves in the audit log. When an auditor asks "how did you produce this package?" you can replay the agent's actions.</p>
+</section>
+
+<section id="controls">
+  <h2>4 — Controls-validation agent</h2>
+  <p>SOX requires evidence that controls operated effectively. This agent samples transactions, evaluates them against the control narrative, and produces the testing workpaper.</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>For control C (e.g., "all JEs &gt; $X require two-level approval"), sample N transactions for the period, verify the control operated, produce the workpaper.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>SOX Lead / Internal Audit.</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 1.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Control narrative, sampling methodology, period, transaction universe.</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>sample_transactions</code> (stratified), <code>fetch_transaction_detail</code>, <code>fetch_approval_chain</code>, <code>evaluate_against_control</code>, <code>generate_workpaper</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td>Structured workpaper: sample, evidence per item, exceptions, pass/fail.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>SOX Lead reviews workpaper; signs off; archives for external auditor.</td></tr>
+      <tr><td><strong>Audit log</strong></td><td>Standard + the sampling random seed (for reproducibility).</td></tr>
+      <tr><td><strong>Bail</strong></td><td>Exception rate &gt; threshold → escalate immediately; auditor needs to know.</td></tr>
+    </tbody>
+  </table>
+  <p>The reproducibility (random seed) detail is high-signal — it tells auditors they can rerun your sample and get the same selection.</p>
+</section>
+
+<section id="close-checklist">
+  <h2>5 — Close-checklist orchestrator</h2>
+  <p>The planner-style agent that runs the close. Not a doer; a coordinator. It tracks the 80-task close list, nudges owners, summarizes blockers, and dispatches the recon agents.</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>Run the close calendar; coordinate sub-agents; produce CFO-readable status.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Controller.</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 1 itself (orchestration). Sub-agents have their own tiers.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Close calendar (from BlackLine), prior-period actuals, current-period status.</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>fetch_close_tasks</code>, <code>fetch_task_status</code>, <code>nudge_owner</code> (Slack/email), <code>spawn_recon_agent</code>, <code>summarize_status</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td>Daily close status brief + Slack nudges.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>None at orchestration tier; sub-agents have their own.</td></tr>
+    </tbody>
+  </table>
+  <p>This is the cleanest first instance of the platform pattern: one agent coordinating other agents, each with its own Process Owner.</p>
+</section>
+
+<section id="variance">
+  <h2>6 — Variance commentary agent</h2>
+  <p>At close, every account with material movement period-over-period gets a commentary ("Revenue is up $4.2M vs. prior month driven by..."). This is grinding work; LLMs are very good at it.</p>
+  <table>
+    <tbody>
+      <tr><td><strong>Goal</strong></td><td>For each account where variance exceeds threshold, draft a candidate flux commentary citing transactions.</td></tr>
+      <tr><td><strong>Process Owner</strong></td><td>Account recon owner.</td></tr>
+      <tr><td><strong>Risk tier</strong></td><td>Tier 1 — drafts; humans edit and approve.</td></tr>
+      <tr><td><strong>Inputs</strong></td><td>Current and prior-N period balances, top transactions driving the variance, prior-period commentary (for tone consistency).</td></tr>
+      <tr><td><strong>Tools</strong></td><td><code>fetch_period_balances</code>, <code>fetch_top_drivers</code>, <code>fetch_prior_commentary</code>, <code>draft_commentary</code>.</td></tr>
+      <tr><td><strong>Output</strong></td><td>Draft markdown per account, with explicit citations.</td></tr>
+      <tr><td><strong>HITL gate</strong></td><td>Recon owner reviews and edits before close.</td></tr>
+    </tbody>
+  </table>
+  <p>Add an <strong>anti-fabrication</strong> rule in the system prompt: <em>"Every numeric claim must cite a transaction id or a balance fetched via tool. Do not invent reasons. If you cannot identify a driver, say so."</em></p>
+</section>
+
+<section id="composition">
+  <h2>Composing agents — the platform view</h2>
+  <p>These agents are not islands. A real close looks like:</p>
+  <pre>
+  T-3: Close orchestrator starts the calendar.
+  T-2: Pre-close checklist nudges. Treasury monitor flags cash positions.
+  T-1: Recon agents fan out across 40 accounts.
+       Variance commentary drafts as recons complete.
+  T+0: Controller reviews proposed JEs. Approves the recurring accruals.
+       Approves variance commentary.
+  T+1: Audit-prep agent assembles the close package for external auditor sample.
+       Controls-validation agent samples March JEs &gt; $500K and produces workpaper.
+  T+2: Close signed off.
+  </pre>
+  <p>The audit log spans all of this. Every agent's run is queryable: <em>"show me all proposed JEs that were rejected by the controller in the last 6 closes"</em> becomes a one-line query — and that's exactly the kind of question an auditor will ask.</p>
+</section>
+
+<section id="prototyping">
+  <h2>Things to prototype before interview day</h2>
+  <p>If you have 1-2 evenings, build <em>one</em> of these. It will dramatically sharpen your answers.</p>
+  <ul>
+    <li><strong>Tiny recon agent</strong>: two CSVs (a "GL" and a "bank statement" with deliberate breaks), Claude API, three tools (load_gl, load_bank, propose_match). Have it output a structured ReconciliationResult.</li>
+    <li><strong>Treasury monitor</strong>: a mock balances JSON, a Claude call that produces a morning brief, an n8n flow that wraps it in a Slack post.</li>
+    <li><strong>MCP server skeleton</strong>: a stdio MCP server that exposes two tools (<code>fetch_balance</code>, <code>list_accounts</code>) against a SQLite fixture.</li>
+  </ul>
+  <p>Each is 60-120 minutes. The shared payoff: you can say in your interview "I built this last week, here's what I learned" — and that beats any amount of theoretical answer.</p>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Finance systems</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

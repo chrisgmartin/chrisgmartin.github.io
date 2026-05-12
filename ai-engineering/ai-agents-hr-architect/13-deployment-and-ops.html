@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#environments">Environments &amp; staging</a>
+    <a href="#workday-sandbox">Workday sandbox/tenant</a>
+    <a href="#change-control">Change control &amp; payroll calendar</a>
+    <a href="#cicd">CI/CD with HITL gates</a>
+    <a href="#rollback">Rollback strategy</a>
+    <a href="#observability">Observability &amp; run logs</a>
+    <a href="#pii-logs">PII handling in logs</a>
+    <a href="#secrets">Secrets &amp; auth</a>
+    <a href="#on-call">On-call &amp; runbooks</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Operations</h1>
+  <p class="subtitle">Shipping HR agents to production safely — staging that mirrors Workday, change control synced to payroll calendars, CI gates that include HITL, observability, and PII-safe logs.</p>
+</header>
+
+<section id="environments">
+  <h2>Environments &amp; staging</h2>
+  <p>The three-environment baseline:</p>
+  <table>
+    <thead><tr><th>Env</th><th>Workday tenant</th><th>Data</th><th>Who uses it</th></tr></thead>
+    <tbody>
+      <tr><td>Local / dev</td><td>Workday sandbox (developer tenant)</td><td>Synthetic / scrubbed</td><td>Engineers</td></tr>
+      <tr><td>Staging</td><td>Workday sandbox preview / impl tenant</td><td>Scrubbed copy of prod, refreshed periodically</td><td>QA, HRKX UAT</td></tr>
+      <tr><td>Production</td><td>Workday production tenant</td><td>Live employee data</td><td>employees, HRKX operations</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Critical staging rule</span>
+    <p>Staging must use a Workday sandbox that mirrors production schema and BP configuration. Otherwise an EIB tested in staging may fail in prod because a calc field exists only in prod or a BP step routes differently.</p>
+  </div>
+</section>
+
+<section id="workday-sandbox">
+  <h2>Workday sandbox &amp; tenant refresh cadence</h2>
+  <p>Workday provides multiple tenants — Implementation, Sandbox, Sandbox Preview, Production. Important properties:</p>
+  <ul>
+    <li>Sandbox is <strong>refreshed from production on a schedule</strong> (weekly or per-event). Your test data is wiped at refresh.</li>
+    <li>Sandbox Preview <strong>previews upcoming Workday releases</strong> before they hit production — your integration must be tested there before each release weekend.</li>
+    <li>Configuration changes (BPs, calc fields, security) made in sandbox <strong>don't auto-propagate</strong> to prod — they migrate via Workday's release/config migration tools or are manually re-keyed.</li>
+  </ul>
+  <p>For your agent: pin to the Sandbox Preview tenant during the two weeks before each Workday release. Run a regression against it. Block release of agent changes that would conflict with the upcoming Workday release.</p>
+</section>
+
+<section id="change-control">
+  <h2>Change control synced to the payroll calendar</h2>
+  <p>The single most People-specific operational discipline: <strong>no agent or integration change deploys to production within the payroll lock window for any major-population country.</strong></p>
+  <p>Concretely:</p>
+  <ul>
+    <li>Maintain a calendar of all payroll cutoffs across all entities</li>
+    <li>Highlight a "no-deploy" window of ~3 business days before each cutoff</li>
+    <li>If you have multiple frequencies (monthly UK, bi-weekly US), the no-deploy windows overlap; in practice you have ~2 windows per month where you <em>can</em> deploy</li>
+    <li>Emergency changes require Payroll Ops + Process Owner sign-off, with a rollback plan in hand</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">def can_deploy(now: date, countries: list[str], cal: PayrollCalendar) -> dict:
+    """Return whether deploy is safe today, with rationale."""
+    blockers = []
+    for c in countries:
+        win = cal.lock_window(c, now)
+        if win["status"] in ("locked", "caution"):
+            blockers.append({"country": c, **win})
+    return {"safe": not blockers, "blockers": blockers}</code></pre>
+</div>
+</section>
+
+<section id="cicd">
+  <h2>CI/CD with HITL gates</h2>
+  <p>CI for an HR agent pipeline has more gates than a typical web service:</p>
+  <ol>
+    <li><strong>Lint, type check</strong> — black, ruff, mypy</li>
+    <li><strong>Unit tests</strong> — green, with coverage threshold on critical modules (idempotency, payroll-window, redaction)</li>
+    <li><strong>Schema tests</strong> — every Pydantic model round-trips; EIB header snapshot matches</li>
+    <li><strong>Eval suite</strong> — runs on a labeled set; metrics meet thresholds</li>
+    <li><strong>PII tests</strong> — zero tolerance; any regression blocks merge</li>
+    <li><strong>Fairness baselines</strong> — for agents with fairness implications, the dashboard delta is within threshold</li>
+    <li><strong>Staging deploy + smoke test</strong> — run a known input through the deployed agent against sandbox Workday</li>
+    <li><strong>HITL approval for promotion</strong> — to ship the change, the Process Owner approves in the release tool</li>
+    <li><strong>Payroll-calendar check</strong> — automated, blocks if in lock window without override</li>
+    <li><strong>Production deploy</strong> — with canary if relevant; full rollout after observation window</li>
+  </ol>
+
+  <div class="callout insight">
+    <span class="callout-label">"Driving adoption, not just delivery"</span>
+    <p>The Process Owner approval is not a rubber stamp — it forces the architect to bring the HRKX operator into the loop on every change. That's how adoption gets driven: by making them the gatekeeper of changes to their own tool.</p>
+  </div>
+</section>
+
+<section id="rollback">
+  <h2>Rollback strategy</h2>
+  <p>Rolling back an HR agent is harder than rolling back a web service because <strong>partial effects may have committed to Workday and downstream systems</strong>. Plan for it:</p>
+  <ul>
+    <li><strong>Feature flags everywhere</strong> — every new agent capability is behind a flag, toggle-off rolls back instantly</li>
+    <li><strong>Idempotency keys</strong> let you safely re-run after a rollback</li>
+    <li><strong>The propose/commit split</strong> means a rollback at the proposing stage costs nothing — just abandon the queued proposals</li>
+    <li><strong>Audit log preserves intent</strong> — even rolled-back runs are logged, so you can reconstruct what would have happened</li>
+    <li><strong>For committed actions, you build the reversal</strong> — there's no automatic undo; the reversal is a new BP (e.g., revert job change)</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The honest framing</span>
+    <p>For payroll-affecting commits, "rollback" usually means "manually reverse with Payroll Ops." Don't promise instant rollback you can't deliver. Promise instant <em>halt</em> (stop further commits), then a manual reversal plan with named owners.</p>
+  </div>
+</section>
+
+<section id="observability">
+  <h2>Observability &amp; run logs</h2>
+  <p>Three layers of observability:</p>
+
+  <h3>Infrastructure</h3>
+  <ul>
+    <li>Standard APM on the n8n hosts, Python services, and MCP servers</li>
+    <li>Workday API call rates, error rates, latency (Workday is the most common bottleneck)</li>
+    <li>Cost dashboards per agent (Claude tokens, EIB run frequency)</li>
+  </ul>
+
+  <h3>Agent-level</h3>
+  <ul>
+    <li>Run count per agent per day</li>
+    <li>Tool call distribution (which tools fired, in what order)</li>
+    <li>Token usage per run (input, cached, output)</li>
+    <li>Refusal rate by reason</li>
+    <li>Halt rate by halt-criterion</li>
+  </ul>
+
+  <h3>Outcome-level</h3>
+  <ul>
+    <li>Approval rate (% of HITL proposals approved as-drafted)</li>
+    <li>Edit rate (% approved after human edits)</li>
+    <li>Reject rate</li>
+    <li>Time-to-decision (proposal → approval/reject)</li>
+    <li>Sampled human review pass rate (on auto-committed low-tier flows)</li>
+  </ul>
+
+  <p>The North-Star metric for an HR agent's health: <strong>edit rate</strong>. Tracks "how often is the human modifying what the agent drafted?" High edit rate = agent isn't trusted. Low edit rate = ready to consider loosening HITL.</p>
+</section>
+
+<section id="pii-logs">
+  <h2>PII handling in logs</h2>
+  <p>The rules:</p>
+  <ul>
+    <li><strong>Never log Restricted-class fields verbatim.</strong> Salary, SSN, government ID, performance rating, medical info.</li>
+    <li><strong>Log hashes or tokens</strong> for cross-reference. <code>worker_id_hash</code> in log; the resolution table is access-controlled.</li>
+    <li><strong>Structured log fields, not free-text</strong> — easier to redact, easier to audit, easier to filter on data class.</li>
+    <li><strong>Error messages strip PII</strong> — "validation failed for proposal P-123" not "validation failed: SSN 123-45-6789 was wrong format."</li>
+    <li><strong>Per-record retention</strong> — operational logs aged out after retention; Restricted-class agent run logs retained per policy but access-restricted.</li>
+    <li><strong>Log access is logged</strong> — who pulled what audit entry, when.</li>
+  </ul>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import logging, hashlib, json
+
+class PIISafeFormatter(logging.Formatter):
+    RESTRICTED_KEYS = {"ssn", "salary", "salary_amount", "performance_rating", "govt_id"}
+
+    def format(self, record):
+        if isinstance(record.msg, dict):
+            redacted = {k: ("&lt;redacted&gt;" if k in self.RESTRICTED_KEYS else v)
+                        for k, v in record.msg.items()}
+            record.msg = json.dumps(redacted)
+        return super().format(record)
+
+def hash_id(worker_id: str) -> str:
+    return hashlib.sha256(worker_id.encode()).hexdigest()[:16]</code></pre>
+</div>
+</section>
+
+<section id="secrets">
+  <h2>Secrets &amp; auth</h2>
+  <ul>
+    <li><strong>Workday integration system user (ISU)</strong> with minimum privileges for the integration — read for read-MCP, write only for write-MCP</li>
+    <li><strong>Workday tokens are short-lived</strong> — refresh logic is first-class, not bolt-on</li>
+    <li><strong>Separate ISUs per agent</strong> when feasible — limits blast radius on credential compromise</li>
+    <li><strong>Secrets manager</strong>, not env vars in n8n exports</li>
+    <li><strong>Rotation</strong> — quarterly minimum, automated where possible</li>
+    <li><strong>Audit on credential use</strong> — Workday's audit log captures every ISU action; correlate with your agent's run_id</li>
+  </ul>
+</section>
+
+<section id="on-call">
+  <h2>On-call &amp; runbooks</h2>
+  <p>Each agent has a runbook owned by its Process Owner. The runbook contains:</p>
+  <ul>
+    <li>What the agent does, in 3 sentences</li>
+    <li>Trigger and schedule</li>
+    <li>Halt criteria</li>
+    <li>How to read the audit log</li>
+    <li>Common failure modes and their resolutions</li>
+    <li>How to disable the agent (the kill switch)</li>
+    <li>Escalation chain — who to call when</li>
+    <li>Replay protocol (given a run_id, how to reproduce)</li>
+    <li>Postmortem template</li>
+  </ul>
+
+  <p>For Tier 3+ agents, on-call rotation includes the architect <em>and</em> the Process Owner. The architect debugs technical; the Process Owner decides business resolution.</p>
+</section>
+
+<section id="interview-frames">
+  <h2>Interview framings worth memorizing</h2>
+  <ul>
+    <li>"Staging mirrors a Workday Sandbox tenant; we test against Sandbox Preview during the two weeks before each Workday release."</li>
+    <li>"No deploy window during the 3 business days before any major-population payroll cutoff. Calendar-aware change control is a hard rule."</li>
+    <li>"For Tier 3+, the Process Owner is a CI gate. They approve to ship. That's how adoption gets driven."</li>
+    <li>"Rollback for payroll-affecting commits means halt + manual reversal with Payroll Ops. I don't promise instant undo I can't deliver."</li>
+    <li>"My North-Star agent health metric is edit rate. It's the closest proxy to operator trust."</li>
+    <li>"Logs never carry Restricted-class fields verbatim. Hashes for cross-reference, structured fields for redaction, access logged on the audit store."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Data &amp; pipelines</a> · <a href="14-domain-context.html">Next: Domain context →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

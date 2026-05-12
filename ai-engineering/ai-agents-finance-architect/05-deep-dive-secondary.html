@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — Finance Systems Integration</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#overview">The stack at a glance</a>
+    <a href="#netsuite">NetSuite — the GL</a>
+    <a href="#blackline">BlackLine — the recon engine</a>
+    <a href="#kyriba">Kyriba — treasury</a>
+    <a href="#fireblocks">Fireblocks — custody</a>
+    <a href="#lukka">Lukka — crypto subledger</a>
+    <a href="#data-flows">Data flows across the close cycle</a>
+    <a href="#first-principles">First-principles stack evaluation</a>
+    <a href="#api-patterns">API integration patterns</a>
+    <a href="#agentic-layer">The agentic layer on top</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical core · Secondary</span>
+  <h1>Finance Systems Integration</h1>
+  <p class="subtitle">What NetSuite, BlackLine, Kyriba, Fireblocks, and Lukka each do, the data flows between them, and how an AI-native agentic layer plugs in alongside (and eventually simplifies) the existing stack.</p>
+</header>
+
+<section id="overview">
+  <h2>The stack at a glance</h2>
+  <p>If you take nothing else from this chapter, take this table — you should be able to recite it cold.</p>
+  <table>
+    <thead><tr><th>System</th><th>What it is</th><th>Primary job</th><th>You interact with it via</th></tr></thead>
+    <tbody>
+      <tr><td><strong>NetSuite</strong></td><td>ERP / GL</td><td>Books of record. General ledger, AR, AP, fixed assets, multi-entity consolidation.</td><td>SuiteTalk REST + SuiteQL; CSV imports; SuiteScript for server-side.</td></tr>
+      <tr><td><strong>BlackLine</strong></td><td>Reconciliation &amp; close automation</td><td>Account reconciliations, certifications, close task management, JE workflow.</td><td>REST API, scheduled imports, BlackLine Studio.</td></tr>
+      <tr><td><strong>Kyriba</strong></td><td>Treasury management</td><td>Cash positioning, payments, FX, in-house banking, liquidity forecasting.</td><td>Kyriba APIs, secure file transfer for bank data.</td></tr>
+      <tr><td><strong>Fireblocks</strong></td><td>Crypto custody / MPC wallet</td><td>Holds crypto assets; signs transactions; policy engine; transaction monitoring.</td><td>Fireblocks API, webhooks for transaction events.</td></tr>
+      <tr><td><strong>Lukka</strong></td><td>Crypto subledger &amp; fair value</td><td>Cost basis tracking, lot accounting, fair value, on-chain reconciliation, regulatory reporting.</td><td>Lukka APIs, batch ingestion of on-chain &amp; exchange data.</td></tr>
+    </tbody>
+  </table>
+  <p>A simple mental model: <strong>Fireblocks holds the crypto. Lukka accounts for it. Banks hold fiat. Kyriba positions it. NetSuite books both. BlackLine reconciles everything to NetSuite.</strong></p>
+</section>
+
+<section id="netsuite">
+  <h2>NetSuite — the General Ledger</h2>
+  <p>The book of record. Every journal entry, every account, every entity rolls up here.</p>
+  <h3>Things to know cold</h3>
+  <ul>
+    <li><strong>Chart of accounts (CoA)</strong>: hierarchical account structure. Large orgs run thousands of accounts × multiple subsidiaries.</li>
+    <li><strong>Subsidiaries &amp; consolidation</strong>: NetSuite OneWorld handles multi-entity. Consolidation involves elimination entries between intercompany pairs.</li>
+    <li><strong>Periods</strong>: monthly fiscal periods. Periods get <em>closed</em> — once closed, posting requires period re-opening (a control event).</li>
+    <li><strong>Subledgers</strong>: AR, AP, fixed assets feed the GL.</li>
+    <li><strong>SuiteTalk REST</strong>: modern REST API. <strong>SuiteQL</strong>: SQL-like queries against NetSuite data.</li>
+    <li><strong>Rate limits</strong>: real. Plan for pagination, retries, and async patterns.</li>
+  </ul>
+  <h3>What agents do against NetSuite</h3>
+  <ul>
+    <li>Read trial balance, journal entries, transaction details.</li>
+    <li>Propose journal entries (write to staging table, never direct post).</li>
+    <li>Read CoA for prompt context.</li>
+    <li>Read subledger detail for reconciliations.</li>
+  </ul>
+</section>
+
+<section id="blackline">
+  <h2>BlackLine — the reconciliation engine</h2>
+  <p>The system that runs your monthly close discipline. If NetSuite is the books, BlackLine is the close project manager.</p>
+  <h3>What it does</h3>
+  <ul>
+    <li><strong>Account reconciliations</strong>: every balance-sheet account has a recon owner. BlackLine tracks status, holds supporting docs, runs matching rules.</li>
+    <li><strong>Close task management</strong>: 80+ tasks per close, owners, dependencies, deadlines.</li>
+    <li><strong>Journal entry workflow</strong>: route JEs for approval before they hit NetSuite.</li>
+    <li><strong>Certification</strong>: monthly attestation that an account is reconciled and correct.</li>
+    <li><strong>Variance analysis</strong>: flux explanations period-over-period.</li>
+  </ul>
+  <h3>Why agents love this</h3>
+  <p>BlackLine is structured, auditable, and process-aware. An agent that produces a recon can hand it to BlackLine's workflow rather than reinventing approvals. The Process Owner concept aligns naturally with BlackLine's recon-owner concept.</p>
+  <h3>Risks</h3>
+  <p>BlackLine has its own matching rules and connectors. If your agent and BlackLine both try to match the same transactions, you'll create double-matching bugs. <strong>Decide the boundary up front</strong>: typically, agent handles the "long tail" (the items BlackLine's rules can't match) while BlackLine handles the bulk auto-match.</p>
+</section>
+
+<section id="kyriba">
+  <h2>Kyriba — treasury management</h2>
+  <p>The cockpit for cash and liquidity. Aggregates bank balances, manages payments, handles FX exposure, runs cash forecasts.</p>
+  <h3>Things to know</h3>
+  <ul>
+    <li><strong>Bank connectivity</strong>: SWIFT, BAI, MT940, EBICS — file formats and protocols that move banking data.</li>
+    <li><strong>Cash positioning</strong>: real-time view of where the company's cash is, across banks and accounts.</li>
+    <li><strong>Sweeps &amp; ZBA</strong>: automated movement of cash to concentration accounts (zero-balance account, or sweep to a money-market fund / MMF).</li>
+    <li><strong>FX exposure</strong>: net positions by currency; hedging workflow.</li>
+    <li><strong>Payment factory</strong>: standardized payment generation and approval.</li>
+  </ul>
+  <h3>What agents do against Kyriba</h3>
+  <ul>
+    <li>Treasury monitoring agent: read cash positions, flag thresholds, alert.</li>
+    <li>Sweep-suggestion agent: propose movements; human approves.</li>
+    <li>Forecast assistant: pull historical patterns, propose forecast updates.</li>
+    <li>FX exposure summary for treasurer's daily review.</li>
+  </ul>
+</section>
+
+<section id="fireblocks">
+  <h2>Fireblocks — crypto custody</h2>
+  <p>Institutional crypto custody using MPC (multi-party computation) wallets. Fireblocks holds the keys, signs transactions, enforces policy.</p>
+  <h3>Things to know</h3>
+  <ul>
+    <li><strong>Vaults &amp; wallets</strong>: organizational units holding assets. Multiple asset types per vault.</li>
+    <li><strong>Policy engine</strong>: rules about who can sign what, when, with how many approvers, to which destinations (whitelists).</li>
+    <li><strong>Transaction lifecycle</strong>: queued → policy-checked → signed → broadcast → confirmed on-chain.</li>
+    <li><strong>API + webhooks</strong>: pull balances, push transaction notifications.</li>
+    <li><strong>AddressBook</strong>: known counterparty addresses with classification.</li>
+  </ul>
+  <h3>For Finance specifically</h3>
+  <p>The Finance side cares about <em>balances</em> and <em>transactions</em>, not the cryptographic signing. Fireblocks is your source of truth for "what does the company hold on-chain?" — which Lukka then turns into accounting entries, which NetSuite books.</p>
+</section>
+
+<section id="lukka">
+  <h2>Lukka — crypto subledger &amp; fair value</h2>
+  <p>The least familiar system for most candidates and the most distinctive piece of a crypto-native finance stack. Spend an extra five minutes here.</p>
+  <h3>What Lukka does</h3>
+  <ul>
+    <li><strong>Crypto subledger</strong>: takes raw on-chain and exchange data, produces accounting-grade ledgers (lots, cost basis, gains/losses).</li>
+    <li><strong>Fair value</strong>: principal-market fair value of digital assets at any timestamp — critical for FASB ASU 2023-08 (Crypto Assets fair value).</li>
+    <li><strong>On-chain reconciliation</strong>: ties internal records to blockchain reality across many chains.</li>
+    <li><strong>Tax &amp; regulatory reporting</strong>: jurisdiction-specific outputs.</li>
+  </ul>
+  <h3>Why this is hard</h3>
+  <p>Crypto accounting has problems traditional accounting doesn't:</p>
+  <ul>
+    <li>Many chains, each with their own transaction model (UTXO vs. account-based).</li>
+    <li>"Internal" transfers between own wallets are not taxable events but look like transactions.</li>
+    <li>Fair value can move minute-to-minute; the timestamp policy matters.</li>
+    <li>Lot selection (FIFO/HIFO/specific ID) drives reported gains/losses.</li>
+    <li>Wrapped tokens, staking rewards, airdrops — each is a distinct accounting event class.</li>
+  </ul>
+  <p>Lukka exists so you don't reinvent this. The agents do not redo Lukka's work; they consume Lukka outputs and reconcile to NetSuite.</p>
+</section>
+
+<section id="data-flows">
+  <h2>Data flows across the close cycle</h2>
+  <p>The shape, drawn on a whiteboard:</p>
+  <pre>
+    Banks ──────► Kyriba ─────────► NetSuite (Cash entries)
+                                          ▲
+    Blockchain ──► Fireblocks ──► Lukka ──┤ (Crypto subledger → GL)
+                                          │
+    Exchanges ─────────────────► Lukka ───┘
+                                          ▲
+                                          │
+                                    BlackLine
+                                  (recons GL vs.
+                                   source systems)
+                                          ▲
+                                          │
+                                  Agentic Layer
+                            (proposes JEs, narrates,
+                             flags anomalies, executes
+                             checklists, runs evals)
+  </pre>
+  <p>Two important reading directions:</p>
+  <ul>
+    <li><strong>Bottom-up</strong>: real-world events (a bank deposit, an on-chain transfer) flow up into systems-of-record and eventually into NetSuite as journal entries.</li>
+    <li><strong>Top-down (reconciliation)</strong>: BlackLine and your agentic layer compare NetSuite balances against source-system balances and flag breaks.</li>
+  </ul>
+</section>
+
+<section id="first-principles">
+  <h2>First-principles stack evaluation</h2>
+  <div class="callout insight">
+    <span class="callout-label">From the JD</span>
+    <p>"Evaluate the company's existing finance systems stack from first principles, including platforms and the interfaces and data flows between them. Identify opportunities to simplify the stack, reduce manual intervention, and define a scalable target architecture."</p>
+  </div>
+  <p>This is the architect question, and the JD asks for it explicitly. The framework:</p>
+  <ol>
+    <li><strong>What is each system's irreducible job?</strong> Strip features, what's the core function? NetSuite = GL. BlackLine = recon workflow. Etc.</li>
+    <li><strong>Where do systems overlap?</strong> BlackLine and NetSuite both have JE workflow. Kyriba and bank portals both have balance views.</li>
+    <li><strong>Where are the integration gaps?</strong> Manual exports/imports, spreadsheets in the middle, custom scripts no one owns.</li>
+    <li><strong>What does an AI-native target look like?</strong> Agentic layer as system-of-action; systems-of-record stay; some workflow tools (e.g., BlackLine task management) potentially get replaced by agent-driven workflows.</li>
+    <li><strong>What's the migration path?</strong> Run the agentic layer alongside. Replace specific workflows piece by piece. Sunset overlapping features only when the agent layer has proven equivalent controls.</li>
+  </ol>
+  <p>The senior answer is <em>not</em> "rip out BlackLine." It's: <em>"BlackLine's matching rules and recon workflow are mature; the agentic layer adds value on the long tail and on cross-system orchestration. Three years out, the agentic layer might absorb close task management; the recon engine stays."</em></p>
+</section>
+
+<section id="api-patterns">
+  <h2>API integration patterns</h2>
+  <p>You'll be asked about the practical realities. Cold-knowledge:</p>
+  <table>
+    <thead><tr><th>Concern</th><th>Pattern</th></tr></thead>
+    <tbody>
+      <tr><td>Authentication</td><td>OAuth 2.0 for most; token-based for NetSuite SuiteTalk; signed requests for Fireblocks.</td></tr>
+      <tr><td>Rate limits</td><td>Token bucket per service; exponential backoff with jitter on 429.</td></tr>
+      <tr><td>Pagination</td><td>Cursor or offset; never assume page 1 has all data.</td></tr>
+      <tr><td>Idempotency</td><td>Idempotency-Key header on writes (NetSuite supports; Fireblocks supports via externalTxId).</td></tr>
+      <tr><td>Webhooks</td><td>For Fireblocks transaction events; verify HMAC signatures; idempotent handlers.</td></tr>
+      <tr><td>Bulk</td><td>NetSuite has bulk-export endpoints; BlackLine has scheduled imports; Lukka batch APIs for large reconciliation runs.</td></tr>
+      <tr><td>Schema drift</td><td>Pin API versions; alert on unexpected fields; treat schema changes as a release event.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Skeleton: a hardened NetSuite client</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+class NetSuiteClient:
+    def __init__(self, base_url, auth, timeout=30):
+        self.client = httpx.AsyncClient(base_url=base_url, auth=auth, timeout=timeout)
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.HTTPStatusError)),
+        reraise=True,
+    )
+    async def suiteql(self, query: str, params: dict | None = None) -&gt; list[dict]:
+        r = await self.client.post("/services/rest/query/v1/suiteql",
+                                   json={"q": query, "params": params or {}})
+        if r.status_code == 429:
+            raise httpx.HTTPStatusError("rate limit", request=r.request, response=r)
+        r.raise_for_status()
+        return r.json().get("items", [])
+</code></pre></div>
+</section>
+
+<section id="agentic-layer">
+  <h2>The agentic layer on top</h2>
+  <p>The target architecture from the JD: <em>"Build an agentic finance layer that runs alongside the existing stack today, automating workflows while defining the migration path toward a more scalable, AI-native architecture over time."</em></p>
+  <p>Concretely, you'll build:</p>
+  <ul>
+    <li><strong>One MCP server per system</strong>: <code>netsuite-mcp</code>, <code>blackline-mcp</code>, <code>kyriba-mcp</code>, <code>fireblocks-mcp</code>, <code>lukka-mcp</code>. Each exposes a narrow set of read tools and explicitly-named staging-write tools.</li>
+    <li><strong>A shared identity / audit layer</strong>: every tool call carries caller identity, workflow run id, idempotency key.</li>
+    <li><strong>A library of workflow templates</strong> (n8n + Python): bank rec, intercompany rec, on-chain rec, treasury monitor, close checklist, accruals proposal.</li>
+    <li><strong>A central eval harness</strong> (chapter 07) measuring each workflow's correctness over time.</li>
+    <li><strong>A governance dashboard</strong>: every active automation, its tier, its Process Owner, its last eval pass, its uptime.</li>
+  </ul>
+  <p>That last bullet is the foundation called out in the JD's fifth responsibility area. Build it early; it's the artifact that makes you "platform" rather than "scripts."</p>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← Agentic architecture</a> · <a href="06-applied-patterns.html">Next: Applied patterns →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Governance &amp; Audit — Observability for Agent Systems</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why this is infra's problem</a>
+    <a href="#structured-logs">Structured logs</a>
+    <a href="#trace-ids">Trace IDs through tool calls</a>
+    <a href="#otel">OpenTelemetry in Rust</a>
+    <a href="#redaction">PII redaction</a>
+    <a href="#audit-logs">Audit logs for autonomous actions</a>
+    <a href="#guardrails">Safety guardrails</a>
+    <a href="#kill-switch">Kill switches</a>
+    <a href="#rate-caps">Rate caps</a>
+    <a href="#allow-lists">Action allow-lists</a>
+    <a href="#breakglass">Human-approval breakglass</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-error-handling.html">← Previous</a>
+    <a href="10-coding-fundamentals.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Governance &amp; Audit</h1>
+  <p class="subtitle">Observability for agent systems — structured logs, distributed traces through tool calls, OpenTelemetry, PII redaction. Safety guardrails — kill switches, rate caps, allow-lists, breakglass approval.</p>
+</header>
+
+<section id="why">
+  <h2>Why this is infrastructure's problem</h2>
+  <p>The Agent Systems team decides <em>what</em> the agent does. You decide <em>what gets recorded, who can stop it, and what bounds it stays inside</em>. In a high-stakes fintech, that boundary is the difference between "shippable" and "shouldn't have shipped":</p>
+  <ul>
+    <li>Regulators ask "why did your AI do X?" — you produce the trace.</li>
+    <li>Security asks "could an agent action escape its scope?" — you point at the allow-list and the audit log.</li>
+    <li>Ops asks "an agent is in a retry storm against a partner, how do I stop it?" — you point at the kill switch.</li>
+    <li>Privacy asks "do you handle PII in logs correctly?" — you point at the redaction layer.</li>
+  </ul>
+  <p>This is exactly what the JD means by "Define guardrails, observability, and failure handling for agent-driven workflows."</p>
+</section>
+
+<section id="structured-logs">
+  <h2>Structured logs</h2>
+  <p>Plain text logs are useless at scale. Use JSON-line logs with consistent fields. In Rust, the <code>tracing</code> crate is the standard.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tracing::{info, instrument};
+
+#[instrument(skip(req), fields(run_id = %req.run_id, model = %req.model))]
+pub async fn handle(req: GenerateReq) -&gt; Result&lt;Resp, Error&gt; {
+    info!(input_tokens = req.tokens.len(), "request received");
+    let resp = backend.call(&amp;req).await?;
+    info!(output_tokens = resp.tokens.len(), cost_usd = ?resp.cost, "request complete");
+    Ok(resp)
+}
+</code></pre></div>
+  <p>Logs to ship:</p>
+  <ul>
+    <li><strong>Per request:</strong> request_id, run_id, user_id, model, input_tokens, output_tokens, cost, latency, status.</li>
+    <li><strong>Per tool call:</strong> run_id, tool_name, idem_key, args_hash, result_hash, status, latency.</li>
+    <li><strong>Per approval:</strong> run_id, tool_name, approver, decision, latency-to-approve.</li>
+    <li><strong>Per error:</strong> error_kind, source, retryable, full chain via <code>tracing-error</code>.</li>
+  </ul>
+  <p>Don't log full prompts and responses by default — they're large, PII-laden, and expensive to store hot. Log hashes and store the bodies in cheaper content-addressed storage.</p>
+</section>
+
+<section id="trace-ids">
+  <h2>Trace IDs propagated through tool calls</h2>
+  <p>A distributed trace is a tree of spans. Each span is one operation (HTTP call, function, tool invocation). Spans share a <strong>trace ID</strong> and reference their <strong>parent span ID</strong>. Result: you can reconstruct the entire path of a request, across services.</p>
+  <p>For an agent run:</p>
+  <pre><code>trace(run_id=R1)
+├── span: orchestrator.run
+│   ├── span: model.call (step 1)
+│   ├── span: tool.dispatch.search_kyc
+│   │   └── span: kyc_service.lookup
+│   ├── span: model.call (step 2)
+│   ├── span: tool.dispatch.draft_summary
+│   └── span: model.call (step 3)
+</code></pre>
+  <p>Propagation rules:</p>
+  <ul>
+    <li><strong>HTTP/gRPC requests carry trace context</strong> in headers (<code>traceparent</code>, <code>tracestate</code>). tower/tonic with the OTel middleware do this automatically.</li>
+    <li><strong>Async tasks inside a process</strong> — use <code>#[instrument]</code> or <code>.instrument(span)</code> to keep the span context across spawn boundaries.</li>
+    <li><strong>Background jobs and queues</strong> — propagate trace context in the message envelope. Easy to forget.</li>
+    <li><strong>Don't generate a fresh trace ID per step</strong> — the whole agent run shares one trace ID.</li>
+  </ul>
+</section>
+
+<section id="otel">
+  <h2>OpenTelemetry in Rust</h2>
+  <p>OTel is the cross-language standard. In Rust, <code>tracing</code> + <code>tracing-opentelemetry</code> bridges to OTLP exporters (Jaeger, Tempo, Honeycomb, Datadog, etc).</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use opentelemetry::{global, KeyValue};
+use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::{prelude::*, EnvFilter};
+
+fn init_tracing() {
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint("http://otel-collector:4317")
+        )
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+        .unwrap();
+
+    let otel = tracing_opentelemetry::layer().with_tracer(tracer);
+    let fmt = tracing_subscriber::fmt::layer().json();
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(otel)
+        .with(fmt)
+        .init();
+}
+</code></pre></div>
+  <p>Metrics use <code>opentelemetry-prometheus</code> or push directly to OTLP. Standard metrics for an inference gateway:</p>
+  <ul>
+    <li><code>requests_total{model, status}</code> (counter)</li>
+    <li><code>request_duration_seconds{model, status}</code> (histogram, for p50/p99)</li>
+    <li><code>tokens_total{model, kind="input|output"}</code> (counter)</li>
+    <li><code>cost_usd_total{model, tenant}</code> (counter)</li>
+    <li><code>concurrent_inflight{backend}</code> (gauge)</li>
+    <li><code>circuit_breaker_state{backend}</code> (gauge: 0=closed, 1=open, 2=half-open)</li>
+  </ul>
+</section>
+
+<section id="redaction">
+  <h2>PII redaction</h2>
+  <p>Two flavors of PII risk in agent infra:</p>
+  <ol>
+    <li><strong>In logs and traces</strong> — full prompts may contain customer names, account numbers, identifiers. Don't ship those raw to a third-party APM.</li>
+    <li><strong>In prompts sent to external model providers</strong> — depending on contract and jurisdiction, you may need to redact or tokenize before the call.</li>
+  </ol>
+  <p>Patterns:</p>
+  <ul>
+    <li><strong>Tokenize at the boundary.</strong> Replace <code>account_id=12345</code> with <code>account_id=ACCT_T0a8f</code>. Keep the mapping in a separate, access-controlled store. Logs reference tokens, not raw values.</li>
+    <li><strong>Redact known patterns.</strong> Regex for emails, SSNs, card numbers; replace with <code>[REDACTED]</code>.</li>
+    <li><strong>Hash, not log.</strong> Log <code>prompt_hash=sha256(prompt)</code>; store the prompt body in an access-controlled content store keyed by hash.</li>
+    <li><strong>Per-tenant data plane.</strong> EU customer prompts only go to EU-resident models when contractually required.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The leakage corner case</span>
+    <p>Even hashed prompts can leak. If your prompt template includes the customer's name in a predictable place, two requests for the same customer hash to the same value. Salt per-tenant; or only hash for diagnostics, not as a primary identifier.</p>
+  </div>
+</section>
+
+<section id="audit-logs">
+  <h2>Audit logs for autonomous actions</h2>
+  <p>An <em>audit log</em> is different from regular service logs: append-only, retention-bound, tamper-evident, indexed for legal/regulatory queries. For every agent run, you record:</p>
+  <ul>
+    <li>Run start: run_id, user, model versions, prompt versions, tool catalog version, policy version.</li>
+    <li>Each model call: prompt hash, response hash, model+params, latency, cost.</li>
+    <li>Each tool dispatch: tool, args hash, idem key, outcome hash, approver (if applicable).</li>
+    <li>Each approval: approver, timestamp, decision, what they saw.</li>
+    <li>Run end: final outcome, total cost, total steps.</li>
+  </ul>
+  <p>Storage:</p>
+  <ul>
+    <li><strong>Append-only Postgres table</strong> (write-only role) or Kafka topic with infinite retention for the audit window.</li>
+    <li><strong>Hash-chain</strong> events for tamper evidence: each event includes a hash of the previous event.</li>
+    <li><strong>Cold archive</strong> to S3 with object-lock for the regulatory retention period.</li>
+    <li><strong>Searchable index</strong> (OpenSearch / BigQuery) — denormalized for fast "give me all runs for user X on date Y."</li>
+  </ul>
+</section>
+
+<section id="guardrails">
+  <h2>Safety guardrails — the kit</h2>
+  <p>Guardrails are the things that bound an agent's behavior independent of what it "wants" to do. The kit:</p>
+  <table>
+    <thead><tr><th>Guardrail</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td>Kill switch</td><td>Halt all agent runs immediately (global or per-policy).</td></tr>
+      <tr><td>Rate caps</td><td>Per-user, per-tenant, per-tool, per-policy. Stops runaway agents.</td></tr>
+      <tr><td>Action allow-list</td><td>Per-policy enumerated set of tools that may be called.</td></tr>
+      <tr><td>Cost budget</td><td>Per-run, per-tenant, per-day. Hard cap.</td></tr>
+      <tr><td>Step limit</td><td>Per-run max steps. Prevents loops.</td></tr>
+      <tr><td>Deadline</td><td>Wall-clock max per run.</td></tr>
+      <tr><td>Risk-tier approval</td><td>High-tier actions require human approval before dispatch.</td></tr>
+      <tr><td>Anomaly rate-limit</td><td>If tool-call rate deviates &gt;Nσ from baseline, pause and alert.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kill-switch">
+  <h2>Kill switches</h2>
+  <p>The simplest, most important guardrail. A flag in a fast-readable store (Redis, a config service) that every executor checks before each step.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">pub struct KillSwitch {
+    client: redis::aio::ConnectionManager,
+    cache: std::sync::Arc&lt;arc_swap::ArcSwap&lt;KillState&gt;&gt;,
+}
+
+impl KillSwitch {
+    // Polled in the background, latest state cached locally for cheap reads.
+    pub fn is_killed(&amp;self, policy: &amp;str) -&gt; bool {
+        self.cache.load().policies.contains(policy)
+            || self.cache.load().global
+    }
+}
+
+// In the executor:
+if kill.is_killed(&amp;run.policy) {
+    halt_run(&amp;run, "kill_switch").await?;
+    return;
+}
+</code></pre></div>
+  <p>Properties to verify in design discussion:</p>
+  <ul>
+    <li><strong>Activatable in seconds.</strong> Not "redeploy with a feature flag." A button somewhere.</li>
+    <li><strong>Per-policy granularity.</strong> Killing the SAR-draft agent shouldn't kill the alert-triage agent.</li>
+    <li><strong>Audited.</strong> Who pushed the button, when, why.</li>
+    <li><strong>Discoverable.</strong> On-call should know it exists and how to use it.</li>
+    <li><strong>Cached locally</strong> so a Redis outage doesn't break the kill check (it should fail closed = act-as-killed, or fail open = act-as-allowed; the safer default depends on context).</li>
+  </ul>
+</section>
+
+<section id="rate-caps">
+  <h2>Rate caps</h2>
+  <p>Token-bucket per dimension. See chapter <a href="11-coding-problems.html">11</a> for the implementation. Dimensions you want for agent infra:</p>
+  <ul>
+    <li><strong>Per user.</strong> One user can't burn the whole tenant's budget.</li>
+    <li><strong>Per tenant.</strong> One tenant can't burn the fleet.</li>
+    <li><strong>Per tool.</strong> A flaky external tool can't be hammered.</li>
+    <li><strong>Per (run, tool).</strong> A single run can't call the same tool 1000 times.</li>
+    <li><strong>Per model.</strong> Expensive models get tighter caps.</li>
+  </ul>
+</section>
+
+<section id="allow-lists">
+  <h2>Action allow-lists</h2>
+  <p>Per-policy, the agent has access to a named set of tools and no others. The orchestrator enforces this at dispatch time — never at prompt-construction time only. Defense in depth: even if a model is prompt-injected into requesting a forbidden tool, the dispatcher refuses.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">pub struct Policy {
+    pub id: String,
+    pub tools_allowed: std::collections::HashSet&lt;String&gt;,
+    pub risk_tier: RiskTier,
+    pub max_steps: u32,
+    pub max_cost_usd: f32,
+}
+
+fn authorize_tool(policy: &amp;Policy, tool: &amp;str) -&gt; Result&lt;(), AuthError&gt; {
+    if policy.tools_allowed.contains(tool) {
+        Ok(())
+    } else {
+        Err(AuthError::ToolNotAllowed(tool.into()))
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="breakglass">
+  <h2>Human-approval breakglass</h2>
+  <p>"Breakglass" comes from physical-security parlance: a sealed override available only in emergency. In agent infra:</p>
+  <ul>
+    <li><strong>High-risk tools require human approval</strong> in the normal flow.</li>
+    <li><strong>Some workflows need an "emergency override"</strong> — e.g., security incident triage where you accept a higher-risk action under sign-off.</li>
+    <li><strong>Breakglass is audited heavily.</strong> Multiple approvers, justification text, automatic retroactive review.</li>
+  </ul>
+  <p>Architecturally: the approval queue is its own service. Tools that require approval publish a request; an operator UI displays it; the operator approves/denies; the executor receives the decision and continues. Timeouts on approval (e.g., 30 min) result in a default-deny.</p>
+  <div class="callout insight">
+    <span class="callout-label">Interview synthesis</span>
+    <p>"For high-tier autonomous actions, the architecture is: allow-list at dispatch, idempotency key on the call, approval gate before execution, audit event on intent and outcome, kill switch over the whole policy. Defense in depth — no single failure of any one of those lets a bad action through."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="08-error-handling.html">← Error handling</a> · <a href="10-coding-fundamentals.html">Next: Coding fundamentals →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

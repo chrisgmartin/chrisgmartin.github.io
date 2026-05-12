@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#taxonomy">A taxonomy of GPU failures</a>
+    <a href="#cuda-oom">CUDA OOM</a>
+    <a href="#nccl">NCCL hangs &amp; collectives</a>
+    <a href="#nvlink">NVLink &amp; fabric failures</a>
+    <a href="#driver-mismatch">Driver/runtime mismatches</a>
+    <a href="#kernel-panics">Kernel panics &amp; node death</a>
+    <a href="#queue-overflow">Queue overflow &amp; backpressure</a>
+    <a href="#timeouts">Request timeouts</a>
+    <a href="#partial-load">Partial model loading</a>
+    <a href="#recovery">Recovery patterns</a>
+    <a href="#idempotency">Idempotency for inference retries</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Critical</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">What goes wrong on a GPU fleet — CUDA OOM, NCCL hangs, NVLink failures, kernel panics, queue overflow — how you detect each, and the recovery patterns that keep the system going.</p>
+</header>
+
+<section id="taxonomy">
+  <h2>A taxonomy of GPU failures</h2>
+  <p>Interviewers love debug questions because real production experience leaks through. The candidates who've owned a fleet reach for known buckets; the ones who haven't pattern-match on generic SRE answers. The taxonomy:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Typical failures</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hardware</strong></td><td>HBM ECC, GPU off bus (Xid 79), thermal throttling, power glitch, NVLink degraded, NIC degraded</td></tr>
+      <tr><td><strong>Driver / firmware</strong></td><td>Xid storms, GSP RPC timeouts (Xid 119/120), driver/runtime mismatch, fabric manager crash</td></tr>
+      <tr><td><strong>CUDA / app</strong></td><td>OOM, illegal memory access (Xid 31), kernel assertion, deadlock</td></tr>
+      <tr><td><strong>Collectives</strong></td><td>NCCL hang at init, NCCL timeout mid-run, ring vs tree fallback, P2P disabled</td></tr>
+      <tr><td><strong>Orchestration</strong></td><td>Device plugin gone, pod stuck pending, gang-scheduling deadlock, evictions cascading</td></tr>
+      <tr><td><strong>Network / fabric</strong></td><td>Subnet manager flap, congestion, NIC port down, RDMA not negotiated</td></tr>
+      <tr><td><strong>Storage</strong></td><td>Slow weight pull, NFS hang, NVMe full, Lustre client stuck</td></tr>
+      <tr><td><strong>Serving</strong></td><td>Queue overflow, KV-cache exhaustion, model partially loaded, deadlock in batch</td></tr>
+    </tbody>
+  </table>
+  <p>Knowing the buckets is half the answer.</p>
+</section>
+
+<section id="cuda-oom">
+  <h2>CUDA out-of-memory</h2>
+  <p>The most common and most varied. Diagnose by <em>when</em> it happens.</p>
+  <table>
+    <thead><tr><th>When</th><th>Likely cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>At model load</td><td>Weights don't fit at this precision / TP shape</td><td>Reduce precision, increase TP, smaller model</td></tr>
+      <tr><td>On first request</td><td>Activation memory + KV reservation too big</td><td>Reduce <code>max-model-len</code>, lower <code>gpu-memory-utilization</code></td></tr>
+      <tr><td>Under load, after running fine</td><td>KV-cache pressure as concurrency rose</td><td>Cap <code>max-num-seqs</code>; consider FP8 KV-cache</td></tr>
+      <tr><td>Mid-training step N</td><td>Activation memory peaks; fragmentation; growing batch</td><td>Gradient checkpointing, memory snapshot, smaller microbatch</td></tr>
+      <tr><td>Random / intermittent</td><td>Fragmentation; allocator caching pathology</td><td>PyTorch <code>expandable_segments</code>, restart on memory pressure</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Triage: where did memory go?
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
+# Inside the process:
+python -c "import torch; print(torch.cuda.memory_summary())"
+# Time-series view (one second resolution):
+dcgmi dmon -e 252,140  # FB_USED, FB_FREE
+</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">vLLM-specific</span>
+    <p>vLLM pre-allocates a fixed KV-cache pool at startup based on <code>--gpu-memory-utilization</code>. If you OOM at startup, lower that number. If you OOM mid-request you've configured something else wrong — vLLM should preempt to disk rather than crash if there's a swap config.</p>
+  </div>
+</section>
+
+<section id="nccl">
+  <h2>NCCL hangs &amp; collective failures</h2>
+  <p>NCCL is the collective communication library — all-reduce, all-gather, broadcast — across GPUs. Hangs are the worst class of failure because they don't error; they just stop.</p>
+  <h3>Hang at init</h3>
+  <p>Usually a network reachability or topology problem. Set <code>NCCL_DEBUG=INFO</code> and re-run; you'll see which rank is waiting for which peer.</p>
+  <ul>
+    <li>Firewall blocking the NCCL ports.</li>
+    <li><code>NCCL_SOCKET_IFNAME</code> picking a management NIC instead of the high-speed fabric.</li>
+    <li>IB link down (<code>ibstat</code>).</li>
+    <li>One rank's pod still pulling its image while others wait.</li>
+  </ul>
+  <h3>Hang mid-training</h3>
+  <p>One rank crashed or stalled; the others wait for it in an all-reduce. NCCL 2.18+ has watchdog timers (<code>NCCL_ASYNC_ERROR_HANDLING=1</code>, <code>TORCH_NCCL_BLOCKING_WAIT=1</code>) that error out instead of hanging forever. <strong>Always set them in production.</strong></p>
+  <h3>Throughput cliff after a "successful" job</h3>
+  <p>NCCL fell back from ring/IB to tree/TCP. The job runs but at 1/10 the bandwidth. Watch the <code>NCCL INFO</code> output for "via TCP" — that's the signal.</p>
+</section>
+
+<section id="nvlink">
+  <h2>NVLink &amp; fabric failures</h2>
+  <p>NVLink errors show up as Xid 74. Sometimes one link of N is degraded and the GPU keeps running at reduced bandwidth — silently.</p>
+  <ul>
+    <li><strong>Detection</strong> — DCGM exposes per-link error counters. <code>nvidia-smi nvlink -e</code> shows link errors.</li>
+    <li><strong>NVSwitch failures</strong> — fabric manager logs are first stop. <code>journalctl -u nvidia-fabricmanager</code>.</li>
+    <li><strong>Action</strong> — drain the node, run diagnostics (NVIDIA Field Diagnostic), often RMA.</li>
+  </ul>
+  <p>Inter-node fabric (IB/RoCE) failures look like a node "running slower than usual." Same drill: check link state, check switch port counters, check the subnet manager.</p>
+</section>
+
+<section id="driver-mismatch">
+  <h2>Driver / runtime mismatches</h2>
+  <p>The most common new-cluster outage. Symptoms:</p>
+  <ul>
+    <li><code>CUDA driver version is insufficient for CUDA runtime version</code> on app startup.</li>
+    <li>Pods come up but <code>nvidia-smi</code> inside fails or shows fewer GPUs than expected.</li>
+    <li>Device plugin healthy but kubelet reports zero allocatable GPUs.</li>
+  </ul>
+  <p>Causes:</p>
+  <ul>
+    <li>Driver upgraded on host, kernel module not reloaded.</li>
+    <li><code>nvidia-container-toolkit</code> mismatched with driver.</li>
+    <li>Container has newer CUDA than host driver supports.</li>
+    <li>UVM module not loaded after driver upgrade (needs reboot).</li>
+  </ul>
+  <p>Fix: drain, reboot if needed, verify <code>nvidia-smi</code> on host, restart device plugin DaemonSet, smoke test.</p>
+</section>
+
+<section id="kernel-panics">
+  <h2>Kernel panics &amp; node death</h2>
+  <p>NVIDIA drivers run privileged kernel modules. A bad interaction can panic the kernel. The node disappears from K8s.</p>
+  <ul>
+    <li>K8s node controller marks <code>NotReady</code> after the kubelet heartbeat fails.</li>
+    <li>Pods on the node are eventually evicted (with grace; PDB-respecting workloads need attention).</li>
+    <li><strong>The blast radius is everything that was running on the node.</strong> A training job with one rank on that node is dead unless it had checkpointing.</li>
+  </ul>
+  <p>Resilience moves:</p>
+  <ul>
+    <li>Checkpoint training to durable storage every N steps.</li>
+    <li>Replicas ≥ 2 for any online service; never colocate them on one node.</li>
+    <li>Pod anti-affinity by node, ideally by rack/AZ.</li>
+    <li>Aggressive node health gates (NPD — node-problem-detector — to auto-cordon on Xid bursts).</li>
+  </ul>
+</section>
+
+<section id="queue-overflow">
+  <h2>Queue overflow &amp; backpressure</h2>
+  <p>Inference servers have queues. Queues fill. When they fill, you either reject, slow down, or melt down. The right answer is <em>reject loudly, fast, at the edge</em>.</p>
+  <ul>
+    <li><strong>Hard concurrency limit</strong> at the gateway. Beyond it: 429 with <code>Retry-After</code>.</li>
+    <li><strong>Per-tenant rate limits</strong> so one team can't starve others.</li>
+    <li><strong>Queue time SLO</strong> — if a request has been queued &gt; X ms, drop it (the user has already given up).</li>
+    <li><strong>Load shedding</strong> on saturation — start dropping low-priority traffic before high-priority traffic suffers.</li>
+    <li><strong>Circuit breakers</strong> — when a backend is melting, route around it.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Senior signal</span>
+    <p>"My instinct is to make failure modes <em>boring</em>: predictable 429s with a clear retry policy, rather than wandering p99 and gateway timeouts. Backpressure earlier is almost always better than 'just queue it.'"</p>
+  </div>
+</section>
+
+<section id="timeouts">
+  <h2>Request timeouts</h2>
+  <p>LLM requests can be long. Defaults of 30 seconds are wrong. Set timeouts deliberately:</p>
+  <ul>
+    <li><strong>Connect timeout</strong> — short (1-2s). Network problem, fail fast.</li>
+    <li><strong>First-token timeout</strong> — based on TTFT SLO + slack (e.g. 5s).</li>
+    <li><strong>Total request timeout</strong> — based on max output length × per-token budget. For a 2k-token output at 50 tok/s, that's 40s minimum; set 60s with margin.</li>
+    <li><strong>Streaming heartbeat</strong> — if no tokens received in N seconds during streaming, abort. Detects stuck decoders.</li>
+  </ul>
+</section>
+
+<section id="partial-load">
+  <h2>Partial model loading</h2>
+  <p>Distributed serving (TP &gt; 1) means N processes each load a shard. If process 3 fails to load, processes 0/1/2 wait at the synchronization barrier and time out. Symptoms:</p>
+  <ul>
+    <li>vLLM hangs at startup with no useful log.</li>
+    <li>One rank's process exits, others hang.</li>
+    <li>K8s pod readiness never goes true.</li>
+  </ul>
+  <p>Fix patterns:</p>
+  <ul>
+    <li>Aggressive startup probe timeouts; let K8s kill the pod and restart together.</li>
+    <li>NCCL watchdog on init.</li>
+    <li>All ranks in one pod (vLLM does this for intra-node TP) — the failure becomes a single process exit, not a hang.</li>
+    <li>Pre-fetch weights to local NVMe before pod start so loading is fast and deterministic.</li>
+  </ul>
+</section>
+
+<section id="recovery">
+  <h2>Recovery patterns</h2>
+  <p>You'll be asked "how do you recover" for several of the above. Have these patterns ready by name.</p>
+  <h3>Restart with backoff</h3>
+  <p>Crash → restart → exponential backoff if it keeps failing → eventually quarantine the node. The default for most things. Kubernetes <code>restartPolicy: Always</code> + CrashLoopBackOff handles 80% of cases.</p>
+  <h3>Drain and replace</h3>
+  <p>Suspect node: <code>kubectl cordon</code>, then <code>kubectl drain</code> with PDB respect. Replacement node comes online; ASG/MIG/MachineSet brings up new capacity. Use for Xid storms, driver suspicion, NIC errors.</p>
+  <h3>Circuit breaker</h3>
+  <p>Front of an unreliable backend, track error rate. Above threshold, fail fast for a cooldown window rather than piling on. Half-open probe traffic on recovery. Standard pattern; doubly important in front of GPU services because melt-down is worse than fail-fast.</p>
+  <h3>Bulkhead</h3>
+  <p>Isolate failure to a single tenant or replica pool. If team A's model is broken, only team A's queue overflows, not the cluster.</p>
+  <h3>Graceful shutdown / drain on preemption</h3>
+  <p>SIGTERM → stop accepting new requests → finish in-flight up to a budget → flush metrics → exit. Critical for spot/preemptible.</p>
+  <h3>Checkpoint &amp; resume (training)</h3>
+  <p>Async snapshot every N steps to durable storage. On restart, load latest and continue. Sharded checkpoint formats (PyTorch DCP, DeepSpeed) so 1000-GPU jobs can checkpoint in seconds.</p>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency for inference retries</h2>
+  <p>If a request fails mid-stream, can the client retry safely? Three cases:</p>
+  <ul>
+    <li><strong>Pure inference, no side effects</strong> — retry is safe. Two responses with the same prompt are at most "different sampled outputs," and at a fixed seed/temperature they're identical.</li>
+    <li><strong>Inference with tool calls</strong> — the tool may have side effects. Need idempotency keys; the agent layer (not infra) usually handles this.</li>
+    <li><strong>Cached responses</strong> — same prompt → same cached output, naturally idempotent.</li>
+  </ul>
+  <p>Operationally:</p>
+  <ul>
+    <li>Accept a client-provided <strong>request ID</strong> at the gateway.</li>
+    <li>De-dupe on the request ID within a short window.</li>
+    <li>For streaming, an interrupted stream is hard to resume; document that the contract is "retry from scratch."</li>
+    <li>Don't bill twice for retried requests that failed before the first token.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Interview-grade closing</span>
+    <p>"My design assumption is that any individual GPU, node, or replica can die without warning. The system has to absorb that — retries with idempotency, graceful drains, circuit breakers in front of melting backends, and bounded queues so failure shows up as predictable 429s rather than wandering tails."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Previous</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; audit →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

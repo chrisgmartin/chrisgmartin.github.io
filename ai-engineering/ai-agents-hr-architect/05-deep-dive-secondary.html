@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Workday Deep Dive — AI Agents Architect, HR</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why Workday is the bar</a>
+    <a href="#worker-model">The worker model</a>
+    <a href="#position-job-profile">Position vs job vs job profile</a>
+    <a href="#sup-org">Supervisory organizations</a>
+    <a href="#effective-dating">Effective dating</a>
+    <a href="#bp">Business processes</a>
+    <a href="#cond-rules">Condition rules</a>
+    <a href="#calc-fields">Calculated fields</a>
+    <a href="#job-changes">Job change workflows</a>
+    <a href="#conversions">Worker conversions</a>
+    <a href="#eib">EIB deep dive</a>
+    <a href="#integrations">Integration architecture</a>
+    <a href="#prism">Prism &amp; reporting</a>
+    <a href="#payroll-constraint">The payroll dependency constraint</a>
+    <a href="#interview-frames">Interview framings</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Deep dive — secondary</span>
+  <h1>Workday Deep Dive</h1>
+  <p class="subtitle">The HRIS at the center of everything. The vocabulary, the data model, the integration architecture, and why payroll dependencies dictate the design of every agent that touches it.</p>
+</header>
+
+<section id="why">
+  <h2>Why Workday fluency is the bar</h2>
+  <p>The JD names Workday explicitly: <em>"Deep working knowledge of Workday, including job change workflows, worker conversions, EIB data uploads, integration architecture, and payroll dependencies."</em> If you've never administered a Workday tenant, this is your most asymmetric place to study. The interviewers can tell within five minutes whether you can carry a Workday conversation. They are looking for:</p>
+  <ul>
+    <li>The right nouns (Position, Job Profile, Supervisory Organization, Business Process, EIB)</li>
+    <li>Familiarity with how a change actually moves through the system</li>
+    <li>Awareness of integration patterns (Studio, Core Connectors, RaaS, web services)</li>
+    <li>Respect for the payroll-calendar constraint that gates everything</li>
+  </ul>
+  <p>This chapter is the survival kit. <a href="14-domain-context.html">14-domain-context</a> has the glossary.</p>
+</section>
+
+<section id="worker-model">
+  <h2>The worker model — the central object</h2>
+  <p>Workday's <strong>Worker</strong> is the unified identity object. A Worker can be an Employee or a Contingent Worker. Key properties:</p>
+  <ul>
+    <li><strong>Worker ID</strong> — internal identifier (often <code>W-12345</code> or similar in different tenants)</li>
+    <li><strong>Employee ID</strong> — public-facing identifier; often the one referenced externally</li>
+    <li><strong>Worker Type</strong> — Employee, Contingent Worker, etc.</li>
+    <li><strong>Position</strong> — the slot they fill</li>
+    <li><strong>Job Profile</strong> — what kind of job that position is</li>
+    <li><strong>Supervisory Organization</strong> — who they report into (the org node)</li>
+    <li><strong>Manager</strong> — derived from supervisory org</li>
+    <li><strong>Location</strong> — physical / remote</li>
+    <li><strong>Country</strong> — tax / legal jurisdiction</li>
+    <li><strong>FTE</strong> — full-time equivalent fraction</li>
+    <li><strong>Hire date, original hire date, continuous service date</strong> — distinct fields, all matter</li>
+    <li><strong>Termination date</strong> — when relevant</li>
+    <li><strong>Compensation plan</strong> — base, bonus, equity, allowances</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The "rehire" subtlety</span>
+    <p>A rehired worker keeps their original Worker ID but gets a new hire-event. <strong>Original hire date</strong> stays, <strong>continuous service date</strong> resets (or doesn't, depending on policy). This matters enormously for agent design: a "hire" agent must check rehire status first, or it'll create duplicate workers.</p>
+  </div>
+</section>
+
+<section id="position-job-profile">
+  <h2>Position vs Job vs Job Profile — the trio interviewers test</h2>
+  <p>This is the most-failed quiz in Workday interviews. Get it cold:</p>
+  <table>
+    <thead><tr><th>Concept</th><th>What it is</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Job Profile</td><td>A <em>template</em> describing a kind of job — title, comp grade, pay range, FLSA, family/group. Many workers can share one profile.</td><td>"Senior Software Engineer, P4"</td></tr>
+      <tr><td>Position</td><td>A specific <em>slot</em> in the org chart, tied to a supervisory org, with a position ID. One position is held by zero or one workers at a time.</td><td>"Position #P-7281 — Senior SWE on Wallet team"</td></tr>
+      <tr><td>Job</td><td>The instance — a particular worker filling a particular position with a particular job profile, effective some date.</td><td>"Jane Doe holds position P-7281 as a Senior SWE since 2024-03-01"</td></tr>
+    </tbody>
+  </table>
+  <p>The headache: a tenant can be in <strong>Position Management</strong>, <strong>Job Management</strong>, or hybrid. Most Workday tenants of any maturity use Position Management. Don't assume — ask in interview ("is the tenant on position management?").</p>
+</section>
+
+<section id="sup-org">
+  <h2>Supervisory organizations</h2>
+  <p>The org chart is built from <strong>Supervisory Organizations</strong> ("sup orgs"). Each sup org:</p>
+  <ul>
+    <li>Has a manager (a Worker)</li>
+    <li>Contains workers (and/or positions)</li>
+    <li>Has a parent sup org (the chain of command)</li>
+    <li>Has its own ID</li>
+  </ul>
+  <p>Reorgs happen by moving sup orgs in the tree, or by moving positions between sup orgs. Both have implications: location may change, allocations may change, business process routing may change.</p>
+  <p>In agent terms: <em>any "move team" request requires touching sup-org membership for the position, not the worker.</em> A subtle point that signals fluency.</p>
+</section>
+
+<section id="effective-dating">
+  <h2>Effective dating — why it changes everything</h2>
+  <p>Workday is fundamentally an <strong>effective-dated</strong> system. Every record has an effective date. A change to a worker on 2026-07-01 doesn't overwrite the prior record — it creates a new version with that effective date, and the prior version remains queryable.</p>
+  <p>Consequences for agents:</p>
+  <ul>
+    <li>"What is Jane Doe's salary?" is incomplete. The right question is "what is Jane Doe's salary <em>as of</em> [date]?"</li>
+    <li>Future-dated changes exist — a comp change with effective date next month is already in the system, but not yet active.</li>
+    <li>Historical queries (headcount on 2024-12-31) require effective-dated reads, not "current" reads.</li>
+    <li>Retro changes are a thing — and they create the most subtle payroll issues.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The agent trap</span>
+    <p>An agent asked "what is Jane's manager?" that doesn't pass an effective date will get <em>today's</em> manager. If the question is for an event yesterday, that may be wrong. Always propagate effective dates through tool calls.</p>
+  </div>
+</section>
+
+<section id="bp">
+  <h2>Business processes — Workday's workflow engine</h2>
+  <p>A <strong>Business Process</strong> (BP) in Workday is a configurable workflow: a sequence of steps (some automated, some requiring action) with routing, approvals, and notifications. Hire, Terminate, Job Change, Compensation Change — each is a BP. BPs have:</p>
+  <ul>
+    <li><strong>Initiation</strong> — who can kick it off</li>
+    <li><strong>Steps</strong> — actions, approvals, sub-processes, integrations</li>
+    <li><strong>Routing</strong> — which security group / role handles each step</li>
+    <li><strong>Conditions</strong> — rules that skip or branch</li>
+    <li><strong>Notifications</strong> — what's sent on transitions</li>
+  </ul>
+  <p>For an agent architect, BPs matter because:</p>
+  <ul>
+    <li>Your "propose hire" tool actually <em>initiates a Hire BP</em>; it doesn't write the worker directly.</li>
+    <li>Approvals already exist inside Workday BPs — your HITL gate may align with a BP step, not replace it.</li>
+    <li>The audit trail of the BP is what regulators see, not just your agent's log.</li>
+  </ul>
+</section>
+
+<section id="cond-rules">
+  <h2>Condition rules</h2>
+  <p>Condition rules let a BP step skip, route differently, or fire based on data. Example: "if the new compensation is &gt;10% above the band midpoint, route to VP for approval." Conditions are expressed in Workday's condition-rule syntax against the BP's source data.</p>
+  <p>Interview-relevant: an agent that proposes a comp change must understand that an aggressive proposal will trip a condition rule and route to a higher approver. Surface that in the HITL preview ("this change will route to VP because it's +12% over band midpoint"). That kind of foresight is senior signal.</p>
+</section>
+
+<section id="calc-fields">
+  <h2>Calculated fields</h2>
+  <p><strong>Calculated fields</strong> are Workday's way to derive values from existing data — e.g., "tenure in months," "FTE-adjusted base salary," "manager's manager." They are composable, evaluated at report-run time, and live within the tenant's metadata.</p>
+  <p>You won't be quizzed on exact function names (and you shouldn't pretend to remember them). You should know:</p>
+  <ul>
+    <li>What a calc field is and when you'd use one (vs. a Prism transformation, vs. external SQL)</li>
+    <li>That they participate in reports, integrations (Core Connector, RaaS), and BP conditions</li>
+    <li>Performance cost — heavy calc-field chains slow reports</li>
+  </ul>
+  <p>In interview: <em>"For tenure-based logic in an agent, I'd prefer to consume a pre-computed calc field via RaaS rather than re-derive in Python. Single source of truth and the People team can adjust it without code changes."</em></p>
+</section>
+
+<section id="job-changes">
+  <h2>Job change workflows</h2>
+  <p>"Job Change" is the BP that handles promotions, lateral moves, transfers, reorgs, FTE changes, and comp changes (sometimes a separate BP). It's the most-touched BP after Hire and Terminate. The shape:</p>
+  <ol>
+    <li>Initiator (manager or HRBP) starts the BP for a specific worker</li>
+    <li>Fields propose: new job profile, new position, new sup org, new location, new FTE, effective date, reason</li>
+    <li>Routing: manager → HRBP → Comp partner → optional VP (condition rule) → automation hooks → BP completion</li>
+    <li>Side effects: worker record updated effective-dated, downstream integrations fire (payroll, IT provisioning, equity)</li>
+  </ol>
+  <p>The agent angle: an agent that drafts a job change must produce all the fields, respect the routing implications, and never bypass the BP. The EIB pattern is one way to feed proposed Job Changes in bulk; the web-service / Studio pattern is the other.</p>
+</section>
+
+<section id="conversions">
+  <h2>Worker conversions</h2>
+  <p>Common conversion scenarios, each with its own headaches:</p>
+  <ul>
+    <li><strong>Contingent → Employee</strong> — new hire BP variant. Often retains tenure for some purposes (continuous service date), not others (vesting, bonus eligibility).</li>
+    <li><strong>Employee → Contingent</strong> — rare, complex, sometimes a "terminate + new contingent" workflow.</li>
+    <li><strong>EOR → Direct Employment</strong> — The company has employees in 70+ countries; many start under an EOR (Employer of Record) and convert when the company sets up a local entity. This is a coordinated termination from the EOR, hire into the company's local entity, and pay-history continuity that's manually preserved.</li>
+    <li><strong>Internal Mobility (country change)</strong> — tax jurisdiction shifts, equity treatment may change, payroll system may change.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The conversion agent design</span>
+    <p>A worker-conversion agent rarely <em>commits</em> the conversion. It's the kind of workflow where the agent assembles the data, drafts the EIB, flags the regulatory considerations, and presents a comprehensive package to the HRBP and Payroll for approval. The complexity comes from cross-system data continuity, not from the BP itself.</p>
+  </div>
+</section>
+
+<section id="eib">
+  <h2>EIB — Enterprise Interface Builder</h2>
+  <p>EIB is Workday's bulk-data interface. Two flavors:</p>
+  <ul>
+    <li><strong>Inbound EIB</strong> — upload a spreadsheet (or web-service payload) to mass-update records. Run hires, terminations, comp changes, job changes in batches.</li>
+    <li><strong>Outbound EIB</strong> — push data out on a schedule (e.g. nightly worker file to a downstream system).</li>
+  </ul>
+  <p>Inbound EIB shape (you should be able to describe this in interview without notes):</p>
+  <ol>
+    <li>Build an <strong>EIB template</strong> in the tenant — a spreadsheet shape mapped to a Workday web service.</li>
+    <li>The template has fixed columns matching the WS's expected fields (e.g. for <em>Hire</em>: applicant ID, hire date, position ID, job profile, sup org, location, comp data, etc.).</li>
+    <li>Populate the spreadsheet from your source (your agent's proposed-actions queue).</li>
+    <li>Upload to Workday. EIB runs the underlying BP <em>once per row</em>.</li>
+    <li>EIB returns a run summary: successes and failures, with per-row error reasons.</li>
+  </ol>
+  <p>Failure modes you should name unprompted:</p>
+  <ul>
+    <li><strong>Partial failure</strong> — 47 of 50 rows succeed, 3 fail. You must handle this: re-run only the failures with the same idempotency intent, never re-run the whole batch.</li>
+    <li><strong>BP routing during EIB</strong> — EIB-initiated BPs still route. Approvals may queue up.</li>
+    <li><strong>Effective-date conflicts</strong> — an EIB row for "comp change effective 2026-07-01" against a worker with a future-dated change beyond that date will conflict.</li>
+    <li><strong>Calendar conflicts</strong> — running an EIB during payroll cutoff is the cardinal sin.</li>
+  </ul>
+  <p>The agent angle: your "propose Workday change" tools should produce EIB-ready CSV rows, validated against the template shape <em>before</em> human approval. Validation in Python catches errors before they hit Workday.</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-python">import pandas as pd
+from pydantic import BaseModel
+from typing import Literal
+
+class EIBJobChangeRow(BaseModel):
+    employee_id: str
+    effective_date: str           # YYYY-MM-DD
+    new_position_id: str | None
+    new_job_profile: str | None
+    new_supervisor_id: str | None
+    new_location: str | None
+    new_fte: float | None
+    reason_code: Literal["PROMOTION", "LATERAL", "FTE_CHANGE", "REORG"]
+    business_process_comment: str
+
+def build_eib(proposed_rows: list[dict]) -> pd.DataFrame:
+    """Validate each row and emit the exact column shape Workday's EIB expects."""
+    validated = [EIBJobChangeRow(**r).model_dump() for r in proposed_rows]
+    df = pd.DataFrame(validated)
+    # Workday's EIB template requires specific column order and headers
+    return df[[
+        "employee_id", "effective_date", "new_position_id",
+        "new_job_profile", "new_supervisor_id", "new_location",
+        "new_fte", "reason_code", "business_process_comment",
+    ]]</code></pre>
+</div>
+</section>
+
+<section id="integrations">
+  <h2>Integration architecture — Studio, Core Connectors, RaaS, web services</h2>
+  <p>Workday's integration toolkit, in plain language:</p>
+  <table>
+    <thead><tr><th>Tool</th><th>What it is</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Web services</strong> (SOAP / REST)</td><td>Workday's public APIs. <em>Get_Workers</em>, <em>Hire_Employee</em>, etc.</td><td>Transactional reads/writes, low-latency, programmatic</td></tr>
+      <tr><td><strong>RaaS</strong> (Reports as a Service)</td><td>Expose a custom Workday report as a web service endpoint returning JSON/XML</td><td>Custom queries that calc-fields can express; consumed by external systems</td></tr>
+      <tr><td><strong>Core Connectors</strong></td><td>Pre-built outbound integrations — Benefits Provider, Compensation, Payroll, etc.</td><td>Standardized outbound feeds to common downstream systems</td></tr>
+      <tr><td><strong>EIB</strong></td><td>Bulk file-based (or simple web-service) integration tool</td><td>Mass updates, scheduled extracts, lightweight one-shot integrations</td></tr>
+      <tr><td><strong>Studio</strong></td><td>Visual ETL on top of Workday integration framework; transforms, branches, conditionals</td><td>Complex outbound integrations that need transformation, multi-step orchestration, error handling</td></tr>
+      <tr><td><strong>Workday Extend</strong></td><td>Build apps inside Workday using its platform</td><td>Custom UI inside the tenant; out of scope for most agent work</td></tr>
+    </tbody>
+  </table>
+  <p>The agent architect's allocation:</p>
+  <ul>
+    <li><strong>RaaS</strong> for custom reads (e.g. "all engineering ICs in EMEA hired in last 30 days").</li>
+    <li><strong>Web services (REST)</strong> for targeted reads when RaaS feels heavy.</li>
+    <li><strong>EIB</strong> for bulk proposed writes (the agent assembles, human approves, EIB runs).</li>
+    <li><strong>Studio</strong> usually owned by Integrations team, not the AI architect. Know it exists, don't claim to be a Studio developer unless you are.</li>
+  </ul>
+</section>
+
+<section id="prism">
+  <h2>Prism &amp; reporting</h2>
+  <p><strong>Workday Prism Analytics</strong> is Workday's data lake / warehouse extension. It ingests external data, joins with Workday data, and serves analytics. Useful for People analytics that needs to blend Workday with external sources (Ashby, Qualtrics, Greenhouse).</p>
+  <p>Listed as a "nice to have." If you have Prism experience, lean in. If not: <em>"I haven't built in Prism specifically; I've done equivalent work in a BigQuery / Snowflake / dbt warehouse. The model is similar — join Workday outbound feeds with external sources, build derived models, expose for reporting."</em></p>
+</section>
+
+<section id="payroll-constraint">
+  <h2>The payroll dependency constraint — the killer</h2>
+  <p>Every Workday change has potential payroll implications. Payroll runs on a calendar with hard cutoffs. Within a few business days of cutoff, the payroll team locks down changes. Mid-payroll-run, no changes accepted. Post-run-but-pre-funding, changes route into the <em>next</em> cycle.</p>
+  <p>This dictates everything about agent design:</p>
+  <ul>
+    <li><strong>The payroll calendar must be a first-class input</strong> to any agent that proposes worker writes. <code>get_payroll_calendar</code> is one of the first tool calls.</li>
+    <li><strong>Default refusal during lock windows</strong> — an agent that's asked to commit a comp change during payroll lock should refuse and escalate, not retry, not queue silently.</li>
+    <li><strong>Retro changes increase scrutiny</strong> — a change with an effective date in the past triggers retro pay. Always flag retro changes as higher-tier HITL.</li>
+    <li><strong>Cross-country payroll calendars differ</strong> — UK payroll cutoff is not US payroll cutoff. Multi-country workforces have multiple lock windows.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The interview-winning sentence</span>
+    <p><em>"My default agent behavior near a payroll cutoff is to halt and route to a human, not to try to squeeze the change in. The cost of a late change is paid in payroll exceptions, retro adjustments, and team trust — not in agent throughput."</em></p>
+  </div>
+</section>
+
+<section id="interview-frames">
+  <h2>Interview framings worth memorizing</h2>
+  <ul>
+    <li>"Workday is effective-dated — every tool call propagates an effective date or it's incomplete."</li>
+    <li>"EIB partial failures need per-row retry with stable idempotency keys. I never re-run the whole batch."</li>
+    <li>"My agent's writes always go through the Hire / Job Change BP, never around it. The BP's audit trail is what regulators and Payroll trust."</li>
+    <li>"Position vs Job vs Job Profile — Position is the slot, Profile is the template, Job is a worker filling a Position with a Profile from a date."</li>
+    <li>"Near a payroll cutoff, the agent's correct behavior is escalate, not commit."</li>
+    <li>"For custom reads I prefer RaaS to raw web services — it stays in Workday's reporting framework, the People team can change the report without my involvement."</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← Agentic workflow architecture</a> · <a href="06-applied-patterns.html">Next: Applied patterns →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

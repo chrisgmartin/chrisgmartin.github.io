@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive: GPU Scheduling &amp; Orchestration — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#problem">The scheduling problem</a>
+    <a href="#device-plugin">Kubernetes device plugin</a>
+    <a href="#mig">MIG — Multi-Instance GPU</a>
+    <a href="#mps">MPS — Multi-Process Service</a>
+    <a href="#time-slicing">Time-slicing &amp; the three sharing modes</a>
+    <a href="#gang">Gang scheduling</a>
+    <a href="#priority">Priority &amp; preemption</a>
+    <a href="#quotas">Quotas &amp; fair share</a>
+    <a href="#node-config">Node configuration</a>
+    <a href="#topology">Topology-aware scheduling</a>
+    <a href="#isolation">Workload isolation</a>
+    <a href="#signals">Queue depth &amp; saturation signals</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Deep Dive — GPU Scheduling &amp; Orchestration</h1>
+  <p class="subtitle">The second pillar of the role. Device plugins, MIG, MPS, gang scheduling, priority and preemption, quotas, NUMA-aware node config, and the signals that tell you a scheduler is under-serving its tenants.</p>
+</header>
+
+<section id="problem">
+  <h2>The scheduling problem, in one paragraph</h2>
+  <p>You have a heterogeneous fleet — H100s, A100s, maybe L40s, with different memory sizes and topology. You have multiple tenants — research training, online inference, batch evaluation, dev/notebooks. Their workloads have different shapes: long jobs with strict topology requirements (training), short jobs with strict latency requirements (online inference), bursty jobs with elastic needs (batch). Fair use across teams matters; so does maximizing utilization; so does respecting priority for the production path. The "scheduler" you build is the answer to "who gets which GPU, when, and what happens when the answer changes."</p>
+</section>
+
+<section id="device-plugin">
+  <h2>Kubernetes device plugin</h2>
+  <p>K8s itself only knows about CPU, memory, and ephemeral storage. The NVIDIA <strong>device plugin</strong> (a DaemonSet) introduces <code>nvidia.com/gpu</code> as a schedulable resource. The flow:</p>
+  <ol>
+    <li>Plugin starts on each GPU node, discovers GPUs via NVML.</li>
+    <li>Registers with kubelet over a Unix socket.</li>
+    <li>Kubelet advertises N GPUs as allocatable to the API server.</li>
+    <li>Scheduler sees pod request <code>nvidia.com/gpu: 4</code>, finds a node with ≥4 free, binds.</li>
+    <li>Kubelet calls plugin's <code>Allocate()</code>, which returns env vars and device mounts.</li>
+    <li>Container starts with <code>NVIDIA_VISIBLE_DEVICES</code> set; toolkit hook bind-mounts devices.</li>
+  </ol>
+  <p>The plugin is also where you configure <strong>sharing modes</strong>: exclusive, time-slicing, MPS, or MIG.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># NVIDIA device plugin config — time-slicing example
+version: v1
+flags:
+  migStrategy: "single"        # or "mixed" or "none"
+sharing:
+  timeSlicing:
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4            # 4 virtual GPUs share each physical
+</code></pre></div>
+  <p>The NVIDIA <strong>GPU Operator</strong> ships the device plugin together with driver containers, container toolkit, DCGM exporter, and MIG manager — strongly recommended over rolling your own.</p>
+</section>
+
+<section id="mig">
+  <h2>MIG — Multi-Instance GPU</h2>
+  <p>MIG (A100/H100/B100) partitions a single GPU into up to 7 hardware-isolated instances. Each instance gets dedicated SM partitions, L2 slices, and memory. This is <em>real</em> isolation — separate fault domains, separate memory bandwidth, no noisy neighbor.</p>
+  <table>
+    <thead><tr><th>Profile (H100 80GB)</th><th>Memory</th><th>Slices</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>1g.10gb</td><td>10 GB</td><td>1/7</td><td>Small model serving, notebooks</td></tr>
+      <tr><td>2g.20gb</td><td>20 GB</td><td>2/7</td><td>Mid-size inference</td></tr>
+      <tr><td>3g.40gb</td><td>40 GB</td><td>3/7</td><td>Mid-large inference</td></tr>
+      <tr><td>7g.80gb</td><td>80 GB</td><td>7/7 (full)</td><td>Full GPU back</td></tr>
+    </tbody>
+  </table>
+  <p>Tradeoffs:</p>
+  <ul>
+    <li><strong>Hardware isolation</strong> — predictable performance under multi-tenancy. Great for shared inference platforms.</li>
+    <li><strong>Static partitioning</strong> — you choose profiles at boot; changing requires a workload drain. Mixed-profile nodes complicate scheduling.</li>
+    <li><strong>No NVLink between MIG instances</strong> — multi-MIG-instance models lose collectives. MIG is a small-job platform.</li>
+    <li><strong>No P2P, no MPS</strong> within a MIG instance — they're mutually exclusive.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">When to choose MIG</span>
+    <p>You have many small inference workloads (sub-10 GB models, embedding services, classifiers) and want strong isolation guarantees for SLOs. Don't reach for MIG for training or big-model serving.</p>
+  </div>
+</section>
+
+<section id="mps">
+  <h2>MPS — Multi-Process Service</h2>
+  <p>MPS lets multiple CUDA processes share a single GPU's SMs concurrently via a server proxy. Unlike default context-switching (which serializes work), MPS interleaves kernels from different processes on the SMs.</p>
+  <ul>
+    <li><strong>Better utilization</strong> when each tenant is too small to saturate the GPU.</li>
+    <li><strong>Soft isolation only</strong> — one process's OOM can affect neighbors; one process's bug can corrupt others (less so with Volta+ MPS, but still weaker than MIG).</li>
+    <li><strong>Per-process SM percentage caps</strong> available; per-process memory caps available on Volta+.</li>
+    <li><strong>Latency improves</strong> for many concurrent small workloads compared to default time-slicing.</li>
+  </ul>
+  <p>MPS is the right choice when you have many small co-trusted clients (e.g. several inference replicas sharing a node) and you've accepted the weaker isolation in exchange for better utilization.</p>
+</section>
+
+<section id="time-slicing">
+  <h2>The three sharing modes, side by side</h2>
+  <table>
+    <thead><tr><th>Mode</th><th>Isolation</th><th>Concurrency</th><th>Memory split</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Exclusive</strong></td><td>Full</td><td>One process</td><td>All</td><td>Training, big-model serving, anything that saturates the GPU</td></tr>
+      <tr><td><strong>Time-slicing</strong> (default fallback)</td><td>Logical only — no perf isolation</td><td>Round-robin contexts</td><td>Shared</td><td>Dev/notebooks where utilization beats predictability</td></tr>
+      <tr><td><strong>MPS</strong></td><td>Soft (process-level)</td><td>True concurrent kernels</td><td>Shared (caps on Volta+)</td><td>Many small co-trusted inference replicas</td></tr>
+      <tr><td><strong>MIG</strong></td><td>Hardware</td><td>True parallel, isolated</td><td>Strict per-instance</td><td>Multi-tenant inference with SLOs</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="gang">
+  <h2>Gang scheduling</h2>
+  <p>Distributed training needs <em>all N pods to start at the same time</em>. If only 6 of 8 pods land and the other 2 are pending, the 6 idle GPUs are useless and may block someone else. Vanilla Kubernetes will happily start the 6.</p>
+  <p>Solutions:</p>
+  <ul>
+    <li><strong>Volcano</strong> — Apache project, full batch scheduler for K8s with gang scheduling, queues, fair share. Common in production AI fleets.</li>
+    <li><strong>Kueue</strong> — Kubernetes-native job queueing built by SIG-Scheduling. Newer, simpler, increasingly the default.</li>
+    <li><strong>Yunikorn</strong> — Apache, started at Lyft / Cloudera, hierarchical queues.</li>
+    <li><strong>PodGroup</strong> (Volcano) / <strong>Workload</strong> (Kueue) — the CRDs that express "schedule all N or none."</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># Kueue: a ClusterQueue with cohort-level borrowing
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: research-h100
+spec:
+  cohort: gpu-fleet
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu", "cpu", "memory"]
+      flavors:
+        - name: h100-sxm
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 32
+              borrowingLimit: 16   # can borrow from cohort up to 16 more
+            - name: cpu
+              nominalQuota: 384
+            - name: memory
+              nominalQuota: 4Ti
+</code></pre></div>
+</section>
+
+<section id="priority">
+  <h2>Priority &amp; preemption</h2>
+  <p>Production inference must beat researcher fine-tuning when capacity is tight. K8s gives you <code>PriorityClass</code>:</p>
+  <ul>
+    <li><strong>inference-online</strong> — highest priority, can preempt others.</li>
+    <li><strong>training-prod</strong> — high but below online.</li>
+    <li><strong>research-batch</strong> — low, preemptible.</li>
+    <li><strong>opportunistic</strong> — negative priority, runs only if nothing else wants the resource.</li>
+  </ul>
+  <p>The interesting part is the <em>preemption policy</em>:</p>
+  <ul>
+    <li><strong>Graceful preemption</strong> — send SIGTERM, give a budget (e.g. 60s) to checkpoint, then SIGKILL.</li>
+    <li><strong>Hard preemption</strong> — kill now. Used when the system is in trouble.</li>
+    <li><strong>Preemption avoidance</strong> — only preempt if no other node fits; bin-packing-aware.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Don't preempt naively</span>
+    <p>Killing a 6-hour fine-tuning run 2 minutes before completion to make room for a 5-second inference request is a classic mid-system failure. Combine priority with <em>checkpointing</em>, <em>preemption cooldowns</em>, and <em>queue depth</em> so a 5-second request waits 30 seconds instead of murdering a checkpoint cycle.</p>
+  </div>
+</section>
+
+<section id="quotas">
+  <h2>Quotas &amp; fair share</h2>
+  <p>The company has teams; teams have budgets. The scheduler enforces them.</p>
+  <ul>
+    <li><strong>ResourceQuota</strong> per namespace — hard caps on <code>requests.nvidia.com/gpu</code>.</li>
+    <li><strong>LimitRange</strong> — per-pod defaults and maxes.</li>
+    <li><strong>Hierarchical queues</strong> (Volcano, Yunikorn) — "research" gets 60%, "product" gets 40%, with borrowing when one is idle.</li>
+    <li><strong>Fair-share / DRF</strong> (Dominant Resource Fairness) — when both demand more than their share, allocate proportionally.</li>
+    <li><strong>Backfill</strong> — small jobs slip into gaps left by large gang jobs waiting for placement.</li>
+  </ul>
+  <p>Quota is also a <em>cost</em> mechanism: a team that consistently uses 100% of its quota is the signal that you should resize or renegotiate.</p>
+</section>
+
+<section id="node-config">
+  <h2>Node configuration that matters</h2>
+  <p>The "boring" host config is where many GPU perf bugs hide.</p>
+  <ul>
+    <li><strong>NUMA pinning</strong> — pin pod CPUs to the NUMA node where the GPUs physically attach. K8s <code>topology manager</code> with <code>single-numa-node</code> policy.</li>
+    <li><strong>CPU pinning &amp; isolation</strong> — exclusive CPU sets via the <code>cpu manager</code>. Inference latency is sensitive to scheduler jitter.</li>
+    <li><strong>Hugepages</strong> — enable 2 MiB or 1 GiB hugepages for RDMA-heavy paths.</li>
+    <li><strong>IRQ affinity</strong> — NIC interrupts on the right NUMA node.</li>
+    <li><strong>CPU governor</strong> — <code>performance</code>, not <code>powersave</code>. (Yes, this is a real production gotcha.)</li>
+    <li><strong>Persistence mode</strong> — <code>nvidia-smi -pm 1</code> or run <code>nvidia-persistenced</code> so the driver doesn't unload between processes.</li>
+    <li><strong>Fabric Manager</strong> — required for NVSwitch nodes (DGX-class, HGX).</li>
+    <li><strong>ECC settings</strong>, <strong>GPU clocks</strong>, <strong>application clocks</strong> — usually leave at default; document if you don't.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># kubelet config: NUMA-aware GPU placement
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cpuManagerPolicy: static
+topologyManagerPolicy: single-numa-node
+reservedSystemCPUs: "0,1,48,49"
+featureGates:
+  CPUManager: true
+  TopologyManager: true
+</code></pre></div>
+</section>
+
+<section id="topology">
+  <h2>Topology-aware scheduling</h2>
+  <p>A pod requesting 4 GPUs on an 8-GPU H100 node should get 4 GPUs <em>connected by NVLink as a single NVSwitch group</em>, not a random 4 of 8. The NVIDIA device plugin supports topology-aware allocation:</p>
+  <ul>
+    <li><strong>Best-effort</strong> mode prefers same-NVLink-domain GPUs but won't fail if unavailable.</li>
+    <li><strong>Strict</strong> mode refuses to allocate if topology can't be satisfied.</li>
+  </ul>
+  <p>Across nodes: place gang-scheduled pods on nodes connected to the <em>same rail</em> of the IB fabric. Tools like <strong>Kueue's flavor fungibility</strong>, <strong>kube-scheduler-extender</strong>, or vendor schedulers (Run:AI, etc.) handle this.</p>
+</section>
+
+<section id="isolation">
+  <h2>Workload isolation — what guarantees can you actually make?</h2>
+  <p>Be precise here in interviews. Different mechanisms give different guarantees.</p>
+  <table>
+    <thead><tr><th>Mechanism</th><th>What it isolates</th><th>What it doesn't</th></tr></thead>
+    <tbody>
+      <tr><td>Separate K8s namespace</td><td>API surface, RBAC, secrets, network policy</td><td>Anything on the GPU itself</td></tr>
+      <tr><td>Separate node pool / taints</td><td>Physical hardware co-tenancy</td><td>Fabric noisy neighbors at scale</td></tr>
+      <tr><td>MIG</td><td>SMs, memory, memory bandwidth, fault domain</td><td>Across NVSwitch — none</td></tr>
+      <tr><td>MPS</td><td>Process address spaces, with memory caps on Volta+</td><td>Performance interference between tenants</td></tr>
+      <tr><td>Time-slicing</td><td>Functional correctness</td><td>Any kind of latency predictability</td></tr>
+      <tr><td>Exclusive GPU</td><td>Everything device-level</td><td>Host CPU, NIC, NUMA noise</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Senior signal</span>
+    <p>"I can guarantee X with MIG; with MPS I can guarantee Y but not Z; with exclusive allocation everything except host-side noise. What isolation level does this workload actually need?" — this is the answer that gets you out of the multi-tenancy trap.</p>
+  </div>
+</section>
+
+<section id="signals">
+  <h2>Queue depth &amp; saturation signals</h2>
+  <p>How do you know your scheduler is failing? Watch:</p>
+  <ul>
+    <li><strong>Pending pod count + age</strong> per priority class. Online inference pending &gt; 0 is an immediate page.</li>
+    <li><strong>Queue depth</strong> per Kueue/Volcano queue.</li>
+    <li><strong>Time-to-bind</strong> p95 for new pods.</li>
+    <li><strong>GPU allocatable vs available vs SM-active</strong> — three different things; the gap between them is where waste hides.</li>
+    <li><strong>Preemption rate</strong> — sudden spikes mean priority is being abused or capacity has shifted.</li>
+    <li><strong>Fragmentation</strong> — number of nodes with idle GPUs that no pending pod can use (wrong topology, wrong taints).</li>
+  </ul>
+  <p>The dashboard you build for this is half the role's day-to-day. See <a href="12-data-pipelines.html">chapter 12</a> for the telemetry pipeline.</p>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← Previous</a> · <a href="06-applied-patterns.html">Next: Applied patterns →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

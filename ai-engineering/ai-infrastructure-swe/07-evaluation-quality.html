@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation &amp; Quality — Service-Level Evals for AI Infra</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#two-layers">Two layers of eval</a>
+    <a href="#slos">SLOs</a>
+    <a href="#load-testing">Load testing</a>
+    <a href="#chaos">Chaos engineering</a>
+    <a href="#integration">Integration tests against real LLMs</a>
+    <a href="#fuzz">Fuzz testing protocol parsers</a>
+    <a href="#agent-end-to-end">Agent end-to-end success rates</a>
+    <a href="#perf-regression">Perf regression suites</a>
+    <a href="#error-budget">Error budgets</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-applied-patterns.html">← Previous</a>
+    <a href="08-error-handling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Evaluation &amp; Quality</h1>
+  <p class="subtitle">Service-level evals — load testing, chaos, integration, fuzzing, end-to-end success — plus SLOs and error budgets. The infra-tier view of "is the system working?"</p>
+</header>
+
+<section id="two-layers">
+  <h2>Two layers of eval — and where you live</h2>
+  <p>The agent ecosystem evaluates at two layers, and your role lives mostly in the second one:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Owned by</th><th>Measures</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Agent quality</strong></td><td>Agent Systems / ML team</td><td>Task success rate, trajectory match, hallucination rate, prompt regression</td></tr>
+      <tr><td><strong>Service quality</strong></td><td>You (AI Infrastructure)</td><td>SLOs, latency, throughput, error rate, availability, cost</td></tr>
+    </tbody>
+  </table>
+  <p>The boundary is fuzzy at "agent end-to-end success as observed at the infra tier" — see <a href="#agent-end-to-end">below</a>. Mostly, your evals are about the system staying up and fast under realistic conditions.</p>
+</section>
+
+<section id="slos">
+  <h2>SLOs — what the service promises</h2>
+  <p>A senior SWE on this team should be able to write SLOs in their sleep. The typical bundle:</p>
+  <ul>
+    <li><strong>Availability</strong> — 99.9% (3.5 min/month down) or 99.95% (~22 min/month).</li>
+    <li><strong>Success rate</strong> — % of requests returning a valid response (excludes user-caused 4xx). E.g., ≥99.9%.</li>
+    <li><strong>Latency</strong> — p50, p95, p99, p999. For inference gateway: e.g., p99 first-token-latency &lt; 500ms; p99 total &lt; 30s for completions.</li>
+    <li><strong>Throughput</strong> — sustained QPS the system handles before SLO violation.</li>
+    <li><strong>Saturation</strong> — utilization headroom (CPU, memory, queue depth, KV cache).</li>
+  </ul>
+  <p>For streaming endpoints, latency SLOs split:</p>
+  <ul>
+    <li><strong>Time to first token (TTFT)</strong> — how fast the first byte streams to the client. Dominated by queueing + prefill.</li>
+    <li><strong>Inter-token latency (ITL)</strong> — pause between tokens. Dominated by decode step.</li>
+    <li><strong>Total completion time</strong> — for fixed-length workloads.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Interview line</span>
+    <p>"For an LLM gateway, TTFT and ITL are the two latency SLOs that map to UX. Total latency hides the user-felt experience because a slow 1st token feels different from slow steady streaming."</p>
+  </div>
+</section>
+
+<section id="load-testing">
+  <h2>Load testing</h2>
+  <p>You should be able to drive the service with realistic load and watch where it breaks. Tools:</p>
+  <table>
+    <thead><tr><th>Tool</th><th>For</th></tr></thead>
+    <tbody>
+      <tr><td><code>k6</code></td><td>HTTP/SSE load; JS scripts; great defaults.</td></tr>
+      <tr><td><code>vegeta</code></td><td>Constant-rate HTTP load; simple CLI.</td></tr>
+      <tr><td><code>ghz</code></td><td>gRPC load testing.</td></tr>
+      <tr><td><code>locust</code></td><td>Python-scripted load; good for complex agent workloads.</td></tr>
+      <tr><td>Custom Rust harness</td><td>When you need realistic prompt distributions and SSE consumption.</td></tr>
+    </tbody>
+  </table>
+  <p>What to measure:</p>
+  <ul>
+    <li><strong>Open-loop vs closed-loop.</strong> Open-loop holds the request rate constant regardless of latency — this is what real users do. Closed-loop matches concurrency. Always include open-loop for tail-latency truth.</li>
+    <li><strong>Latency at saturation, not at empty.</strong> Bench at 50%, 75%, 90% of expected peak.</li>
+    <li><strong>Prompt-length distributions</strong> matter for LLM gateways. Long-context requests behave differently from short ones.</li>
+  </ul>
+</section>
+
+<section id="chaos">
+  <h2>Chaos engineering</h2>
+  <p>Inject failures in pre-production (and very carefully in production) to verify the system degrades gracefully.</p>
+  <ul>
+    <li><strong>Kill a backend mid-traffic.</strong> Do circuit breakers open? Does routing failover?</li>
+    <li><strong>Inject latency on the wire.</strong> Linux <code>tc</code> netem, Toxiproxy. Tail latency under wire jitter.</li>
+    <li><strong>Drop packets.</strong> Same tools.</li>
+    <li><strong>Saturate Redis.</strong> Watch the gateway degrade — does it use rate-limit decisions as soft hints, or hard-fail?</li>
+    <li><strong>Postgres failover.</strong> Does the orchestrator resume runs after the DB rotates?</li>
+    <li><strong>Fill memory.</strong> Run out of KV cache on a backend. Does the gateway route around it?</li>
+  </ul>
+  <p>The principle: failures you've already practiced are not 2am pages. They're routine.</p>
+</section>
+
+<section id="integration">
+  <h2>Integration tests against real LLM endpoints</h2>
+  <p>Most code can be unit tested with mocked LLM calls. Some can't:</p>
+  <ul>
+    <li><strong>Streaming response handling</strong> — SSE keepalive, partial-message reassembly, mid-stream cancellation. These break against mocks but pass; test against a real endpoint in CI.</li>
+    <li><strong>Backend protocol compliance</strong> — vLLM, Triton, and Anthropic's API all have subtle differences in error shapes, token formats, retry semantics. Tests that mock all three lie.</li>
+    <li><strong>Latency-sensitive contracts</strong> — does your timeout still produce a clean error path when the upstream is slow but not failing?</li>
+  </ul>
+  <p>The pattern: a small dedicated test backend (local vLLM with a tiny model, or a recorded-replay HTTP server), run as part of nightly integration. PR tests stay on mocks for speed.</p>
+</section>
+
+<section id="fuzz">
+  <h2>Fuzz testing protocol parsers</h2>
+  <p>Anywhere you parse external input — JSON tool args, model-emitted JSON, SSE frames, protobuf payloads — is a fuzz target. <code>cargo-fuzz</code> (libFuzzer) and <code>afl.rs</code> are the standard tools.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// fuzz_targets/parse_tool_args.rs
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &amp;[u8]| {
+    if let Ok(s) = std::str::from_utf8(data) {
+        let _ = my_service::parse_tool_args(s);
+        // The parse must not panic on any input. That's the contract.
+    }
+});
+</code></pre></div>
+  <p>What you get: confidence that malformed model output doesn't panic the service. Critical, because LLMs emit malformed JSON for fun.</p>
+</section>
+
+<section id="agent-end-to-end">
+  <h2>Agent end-to-end success rates (as observed from infra)</h2>
+  <p>The Agent Systems team owns "is this agent good?" You own "did the system give the agent a fair chance to be good?" The infra-tier metrics:</p>
+  <ul>
+    <li><strong>Runs that completed</strong> vs runs that hit step/budget/deadline limits.</li>
+    <li><strong>Tool call success rate</strong> per tool. A tool that's at 95% success is healthier than one at 60%.</li>
+    <li><strong>Median and tail step count</strong> per run. Tail run with 200 steps is suspicious — probably stuck.</li>
+    <li><strong>Cost per successful run.</strong> Trend over weeks. Regressions are a signal.</li>
+    <li><strong>Approval rate</strong> on human-in-the-loop gates. Low approval = the agent is suggesting bad actions = something upstream regressed.</li>
+    <li><strong>Cancellation rate</strong> by client. High cancellation = users giving up = latency or quality problem.</li>
+  </ul>
+  <p>You feed all this to dashboards. The Agent Systems team uses it to decide whether to investigate a regression.</p>
+</section>
+
+<section id="perf-regression">
+  <h2>Perf regression suites</h2>
+  <p>Every release should be benchmarked before deploy. The minimum suite:</p>
+  <ul>
+    <li><strong>Microbenchmarks (<code>criterion</code>)</strong> for hot functions. Catches algorithmic regressions in PR review.</li>
+    <li><strong>Load test (<code>k6</code> / <code>ghz</code>)</strong> in CI against a representative workload. Compare p99 and throughput against last release.</li>
+    <li><strong>Allocation count benchmarks (<code>dhat-rs</code> or <code>iai</code>)</strong> on a synthetic request. Catches "this PR added a per-request allocation."</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">// benches/parse.rs
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+fn bench_parse(c: &amp;mut Criterion) {
+    let input = include_str!("../fixtures/sample_tool_args.json");
+    c.bench_function("parse_tool_args", |b| {
+        b.iter(|| my_service::parse_tool_args(black_box(input)))
+    });
+}
+
+criterion_group!(benches, bench_parse);
+criterion_main!(benches);
+</code></pre></div>
+</section>
+
+<section id="error-budget">
+  <h2>Error budgets</h2>
+  <p>SLOs define a budget. 99.9% availability = 43 minutes/month down. You spend that budget on real outages, planned maintenance, risky deploys. When the budget is burned, deploys freeze.</p>
+  <ul>
+    <li><strong>Burn-rate alerts</strong> — alert when budget is burning N× faster than nominal over a short window. Earlier detection than "the budget is gone."</li>
+    <li><strong>Multi-window burn rate</strong> — alert on both fast-burn (over 1h) and slow-burn (over 24h) to catch both incidents and slow degradations.</li>
+    <li><strong>Budget freezes</strong> — when the monthly budget is gone, no new feature deploys. Forces investment in reliability.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Interview phrasing</span>
+    <p>"SLO + error budget gives you a quantitative answer to 'should we deploy this risky change?' If we have budget, we ship and watch closely. If we don't, we don't. It moves the conversation from opinion to math."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="06-applied-patterns.html">← Applied patterns</a> · <a href="08-error-handling.html">Next: Error handling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

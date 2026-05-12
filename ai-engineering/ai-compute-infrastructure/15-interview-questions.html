@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Practice Interview Questions — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body data-practice-key="ai-compute-infra-practice">
+
+<div class="layout layout-wide">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#serving">1. Serving</a>
+    <a href="#sched">2. Scheduling &amp; orchestration</a>
+    <a href="#observ">3. Observability</a>
+    <a href="#errors">4. Error handling</a>
+    <a href="#design">5. System design</a>
+    <a href="#cost">6. Cost optimization</a>
+    <a href="#coding">7. Coding</a>
+    <a href="#behavioral">8. Behavioral</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="14-domain-context.html">← Previous</a>
+    <a href="16-day-of.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · Reference · Drill mode</span>
+  <h1>Practice Interview Questions</h1>
+  <p class="subtitle">Twenty-eight questions across eight sections. Toggle drill mode to hide answers, study mode to reveal them. Track which you've passed.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">How to drill</span>
+  <p>Read the question aloud. Speak the answer out loud for 60 seconds. Then reveal and compare. Mark a checkbox when you'd give a confident answer cold. Aim for 90%+ confidence across all eight sections before the loop.</p>
+</div>
+
+<div class="drill-controls">
+  <button id="drill-toggle" class="drill-btn">Toggle drill mode</button>
+  <button id="reset-progress" class="drill-btn">Reset progress</button>
+</div>
+
+<!-- ============================ -->
+<section id="serving">
+  <h2>1. Serving</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="s1"> <strong>Q1.1</strong> — Explain paged attention and why it matters.</label></summary>
+  <p>vLLM treats KV-cache as virtual memory, divided into fixed-size <em>blocks</em> (e.g. 16 tokens). Each sequence has a <em>block table</em> mapping logical positions to physical blocks. Benefits: near-zero fragmentation (only allocate what's used, not max-context per sequence); copy-on-write sharing of identical prefixes between requests; admission control is exact (we know how many blocks remain). It dramatically improves throughput vs. contiguous KV-cache allocation, especially under varying sequence lengths.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="s2"> <strong>Q1.2</strong> — Continuous batching vs. static batching — what changes operationally?</label></summary>
+  <p>Static batching collects requests until a batch fills or a timeout, then runs the whole batch through. Slowest request determines batch latency; GPU goes idle at batch boundaries. Continuous batching operates at the <em>iteration</em> level — every forward pass, the scheduler adds new sequences and removes finished ones, so the GPU is never idle waiting for slow requests, and new requests join immediately. Operationally: lower TTFT, higher throughput, but the static dynamic-batching knobs (max_queue_delay) become irrelevant; the new knobs are max-num-seqs and KV-cache utilization.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="s3"> <strong>Q1.3</strong> — When would you pick Triton over vLLM, and vice versa?</label></summary>
+  <p>vLLM if the workload is one or a few LLMs with OpenAI-compatible API and latency-sensitive chat. Triton if you have a portfolio of models (tokenizers, embeddings, classifiers, several LLMs), mixed frameworks (TensorRT, ONNX, PyTorch, Python), or want one unified server with model-repository semantics and dynamic batching for non-LLM models. You can also run vLLM <em>inside</em> Triton via the vLLM backend to get both.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="s4"> <strong>Q1.4</strong> — A 70B model takes 140 GB in FP16. How do you fit it on 4× H100 80 GB and what are the tradeoffs?</label></summary>
+  <p>Tensor parallel TP=4 over NVLink puts ~35 GB of weights on each GPU, plus shared KV-cache pool and activation memory. Tradeoffs: TP adds an all-reduce per layer (cheap over NVLink, expensive across nodes); pull TP&gt;1 only intra-node for inference. Alternatives: FP8 quantization (~70 GB total → fits on 2× H100); INT4 (~35 GB → fits on 1× H100 with room for cache, at some quality cost); H200/B200 with bigger HBM. The senior answer is to ask what TTFT/throughput target makes the precision/parallelism choice obvious.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="sched">
+  <h2>2. Scheduling &amp; orchestration</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="o1"> <strong>Q2.1</strong> — MIG vs. MPS vs. exclusive — when do you pick which?</label></summary>
+  <p>Exclusive for any workload that saturates a GPU (big-model serving, training). MIG when many small inference workloads share a node and you need hardware-isolated SLOs (e.g. multi-tenant inference platform — each tenant gets a guaranteed slice). MPS when you have many small co-trusted clients sharing a GPU and want better utilization than time-slicing, accepting softer isolation. Default time-slicing only for dev/notebooks where utilization matters more than predictability.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="o2"> <strong>Q2.2</strong> — Why is gang scheduling needed for training and how do you implement it on K8s?</label></summary>
+  <p>Distributed training requires all N workers to start together — if 6 of 8 land and 2 are pending, the 6 idle GPUs are unusable. Vanilla K8s starts the 6 happily. Gang scheduling holds back the start until all N can be scheduled. Implement via Volcano (PodGroup), Kueue (Workload), or Yunikorn. The scheduler reserves capacity for the whole group atomically and only places pods when N can fit.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="o3"> <strong>Q2.3</strong> — How do you fairly share GPUs between research and production?</label></summary>
+  <p>Hierarchical queues with priority classes. Production gets the highest priority class with preemption rights. Research gets a guaranteed quota plus borrowing rights up to a cohort cap when production is idle. Preemption is graceful: SIGTERM + checkpoint window, not SIGKILL, so research jobs lose at most N steps. Quota enforced via ResourceQuota; queue-level fairness via Kueue / Volcano. Surface a daily "what each team used" report for accountability.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="o4"> <strong>Q2.4</strong> — What signals tell you the scheduler is under-serving its tenants?</label></summary>
+  <p>Pending pod age per priority class (online &gt;0 is a page). Time-to-bind p95 rising. Fragmentation — nodes with idle GPUs no pending pod can use due to topology/taints. Preemption rate spikes. Gap between <code>allocatable</code> and <code>SM-active</code>: high gap = bad placement, low utilization despite full allocation. Quota saturated for a team that's still queueing means you need to renegotiate.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="observ">
+  <h2>3. Observability</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="ob1"> <strong>Q3.1</strong> — What's wrong with answering "GPU utilization is 90%"?</label></summary>
+  <p>Three different things are called utilization. nvidia-smi's "GPU-Util" is the fraction of time <em>any</em> kernel ran — a tiny kernel looping shows 100%. DCGM's SM-active is better. SM-occupancy (warps issued / max) is best for compute-bound work. For LLM decode, the right metric is HBM <em>bandwidth</em> utilization because decode is memory-bound, not compute-bound. A senior answer names which metric you mean.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="ob2"> <strong>Q3.2</strong> — Walk me through the metrics you'd put on the team's wall-monitor.</label></summary>
+  <p>Top half: fleet SM-active heatmap by node, fleet HBM used heatmap. Middle: top-five services p95 latency + TTFT, request rate, error rate. Queue depth in front of each service by priority class. Bottom: $/million-tokens trendline; quota usage by team; pending pods. The rule: if any panel turns red, that's the team's afternoon.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="ob3"> <strong>Q3.3</strong> — How do you trace a slow LLM request across services?</label></summary>
+  <p>OpenTelemetry. The gateway opens the root span. Each downstream (auth, router, retriever, embedder, reranker, LLM, response post-process) opens child spans with attributes — model, tokens, cache hit, GPU node. Tail-based sampling keeps all traces with errors or latency &gt; threshold so you have high signal at low storage cost. Export to Tempo/Jaeger/Honeycomb; correlate via the request ID in logs and metrics.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="ob4"> <strong>Q3.4</strong> — Why histograms over averages for latency?</label></summary>
+  <p>Averages hide tail. A service with p50 of 100ms and p99 of 5s can have a "300ms average" that suggests health when 1% of users see a broken experience. Histograms let you compute any percentile after the fact and roll up across instances. Use Prometheus histogram buckets sized to the actual distribution; compute <code>histogram_quantile(0.99, ...)</code> for tail metrics.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="errors">
+  <h2>4. Error handling</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="e1"> <strong>Q4.1</strong> — Your vLLM replica is "alive" but throughput dropped 40%. How do you debug?</label></summary>
+  <p>(1) What changed: recent deploy, driver, traffic shape? (2) Request mix: longer prompts, lower prefix-cache hit rate? (3) KV-cache utilization: cache thrashing under more concurrency? (4) dmesg for Xids; the GPU could be silently throttling on thermal or ECC. (5) Compare to neighbor replicas — if only this one is bad, restart it; if all are bad, look upstream. (6) p95 SM-active and DRAM-active to see whether it's compute or memory bound. The discipline: change → confirm → isolate.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="e2"> <strong>Q4.2</strong> — NCCL all-reduce hangs at training startup. Where do you look?</label></summary>
+  <p>Set <code>NCCL_DEBUG=INFO</code>, re-run, read which rank is waiting for which peer. Usual culprits: firewall blocking NCCL ports between nodes; NCCL_SOCKET_IFNAME picked a management NIC; one rank's pod is still pulling its image; IB link down (<code>ibstat</code>); subnet manager issue. In production, set <code>NCCL_ASYNC_ERROR_HANDLING=1</code> and <code>TORCH_NCCL_BLOCKING_WAIT=1</code> so hangs error out within a watchdog timeout instead of stalling forever.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="e3"> <strong>Q4.3</strong> — A request fails mid-stream. Is retry safe?</label></summary>
+  <p>For pure inference: yes — at fixed seed/temp the output is deterministic; otherwise differing samples are acceptable. For inference with tool calls: not without idempotency keys on the tools — the agent layer handles this. For billing: don't bill twice for retried requests that failed before the first token. Accept a client-provided request ID at the gateway, de-dupe within a short window. Streaming retries are usually "retry from scratch" in the contract.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="e4"> <strong>Q4.4</strong> — Queue overflows under burst traffic. What's the playbook?</label></summary>
+  <p>Reject loudly at the edge with 429 + Retry-After. Per-tenant rate limits so one team can't starve others. Queue-time SLO — drop requests that have queued past their deadline (the user gave up). Load-shed low-priority traffic before high-priority. Circuit breaker in front of a melting backend. The principle: predictable 429s beat wandering p99 timeouts.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="design">
+  <h2>5. System design</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="d1"> <strong>Q5.1</strong> — Design an internal LLM gateway that fronts open-weights models at 10k RPS, p95 ≤ 1s.</label></summary>
+  <p>Frame the triangle first: latency-bounded, customer-facing, so optimize TTFT and tail; accept higher cost.</p>
+  <ol>
+    <li>Edge: TLS termination, auth (mTLS or API key), per-tenant rate limiting, request validation, observability injection.</li>
+    <li>Router: model name → backend pool; weighted routing for canaries; circuit breaker; load shedding.</li>
+    <li>Backend pools: vLLM with prefix caching enabled, FP8 KV-cache, TP=4 on H100 SXM nodes. Sized for P50 from reserved + P25 on-demand + spot for batch elsewhere.</li>
+    <li>Autoscaler: KEDA on <code>num_requests_waiting</code> metric, scale-in with long cooldown to preserve KV-cache.</li>
+    <li>Observability: OTel traces, RED metrics per route, DCGM per node, cost dashboard per tenant.</li>
+    <li>Failure modes: 429 on saturation, retry-with-jitter advice, circuit breaker on backend health, blue/green for changes.</li>
+    <li>Capacity math: 10k RPS / 1.6 RPS-per-GPU-equivalent at our token profile = ~6300 GPUs equivalent at saturation; size to 30% headroom = ~9000. Mix of reserved/on-demand based on $/GPU-hour spread.</li>
+  </ol>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="d2"> <strong>Q5.2</strong> — Design a multi-tenant inference platform for five product teams.</label></summary>
+  <p>Pool the hardware by accelerator type; tenants are namespaces with quota + borrowing. Isolation: full GPU for big-model serving, MIG for small models that need SLOs, MPS only where tenants trust each other. Router routes by model name to the right pool. Observability: per-tenant dashboards (latency, throughput, GPU-hours, cost). Self-service "deploy a model" via KServe CRDs. Governance: weekly cost review; quota review quarterly.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="d3"> <strong>Q5.3</strong> — Design the rollout path for a new NVIDIA driver across the fleet.</label></summary>
+  <p>Pin via GPU Operator. Build a new driver container image. Deploy first to a dev node, run smoke + perf regression. Then to a single canary in pre-prod, soak 24h, compare DCGM Xids/temp/throughput baselines. Then to 5% of prod (one AZ), soak 24h with on-call watching. Then 25%, 50%, 100% staged across AZs with soak between gates. Pre-defined rollback at each gate. Communicate via incident-style status to stakeholders.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="d4"> <strong>Q5.4</strong> — Design a system to keep training jobs running on spot capacity.</label></summary>
+  <p>Spot for ~70% of the fleet, on-demand reserve for the rest. Async checkpointing every N minutes to durable storage (object + Lustre cache). On spot warning (2-min for AWS), drain the worker: stop accepting steps, flush state, exit. Re-launch picks up latest checkpoint. Use elastic training (TorchElastic) so jobs survive worker churn without dying. Hedge across instance families and AZs. Track "% time productive" as the headline metric; alert when productivity drops below threshold.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="cost">
+  <h2>6. Cost optimization</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="c1"> <strong>Q6.1</strong> — How would you decide between in-house GPUs and hosted APIs for a workload?</label></summary>
+  <p>Five-factor: (1) privacy — does the workload touch regulated data? (2) latency — is the API round trip + tail compatible with the SLO? (3) reliability — is the external API a tolerable dependency? (4) cost — at expected volume, blended in-house $/M-tokens vs API $/M-tokens, plus operating overhead. (5) differentiation — is the model fine-tuned or custom? At the company, (1) usually pushes toward in-house even when (4) is close. The cost math always assumes high utilization; idle reserved GPUs flip the answer.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="c2"> <strong>Q6.2</strong> — Where's the biggest waste in a typical GPU fleet?</label></summary>
+  <p>Idle reserved capacity (paying for GPUs no one used). Over-provisioned replicas with rounded-up GPU counts. Spot capacity unused because batch workloads weren't migrated. Cold prefix-cache loss from frequent scale-in. Inefficient quantization (FP16 where FP8 is fine). Lone-tenant nodes with poor packing. The dashboard is "idle GPU-hours per team per day" with a top-N table.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="c3"> <strong>Q6.3</strong> — A workload is at 30% SM-active. Is that bad?</label></summary>
+  <p>Depends. For LLM decode, 30% SM-active is normal — decode is memory-bandwidth-bound, not compute-bound. Look at DRAM-active; if that's 70-80%, you're saturated and SM-active doesn't matter. For a vision model or training step, 30% SM-active <em>is</em> bad — likely data-loader starvation, small batch size, or sync overhead. The same number means different things depending on the workload shape; the senior framing is "is the bottleneck resource saturated?"</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="coding">
+  <h2>7. Coding</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="cd1"> <strong>Q7.1</strong> — Sketch a token-bucket rate limiter.</label></summary>
+  <p>State: capacity, refill_per_sec, current tokens, last_ts. On <code>allow(now, cost)</code>: refill = min(capacity, tokens + (now - last_ts) × refill_per_sec); if refill ≥ cost, debit and return True. Constant time, constant memory. Clamp time backwards. Generalize cost for variable-size LLM requests.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="cd2"> <strong>Q7.2</strong> — Compute p99 latency over a sliding 5-minute window.</label></summary>
+  <p>Exact: deque of (ts, latency); evict head while head_ts &lt; now − window; sort and pick the 99th element on query. O(n log n) per query. Production: HDR histogram or t-digest for bounded memory and O(log n) updates with small error. Bucketed histogram per second + merge across window also works.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="cd3"> <strong>Q7.3</strong> — Implement a batch buffer that emits batches of up to B items every W ms.</label></summary>
+  <p>Async loop. <code>submit(item)</code> appends to a buffer and sets a wakeup event. The loop awaits either the event (buffer non-empty) or a timeout (W ms). When B items are present, flush immediately; otherwise on timeout flush whatever is there. Return per-item futures so callers get their result back. Handle shutdown by flushing partials.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="cd4"> <strong>Q7.4</strong> — Pack N inference jobs (each needs M_i GB) onto K GPUs of 80 GB each.</label></summary>
+  <p>First-fit decreasing: sort jobs by size descending; for each, place on first bin with space; open a new bin if none fits. Within 11/9 of optimal for bin packing. Extension to discuss: multi-dimensional (compute + memory) is NP-hard in general; LP-relaxation or Kueue topology-aware schedulers handle real production. Mention this; don't try to derive it.</p>
+  </details>
+</section>
+
+<!-- ============================ -->
+<section id="behavioral">
+  <h2>8. Behavioral</h2>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="b1"> <strong>Q8.1</strong> — Tell me about a production incident you led.</label></summary>
+  <p>STAR. <strong>Situation</strong>: scope, scale, severity. <strong>Task</strong>: your role, what was at stake. <strong>Action</strong>: how you triaged, what you escalated, the call you made under uncertainty. <strong>Result</strong>: time to mitigate, blast radius, what changed durably (PIR action that shipped). Bonus: a sentence on what you'd do differently. Avoid heroism; emphasize coordination and the durable fix.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="b2"> <strong>Q8.2</strong> — Tell me about a time you disagreed with a researcher's request.</label></summary>
+  <p>Useful to have a story where you said "no" or "not yet" to a researcher and proposed a better path. Show that you respect the user, understand their goal, and protect the substrate. Resolution: a small experiment that resolved the disagreement with data, not opinion.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="b3"> <strong>Q8.3</strong> — A new framework lands that promises a big speedup. How do you evaluate it?</label></summary>
+  <p>Read claims, but verify on your workload — your prompt distribution, your model, your GPUs. Reproduce one benchmark to ground-truth. Stand up a soak in pre-prod. Measure quality regression alongside performance. Cost the operational debt (new tool means new on-call runbooks, new failure modes). Decide on a small bet (a single use case) before fleet adoption. Don't be first; don't be last.</p>
+  </details>
+
+  <details class="reveal"><summary><label><input type="checkbox" data-q="b4"> <strong>Q8.4</strong> — Why this role, why this company?</label></summary>
+  <p>Specific. the company is building in-house AI compute precisely because privacy, latency, and cost matter for a regulated exchange — that's the framing where this team's leverage is highest. Be concrete about what attracts you (the in-house mandate, the senior small team, the chance to own the substrate). Avoid generic "I love AI" — talk about <em>this team's</em> mandate. End with a question.</p>
+  </details>
+</section>
+
+<footer>
+  <p><a href="14-domain-context.html">← Previous</a> · <a href="16-day-of.html">Next: Day-of tactics →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

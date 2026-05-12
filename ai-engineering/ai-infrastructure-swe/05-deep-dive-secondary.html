@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — ML Inference &amp; Orchestration Architecture</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-this-layer">Why this layer exists</a>
+    <a href="#calling-vllm">Calling vLLM/Triton from Rust</a>
+    <a href="#batching">Batching at the gateway</a>
+    <a href="#streaming">Streaming responses (SSE)</a>
+    <a href="#prompt-cache">Prompt cache awareness</a>
+    <a href="#kv-cache">KV-cache sharing concerns</a>
+    <a href="#orchestration">Agent orchestration patterns</a>
+    <a href="#tool-dispatch">Tool dispatch</a>
+    <a href="#multi-step">Multi-step plans</a>
+    <a href="#partial-state">Partial-state recovery</a>
+    <a href="#sub-agent">Sub-agent isolation</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Secondary</span>
+  <h1>ML Inference &amp; Orchestration Architecture</h1>
+  <p class="subtitle">Model serving from a SWE's point of view — what your Rust gateway must wrap, how agent orchestration sits above it, and the cross-layer concerns that only show up in production.</p>
+</header>
+
+<section id="why-this-layer">
+  <h2>Why this layer exists</h2>
+  <p>Raw inference servers (vLLM, Triton, TGI) are batching, GPU-saturating text generators. They are <em>not</em> a public API. They have no auth, no per-tenant quotas, no cost accounting, no audit logging, no agent state, no plan execution, no idempotency. The AI Infrastructure layer is everything that sits between the public-facing service contract and those raw inference servers.</p>
+  <div class="callout insight">
+    <span class="callout-label">The two-layer split</span>
+    <p><strong>Inference layer (vLLM, GPU fleet):</strong> "given these tokens and this sampling config, give me back the next tokens fast." <strong>Infrastructure layer (your Rust services):</strong> "given this user, this agent, this tool catalog, this budget, this safety policy — orchestrate inference and tool calls until the goal is achieved, with audit and recovery."</p>
+  </div>
+  <p>The interview frame: <em>"vLLM is great at maximizing GPU throughput for batched generation. Everything else — auth, batching at the gateway, streaming to the client, retries, hedging, agent state — lives in the Rust layer on top."</em></p>
+</section>
+
+<section id="calling-vllm">
+  <h2>Calling vLLM/Triton from a Rust service</h2>
+  <p>vLLM exposes an OpenAI-compatible HTTP server out of the box. Triton uses HTTP or gRPC. TGI uses HTTP/SSE. From Rust, the pattern is similar:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use reqwest::Client;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize)]
+struct CompletionReq&lt;'a&gt; {
+    model: &amp;'a str,
+    messages: &amp;'a [Message&lt;'a&gt;],
+    max_tokens: u32,
+    temperature: f32,
+    stream: bool,
+}
+
+async fn generate(client: &amp;Client, base_url: &amp;str, req: CompletionReq&lt;'_&gt;)
+    -&gt; Result&lt;CompletionResp, BackendError&gt;
+{
+    let resp = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&amp;req)
+        .timeout(std::time::Duration::from_secs(60))
+        .send().await?;
+    if !resp.status().is_success() {
+        return Err(BackendError::Status(resp.status()));
+    }
+    Ok(resp.json().await?)
+}
+</code></pre></div>
+  <p>Things to get right at this layer:</p>
+  <ul>
+    <li><strong>Connection pooling.</strong> One <code>reqwest::Client</code> per process; it pools HTTP/2 connections.</li>
+    <li><strong>Deadlines.</strong> Forward the request deadline; don't use a static timeout.</li>
+    <li><strong>Retry only on idempotent failures.</strong> A network error before any tokens were emitted is retryable. Mid-stream failure is not (the next attempt would re-bill the user and likely re-execute side effects).</li>
+    <li><strong>Healthchecks.</strong> Pull inference backends out of rotation when they're unhealthy.</li>
+    <li><strong>Load balancing.</strong> Round-robin within a pool; affinity to a node when you want prompt-cache hits.</li>
+  </ul>
+</section>
+
+<section id="batching">
+  <h2>Batching at the gateway</h2>
+  <p>vLLM already does <strong>continuous batching</strong> internally — it groups in-flight requests, runs decode-step matmuls together, and adds new requests to the batch each step. So you do <em>not</em> need to batch at the gateway in the simple "wait 50ms, then send N requests" sense.</p>
+  <p>But there are still gateway-level batching/multiplexing concerns:</p>
+  <ul>
+    <li><strong>Connection multiplexing.</strong> HTTP/2 lets you fanout many concurrent requests over one connection. Use it.</li>
+    <li><strong>Coalescing duplicate prompts</strong> — if 50 users ask the same exact prompt within 100ms (system prompt + identical user query), can you serve one inference and broadcast the result? Sometimes yes (cache-friendly), sometimes no (privacy/per-user context).</li>
+    <li><strong>Request hedging</strong> — fire to two backends after a small delay; take whichever returns first. Trades cost for tail-latency improvement.</li>
+    <li><strong>Embedding batching</strong> — embedding endpoints <em>do</em> benefit from gateway-side batching (low per-request cost, high batch efficiency). Batch with a max-N + max-delay window.</li>
+  </ul>
+</section>
+
+<section id="streaming">
+  <h2>Streaming responses (Server-Sent Events)</h2>
+  <p>LLMs emit tokens one at a time. The user experience demands you stream them to the client, not wait for the full completion. The standard wire format is SSE — text/event-stream with newline-delimited frames.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use axum::response::sse::{Event, Sse};
+use futures::stream::Stream;
+
+async fn stream_handler(req: GenerateReq)
+    -&gt; Sse&lt;impl Stream&lt;Item = Result&lt;Event, std::convert::Infallible&gt;&gt;&gt;
+{
+    let upstream = call_vllm_stream(req).await;
+    // upstream: Stream&lt;Item = Result&lt;Token, BackendError&gt;&gt;
+    let sse = upstream.map(|tok| {
+        match tok {
+            Ok(t)  =&gt; Ok(Event::default().data(serde_json::to_string(&amp;t).unwrap())),
+            Err(_) =&gt; Ok(Event::default().event("error").data("backend_failure")),
+        }
+    });
+    Sse::new(sse).keep_alive(KeepAlive::default())
+}
+</code></pre></div>
+  <p>Cross-cutting concerns in streaming:</p>
+  <ul>
+    <li><strong>Backpressure.</strong> If the client is slow, you need to pause pulling from the upstream. Bounded channel between upstream consumer and client emitter does this.</li>
+    <li><strong>Cancellation.</strong> If the client disconnects, you must cancel the upstream call so you stop spending GPU time. tonic + tower handle this if you propagate the request future correctly.</li>
+    <li><strong>Heartbeats / keepalives.</strong> Proxies kill idle SSE connections. Emit periodic <code>: ping</code> frames.</li>
+    <li><strong>Partial-failure UX.</strong> If a stream dies mid-generation, decide: error out the request, retry from scratch, or hand the partial back to the client?</li>
+  </ul>
+</section>
+
+<section id="prompt-cache">
+  <h2>Prompt-cache awareness</h2>
+  <p>Modern LLM serving stacks reuse the KV-cache (the precomputed attention state) for prompt prefixes that repeat across requests — <strong>prefix caching</strong>. The implication for your gateway:</p>
+  <ul>
+    <li><strong>Affinity-route to maximize cache hits.</strong> If user A's request shares the same long system prompt as user B's, and they both hit the same vLLM replica, both benefit from the cached prefix. Random load balancing destroys this.</li>
+    <li><strong>Consistent-hashing</strong> on a stable prompt-prefix hash gives you sticky routing without a leader.</li>
+    <li><strong>Pin system prompts</strong> to a small set of versioned strings. Per-request system-prompt mutation kills prefix cache hit rate.</li>
+    <li><strong>Prompt cache TTL</strong> — caches evict under memory pressure. Expect colder tails after restarts.</li>
+  </ul>
+  <p>For Anthropic and OpenAI APIs, prompt caching is an explicit feature with cache markers in the request. Your gateway should pass through and account for cached-token billing.</p>
+</section>
+
+<section id="kv-cache">
+  <h2>KV-cache sharing concerns</h2>
+  <p>The KV-cache holds per-request attention state. Two concerns leak into the infra layer:</p>
+  <ul>
+    <li><strong>Memory pressure</strong> — long contexts use more KV-cache memory per request. Throughput drops when many long-context requests run concurrently. Your gateway needs to know "this backend is at 80% KV memory; route new long-context requests elsewhere."</li>
+    <li><strong>Cache sharing across tenants</strong> — if tenant A's system prompt is shared with tenant B (e.g., a common base prompt), prefix caching means tenant B might benefit from tenant A's work. Usually fine. If the prompt contains tenant-specific keys, that's a leak vector — keep secrets out of cacheable prefixes.</li>
+  </ul>
+</section>
+
+<section id="orchestration">
+  <h2>Agent orchestration — the layer above inference</h2>
+  <p>An agent is a loop: model proposes an action (a tool call, or "I'm done"), the action runs, the result feeds back, the model proposes the next action. As an infrastructure SWE you own the <strong>executor</strong> — the service that runs this loop reliably at scale.</p>
+  <div class="callout insight">
+    <span class="callout-label">The shape of an agent run</span>
+    <pre><code>run = {
+  id, user, plan_version, model_version, deadline, budget,
+  state: { messages, tool_results, partial_outputs },
+  step_count, status
+}
+loop:
+  model.call(state.messages) -&gt; either tool_call or final_answer
+  if final_answer: persist, return
+  if tool_call:
+    tool = tool_router.lookup(name)
+    if tool.requires_approval: pause, wait for human
+    result = tool.call(args, idem_key)
+    state.messages += [tool_call, tool_result]
+    if step_count &gt; budget.max_steps: halt
+</code></pre>
+  </div>
+  <p>Everything in this loop is an infrastructure concern. Tool dispatch, state persistence, deadline/budget accounting, retry, audit, cancellation, partial-state recovery — those are your code.</p>
+</section>
+
+<section id="tool-dispatch">
+  <h2>Tool dispatch</h2>
+  <p>A "tool" is a function the model can call. The dispatcher's job: look up the tool by name, validate arguments against the schema, enforce auth and policy, execute, and return a result the model can read.</p>
+  <ul>
+    <li><strong>Schema validation</strong> — never trust model-generated args. JSON-schema-validate before dispatching.</li>
+    <li><strong>Auth scoping</strong> — the tool runs under the user's identity, not god-mode. If the model asks for a tool the user can't use, deny.</li>
+    <li><strong>Idempotency</strong> — every side-effecting tool gets an idempotency key from the orchestrator. Retries don't duplicate.</li>
+    <li><strong>Timeouts</strong> — every tool call has its own deadline within the agent's overall deadline.</li>
+    <li><strong>Approval gates</strong> — high-tier tools (money movement, sending external messages) pause for human approval before executing.</li>
+    <li><strong>Result shape</strong> — return structured success/error so the model can react. <code>{"error": "...", "retryable": true}</code> beats raw stack traces.</li>
+  </ul>
+</section>
+
+<section id="multi-step">
+  <h2>Multi-step plans</h2>
+  <p>Two common shapes:</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>What it is</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ReAct (reason-act-observe)</strong></td><td>Model produces the next single action based on the current state. Loop.</td><td>Flexible, easy to reason about, no upfront plan. Can wander.</td></tr>
+      <tr><td><strong>Plan-then-execute</strong></td><td>Model produces an explicit multi-step plan, the executor walks it step-by-step.</td><td>More predictable, easier to checkpoint, easier to bound cost. Less adaptive mid-run.</td></tr>
+      <tr><td><strong>Tree of thought / search</strong></td><td>Multiple candidate steps evaluated, best chosen.</td><td>Expensive; rare in production.</td></tr>
+    </tbody>
+  </table>
+  <p>From the infra side, both reduce to "execute a sequence of tool calls with state between them" — your executor doesn't really care which pattern the agent uses, as long as the state machine is well-defined.</p>
+</section>
+
+<section id="partial-state">
+  <h2>Partial-state recovery</h2>
+  <p>An agent run can take minutes. Processes restart. Crashes happen. The executor must be able to resume.</p>
+  <ul>
+    <li><strong>Persist after every step.</strong> The run record (state, step count, last tool result) is written to a durable store after each step before issuing the next model call.</li>
+    <li><strong>Idempotent step execution.</strong> Resuming from step N must not re-execute step N's side effects. Idempotency keys on side-effecting tools, plus a "completed steps" log.</li>
+    <li><strong>Single-owner lock.</strong> Only one executor instance can be advancing a given run at a time. Use a Postgres advisory lock, Redis lease, or a Raft-backed run registry.</li>
+    <li><strong>Stuck-state detection.</strong> If a run has been in "executing step N" for 5x the median step duration, alert / fail / escalate.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">async fn step(run: &amp;mut RunState, executor: &amp;Executor) -&gt; Result&lt;()&gt; {
+    let next_action = call_model(&amp;run.messages).await?;
+    match next_action {
+        Action::ToolCall { name, args, idem_key } =&gt; {
+            // 1. record intent
+            store.append_event(&amp;run.id, Event::ToolCallStarted { name: name.clone(), idem_key }).await?;
+            // 2. dispatch
+            let result = executor.dispatch(&amp;name, &amp;args, idem_key).await?;
+            // 3. record outcome
+            store.append_event(&amp;run.id, Event::ToolCallCompleted { result: result.clone() }).await?;
+            run.messages.push(Message::tool_result(name, result));
+        }
+        Action::Done { answer } =&gt; {
+            store.mark_complete(&amp;run.id, answer).await?;
+        }
+    }
+    Ok(())
+}
+</code></pre></div>
+</section>
+
+<section id="sub-agent">
+  <h2>Sub-agent isolation</h2>
+  <p>An agent that spawns sub-agents — common in research/coding agents — introduces blast-radius questions. Patterns:</p>
+  <ul>
+    <li><strong>Separate run IDs.</strong> A sub-agent is its own run record with its own state, deadline, budget — not a nested message in the parent.</li>
+    <li><strong>Bounded budgets.</strong> The parent declares "this sub-agent gets at most N tokens / M steps / $K cost." Hard caps.</li>
+    <li><strong>Trace propagation.</strong> The parent's trace ID is set as a parent of the sub-agent's spans for end-to-end visibility.</li>
+    <li><strong>Tool authority restriction.</strong> A sub-agent inherits a <em>subset</em> of the parent's tool authority, never a superset.</li>
+    <li><strong>Result-only return.</strong> The sub-agent's full message history doesn't pollute the parent's context unless the parent explicitly fetches it.</li>
+    <li><strong>Cancellation cascades.</strong> Cancelling the parent must cancel all sub-agents. This is structured concurrency; see <a href="08-error-handling.html">08-error-handling</a>.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Interview line</span>
+    <p>"Sub-agent isolation is just process isolation for the agent world — each one is its own run with its own state, budget, and tool scope. The parent kicks one off, awaits a result, doesn't share execution context."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← High-perf Rust services</a> · <a href="06-applied-patterns.html">Next: Applied patterns →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

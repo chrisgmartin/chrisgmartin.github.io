@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#cluster-deploy">Cluster deploy patterns</a>
+    <a href="#node-pools">Node pools by accelerator</a>
+    <a href="#images">Image management with weights</a>
+    <a href="#bluegreen">Blue/green &amp; canary inference</a>
+    <a href="#rollback">Rollback strategy</a>
+    <a href="#observability">The observability stack</a>
+    <a href="#profilers">Profilers — Nsight &amp; friends</a>
+    <a href="#incident">Incident response</a>
+    <a href="#runbook-anatomy">Anatomy of a good runbook</a>
+    <a href="#oncall">On-call sustainability</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Ops</h1>
+  <p class="subtitle">How the fleet actually ships and runs. Node pools, image management, blue/green and canary, rollback, observability stack, profiling under load, and the incident discipline that keeps a small team alive on a big cluster.</p>
+</header>
+
+<section id="cluster-deploy">
+  <h2>Cluster deploy patterns</h2>
+  <p>A production GPU cluster isn't one Kubernetes cluster. Most production fleets run several:</p>
+  <ul>
+    <li><strong>Production inference</strong> — strict SLAs, reserved capacity, change-controlled.</li>
+    <li><strong>Research / experimentation</strong> — looser, faster iteration, can absorb churn.</li>
+    <li><strong>Pre-prod / staging</strong> — production-shaped, used as canary.</li>
+    <li><strong>Dev / batch</strong> — cheaper hardware, spot, mixed.</li>
+  </ul>
+  <p>Separation isolates blast radius and lets each cluster carry its own change cadence. Cluster lifecycle managed via IaC: Terraform for the cluster shell, Helm/Kustomize for the workloads, GitOps (Argo CD / Flux) as the reconciler.</p>
+</section>
+
+<section id="node-pools">
+  <h2>Node pools by accelerator</h2>
+  <p>Within a cluster, separate node pools per accelerator type. Workloads use <code>nodeSelector</code>/<code>affinity</code> + taints to land on the right pool.</p>
+  <table>
+    <thead><tr><th>Pool</th><th>Hardware</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td><code>h100-sxm-online</code></td><td>8× H100 SXM, NVLink, IB fabric, reserved</td><td>Production LLM serving, big-model TP</td></tr>
+      <tr><td><code>a100-pcie-mid</code></td><td>4-8× A100 PCIe, cheaper, on-demand</td><td>Mid-tier services, internal tools</td></tr>
+      <tr><td><code>l40s-mig</code></td><td>L40S split into MIG instances</td><td>Small inference, embeddings, classifiers</td></tr>
+      <tr><td><code>h100-spot</code></td><td>Spot/preemptible H100</td><td>Batch inference, training, evals</td></tr>
+      <tr><td><code>cpu-control-plane</code></td><td>No GPUs</td><td>Gateways, controllers, exporters</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># Pinning a workload to the right pool
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama3-70b
+spec:
+  template:
+    spec:
+      nodeSelector:
+        accelerator: nvidia-h100-sxm
+        node-pool: h100-sxm-online
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: vllm-llama3-70b }
+</code></pre></div>
+</section>
+
+<section id="images">
+  <h2>Image management with model weights</h2>
+  <p>Three deployment patterns, each with a tradeoff. Pick deliberately.</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Weights baked into image</strong></td><td>Atomic deploys, fastest startup, no runtime fetch failure mode</td><td>50-200 GB images; slow rebuilds; large registry footprint</td></tr>
+      <tr><td><strong>Sidecar weight loader</strong> from artifact store to local NVMe</td><td>Slim image; weights versioned independently; reuse across pod restarts</td><td>Initial pull cost; need a local cache strategy</td></tr>
+      <tr><td><strong>Init container</strong> downloads weights on each start</td><td>Simple; small image</td><td>Slow cold starts; failure if registry is flaky; expensive at scale</td></tr>
+    </tbody>
+  </table>
+  <p>Default for production: <strong>sidecar with hostPath NVMe cache</strong>. Weights tagged by content hash. The first pod on a node pulls; subsequent pods hardlink.</p>
+  <div class="callout tip">
+    <span class="callout-label">Pin images by digest</span>
+    <p>In production manifests, use <code>vllm:sha256:abc...</code> not <code>vllm:latest</code>. Tags float, digests don't. Apply the same to weight references.</p>
+  </div>
+</section>
+
+<section id="bluegreen">
+  <h2>Blue/green &amp; canary inference deploys</h2>
+  <p>Two patterns for shipping a model or serving-stack change without taking the service down.</p>
+  <h3>Blue/green</h3>
+  <p>Run both old (blue) and new (green) at the same time. Traffic flipped at the gateway. Fast rollback (flip back). Expensive (2× capacity briefly). Good for big-bang changes.</p>
+  <h3>Canary</h3>
+  <p>Weighted traffic split — 1% to new, then 10%, 50%, 100%. Watch metrics at each gate. Cheaper than blue/green; longer rollouts; finer-grained.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml"># Argo Rollouts canary for a vLLM service
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: vllm-llama3-70b }
+spec:
+  replicas: 8
+  strategy:
+    canary:
+      maxSurge: "25%"
+      steps:
+        - setWeight: 5
+        - pause: { duration: 10m }
+        - analysis:
+            templates:
+              - templateName: latency-and-error-rate
+        - setWeight: 25
+        - pause: { duration: 30m }
+        - setWeight: 50
+        - pause: { duration: 1h }
+        - setWeight: 100
+</code></pre></div>
+  <p>The analysis template hits Prometheus and fails the rollout if p95 latency or 5xx rate exceeds thresholds.</p>
+</section>
+
+<section id="rollback">
+  <h2>Rollback strategy</h2>
+  <p>The minimum bar:</p>
+  <ul>
+    <li><strong>Every deploy is rollbackable</strong> with a single command or a single revert PR.</li>
+    <li><strong>Previous artifact retained</strong> — image, weights, plan files — for at least the duration of the canary plus soak.</li>
+    <li><strong>Practiced</strong> — at least once per quarter, do an intentional rollback in staging.</li>
+    <li><strong>Automated triggers</strong> — analysis template, error-budget burn-rate alert, manual button.</li>
+    <li><strong>Communicate</strong> — the rollback is in the incident channel within 60s of being decided, with the reason.</li>
+  </ul>
+</section>
+
+<section id="observability">
+  <h2>The observability stack</h2>
+  <p>The boring but essential parts. You should be able to name the pieces and explain what each does.</p>
+  <ul>
+    <li><strong>Metrics</strong> — Prometheus + DCGM exporter + service /metrics endpoints. Long-term storage via Mimir/Thanos/VM.</li>
+    <li><strong>Logs</strong> — Fluent-bit / Vector → Loki / Elastic / Datadog. Structured JSON.</li>
+    <li><strong>Traces</strong> — OpenTelemetry collector → Tempo / Jaeger / Honeycomb. Tail-based sampling.</li>
+    <li><strong>Dashboards</strong> — Grafana. One per service, one per team, one for fleet health.</li>
+    <li><strong>Alerts</strong> — Alertmanager → PagerDuty / Opsgenie. Tied to SLOs, not raw metrics.</li>
+    <li><strong>Synthetics</strong> — a probe service hitting each model with canned prompts every minute, watching TTFT and correctness.</li>
+    <li><strong>Profiling</strong> — Nsight Systems for timeline traces; Nsight Compute for kernel-level. Continuous profiling (Parca / Pyroscope) for long-running services.</li>
+  </ul>
+</section>
+
+<section id="profilers">
+  <h2>Profilers — Nsight, PyTorch, dcgmi, py-spy</h2>
+  <p>You will be asked at some point: "How would you profile this?" Have the toolkit by name.</p>
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th><th>When to reach for it</th></tr></thead>
+    <tbody>
+      <tr><td><strong>nvidia-smi</strong></td><td>Coarse, real-time per-device</td><td>First five seconds of any GPU question</td></tr>
+      <tr><td><strong>dcgmi dmon</strong></td><td>Live time-series telemetry</td><td>"Show me utilization right now"</td></tr>
+      <tr><td><strong>Nsight Systems</strong> (<code>nsys</code>)</td><td>Whole-app timeline, kernel-level, CUDA &amp; NCCL events</td><td>"Why is this job slow?" — the workhorse</td></tr>
+      <tr><td><strong>Nsight Compute</strong> (<code>ncu</code>)</td><td>Deep dive into a single kernel — memory throughput, occupancy, stalls</td><td>Optimizing a specific kernel</td></tr>
+      <tr><td><strong>PyTorch profiler</strong></td><td>Python-aware op-level timing, exports to Chrome trace</td><td>PyTorch workloads, framework overhead</td></tr>
+      <tr><td><strong>py-spy</strong></td><td>Sampling Python profiler, no instrumentation</td><td>"What's that Python process doing?"</td></tr>
+      <tr><td><strong>perf</strong></td><td>Linux CPU profiler</td><td>Host-side bottlenecks</td></tr>
+      <tr><td><strong>NCCL traces</strong></td><td><code>NCCL_DEBUG=INFO</code>, NCCL profile output</td><td>Collective performance investigations</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">Profiling in production</span>
+    <p>Nsight overhead is non-trivial; don't profile a live production replica unless you've drained traffic from it. Better: replicate the load on a canary node with a synthetic generator.</p>
+  </div>
+</section>
+
+<section id="incident">
+  <h2>Incident response</h2>
+  <p>The team will get paged. The discipline keeps the pages short and the learning durable.</p>
+  <ol>
+    <li><strong>Acknowledge fast.</strong> The page system tracks ack time. Two minutes is the target.</li>
+    <li><strong>Start an incident channel.</strong> Slack/Teams channel named with the date. Pin the alert.</li>
+    <li><strong>Assign an Incident Commander.</strong> One person owns coordination — even on a small team, one person is "in charge of the incident."</li>
+    <li><strong>Open the runbook.</strong> If one exists, work it.</li>
+    <li><strong>Communicate hourly.</strong> Status update in the channel even if "still investigating."</li>
+    <li><strong>Stop the bleeding before finding the root cause.</strong> Roll back the deploy, drain the bad node, increase capacity — the goal is to restore service first.</li>
+    <li><strong>Once service is restored:</strong> mark incident resolved, schedule the PIR (post-incident review) within a week.</li>
+    <li><strong>PIR produces actions.</strong> Each action has an owner and a date. Action items show up in the next sprint.</li>
+  </ol>
+</section>
+
+<section id="runbook-anatomy">
+  <h2>Anatomy of a good runbook</h2>
+  <p>A runbook should be runnable in the middle of the night by someone who is not the expert. Components:</p>
+  <ol>
+    <li><strong>Title</strong> — what alert triggers this.</li>
+    <li><strong>Severity</strong> — P0/P1/P2.</li>
+    <li><strong>Symptoms</strong> — what you'll see.</li>
+    <li><strong>Likely causes</strong> in order of probability.</li>
+    <li><strong>Diagnostic commands</strong> — copy-pasteable, with expected output.</li>
+    <li><strong>Remediation steps</strong> — copy-pasteable, idempotent.</li>
+    <li><strong>Escalation</strong> — who to wake up and when.</li>
+    <li><strong>Related runbooks</strong> — links.</li>
+    <li><strong>Last updated</strong>, last verified.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Excerpt of a "node Xid storm" runbook
+#
+# Symptom: Alert "DCGMXidErrorsHigh" on node-X
+# Likely:
+#   1) Failing HBM (rate of Xid 63/64) — drain &amp; replace
+#   2) Driver bug (rate of Xid 119/120) — drain, file ticket
+#   3) Power glitch (Xid 79 isolated event) — power-cycle node
+
+# Step 1: confirm
+ssh node-X dmesg | grep -i 'NVRM: Xid' | tail -20
+ssh node-X dcgmi diag -r 1     # quick health check
+
+# Step 2: drain (PDB-respecting)
+kubectl cordon node-X
+kubectl drain node-X --ignore-daemonsets --delete-emptydir-data --timeout=10m
+
+# Step 3: dispatch
+# If diag fails: tag node out of service; open hardware ticket
+# If diag passes: gather logs, reboot, run smoke workload
+</code></pre></div>
+</section>
+
+<section id="oncall">
+  <h2>On-call sustainability</h2>
+  <p>A senior engineer protects on-call quality. In an interview, you can demonstrate this by talking about:</p>
+  <ul>
+    <li><strong>Page-budget hygiene</strong> — measure pages/week/engineer; investigate when it rises.</li>
+    <li><strong>Symptom-based alerts</strong> — only page on user-impacting symptoms.</li>
+    <li><strong>Runbook-or-don't-page rule</strong> — every page either has a runbook or shouldn't exist.</li>
+    <li><strong>Follow-the-sun</strong> if the team spans time zones; otherwise rotation cadence that respects sleep.</li>
+    <li><strong>Action-item velocity from PIRs</strong> — if PIR actions aren't shipping, the same incident will recur.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The closing line</span>
+    <p>"Operability is built, not assumed. Every deploy that ships without a runbook update, an alert mapping, and a dashboard panel is a small debt the team pays later at 3am."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Previous</a> · <a href="14-domain-context.html">Next: Domain context →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

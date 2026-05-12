@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive: Inference Serving — AI Compute Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-llm-serving-hard">Why LLM serving is hard</a>
+    <a href="#kv-cache">KV-cache, the central object</a>
+    <a href="#vllm">vLLM — paged attention &amp; continuous batching</a>
+    <a href="#triton">Triton Inference Server</a>
+    <a href="#tensorrt">TensorRT &amp; TensorRT-LLM</a>
+    <a href="#kserve">KServe</a>
+    <a href="#rayserve">Ray Serve</a>
+    <a href="#torchserve">TorchServe</a>
+    <a href="#parallelism">Parallelism strategies</a>
+    <a href="#speculative">Speculative decoding</a>
+    <a href="#picking">How to pick a stack</a>
+    <a href="#tradeoffs">Latency vs throughput</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Critical</span>
+  <h1>Deep Dive — Inference Serving</h1>
+  <p class="subtitle">The single most-probed area in this loop. vLLM, Triton, TensorRT, KServe, Ray Serve, parallelism strategies, KV-cache, speculative decoding, and how to pick a stack for a given request profile.</p>
+</header>
+
+<section id="why-llm-serving-hard">
+  <h2>Why LLM serving is hard (different from generic ML serving)</h2>
+  <p>A classic ML service is request-in, prediction-out, fixed compute per request. LLM serving has three properties that change the engineering shape:</p>
+  <ol>
+    <li><strong>Two distinct phases per request</strong> — <em>prefill</em> (process the prompt, compute-bound, parallelizable) and <em>decode</em> (generate one token at a time, memory-bandwidth-bound, sequential).</li>
+    <li><strong>Variable, unknown output length.</strong> A request might emit 5 tokens or 2,000. You can't pre-allocate exactly.</li>
+    <li><strong>A large per-request state</strong> — the KV-cache — that lives on the GPU for the entire generation.</li>
+  </ol>
+  <p>Together these make naive batching catastrophic. If you batch eight requests of unknown length, the batch waits for the slowest. GPU goes to 30% utilization. Throughput collapses.</p>
+</section>
+
+<section id="kv-cache">
+  <h2>KV-cache, the central object</h2>
+  <p>Transformer attention at decode time uses <em>K</em> and <em>V</em> projections from <em>all previous tokens</em>. Recomputing them each step would be quadratic. So we cache them per layer per head per sequence in GPU memory. The KV-cache:</p>
+  <ul>
+    <li>Grows linearly with sequence length and batch size.</li>
+    <li>Dominates memory at long contexts. For Llama-3 70B FP16, ~320 KB per token per sequence at TP=1. At 8k context, batch 16: ~40 GB of cache alone.</li>
+    <li>Is freed when the sequence finishes.</li>
+    <li>Can be <em>shared</em> across requests with the same prefix (prefix caching).</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The senior framing</span>
+    <p>"KV-cache management <em>is</em> LLM serving." Almost every interesting choice — paged attention, prefix caching, chunked prefill, swapping, eviction — is a KV-cache question in disguise.</p>
+  </div>
+</section>
+
+<section id="vllm">
+  <h2>vLLM — paged attention &amp; continuous batching</h2>
+  <p>vLLM (Kwon et al., 2023) reshaped open-source LLM serving with two ideas working in concert.</p>
+  <h3>Paged attention</h3>
+  <p>Treat the KV-cache like virtual memory. Carve cache space into fixed-size <em>blocks</em> (e.g. 16 tokens each). A sequence's KV-cache is a list of block IDs, not a contiguous slab. Benefits:</p>
+  <ul>
+    <li><strong>Near-zero fragmentation.</strong> Naive allocators reserve max-context per sequence; paged attention only allocates what's used.</li>
+    <li><strong>Copy-on-write sharing.</strong> Two requests with the same prefix point at the same blocks until they diverge.</li>
+    <li><strong>Predictable admission.</strong> The scheduler knows exactly how many free blocks remain.</li>
+  </ul>
+  <h3>Continuous batching</h3>
+  <p>Also called iteration-level batching or in-flight batching. Instead of batching at request granularity, batch at <em>token-step</em> granularity. Each forward pass, the scheduler:</p>
+  <ol>
+    <li>Looks at active sequences.</li>
+    <li>Adds new requests if there's capacity.</li>
+    <li>Removes finished sequences.</li>
+    <li>Runs one decode step on whoever is in the batch.</li>
+  </ol>
+  <p>Effect: the GPU is never idle waiting for a slow request, and new requests don't wait in line for a "batch window" to fill.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Typical vLLM server invocation
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.92 \
+  --enable-prefix-caching \
+  --max-num-seqs 256 \
+  --kv-cache-dtype fp8
+</code></pre></div>
+  <p>The knobs you'll defend in an interview:</p>
+  <ul>
+    <li><code>--gpu-memory-utilization</code> — what fraction of GPU memory vLLM may use for weights + cache + activations. Higher = more concurrency, lower = more safety margin.</li>
+    <li><code>--max-num-seqs</code> — concurrency cap. Too high and tail latency explodes; too low and you under-utilize.</li>
+    <li><code>--enable-prefix-caching</code> — huge win for system-prompt-heavy workloads (most enterprise apps).</li>
+    <li><code>--kv-cache-dtype fp8</code> — halve cache memory, small quality cost; very common production choice.</li>
+  </ul>
+</section>
+
+<section id="triton">
+  <h2>Triton Inference Server</h2>
+  <p>NVIDIA's general-purpose serving engine. Not LLM-specific. It excels when you have a <em>portfolio</em> of models, possibly mixed framework, and want one server to host them.</p>
+  <h3>Concepts</h3>
+  <ul>
+    <li><strong>Model repository</strong> — filesystem layout of models with <code>config.pbtxt</code> per model.</li>
+    <li><strong>Backends</strong> — TensorRT, ONNX Runtime, PyTorch, Python, TensorRT-LLM, vLLM (yes, you can wrap vLLM inside Triton).</li>
+    <li><strong>Dynamic batching</strong> — Triton batches incoming requests up to a max batch size and a max queue delay.</li>
+    <li><strong>Model ensemble</strong> — chain models server-side (e.g. tokenizer → model → detokenizer).</li>
+    <li><strong>Model analyzer</strong> — sweeps batch sizes and instance counts to find the perf sweet spot.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Triton model repository layout
+models/
+  llama3-70b/
+    config.pbtxt
+    1/
+      model.engine        # TensorRT-LLM plan
+  embedding-bge/
+    config.pbtxt
+    1/
+      model.onnx
+  ensemble-rag/
+    config.pbtxt          # ties tokenizer + retriever + LLM
+    1/
+</code></pre></div>
+  <p>Use Triton when you need: multi-model multi-tenant on the same node, mixed frameworks, dynamic batching for non-LLM models, or you're already on the NVIDIA stack and want one unified control plane.</p>
+</section>
+
+<section id="tensorrt">
+  <h2>TensorRT &amp; TensorRT-LLM</h2>
+  <p>TensorRT is NVIDIA's inference <em>compiler</em>. You feed it a graph (ONNX or torch); it produces a <strong>plan file</strong> tuned for the target GPU. The wins:</p>
+  <ul>
+    <li><strong>Kernel fusion</strong> — adjacent ops compile into single kernels, dropping launch overhead and HBM round-trips.</li>
+    <li><strong>Quantization</strong> — INT8/FP8 with calibration; small quality cost, big throughput win.</li>
+    <li><strong>Layer auto-tuning</strong> — for each layer the compiler benchmarks several kernel variants and picks the fastest <em>for your GPU</em>. Plan files are not portable across SM versions.</li>
+  </ul>
+  <p><strong>TensorRT-LLM</strong> is the LLM-specific extension: paged KV-cache, in-flight batching, FP8, AWQ/SmoothQuant, speculative decoding, tensor-parallel support. Usually deployed behind Triton with the TensorRT-LLM backend.</p>
+  <div class="callout warn">
+    <span class="callout-label">Plan file gotcha</span>
+    <p>A plan file built on H100 won't run on A100 (and vice versa). Plan-file bake-and-bind to a node pool — don't try to be portable.</p>
+  </div>
+</section>
+
+<section id="kserve">
+  <h2>KServe</h2>
+  <p>KServe is a Kubernetes-native serving abstraction. It adds CRDs (<code>InferenceService</code>) that hide the pod/service/HPA plumbing. You declare <em>what</em> to serve; KServe materializes the runtime.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-yaml">apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: llama3-70b
+spec:
+  predictor:
+    minReplicas: 2
+    maxReplicas: 8
+    scaleTarget: 50
+    scaleMetric: concurrency
+    model:
+      modelFormat: { name: huggingface }
+      runtime: kserve-huggingfaceserver
+      storageUri: s3://kraken-models/llama3-70b/
+      resources:
+        limits:
+          nvidia.com/gpu: 4
+</code></pre></div>
+  <p>KServe gives you canary traffic splitting, autoscaling (including scale-to-zero with Knative), and a uniform "deploy a model" UX. Good ergonomics for an internal platform; the cost is another abstraction layer to debug.</p>
+</section>
+
+<section id="rayserve">
+  <h2>Ray Serve</h2>
+  <p>Ray Serve is the right choice when your inference is <em>a graph of Python computation</em>, not "model in, model out." Use cases:</p>
+  <ul>
+    <li>RAG: retriever → reranker → LLM, each at different replica counts.</li>
+    <li>Agent loops with tool calls.</li>
+    <li>Heterogeneous models that must compose with shared state.</li>
+  </ul>
+  <p>Ray Serve handles the deployment-graph plumbing, autoscaling per node, and Python-native development. It runs <em>on top of</em> Ray, so you're carrying a cluster manager.</p>
+</section>
+
+<section id="torchserve">
+  <h2>TorchServe</h2>
+  <p>The PyTorch-native option. Simpler than Triton, less optimized for LLMs than vLLM, but a reasonable choice for traditional PyTorch models (vision, embeddings) when you want minimal extra stack. Less commonly chosen for greenfield LLM workloads in 2025-2026 unless you're already deep on PyTorch tooling.</p>
+</section>
+
+<section id="parallelism">
+  <h2>Parallelism strategies</h2>
+  <p>When a model doesn't fit on one GPU — or fits but you want lower latency — you split it. Three strategies, often combined:</p>
+  <table>
+    <thead><tr><th>Strategy</th><th>What's split</th><th>Communication</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Data parallel (DP)</strong></td><td>The <em>batch</em> across replicas (full model on each)</td><td>All-reduce on gradients (training), independent for inference</td><td>Always your first move at inference when the model fits — N replicas, N× throughput.</td></tr>
+      <tr><td><strong>Tensor parallel (TP)</strong></td><td>Each matmul split column-wise / row-wise across N GPUs</td><td>All-reduce per layer — heavy, latency-sensitive</td><td>When the model doesn't fit on one GPU, or you want lower latency. Usually within a node over NVLink.</td></tr>
+      <tr><td><strong>Pipeline parallel (PP)</strong></td><td>Different <em>layers</em> on different GPUs</td><td>Activations forwarded between stages — less bandwidth but bubbles</td><td>Cross-node scale when TP would saturate the fabric. Common for very large training.</td></tr>
+      <tr><td><strong>Expert parallel (EP)</strong></td><td>MoE experts across GPUs</td><td>All-to-all on token routing</td><td>MoE models like DeepSeek, Mixtral, GPT-oss.</td></tr>
+      <tr><td><strong>Sequence parallel (SP)</strong></td><td>Sequence dimension split</td><td>Adds extra collectives, saves activation memory</td><td>Long-context training.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Rule of thumb for inference TP</span>
+    <p>TP within a node (over NVLink) is essentially free. TP across nodes (over IB) is painful — latency dominated by the slowest collective. If a model needs TP &gt; node size, you usually want PP for the cross-node step.</p>
+  </div>
+</section>
+
+<section id="speculative">
+  <h2>Speculative decoding</h2>
+  <p>Decode is sequential — one token per forward pass. Speculative decoding breaks that limit. Run a small "draft" model fast, propose K tokens, then have the big model verify them in one forward pass (cheap because verification is parallel). Accepted tokens are kept; first rejected token starts the next round.</p>
+  <ul>
+    <li>Typical speedup: 2-3× on aligned workloads.</li>
+    <li>Quality is bit-exact to the target model (it's a sampling trick, not an approximation).</li>
+    <li>Cost: extra GPU memory for the draft model; extra complexity.</li>
+    <li>Variants: <strong>Medusa</strong> (multiple decode heads), <strong>EAGLE</strong>, <strong>Lookahead decoding</strong>, <strong>n-gram speculation</strong> (cheapest, often best).</li>
+  </ul>
+</section>
+
+<section id="picking">
+  <h2>How to pick a serving stack</h2>
+  <p>An interview-grade framework. State the workload, then map.</p>
+  <table>
+    <thead><tr><th>Workload profile</th><th>Likely stack</th></tr></thead>
+    <tbody>
+      <tr><td>Single open-weights LLM, OpenAI-compatible API, latency-sensitive chat</td><td><strong>vLLM</strong> directly, with prefix caching + FP8 KV-cache</td></tr>
+      <tr><td>Many models, mixed frameworks, multi-tenant on shared nodes</td><td><strong>Triton</strong> with vLLM/TensorRT-LLM backends</td></tr>
+      <tr><td>Custom Python pipeline (RAG, agents, multi-stage)</td><td><strong>Ray Serve</strong> or KServe with custom transformers</td></tr>
+      <tr><td>Highest possible single-model throughput on NVIDIA hardware</td><td><strong>TensorRT-LLM</strong> behind Triton, FP8, in-flight batching, speculative decoding</td></tr>
+      <tr><td>Internal "deploy a model" UX on K8s</td><td><strong>KServe</strong> on top of vLLM/Triton runtimes</td></tr>
+      <tr><td>Batch offline scoring</td><td>Plain vLLM with very high <code>max-num-seqs</code> and large batches; latency doesn't matter</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="tradeoffs">
+  <h2>Latency vs throughput, made explicit</h2>
+  <p>These two pull in opposite directions and every serving knob you turn lands somewhere on the curve.</p>
+  <ul>
+    <li><strong>Larger batches</strong> → higher throughput (tokens/sec/GPU), worse per-request latency (you wait behind others' compute).</li>
+    <li><strong>Smaller batches</strong> → better latency, lower throughput, lower utilization.</li>
+    <li><strong>Continuous batching</strong> moves you along this curve much more efficiently than static batching.</li>
+    <li><strong>Tensor parallelism</strong> reduces latency at fixed throughput by spreading the compute, but adds collective overhead — diminishing returns past 4-8 way intra-node.</li>
+    <li><strong>Speculative decoding</strong> improves latency without sacrificing throughput, at the cost of memory and complexity.</li>
+    <li><strong>Quantization</strong> (FP8, INT4) improves both — fewer bytes moved, more cache fits — at the cost of measured quality.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The answer interviewers want</span>
+    <p>"I'd pick the operating point by asking what the request profile looks like. If it's interactive chat I optimize for TTFT and p95, capping batch concurrency. If it's batch evals I crank concurrency and let TTFT slide. You can't optimize both with one config — you usually run two pools."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Previous</a> · <a href="05-deep-dive-secondary.html">Next: GPU scheduling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

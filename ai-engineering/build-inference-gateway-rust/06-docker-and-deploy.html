@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 06 — Docker &amp; Deploy</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#dockerfile">Multi-stage Dockerfile</a>
+    <a href="#cache">Cache the deps</a>
+    <a href="#build">Build it</a>
+    <a href="#run">Run it</a>
+    <a href="#pgo">A word on PGO</a>
+    <a href="#k8s">Kubernetes Deployment</a>
+    <a href="#checkpoint">Checkpoint</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-observability.html">← Previous</a>
+    <a href="07-load-test-and-tuning.html">Next: Load test →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Chapter 06 · ~20 minutes</span>
+  <h1>Docker &amp; Deploy</h1>
+  <p class="subtitle">Builder → distroless multi-stage build, healthcheck wiring, and a Kubernetes Deployment YAML you could actually apply.</p>
+</header>
+
+<section id="dockerfile">
+  <h2>Multi-stage Dockerfile</h2>
+  <p>The strategy: a fat builder image with the Rust toolchain produces a static binary. We then copy that binary into a tiny distroless image. The result is ~15 MB, no shell, no package manager, minimal attack surface.</p>
+
+  <p>Save this at <code>infergw-workspace/Dockerfile</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+
+# ---------- Stage 1: builder ----------
+FROM rust:1.78-slim-bookworm AS builder
+
+# System deps for openssl-sys etc. (rustls avoids most of these).
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+      pkg-config ca-certificates \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# Cache dependencies separately from source for fast incremental builds.
+COPY Cargo.toml Cargo.lock ./
+COPY infergw/Cargo.toml infergw/Cargo.toml
+COPY mock-upstream/Cargo.toml mock-upstream/Cargo.toml
+
+# Touch dummy mains so cargo can resolve and build deps.
+RUN mkdir -p infergw/src mock-upstream/src \
+ &amp;&amp; echo 'fn main(){}' &gt; infergw/src/main.rs \
+ &amp;&amp; echo 'fn main(){}' &gt; mock-upstream/src/main.rs
+
+ENV CARGO_NET_RETRY=10 \
+    RUSTFLAGS="-C target-cpu=x86-64-v3"
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/target \
+    cargo build --release -p infergw \
+ &amp;&amp; rm -f infergw/src/main.rs mock-upstream/src/main.rs
+
+# Now copy real sources and do the actual build.
+COPY infergw infergw
+COPY mock-upstream mock-upstream
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/target \
+    cargo build --release -p infergw \
+ &amp;&amp; cp /work/target/release/infergw /infergw
+
+# ---------- Stage 2: runtime ----------
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=builder /infergw /usr/local/bin/infergw
+
+ENV INFERGW_BIND=0.0.0.0:8080 \
+    INFERGW_LOG_JSON=1 \
+    RUST_LOG=infergw=info,tower_http=info
+
+EXPOSE 8080
+
+# Distroless has no shell, so we exec the binary directly.
+ENTRYPOINT ["/usr/local/bin/infergw"]</code></pre>
+</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Three things that earn their keep here</span>
+    <p><strong>1. <code>distroless/cc-debian12:nonroot</code></strong> — has libc and libgcc (which our binary needs because of <code>rustls-tls</code>'s ring dependency, and because we didn't target musl), runs as a non-root user, and is ~22 MB before our binary. <code>:nonroot</code> avoids the "running containers as root" CVE flag without extra config.</p>
+    <p><strong>2. <code>RUSTFLAGS="-C target-cpu=x86-64-v3"</code></strong> — generates code for ~2017+ x86 CPUs (Haswell or newer). Modest perf win on integer-heavy workloads. Skip this if you might run on older hardware.</p>
+    <p><strong>3. The dummy-main trick</strong> — by building once with empty <code>main.rs</code> files, cargo compiles and caches all your dependencies. The second build only recompiles your code. This cuts incremental Docker builds from minutes to seconds.</p>
+  </div>
+</section>
+
+<section id="cache">
+  <h2>Why the cache mounts matter</h2>
+  <p>The two <code>--mount=type=cache</code> directives are BuildKit-specific and dramatically speed up rebuilds. They persist <code>~/.cargo/registry</code> and the <code>target/</code> directory across builds — between iterations, dependency compilation is essentially free.</p>
+
+  <p>If you're on an older Docker that doesn't support BuildKit by default, set:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">export DOCKER_BUILDKIT=1</code></pre>
+</div>
+</section>
+
+<section id="build">
+  <h2>Build it</h2>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">cd infergw-workspace
+docker build -t infergw:0.1.0 .</code></pre>
+</div>
+
+  <p>First build takes 2–4 minutes (downloading and compiling the dependency tree). Subsequent rebuilds are 10–30 seconds. Check the final size:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">docker images infergw:0.1.0
+# REPOSITORY   TAG     IMAGE ID       CREATED         SIZE
+# infergw      0.1.0   abc123def      1 minute ago    35MB</code></pre>
+</div>
+
+  <p>Around 30–40 MB depending on which features are compiled in. Most of that is the binary itself (Rust release builds aren't tiny — they include monomorphized generics for every async type), plus libc / libgcc / CA certs.</p>
+
+  <details class="collapse-card">
+    <summary>Want to go smaller?</summary>
+    <div class="collapse-card-body">
+      <p>Two options, in order of effort:</p>
+      <ul>
+        <li><strong><code>strip = true</code> in <code>[profile.release]</code></strong> — already done in Chapter 00. Strips debug symbols. ~30% smaller.</li>
+        <li><strong>Target musl with <code>x86_64-unknown-linux-musl</code></strong> and use <code>distroless/static</code> — gives you a single-file ~12 MB image with no libc dependency. Adds build complexity (musl rust toolchain), and some C dependencies (anything depending on OpenSSL) won't build cleanly. With pure-Rust deps (rustls, ring), it just works.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="run">
+  <h2>Run it</h2>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">docker run --rm -p 8080:8080 \
+  -e INFERGW_UPSTREAM=http://host.docker.internal:9000 \
+  -e INFERGW_LOG_JSON=1 \
+  infergw:0.1.0</code></pre>
+</div>
+
+  <p>(<code>host.docker.internal</code> is how a container on Mac / Windows reaches the host's mock-upstream. On Linux, pass <code>--add-host=host.docker.internal:host-gateway</code> or use <code>--network host</code>.)</p>
+
+  <p>From another terminal:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash">curl -i http://127.0.0.1:8080/healthz
+# HTTP/1.1 200 OK ... ok
+
+curl -N -H 'content-type: application/json' \
+  -d '{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}' \
+  http://127.0.0.1:8080/v1/chat/completions</code></pre>
+</div>
+
+  <p>You should see the same SSE stream as before — now flowing through the containerized gateway to the mock running on your host.</p>
+</section>
+
+<section id="pgo">
+  <h2>A word on PGO</h2>
+  <p>Profile-Guided Optimization can give Rust binaries another 5–15% throughput in CPU-bound code. The workflow:</p>
+  <ol>
+    <li>Build with <code>-Cprofile-generate=&lt;dir&gt;</code> instead of the normal release profile.</li>
+    <li>Run a representative load (e.g. <code>oha</code> hitting your gateway for 60s).</li>
+    <li>Merge profiles with <code>llvm-profdata</code>.</li>
+    <li>Rebuild with <code>-Cprofile-use=&lt;merged-file&gt;</code>.</li>
+  </ol>
+
+  <p>For a network-I/O-bound service like this gateway, PGO is mostly a marginal win — your bottleneck is usually <em>upstream</em>, not your CPU. Skip it for v1, revisit if a profile says CPU is actually pegged in the gateway's own code. The <a href="https://doc.rust-lang.org/rustc/profile-guided-optimization.html" target="_blank" rel="noopener">rustc PGO docs</a> walk through the full flow when you're ready.</p>
+</section>
+
+<section id="k8s">
+  <h2>Kubernetes Deployment</h2>
+  <p>A realistic Deployment + Service. Save as <code>infergw-workspace/deploy/k8s.yaml</code>:</p>
+
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infergw
+  labels: { app: infergw }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: infergw }
+  template:
+    metadata:
+      labels: { app: infergw }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: infergw
+          image: infergw:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 8080, name: http }
+          env:
+            - { name: INFERGW_BIND, value: "0.0.0.0:8080" }
+            - { name: INFERGW_UPSTREAM, value: "http://vllm:8000" }
+            - { name: INFERGW_UPSTREAM_TIMEOUT_MS, value: "30000" }
+            - { name: INFERGW_HEDGE_AFTER_MS, value: "1500" }
+            - { name: INFERGW_SHUTDOWN_GRACE_MS, value: "20000" }
+            - { name: INFERGW_LOG_JSON, value: "1" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4317" }
+            - { name: RUST_LOG, value: "infergw=info" }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          lifecycle:
+            preStop:
+              exec:
+                # Give the LB an extra second to update before we close.
+                command: ["/bin/sleep", "2"]   # WON'T WORK on distroless
+                # alternative for distroless: omit preStop and rely on
+                # readyz-flips-on-SIGTERM, plus a long terminationGracePeriod.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infergw
+spec:
+  selector: { app: infergw }
+  ports:
+    - { name: http, port: 80, targetPort: 8080 }</code></pre>
+</div>
+
+  <div class="callout warn">
+    <span class="callout-label">The preStop / distroless tension</span>
+    <p>The classic Kubernetes pattern is "preStop sleeps a few seconds so endpoints drain before the process gets SIGTERM." But distroless has no <code>/bin/sleep</code>. Three options: (a) bake a tiny <code>sleep</code> binary into your image; (b) switch to <code>distroless/cc-debian12:debug</code> which has busybox; (c) skip <code>preStop</code> entirely and rely on the readiness probe flipping to fail immediately when SIGTERM hits (which we implemented in Chapter 01). Option (c) is cleanest if your <code>terminationGracePeriodSeconds</code> is long enough — and it is here.</p>
+  </div>
+
+  <p>Comment out the <code>preStop</code> block and rely on the shutdown logic from Chapter 01. The flow is:</p>
+  <ol>
+    <li>K8s sends SIGTERM.</li>
+    <li>Our shutdown handler flips <code>readyz</code> to 503 immediately.</li>
+    <li>Endpoint controller observes readiness failure within ~3s (matches our probe period).</li>
+    <li>Service load balancer stops routing new requests.</li>
+    <li>In-flight requests drain over the next ~15s (grace period from <code>INFERGW_SHUTDOWN_GRACE_MS</code>).</li>
+    <li>Process exits. K8s acknowledges within the 30s <code>terminationGracePeriodSeconds</code>.</li>
+  </ol>
+
+  <p>Total cycle: ~18s from SIGTERM to clean exit, with zero new requests dropped after step 4.</p>
+
+  <details class="collapse-card">
+    <summary>Apply it to a real cluster</summary>
+    <div class="collapse-card-body">
+      <p>If you have a kind / minikube / k3d cluster running, push the image and apply:</p>
+<div class="code-wrap">
+<button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># kind: load image directly into the cluster (no registry needed)
+kind load docker-image infergw:0.1.0
+
+kubectl apply -f deploy/k8s.yaml
+kubectl rollout status deploy/infergw
+
+# Port-forward to test:
+kubectl port-forward svc/infergw 8080:80</code></pre>
+</div>
+      <p>Then curl as before. Pull the pods down with <code>kubectl rollout restart deploy/infergw</code> and watch the rolling update — readyz flipping correctly is what makes the rollout zero-downtime.</p>
+    </div>
+  </details>
+</section>
+
+<section id="checkpoint">
+  <h2>Checkpoint</h2>
+  <ul>
+    <li><code>docker build -t infergw:0.1.0 .</code> succeeds in ~3 min the first time, ~30s on rebuild.</li>
+    <li>Image is ~35 MB or smaller and runs as non-root.</li>
+    <li>Container starts, serves <code>/healthz</code>, <code>/readyz</code>, <code>/metrics</code>, and <code>/v1/chat/completions</code>.</li>
+    <li>The Kubernetes manifest is realistic: probes, security context, env config, prometheus scrape annotations, shutdown handshake.</li>
+  </ul>
+
+  <p>Next we drive load through it and watch the metrics tell the truth.</p>
+
+  <p style="margin-top: 24px;"><a href="07-load-test-and-tuning.html"><strong>→ Chapter 07: Load test &amp; tuning</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

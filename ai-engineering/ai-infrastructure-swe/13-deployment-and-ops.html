@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — Production Rust Services</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#docker">Multi-stage Docker builds</a>
+    <a href="#release-debug">Release vs debug</a>
+    <a href="#pgo">PGO and LTO</a>
+    <a href="#blue-green">Blue/green</a>
+    <a href="#canary">Canaries</a>
+    <a href="#feature-flags">Feature flags</a>
+    <a href="#rollback">Rollback strategy</a>
+    <a href="#conn-pool">Connection pooling</a>
+    <a href="#shutdown">Graceful shutdown &amp; SIGTERM</a>
+    <a href="#readiness">Readiness vs liveness</a>
+    <a href="#k8s">Kubernetes essentials</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Ops</h1>
+  <p class="subtitle">Docker, release builds, PGO, blue/green and canaries, feature flags, rollback, connection pooling, graceful shutdown. The day-to-day operations craft.</p>
+</header>
+
+<section id="docker">
+  <h2>Multi-stage Docker builds</h2>
+  <p>The standard pattern for Rust images: build in a heavy image, copy the binary into a minimal runtime image. Result: ~20MB images that boot in &lt;1s.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># syntax=docker/dockerfile:1.6
+FROM rust:1.78-slim AS build
+WORKDIR /app
+# Cache deps separately from source
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src &amp;&amp; echo "fn main(){}" &gt; src/main.rs &amp;&amp; \
+    cargo build --release &amp;&amp; rm -rf src
+COPY src ./src
+RUN cargo build --release --bin gateway
+
+FROM gcr.io/distroless/cc-debian12 AS runtime
+COPY --from=build /app/target/release/gateway /usr/local/bin/gateway
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/gateway"]
+</code></pre></div>
+  <p>Things to mention in interviews:</p>
+  <ul>
+    <li><strong>Layer caching</strong> — copying <code>Cargo.toml/Cargo.lock</code> first builds a deps-only layer that's reused across source changes. Huge CI win.</li>
+    <li><strong>Distroless base</strong> — no shell, no package manager, smaller attack surface. <code>cc</code> variant has glibc.</li>
+    <li><strong>Static binary</strong> alternative — build with musl (<code>--target x86_64-unknown-linux-musl</code>) for a fully static binary that runs on <code>scratch</code>. Worth doing for the smallest production image.</li>
+    <li><strong>cargo-chef</strong> — third-party tool that splits Rust builds for better Docker caching; worth knowing by name.</li>
+  </ul>
+</section>
+
+<section id="release-debug">
+  <h2>Release vs debug builds</h2>
+  <p>Never deploy debug builds. Performance differences are 10-100x for compute-bound code. Always run perf tests against release.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">[profile.release]
+opt-level = 3
+lto = "fat"            # whole-program optimization
+codegen-units = 1      # single CGU enables more inlining; slower compile
+panic = "abort"        # smaller binaries, can't unwind across FFI
+strip = true           # strip symbols
+debug = 1              # keep line-number debug info for backtraces in prod
+</code></pre></div>
+  <p>Tradeoffs:</p>
+  <ul>
+    <li><strong><code>lto = "fat"</code></strong> — big perf win; longer compile.</li>
+    <li><strong><code>codegen-units = 1</code></strong> — better inlining; slower compile; you keep it on for prod releases, not dev.</li>
+    <li><strong><code>panic = "abort"</code></strong> — saves binary size, no unwinding overhead, but you lose <code>catch_unwind</code>. Most services don't need it.</li>
+    <li><strong><code>debug = 1</code></strong> — keep just enough debug info for symbolic stack traces. Pair with a separate <code>--strip=symbols</code> step and external symbol upload (sentry, datadog).</li>
+  </ul>
+</section>
+
+<section id="pgo">
+  <h2>PGO and LTO</h2>
+  <p>Profile-Guided Optimization: compile instrumented binary, run representative load, recompile using the profile. Typical wins 5-15% on throughput. Tooling: <code>cargo-pgo</code>.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># 1. instrument
+RUSTFLAGS="-Cprofile-generate=/tmp/pgo" cargo build --release
+
+# 2. run representative workload
+./target/release/gateway &amp;
+# ... load test for ~10 min ...
+killall gateway
+
+# 3. merge profile data
+llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo
+
+# 4. recompile using profile
+RUSTFLAGS="-Cprofile-use=/tmp/pgo.profdata" cargo build --release
+</code></pre></div>
+  <p>Worth doing for the inference gateway; not worth doing for everything. Like jemalloc: benchmark, then claim.</p>
+</section>
+
+<section id="blue-green">
+  <h2>Blue/green deploys</h2>
+  <p>Two production environments (blue, green). Traffic on blue. Deploy new version to green, smoke-test, flip the load balancer. Old blue stays warm; if issue, flip back.</p>
+  <ul>
+    <li><strong>Zero-downtime cutover.</strong></li>
+    <li><strong>Fast rollback</strong> (LB flip is seconds).</li>
+    <li><strong>Cost</strong> — 2x infra during the cutover period.</li>
+    <li><strong>State coordination</strong> — both environments writing to the same DB. Schema migrations must be compatible across both versions during the window.</li>
+  </ul>
+  <p>For stateful services (orchestrators with active runs), blue/green is harder; canaries (next) tend to be better.</p>
+</section>
+
+<section id="canary">
+  <h2>Canaries</h2>
+  <p>Deploy the new version to a small fraction of capacity (e.g., 1% then 10% then 50% then 100%). Monitor SLOs at each step. Roll back on regression.</p>
+  <ul>
+    <li><strong>Traffic split</strong> by header, by user-id hash, or by random sampling.</li>
+    <li><strong>Compare metrics</strong> between canary and baseline pods. Statistical comparison preferred (e.g., the canary's p99 vs baseline's p99 with confidence intervals).</li>
+    <li><strong>Tooling:</strong> Argo Rollouts, Flagger, Spinnaker. Or homegrown — a service mesh (Istio, Linkerd) can route by weight.</li>
+    <li><strong>Auto-rollback</strong> if canary metrics breach. Half-cooked canaries that need humans to notice problems aren't safer.</li>
+  </ul>
+</section>
+
+<section id="feature-flags">
+  <h2>Feature flags</h2>
+  <p>Decouple deploy from release. Ship code dark; flip flag to enable.</p>
+  <ul>
+    <li><strong>Boolean flags</strong> — on/off per environment.</li>
+    <li><strong>Percentage rollout</strong> — enable for X% of users.</li>
+    <li><strong>Targeted rollout</strong> — enable for specific user IDs / tenants.</li>
+    <li><strong>Kill switches</strong> (covered in <a href="09-governance-and-audit.html#kill-switch">09</a>) are a subset.</li>
+  </ul>
+  <p>Tooling: LaunchDarkly, Flagsmith, Unleash, or a homegrown service. In Rust, <code>statsig-rust</code>, <code>launchdarkly-server-sdk</code>, or your own config-watcher pulling from Postgres.</p>
+  <div class="callout warn">
+    <span class="callout-label">Stale flag debt</span>
+    <p>Flags accumulate. Every flag is conditional logic you'll maintain. Set a removal date when you add one. Audit quarterly.</p>
+  </div>
+</section>
+
+<section id="rollback">
+  <h2>Rollback strategy</h2>
+  <p>The bar for production: any change can be rolled back in &lt;5 minutes without coordination.</p>
+  <ul>
+    <li><strong>Code:</strong> Redeploy previous image. Pre-pull images on the cluster so rollback is fast.</li>
+    <li><strong>Feature flag:</strong> Flip the flag. Seconds.</li>
+    <li><strong>Schema changes:</strong> Always backward-compatible. Expand-then-contract: add new fields/columns, deploy code that handles both old and new, only later remove the old.</li>
+    <li><strong>Stateful migrations:</strong> Migrations are forward-only; rolling back code while the DB has the new schema must work.</li>
+    <li><strong>Drill rollback.</strong> Once a quarter, deliberately roll back something in staging. Find the broken assumption while you're not on fire.</li>
+  </ul>
+</section>
+
+<section id="conn-pool">
+  <h2>Connection pooling</h2>
+  <p>Three pools matter most:</p>
+  <ul>
+    <li><strong>Database (Postgres):</strong> <code>sqlx</code>, <code>deadpool-postgres</code>, <code>tokio-postgres</code>. Size = expected concurrent DB ops per replica. 10-50 typical.</li>
+    <li><strong>Redis:</strong> <code>fred</code>, <code>deadpool-redis</code>. Size = concurrent Redis ops per replica. 20-100 typical for hot paths.</li>
+    <li><strong>HTTP (to backends):</strong> <code>reqwest::Client</code> reuses HTTP/2 connections. One <code>Client</code> per process; <code>.pool_max_idle_per_host(N)</code> tunes.</li>
+  </ul>
+  <p>Anti-patterns:</p>
+  <ul>
+    <li>Creating a new client per request — TCP handshake / TLS per call. Disastrous for latency.</li>
+    <li>Holding a DB connection across a long external HTTP call. Locks up the pool.</li>
+    <li>Letting pool sizes exceed downstream capacity — your DB has a max-connections limit; sum of all replicas × pool size must fit.</li>
+  </ul>
+</section>
+
+<section id="shutdown">
+  <h2>Graceful shutdown and SIGTERM</h2>
+  <p>k8s sends SIGTERM, then waits <code>terminationGracePeriodSeconds</code> (default 30s), then SIGKILL. Your service should:</p>
+  <ol>
+    <li><strong>preStop sleep</strong> — sleep 5-10s in the k8s preStop hook so the load balancer notices the pod is going away before SIGTERM arrives.</li>
+    <li><strong>On SIGTERM:</strong> stop accepting new connections, mark unhealthy.</li>
+    <li><strong>Drain</strong> in-flight requests, with a deadline.</li>
+    <li><strong>For long-running runs</strong> (agents): persist state, mark resumable, exit.</li>
+    <li><strong>Close resources</strong>: flush logs/traces, close DB connections, flush kafka producers.</li>
+    <li><strong>Exit zero</strong> on clean shutdown.</li>
+  </ol>
+  <p>See chapter <a href="11-coding-problems.html#p10-shutdown">11 P10</a> for the Rust pattern.</p>
+</section>
+
+<section id="readiness">
+  <h2>Readiness vs liveness</h2>
+  <table>
+    <thead><tr><th>Probe</th><th>Meaning</th><th>On failure</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Liveness</strong></td><td>"Am I alive?" — process responsive.</td><td>k8s kills and restarts the pod.</td></tr>
+      <tr><td><strong>Readiness</strong></td><td>"Can I serve traffic?" — dependencies OK.</td><td>k8s removes from service endpoints; pod stays running.</td></tr>
+      <tr><td><strong>Startup</strong></td><td>"Have I finished initializing?"</td><td>Disables liveness checks until startup passes.</td></tr>
+    </tbody>
+  </table>
+  <p>Endpoints:</p>
+  <ul>
+    <li><code>/livez</code> — returns 200 if the process can answer HTTP. Don't include DB/Redis checks; you don't want k8s killing pods because Postgres flickered.</li>
+    <li><code>/readyz</code> — returns 200 only if downstreams (DB, Redis, backends) are reachable and the service has loaded config.</li>
+    <li><code>/startupz</code> — returns 200 once init complete.</li>
+  </ul>
+</section>
+
+<section id="k8s">
+  <h2>Kubernetes essentials for this role</h2>
+  <p>You don't need to be a k8s expert, but you should be fluent in:</p>
+  <ul>
+    <li><strong>Deployments, Pods, Services, Endpoints.</strong> The day-to-day primitives.</li>
+    <li><strong>HPA (Horizontal Pod Autoscaler)</strong> — scale on CPU, memory, or custom metrics (queue depth, p99 latency).</li>
+    <li><strong>PDBs (Pod Disruption Budgets)</strong> — keep N pods up during voluntary disruption.</li>
+    <li><strong>Resource requests/limits.</strong> Requests = scheduling guarantee; limits = OOMkill threshold. Set both.</li>
+    <li><strong>Node affinity / taints.</strong> Pin the inference gateway near GPU nodes if that matters; or pin away from noisy neighbors.</li>
+    <li><strong>Secrets, ConfigMaps.</strong> Where credentials/config live.</li>
+    <li><strong>Service mesh.</strong> Istio or Linkerd, for mTLS between services, traffic routing for canaries, retries-at-mesh.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Interview anchor</span>
+    <p>"My deploy story is: multi-stage Docker → small image → tagged with git SHA → canary rollout via Argo → automatic rollback on SLO regression. Postgres migrations are expand-then-contract, always backward-compatible during the deploy window. Feature flags decouple deploy from release. SIGTERM triggers a graceful drain with state persistence; preStop sleep handles the LB-aware window. Liveness is process-only; readiness includes dependencies."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Data and pipelines</a> · <a href="14-domain-context.html">Next: Domain context →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

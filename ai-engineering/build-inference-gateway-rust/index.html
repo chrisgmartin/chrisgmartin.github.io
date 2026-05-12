@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Build an Inference Gateway in Rust — Hands-on Tutorial</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout layout-wide">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>On this page</h2>
+    <a href="#what">What we're building</a>
+    <a href="#architecture">Final architecture</a>
+    <a href="#prereqs">Prereqs</a>
+    <a href="#timing">Time estimate</a>
+    <a href="#chapters">Chapter index</a>
+    <a href="#after">After you finish</a>
+  </nav>
+</aside>
+
+<main>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="../../index.html">← Home</a>
+  <span class="sep">›</span>
+  <a href="../index.html">AI Engineering</a>
+  <span class="sep">›</span>
+  <span aria-current="page">Build an Inference Gateway in Rust</span>
+</nav>
+
+<header class="hero">
+  <span class="eyebrow">Build-along · Hands-on</span>
+  <h1>Build an Inference Gateway in Rust</h1>
+  <p class="subtitle">From <code>cargo new</code> to a production-shaped streaming gateway in front of vLLM — with batching, circuit breakers, request hedging, OpenTelemetry tracing, and a multi-stage Dockerfile. Three hours, ten chapters, one working repo at the end.</p>
+</header>
+
+<section id="what">
+  <h2>What we're building</h2>
+  <p>An <strong>inference gateway</strong> is the thin, fast, reliability-shaped layer between your application clients and a fleet of LLM workers (vLLM, TGI, Triton, or anything OpenAI-compatible). It's where you put the cross-cutting concerns that don't belong inside the model server: tenant routing, retries, hedging, batching, observability, auth, rate limits, the works.</p>
+  <p>By the end of this guide you'll have a Rust binary called <code>infergw</code> that:</p>
+  <ul>
+    <li>Speaks HTTP and OpenAI-compatible <code>/v1/chat/completions</code> on the front, with Server-Sent Events streaming.</li>
+    <li>Proxies to one or more upstream vLLM-compatible endpoints (we'll use a local mock so no GPU is required).</li>
+    <li>Coalesces identical in-flight prompts so duplicate requests share a single upstream call.</li>
+    <li>Wraps the upstream call in a circuit breaker, retry budget, and request hedging.</li>
+    <li>Exposes Prometheus metrics on <code>/metrics</code> and emits OTLP traces.</li>
+    <li>Ships as a ~15 MB distroless container with a healthcheck and a Kubernetes Deployment example.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Why Rust for this</span>
+    <p>An inference gateway is mostly I/O — you sit between two HTTP endpoints, push bytes, and update counters. Rust gives you <em>predictable</em> tail latency under load (no GC pauses), a precise async story via <code>tokio</code>, and a binary you can ship without runtime dependencies. The cost is a steeper learning curve, but the streaming-proxy shape is one of Rust's strongest use cases.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>Final architecture</h2>
+  <p>Here's what you'll have running on your laptop by Chapter 6:</p>
+
+<pre style="background: var(--bg-elev); padding: 18px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.5;">
+                       ┌─────────────────────────────────────────────┐
+   client (curl,       │              infergw  (this guide)          │
+   app, agent loop)    │                                             │
+        │              │   ┌──────────┐    ┌─────────────────────┐   │
+        │  POST /v1/   │   │  axum    │    │  proxy service      │   │
+        ├──chat/c. ───►├──►│  router  ├───►│   • coalesce        │   │       ┌──────────────┐
+        │   (SSE)      │   │          │    │   • circuit breaker │   ├──────►│  mock vLLM   │
+        ◄──── tokens ──┤   │          │    │   • retry + hedge   │   │ HTTP  │  (or real)   │
+                       │   └──────────┘    └─────────────────────┘   │       └──────────────┘
+                       │        │                    │               │
+                       │        ▼                    ▼               │
+                       │   /healthz             /metrics ─── prom    │
+                       │   /readyz                 │                 │
+                       │                           ▼                 │
+                       │                       OTLP traces → jaeger  │
+                       └─────────────────────────────────────────────┘
+</pre>
+
+  <p>Every box is a thing you'll write or wire up yourself. The only "magic" is what's inside <code>tokio</code> and <code>axum</code>, and we'll poke at those too.</p>
+</section>
+
+<section id="prereqs">
+  <h2>Prereqs</h2>
+  <ul>
+    <li><strong>Rust 1.75+</strong> via <code>rustup</code>. Verify with <code>rustc --version</code>.</li>
+    <li><strong>Docker</strong> 24+ and <code>docker compose</code>. Needed for Chapter 6 and the optional Jaeger/Prometheus sidecars.</li>
+    <li><strong>curl</strong> and <strong>jq</strong> for poking at endpoints.</li>
+    <li><strong>oha</strong> or <strong>vegeta</strong> for Chapter 7 load tests (you'll install it when you get there).</li>
+    <li>Comfortable with <em>basic</em> Rust: <code>Result</code>, <code>async/await</code>, <code>Arc</code>. You don't need to know <code>tower</code>, <code>hyper</code>, or <code>axum</code> — we'll build the mental model as we go.</li>
+    <li><strong>No GPU required.</strong> We use a tiny local mock upstream that returns canned SSE chunks. If you have a real vLLM endpoint you want to point at, every chapter notes how.</li>
+  </ul>
+</section>
+
+<section id="timing">
+  <h2>Time estimate</h2>
+  <p>About three hours of focused work. Each chapter ends in a runnable checkpoint, so it's safe to stop mid-guide and come back.</p>
+  <table>
+    <thead><tr><th>Chapter</th><th>Time</th><th>Checkpoint</th></tr></thead>
+    <tbody>
+      <tr><td>00 — Prereqs &amp; mock upstream</td><td>~15 min</td><td>curl the mock and see SSE chunks stream</td></tr>
+      <tr><td>01 — Skeleton: axum + tracing + shutdown</td><td>~20 min</td><td><code>/healthz</code> returns OK; Ctrl-C drains cleanly</td></tr>
+      <tr><td>02 — Proxy &amp; streaming</td><td>~30 min</td><td>tokens stream from mock through the gateway</td></tr>
+      <tr><td>03 — Batching &amp; coalescing</td><td>~25 min</td><td>two concurrent identical requests hit upstream once</td></tr>
+      <tr><td>04 — Circuit breaker &amp; hedging</td><td>~30 min</td><td>upstream flaps; gateway sheds and recovers</td></tr>
+      <tr><td>05 — Observability</td><td>~25 min</td><td>Prometheus scrapes; traces appear in Jaeger</td></tr>
+      <tr><td>06 — Docker &amp; deploy</td><td>~20 min</td><td>~15 MB distroless image runs healthy</td></tr>
+      <tr><td>07 — Load test &amp; tuning</td><td>~15 min</td><td>p99 numbers in hand; you've tuned worker threads</td></tr>
+      <tr><td>08 — Where to next</td><td>~5 min</td><td>a stretch idea you want to try</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="chapters">
+  <h2>Chapter index</h2>
+  <div class="guide-grid">
+    <a class="guide-card" href="00-prereqs-and-mock.html">
+      <span class="number">CHAPTER 00</span>
+      <span class="name">Prereqs &amp; mock upstream</span>
+      <p class="desc">Install checklist, set up the project layout, and build a 30-line mock vLLM that returns deterministic SSE chunks so you can develop without a GPU.</p>
+    </a>
+    <a class="guide-card" href="01-skeleton.html">
+      <span class="number">CHAPTER 01</span>
+      <span class="name">Skeleton: axum + tracing + shutdown</span>
+      <p class="desc"><code>cargo new</code>, wire up axum and tokio, add structured tracing, and implement graceful shutdown that drains in-flight requests before exiting.</p>
+    </a>
+    <a class="guide-card" href="02-proxy-streaming.html">
+      <span class="number">CHAPTER 02</span>
+      <span class="name">Proxy &amp; streaming</span>
+      <p class="desc">Forward chat completion requests to the upstream and stream the SSE response back to the client chunk-by-chunk using <code>reqwest</code> and <code>Stream</code>.</p>
+    </a>
+    <a class="guide-card" href="03-batching-and-coalescing.html">
+      <span class="number">CHAPTER 03</span>
+      <span class="name">Batching &amp; coalescing</span>
+      <p class="desc">Add in-flight request coalescing for identical prompts using a singleflight pattern. Measure the speedup on duplicate concurrent requests.</p>
+    </a>
+    <a class="guide-card" href="04-circuit-breakers-hedging.html">
+      <span class="number">CHAPTER 04</span>
+      <span class="name">Circuit breaker &amp; hedging</span>
+      <p class="desc">Wrap the upstream call in a retry budget, a simple circuit breaker, and request hedging that fires a backup call after p95 latency.</p>
+    </a>
+    <a class="guide-card" href="05-observability.html">
+      <span class="number">CHAPTER 05</span>
+      <span class="name">Observability</span>
+      <p class="desc">Prometheus metrics on <code>/metrics</code> (request counts, latency histograms, queue depth, upstream errors) and OTLP traces wired into Jaeger via Docker Compose.</p>
+    </a>
+    <a class="guide-card" href="06-docker-and-deploy.html">
+      <span class="number">CHAPTER 06</span>
+      <span class="name">Docker &amp; deploy</span>
+      <p class="desc">Multi-stage Dockerfile (builder → distroless), release profile tuning, healthcheck wiring, env-var config, and a sample Kubernetes Deployment.</p>
+    </a>
+    <a class="guide-card" href="07-load-test-and-tuning.html">
+      <span class="number">CHAPTER 07</span>
+      <span class="name">Load test &amp; tuning</span>
+      <p class="desc">Drive the gateway with <code>oha</code>, read your own Prometheus metrics under load, and tune <code>tokio</code> worker threads against tail latency.</p>
+    </a>
+    <a class="guide-card" href="08-where-to-next.html">
+      <span class="number">CHAPTER 08</span>
+      <span class="name">Where to next</span>
+      <p class="desc">Stretch ideas — auth, multi-tenancy, KV-cache aware routing, model fallback, structured output validation — and a reading list to go deeper.</p>
+    </a>
+  </div>
+</section>
+
+<section id="after">
+  <h2>After you finish</h2>
+  <p>You'll have a real, runnable Rust gateway you can point a coding interviewer or a hiring manager at. More usefully, you'll have <em>built</em> the things that ML serving infrastructure engineers talk about — coalescing, hedging, circuit breaking, multi-stage builds — instead of having only read about them. The vocabulary will feel different on the way out.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Start anywhere</span>
+    <p>If you only have an hour, do 00→02 and you'll have a working streaming proxy. If you only care about reliability patterns, skim 01 and go straight to 03/04. Each chapter's checkpoint is a clean stopping point.</p>
+  </div>
+
+  <p style="margin-top: 24px;"><a href="00-prereqs-and-mock.html"><strong>→ Start with Chapter 00: Prereqs &amp; mock upstream</strong></a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — Inference Gateway Data Flows</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#flow">Data flow through the gateway</a>
+    <a href="#traces">Trace propagation</a>
+    <a href="#metrics">Metrics pipeline</a>
+    <a href="#logs">Log aggregation</a>
+    <a href="#event-sourcing">Event sourcing for agent actions</a>
+    <a href="#postgres">Postgres for run state</a>
+    <a href="#redis">Redis for ephemeral state</a>
+    <a href="#kafka">Kafka / streaming pipelines</a>
+    <a href="#data-quality">Data quality at the boundaries</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">How data flows through an inference gateway and orchestrator — traces, metrics, logs, audit events, persistence stores, and the streaming pipelines that turn agent runs into useful data downstream.</p>
+</header>
+
+<section id="flow">
+  <h2>Data flow through an inference gateway</h2>
+  <p>The mental picture for the senior interview:</p>
+  <pre><code>client
+  │  HTTP/gRPC request
+  ▼
+[edge: TLS, request ID, auth]
+  │
+  ▼
+[gateway: rate-limit, validate, route]──▶[metrics: counters/histograms]
+  │                                       (Prometheus / OTLP)
+  │
+  ▼
+[backend pool: vLLM / Triton / Anthropic]
+  │
+  ├──▶ [structured logs: JSON lines]
+  │     (Vector / Fluent Bit -&gt; Loki / Elastic)
+  │
+  ├──▶ [traces: OTel spans]
+  │     (OTel Collector -&gt; Tempo / Jaeger)
+  │
+  └──▶ [audit events: append-only]
+        (Kafka topic / Postgres)
+  ▼
+response stream back to client
+</code></pre>
+  <p>Three parallel data planes leave every request: <strong>metrics</strong> (aggregated), <strong>logs</strong> (per-event), <strong>traces</strong> (per-span). Plus the audit event plane for compliance-relevant actions.</p>
+</section>
+
+<section id="traces">
+  <h2>Trace propagation</h2>
+  <p>Already covered structurally in <a href="09-governance-and-audit.html#trace-ids">09</a>. The data-pipeline view:</p>
+  <ul>
+    <li><strong>Process-internal:</strong> spans linked via the <code>tracing</code> crate context.</li>
+    <li><strong>Across processes (HTTP/gRPC):</strong> W3C trace context headers (<code>traceparent</code>, <code>tracestate</code>).</li>
+    <li><strong>Through queues (Kafka):</strong> trace context as a Kafka message header. The consumer continues the trace.</li>
+    <li><strong>Sampling:</strong> head-based vs tail-based. Tail-based (decide to keep a trace after seeing its outcome — e.g., always keep errors) is more useful but costs more.</li>
+    <li><strong>Storage:</strong> Tempo, Jaeger, Honeycomb, Datadog. Retention is short by default (days); important traces archived separately.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Default to do</span>
+    <p>Configure your tracer to <strong>always sample errors</strong> and <strong>sample 1-10% of successes</strong>. Errors are rare and informative; you want them all.</p>
+  </div>
+</section>
+
+<section id="metrics">
+  <h2>Metrics pipeline (Prometheus)</h2>
+  <p>Prometheus pull-based scraping is the default at fintechs. Your Rust service exposes <code>/metrics</code> in Prometheus text format; a scraper polls every 15s. From there:</p>
+  <pre><code>service /metrics ──▶ Prometheus ──▶ Cortex/Thanos (long-term, multi-cluster) ──▶ Grafana
+                  │
+                  └──▶ Alertmanager ──▶ PagerDuty / Slack
+</code></pre>
+  <p>In Rust, use <code>prometheus</code> or <code>metrics</code> + <code>metrics-exporter-prometheus</code>:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use metrics::{counter, histogram};
+
+pub async fn handle(req: GenerateReq) {
+    let t = std::time::Instant::now();
+    let result = call_backend(&amp;req).await;
+    let status = if result.is_ok() { "ok" } else { "err" };
+    counter!("requests_total", 1, "model" =&gt; req.model.clone(), "status" =&gt; status);
+    histogram!("request_seconds", t.elapsed().as_secs_f64(),
+        "model" =&gt; req.model, "status" =&gt; status);
+}
+</code></pre></div>
+  <p>Cardinality discipline: don't use unbounded labels (user_id, request_id) on metrics. Prometheus stores one time series per label combination; unbounded labels OOM the scraper.</p>
+</section>
+
+<section id="logs">
+  <h2>Log aggregation</h2>
+  <p>Service writes JSON-line logs to stdout. A node-level agent (Vector, Fluent Bit, Filebeat) ships them to a backend (Loki, Elasticsearch, CloudWatch, BigQuery).</p>
+  <ul>
+    <li><strong>Don't log to a file the service manages</strong> — let the platform do it. Stdout/stderr is the k8s contract.</li>
+    <li><strong>Structured JSON.</strong> Every log line is parseable. <code>tracing-subscriber</code>'s <code>fmt::layer().json()</code> does this.</li>
+    <li><strong>Sampling for high-volume logs.</strong> 100% sampling for errors; lower for routine info.</li>
+    <li><strong>Don't log full prompts/responses.</strong> Log hashes + length + cost. Store bodies separately with access controls.</li>
+    <li><strong>Sensitive-field redaction</strong> happens at the log layer if anything makes it through the application layer.</li>
+  </ul>
+</section>
+
+<section id="event-sourcing">
+  <h2>Event sourcing for agent actions</h2>
+  <p>An agent run is naturally event-sourced: the state is derived by replaying a sequence of events (RunStarted, ModelCalled, ToolCalled, ApprovalGranted, StepCompleted, RunCompleted). For audit and replay, this is gold.</p>
+  <ul>
+    <li><strong>Events are append-only.</strong> Never updated, never deleted (within retention).</li>
+    <li><strong>State is a projection.</strong> The "current run state" is what you get by folding the event stream.</li>
+    <li><strong>You can replay.</strong> Given the events, you can rebuild any state at any point. Critical for audit ("what did this look like at 2:14pm?").</li>
+    <li><strong>Storage:</strong> Kafka for hot stream; periodic snapshot to S3; Postgres index for fast "give me events for run R" queries.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum RunEvent {
+    Started { run_id: String, user: String, policy: String, at_ms: u64 },
+    ModelCalled { step: u32, prompt_hash: String, resp_hash: String, model: String, cost_usd: f32 },
+    ToolCalled { step: u32, tool: String, idem_key: String, args_hash: String, result_hash: String, ok: bool },
+    ApprovalRequested { step: u32, tool: String },
+    ApprovalDecided { step: u32, approver: String, decision: bool },
+    Completed { final_status: String, total_cost_usd: f32 },
+    Failed { error: String, retryable: bool },
+}
+</code></pre></div>
+</section>
+
+<section id="postgres">
+  <h2>Postgres for run state</h2>
+  <p>The durable home for orchestration state. Schema sketch:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">CREATE TABLE runs (
+  run_id      UUID PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  policy      TEXT NOT NULL,
+  status      TEXT NOT NULL,  -- pending|running|awaiting_approval|complete|failed|cancelled
+  step_count  INTEGER NOT NULL DEFAULT 0,
+  budget_usd  REAL NOT NULL,
+  spent_usd   REAL NOT NULL DEFAULT 0,
+  deadline    TIMESTAMPTZ NOT NULL,
+  state       JSONB NOT NULL,     -- current messages, partial outputs
+  version     BIGINT NOT NULL DEFAULT 0, -- optimistic concurrency
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE run_events (
+  event_id    BIGSERIAL PRIMARY KEY,
+  run_id      UUID NOT NULL REFERENCES runs(run_id),
+  seq         INTEGER NOT NULL,
+  event       JSONB NOT NULL,
+  at_ms       BIGINT NOT NULL,
+  UNIQUE (run_id, seq)
+);
+
+CREATE INDEX run_events_run_id ON run_events (run_id, seq);
+
+CREATE TABLE idempotency (
+  key         UUID PRIMARY KEY,
+  scope       TEXT NOT NULL,    -- (run_id, step_id) or similar
+  status      TEXT NOT NULL,    -- in_progress | done | failed
+  result      JSONB,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at  TIMESTAMPTZ NOT NULL
+);
+</code></pre></div>
+  <p>Patterns:</p>
+  <ul>
+    <li><strong>Optimistic concurrency</strong> via <code>version</code>: <code>UPDATE runs SET ... , version=version+1 WHERE run_id=$1 AND version=$2</code>. If 0 rows updated, retry.</li>
+    <li><strong>Connection pool</strong> via <code>sqlx</code> or <code>deadpool-postgres</code>. Size: typically 10-50 per service replica; tune by load.</li>
+    <li><strong>Migrations</strong> via <code>sqlx-cli</code> or <code>refinery</code>. Versioned, forward-only.</li>
+    <li><strong>Read replicas</strong> for "list my runs" queries; primary for state mutations.</li>
+  </ul>
+</section>
+
+<section id="redis">
+  <h2>Redis for ephemeral state</h2>
+  <p>Postgres is durable but not fast enough for hot path. Redis fills the gap:</p>
+  <ul>
+    <li><strong>Rate-limit token buckets</strong> — INCR/EXPIRE or Lua script.</li>
+    <li><strong>Idempotency in-progress markers</strong> with short TTL (durable record goes to Postgres on completion).</li>
+    <li><strong>Distributed locks</strong> (with <strong>caution</strong> — Redlock is debated; for stronger guarantees use a leased lock in Postgres or a real consensus store).</li>
+    <li><strong>Cached prompt-prefix → backend routing decisions.</strong></li>
+    <li><strong>Pub/sub for kill-switch and cancellation broadcasts.</strong></li>
+    <li><strong>Per-tenant counters</strong> for cost accounting (eventually consistent with the source of truth in Postgres).</li>
+  </ul>
+  <p>Use <code>deadpool-redis</code> or <code>fred</code> for async Redis in Rust. <code>fred</code> has more advanced cluster/sentinel support; <code>deadpool</code> is simpler.</p>
+</section>
+
+<section id="kafka">
+  <h2>Kafka / streaming pipelines</h2>
+  <p>For event streams that need to be consumed by multiple downstream systems (analytics, eval-data collection, audit archive, ML training pipelines):</p>
+  <ul>
+    <li><strong>Topic per event family.</strong> <code>agent.runs.events</code>, <code>gateway.requests</code>, <code>tool.calls</code>.</li>
+    <li><strong>Schema registry.</strong> Avro / Protobuf with versioning. Don't ship free-form JSON.</li>
+    <li><strong>Partitioning</strong> by run_id for run events (preserves order per run).</li>
+    <li><strong>Retention</strong> per topic — short for hot streams, long for audit.</li>
+    <li><strong>Consumer groups</strong> for parallel processing.</li>
+    <li><strong>Exactly-once delivery</strong> is a property of the consumer + idempotent sink, not the broker.</li>
+  </ul>
+  <p>In Rust: <code>rdkafka</code> (librdkafka bindings) is the mainstream client.</p>
+</section>
+
+<section id="data-quality">
+  <h2>Data quality at the boundaries</h2>
+  <p>Garbage in, garbage out. The places to enforce contracts:</p>
+  <ol>
+    <li><strong>Public API request validation.</strong> Strict schemas; reject malformed.</li>
+    <li><strong>Tool args validation.</strong> JSON schema, validated before dispatch.</li>
+    <li><strong>Model response shape.</strong> If you expect JSON, parse strictly. On failure, repair-prompt or escalate.</li>
+    <li><strong>Event publishing.</strong> The event you publish must conform to the schema-registry contract. Fail fast on bad events, don't poison the stream.</li>
+    <li><strong>DB writes.</strong> Postgres CHECK constraints, foreign keys. Make the DB the last line of defense against corruption.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">Senior synthesis</span>
+    <p>"Three planes of data leave every request — metrics (cardinal), logs (per-event), traces (per-span) — plus audit events on a fourth, durable plane. The discipline is keeping each plane appropriately sampled and retained: high cardinality stays in logs/traces; aggregates in metrics; compliance-critical events in the audit plane forever."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Coding problems</a> · <a href="13-deployment-and-ops.html">Next: Deployment and ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

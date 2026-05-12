@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analytics Fundamentals — SQL &amp; Notebook Fluency for PMs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-pms-sql">Why PMs need SQL</a>
+    <a href="#sql-survival">SQL survival kit</a>
+    <a href="#funnel-pattern">The funnel-analysis pattern</a>
+    <a href="#cohort-pattern">The cohort pattern</a>
+    <a href="#window-funcs">Window functions worth knowing</a>
+    <a href="#ab-test-sql">Reading an A/B test in SQL</a>
+    <a href="#notebook">Notebook fluency</a>
+    <a href="#bi-tools">Looker / Mode / Hex craft</a>
+    <a href="#population-discipline">Population definition discipline</a>
+    <a href="#reproducible">Don't ship a chart you can't reproduce</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Analytics</span>
+  <h1>Analytics Fundamentals — SQL &amp; Notebook Fluency for PMs</h1>
+  <p class="subtitle">The "coding" round for a Platform PM is rarely LeetCode. It's SQL on a funnel, a cohort, an A/B test, or an instrumentation gap. Plus notebook and BI tool fluency. This chapter covers the patterns you'll be tested on and the discipline that separates "PM who uses SQL" from "PM who can hold their own with a data scientist."</p>
+</header>
+
+<section id="why-pms-sql">
+  <h2>Why a Platform PM needs SQL</h2>
+  <p>You're going to be the one defining metrics for the platform. Definitions live in queries. The PM who hands off "give me the activation rate" without specifying gets back a number that's defensible-to-the-DS but not what they meant. The PM who writes the query gets the truth.</p>
+  <p>Plus, you'll be asked. Most senior PM loops at fintech / crypto include a SQL round. Sometimes a take-home. Often live.</p>
+  <ul>
+    <li>You don't need to be a data engineer.</li>
+    <li>You do need to write a clean funnel, a clean cohort, and a clean A/B test analysis without hand-holding.</li>
+    <li>You should know enough to spot a bad number when one is presented to you.</li>
+  </ul>
+</section>
+
+<section id="sql-survival">
+  <h2>SQL survival kit</h2>
+  <p>The 80% of SQL that gets PMs through:</p>
+  <ul>
+    <li><code>SELECT</code> + <code>WHERE</code> + <code>GROUP BY</code> + <code>HAVING</code> + <code>ORDER BY</code> — basics.</li>
+    <li><code>JOIN</code> shapes — <code>INNER</code>, <code>LEFT</code>, <code>FULL OUTER</code>. Know what each does to row counts.</li>
+    <li><code>CASE WHEN</code> for derived buckets.</li>
+    <li><code>COUNT</code>, <code>COUNT DISTINCT</code>, <code>SUM</code>, <code>AVG</code>, <code>PERCENTILE_CONT</code>.</li>
+    <li>Date functions — <code>DATE_TRUNC</code>, <code>DATE_DIFF</code>, <code>INTERVAL</code>.</li>
+    <li>CTEs (<code>WITH ... AS</code>) — chain steps readably.</li>
+    <li>Window functions — <code>ROW_NUMBER</code>, <code>LAG</code>, <code>LEAD</code>, <code>SUM OVER</code>.</li>
+    <li><code>NULL</code> handling — <code>COALESCE</code>, <code>IS NULL</code>, behavior in joins.</li>
+  </ul>
+  <p>The Snowflake / BigQuery / Postgres flavor variations are real but small. Don't memorize three; learn one well and translate.</p>
+</section>
+
+<section id="funnel-pattern">
+  <h2>The funnel-analysis pattern</h2>
+  <p>Onboarding is a funnel. Almost every analytics task in this seat starts as "what's our funnel doing?" The pattern, written cleanly:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Onboarding funnel, weekly cohort, by segment
+WITH starts AS (
+  SELECT
+    applicant_id,
+    DATE_TRUNC('week', created_at)         AS cohort_week,
+    segment,
+    region
+  FROM onboarding.applicants
+  WHERE created_at &gt;= '2026-01-01'
+),
+events AS (
+  SELECT applicant_id, event_type, occurred_at
+  FROM onboarding.events
+  WHERE event_type IN (
+    'id_submitted', 'verified', 'approved', 'first_deposit'
+  )
+)
+SELECT
+  s.cohort_week,
+  s.segment,
+  s.region,
+  COUNT(DISTINCT s.applicant_id)                                AS started,
+  COUNT(DISTINCT CASE WHEN e.event_type = 'id_submitted'  THEN s.applicant_id END) AS id_submitted,
+  COUNT(DISTINCT CASE WHEN e.event_type = 'verified'      THEN s.applicant_id END) AS verified,
+  COUNT(DISTINCT CASE WHEN e.event_type = 'approved'      THEN s.applicant_id END) AS approved,
+  COUNT(DISTINCT CASE WHEN e.event_type = 'first_deposit' THEN s.applicant_id END) AS activated
+FROM starts s
+LEFT JOIN events e USING (applicant_id)
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, 2, 3;
+</code></pre></div>
+  <p>Notes a senior PM would call out reviewing this:</p>
+  <ul>
+    <li><strong>Population:</strong> "started" is anyone who created an applicant record after 2026-01-01. That's a choice. Could also be "anyone who confirmed email." Be explicit.</li>
+    <li><strong>Counting distinct applicants</strong> avoids double-counting if events fire twice.</li>
+    <li><strong>Cohort by week of start</strong> means each cohort has a fixed N, so rates are stable to compare.</li>
+    <li><strong>LEFT JOIN</strong> keeps applicants who never produced events — drop-off shows correctly.</li>
+    <li><strong>Cohort window</strong>: you may need to filter cohorts where the most recent ones haven't had time to convert. Otherwise "this week's cohort looks bad" is a measurement artifact.</li>
+  </ul>
+</section>
+
+<section id="cohort-pattern">
+  <h2>The cohort retention pattern</h2>
+  <p>Cohort retention by entry-path — useful for "do users who came in via Pro convert differently?"</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- D7 activation by acquisition source
+WITH cohorts AS (
+  SELECT
+    applicant_id,
+    DATE(created_at)       AS cohort_day,
+    acquisition_source     AS source
+  FROM onboarding.applicants
+  WHERE created_at BETWEEN '2026-01-01' AND CURRENT_DATE - INTERVAL '7 days'
+),
+activated AS (
+  SELECT
+    applicant_id,
+    MIN(occurred_at)       AS first_activation
+  FROM onboarding.events
+  WHERE event_type = 'first_deposit'
+  GROUP BY applicant_id
+)
+SELECT
+  c.source,
+  COUNT(*)                                                         AS cohort_n,
+  COUNT(CASE WHEN a.first_activation &lt;= c.cohort_day + INTERVAL '7 days' THEN 1 END) AS activated_7d,
+  ROUND(100.0 * COUNT(CASE WHEN a.first_activation &lt;= c.cohort_day + INTERVAL '7 days' THEN 1 END)
+        / NULLIF(COUNT(*), 0), 2)                                  AS d7_activation_pct
+FROM cohorts c
+LEFT JOIN activated a USING (applicant_id)
+GROUP BY 1
+ORDER BY cohort_n DESC;
+</code></pre></div>
+  <p>Why the <code>WHERE created_at &lt;= CURRENT_DATE - INTERVAL '7 days'</code>? Because if you include cohorts younger than 7 days, they haven't had time to activate. That's a discipline most candidates miss.</p>
+</section>
+
+<section id="window-funcs">
+  <h2>Window functions worth knowing</h2>
+  <p>Window functions are where SQL stops being "for loops" and starts being analytical. Three you should know cold:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Time-between-events with LAG
+SELECT
+  applicant_id,
+  event_type,
+  occurred_at,
+  LAG(occurred_at) OVER (PARTITION BY applicant_id ORDER BY occurred_at) AS prev_event_at,
+  EXTRACT(EPOCH FROM occurred_at - LAG(occurred_at)
+           OVER (PARTITION BY applicant_id ORDER BY occurred_at)) AS seconds_since_prev
+FROM onboarding.events;
+
+-- First event per applicant with ROW_NUMBER
+WITH ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY applicant_id ORDER BY occurred_at) AS rn
+  FROM onboarding.events
+  WHERE event_type = 'verified'
+)
+SELECT * FROM ranked WHERE rn = 1;
+
+-- Running total with SUM OVER
+SELECT
+  DATE_TRUNC('day', occurred_at) AS day,
+  COUNT(*) AS daily_verifications,
+  SUM(COUNT(*)) OVER (ORDER BY DATE_TRUNC('day', occurred_at)) AS cumulative
+FROM onboarding.events
+WHERE event_type = 'verified'
+GROUP BY 1;
+</code></pre></div>
+</section>
+
+<section id="ab-test-sql">
+  <h2>Reading an A/B test in SQL</h2>
+  <p>Live problem: "We tested vendor B against vendor A. Did B improve approval rate?"</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- Assignment table tells you who got which variant
+-- Be careful: only count post-assignment events
+WITH assignments AS (
+  SELECT applicant_id, variant, assigned_at
+  FROM experiments.vendor_ab
+  WHERE experiment_id = 'idv_vendor_2026q1'
+),
+outcomes AS (
+  SELECT
+    a.applicant_id,
+    a.variant,
+    MAX(CASE WHEN e.event_type = 'approved' AND e.occurred_at &gt; a.assigned_at THEN 1 ELSE 0 END) AS approved
+  FROM assignments a
+  LEFT JOIN onboarding.events e USING (applicant_id)
+  GROUP BY a.applicant_id, a.variant
+)
+SELECT
+  variant,
+  COUNT(*)                                       AS n,
+  SUM(approved)                                  AS approvals,
+  ROUND(100.0 * SUM(approved) / COUNT(*), 2)     AS approval_rate_pct
+FROM outcomes
+GROUP BY variant;
+</code></pre></div>
+  <p>The trap most candidates fall into: counting outcomes that happened <em>before</em> assignment, or counting users who saw both variants because the assignment broke. Naming the trap shows seniority.</p>
+  <p>You won't be expected to compute statistical significance live by hand. You should be able to say "I'd compute a two-proportion z-test or use the bootstrapped CI" and reach for the right tool.</p>
+</section>
+
+<section id="notebook">
+  <h2>Notebook fluency</h2>
+  <p>Jupyter / Hex / Mode / Deepnote notebooks are the standard PM analysis environment. What you need to be able to do:</p>
+  <ul>
+    <li>Open a notebook, connect to the data warehouse, write a query, plot it.</li>
+    <li>Use <code>pandas</code> for slicing — <code>groupby</code>, <code>merge</code>, <code>pivot_table</code>, <code>resample</code>.</li>
+    <li>Use a plotting library — <code>matplotlib</code> or <code>plotly</code> — well enough for an exploratory chart, not production-pretty.</li>
+    <li>Compute basic stats — mean, median, percentiles, <code>scipy.stats</code> for a z-test or t-test.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">import pandas as pd
+import matplotlib.pyplot as plt
+
+# Funnel data from SQL
+df = pd.read_sql(funnel_sql, engine)
+
+# Stage-to-stage conversion
+df['id_submit_rate']  = df['id_submitted']  / df['started']
+df['verify_rate']     = df['verified']      / df['id_submitted']
+df['approve_rate']    = df['approved']      / df['verified']
+df['activation_rate'] = df['activated']     / df['approved']
+
+# By cohort plot
+pivot = df.pivot_table(index='cohort_week', columns='segment',
+                      values='activation_rate', aggfunc='mean')
+pivot.plot(figsize=(10, 5), title='D7 activation by cohort & segment')
+plt.ylabel('activation rate')
+plt.show()
+</code></pre></div>
+</section>
+
+<section id="bi-tools">
+  <h2>Looker / Mode / Hex craft</h2>
+  <p>What the BI fluency check actually is:</p>
+  <ul>
+    <li>Can you read a Looker LookML model and tell whether it's reasonable? (You don't need to write LookML; you do need to recognize what a "view," "explore," and "dimension" are.)</li>
+    <li>Can you build a Mode or Hex report someone else can rerun?</li>
+    <li>Can you spot a metric defined inconsistently across two dashboards?</li>
+    <li>Can you write a dashboard's underlying SQL clean enough that a DS partner can extend it without rewriting?</li>
+  </ul>
+  <p>The PM who pastes a screenshot of a dashboard into a doc is unhelpful. The PM who pastes a screenshot plus the dashboard URL plus the query plus the population definition is the PM who gets trusted.</p>
+</section>
+
+<section id="population-discipline">
+  <h2>Population definition discipline</h2>
+  <p>The single most important habit to demonstrate in a PM analytics round. Before any number, you state the population.</p>
+  <table>
+    <thead><tr><th>Common ambiguity</th><th>The discipline</th></tr></thead>
+    <tbody>
+      <tr><td>"Activation rate"</td><td>"% of applicants who first-deposit within 7 days of being approved, cohorted by week of approval, excluding the most recent 7 days because they haven't had time to convert."</td></tr>
+      <tr><td>"Verified users"</td><td>"Applicants in state 'approved' whose most recent re-screening did not raise a hit."</td></tr>
+      <tr><td>"Onboarding time"</td><td>"Median wall-clock from first applicant event to first 'approved' event, excluding applicants who never reach approved."</td></tr>
+      <tr><td>"Fraud rate"</td><td>"Count of accounts blocked-for-fraud within 90 days of approval / count of approved accounts, by approval cohort week."</td></tr>
+    </tbody>
+  </table>
+  <p>Whenever you say a metric, restate the population. This is the fastest credibility signal in an analytics round.</p>
+</section>
+
+<section id="reproducible">
+  <h2>Don't ship a chart you can't reproduce</h2>
+  <p>The hardest discipline: every chart you share has a query attached. The query is in source control or the dashboard tool, not your local notebook. A reviewer can rerun it and get the same number a week later.</p>
+  <ul>
+    <li>Never paste a screenshot without a link.</li>
+    <li>Never quote a number without naming the dashboard or query.</li>
+    <li>Never ship a metric in a PRD without the SQL definition behind it.</li>
+    <li>Version-control your important queries — they're product artifacts.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">In the interview</span>
+    <p>If asked to walk through how you'd measure something, narrate the population first, the metric next, the query third, and the trap-you-would-avoid last. That's the cadence of a senior PM.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Previous</a> · <a href="11-coding-problems.html">Next: Practice problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

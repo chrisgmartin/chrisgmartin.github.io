@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — Rust Patterns &amp; DSA</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#string-types">String vs &amp;str vs Cow</a>
+    <a href="#ownership-types">Box, Rc, Arc</a>
+    <a href="#async-cancel">Async cancellation</a>
+    <a href="#channel-patterns">Channel patterns</a>
+    <a href="#error-types">Error type design</a>
+    <a href="#trait-objects">Trait objects &amp; generics</a>
+    <a href="#dsa">DSA suite</a>
+    <a href="#concurrency-primitives">Concurrency primitives</a>
+    <a href="#big-o">Big-O cheat sheet</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">Rust patterns interviewers ask about, the DSA suite you should know cold, and the concurrency primitives that come up in async-Rust coding rounds.</p>
+</header>
+
+<section id="string-types">
+  <h2>String vs &amp;str vs Cow</h2>
+  <table>
+    <thead><tr><th>Type</th><th>What it is</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>String</code></td><td>Owned, growable UTF-8 buffer on the heap.</td><td>You need to own + mutate text.</td></tr>
+      <tr><td><code>&amp;str</code></td><td>Borrowed string slice. Pointer + length.</td><td>Read-only access. Default for function arguments.</td></tr>
+      <tr><td><code>&amp;'static str</code></td><td>Borrowed slice with program-long lifetime. String literals.</td><td>Compile-time string constants.</td></tr>
+      <tr><td><code>Cow&lt;'a, str&gt;</code></td><td>Either <code>Borrowed(&amp;'a str)</code> or <code>Owned(String)</code>.</td><td>Sometimes you need to mutate (then own), sometimes you don't (then borrow). Lazy.</td></tr>
+      <tr><td><code>Box&lt;str&gt;</code></td><td>Owned, immutable, heap-allocated. Smaller than <code>String</code> (no capacity field).</td><td>Many small immutable strings stored long-term.</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::borrow::Cow;
+
+// Returns borrowed if no replacement needed, owned if replacement happened.
+fn redact_email(s: &amp;str) -&gt; Cow&lt;'_, str&gt; {
+    if !s.contains('@') {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.replace(|c: char| c.is_alphanumeric(), "*"))
+    }
+}
+</code></pre></div>
+  <p>Interview test: someone hands you <code>fn parse(s: String)</code> as an API. Senior answer: "Take <code>&amp;str</code> unless you're storing it." Strings should usually be borrowed at API boundaries.</p>
+</section>
+
+<section id="ownership-types">
+  <h2>Box, Rc, Arc</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Ownership</th><th>Threading</th><th>Mutable inside?</th></tr></thead>
+    <tbody>
+      <tr><td><code>Box&lt;T&gt;</code></td><td>Unique owner, heap-allocated</td><td>Send if T is Send</td><td>Yes, via <code>&amp;mut</code></td></tr>
+      <tr><td><code>Rc&lt;T&gt;</code></td><td>Reference-counted, multiple owners</td><td>!Send (single-thread only)</td><td>No without interior mutability (<code>RefCell</code>)</td></tr>
+      <tr><td><code>Arc&lt;T&gt;</code></td><td>Atomic reference-counted, multi-owner</td><td>Send + Sync if T is Send + Sync</td><td>No without interior mutability (<code>Mutex</code>/<code>RwLock</code>)</td></tr>
+    </tbody>
+  </table>
+  <p>Default in service code: <code>Arc&lt;T&gt;</code> for shared state across tasks. <code>Box&lt;T&gt;</code> for trait objects and recursive types. <code>Rc&lt;T&gt;</code> is rare in service code (single-threaded scenarios only).</p>
+  <div class="callout warn">
+    <span class="callout-label">Common interview trap</span>
+    <p>"Why does this code compile error?" — the candidate code uses <code>Rc</code> inside a <code>tokio::spawn</code>. Tokio tasks move between threads, so values inside them must be <code>Send</code>. <code>Rc</code> is not. Use <code>Arc</code>.</p>
+  </div>
+</section>
+
+<section id="async-cancel">
+  <h2>Async cancellation</h2>
+  <p>Three things to know cold:</p>
+  <ol>
+    <li><strong>Cancellation = drop.</strong> When you drop a future, its in-flight work stops at the next <code>.await</code> point. Resources owned by the future are released by destructors.</li>
+    <li><strong>Cancellation is cooperative.</strong> If a task is CPU-spinning without awaits, you can't cancel it. The fix is yielding, or moving the work to <code>spawn_blocking</code>.</li>
+    <li><strong>Cancel-safety</strong> is a property of a future: can it be cancelled mid-execution without leaving state corrupted? <code>tokio::select!</code> docs flag which futures are cancel-safe; <code>mpsc::Receiver::recv</code> is, but <code>broadcast::Receiver::recv</code> is not (you may lose a message).</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::select;
+use tokio_util::sync::CancellationToken;
+
+async fn work(token: CancellationToken) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        select! {
+            _ = token.cancelled() =&gt; { break; }   // cooperative cancel
+            _ = interval.tick()   =&gt; { do_step().await; }
+        }
+    }
+    cleanup().await; // runs after cancel
+}
+</code></pre></div>
+</section>
+
+<section id="channel-patterns">
+  <h2>Channel patterns interviewers love</h2>
+
+  <h3>Request-reply with oneshot</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::sync::{mpsc, oneshot};
+
+enum Req { Compute { input: u64, reply: oneshot::Sender&lt;u64&gt; } }
+
+let (tx, mut rx) = mpsc::channel::&lt;Req&gt;(64);
+
+tokio::spawn(async move {
+    while let Some(Req::Compute { input, reply }) = rx.recv().await {
+        let _ = reply.send(input * 2);
+    }
+});
+
+let (rtx, rrx) = oneshot::channel();
+tx.send(Req::Compute { input: 21, reply: rtx }).await.ok();
+let answer = rrx.await.unwrap(); // 42
+</code></pre></div>
+
+  <h3>Fan-out with broadcast</h3>
+  <p>Many tasks subscribe; each gets a copy of every message. Late subscribers miss prior messages.</p>
+
+  <h3>Worker pool with bounded mpsc</h3>
+  <p>One channel feeds N worker tasks. The bounded capacity provides backpressure.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">let (tx, rx) = tokio::sync::mpsc::channel::&lt;Job&gt;(1024);
+let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+
+for _ in 0..16 {
+    let rx = rx.clone();
+    tokio::spawn(async move {
+        loop {
+            let job = { rx.lock().await.recv().await };
+            match job {
+                Some(j) =&gt; process(j).await,
+                None    =&gt; break, // channel closed
+            }
+        }
+    });
+}
+</code></pre></div>
+  <p>Note: a single shared <code>Mutex&lt;Receiver&gt;</code> is the simple form. For higher throughput, give each worker its own receiver via cloning, or use a work-stealing crate.</p>
+</section>
+
+<section id="error-types">
+  <h2>Error type design</h2>
+  <p>For library or service code (where callers branch on errors), define an enum with <code>thiserror</code>:</p>
+  <ul>
+    <li><strong>One variant per failure mode</strong> the caller might handle differently.</li>
+    <li><strong>Include <code>#[from]</code></strong> for source errors that should propagate transparently via <code>?</code>.</li>
+    <li><strong>Add <code>retryable: bool</code></strong> on transient variants. Or use a method <code>fn is_retryable(&amp;self) -&gt; bool</code>.</li>
+    <li><strong>Don't expose internal panics</strong> — convert them at the boundary.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">#[derive(thiserror::Error, Debug)]
+pub enum ToolError {
+    #[error("tool not found: {0}")]
+    NotFound(String),
+    #[error("schema validation failed: {0}")]
+    InvalidArgs(String),
+    #[error("unauthorized: user {user} cannot call {tool}")]
+    Unauthorized { user: String, tool: String },
+    #[error("upstream error: {0}")]
+    Upstream(#[source] BackendError),
+    #[error("timeout after {0:?}")]
+    Timeout(std::time::Duration),
+}
+
+impl ToolError {
+    pub fn is_retryable(&amp;self) -&gt; bool {
+        matches!(self, ToolError::Upstream(_) | ToolError::Timeout(_))
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="trait-objects">
+  <h2>Trait objects vs generics</h2>
+  <p>When you need polymorphism:</p>
+  <table>
+    <thead><tr><th></th><th>Static (generics)</th><th>Dynamic (trait objects)</th></tr></thead>
+    <tbody>
+      <tr><td>Syntax</td><td><code>fn f&lt;T: Tool&gt;(t: T)</code></td><td><code>fn f(t: &amp;dyn Tool)</code> or <code>Box&lt;dyn Tool&gt;</code></td></tr>
+      <tr><td>Dispatch</td><td>Monomorphized at compile time</td><td>Vtable lookup at runtime</td></tr>
+      <tr><td>Binary size</td><td>One copy per concrete type</td><td>One copy</td></tr>
+      <tr><td>Performance</td><td>Slightly faster (inlining)</td><td>Slightly slower (indirect call)</td></tr>
+      <tr><td>Use when</td><td>Hot path; small set of types</td><td>Plugin registries; many types; heterogeneous collections</td></tr>
+    </tbody>
+  </table>
+  <p>For a tool registry (heterogeneous, runtime-known set), <code>Box&lt;dyn Tool&gt;</code> is right. For a generic worker that processes one type at a time, generics are right.</p>
+</section>
+
+<section id="dsa">
+  <h2>DSA — the suite you must know cold</h2>
+  <p>Live coding rounds for Rust infra roles are typically not LeetCode-heavy, but you should be fluent in:</p>
+  <table>
+    <thead><tr><th>Pattern</th><th>Typical problems</th></tr></thead>
+    <tbody>
+      <tr><td>Hash maps / sets</td><td>Two-sum, group anagrams, longest substring without repeat</td></tr>
+      <tr><td>Sliding window</td><td>Max-sum subarray of size k, longest substring with k distinct</td></tr>
+      <tr><td>Two pointers</td><td>Sorted-array two-sum, three-sum, container with most water</td></tr>
+      <tr><td>Stacks / monotonic stacks</td><td>Valid parens, next-greater-element</td></tr>
+      <tr><td>BFS / DFS on graphs</td><td>Connected components, topological sort, shortest path (unweighted)</td></tr>
+      <tr><td>Heaps / priority queues</td><td>Top-k, merge k sorted</td></tr>
+      <tr><td>Tries</td><td>Autocomplete, prefix matching</td></tr>
+      <tr><td>Binary search</td><td>On sorted arrays, on answer space</td></tr>
+      <tr><td>Intervals</td><td>Merge intervals, meeting rooms</td></tr>
+      <tr><td>Streams</td><td>Reservoir sampling, top-k from stream</td></tr>
+    </tbody>
+  </table>
+  <p>For an AI-infra interview specifically, expect at least one of: rate limiting, LRU cache, retry-with-backoff, request coalescing. Those are in <a href="11-coding-problems.html">11</a>.</p>
+</section>
+
+<section id="concurrency-primitives">
+  <h2>Concurrency primitives</h2>
+  <p>Beyond channels and mutexes, know:</p>
+  <ul>
+    <li><strong>Semaphore</strong> — bound concurrent operations. <code>tokio::sync::Semaphore</code>.</li>
+    <li><strong>Notify</strong> — single-producer, single-consumer "something happened" signal.</li>
+    <li><strong>Barrier</strong> — wait until N tasks reach a point.</li>
+    <li><strong>JoinSet</strong> — spawn N tasks, await any/all.</li>
+    <li><strong>Atomics</strong> — <code>AtomicU64</code>, <code>AtomicBool</code>, etc. Use <code>Ordering::Relaxed</code> for counters, <code>Acquire</code>/<code>Release</code> for cross-thread synchronization.</li>
+    <li><strong>arc-swap</strong> — atomic <code>Arc</code> swap. Great for "config you can hot-reload."</li>
+    <li><strong>dashmap</strong> — sharded concurrent hashmap.</li>
+    <li><strong>parking_lot</strong> — faster, smaller <code>Mutex</code>/<code>RwLock</code> for sync contexts.</li>
+  </ul>
+</section>
+
+<section id="big-o">
+  <h2>Big-O cheat sheet for Rust collections</h2>
+  <table>
+    <thead><tr><th>Type</th><th>get</th><th>insert</th><th>remove</th><th>iter</th></tr></thead>
+    <tbody>
+      <tr><td><code>Vec&lt;T&gt;</code></td><td>O(1) indexed</td><td>O(1) amortized push, O(n) middle</td><td>O(n) middle, O(1) pop</td><td>O(n)</td></tr>
+      <tr><td><code>VecDeque&lt;T&gt;</code></td><td>O(1) indexed</td><td>O(1) front/back</td><td>O(1) front/back</td><td>O(n)</td></tr>
+      <tr><td><code>HashMap&lt;K,V&gt;</code></td><td>O(1) avg</td><td>O(1) avg</td><td>O(1) avg</td><td>O(n)</td></tr>
+      <tr><td><code>BTreeMap&lt;K,V&gt;</code></td><td>O(log n)</td><td>O(log n)</td><td>O(log n)</td><td>O(n) sorted</td></tr>
+      <tr><td><code>BinaryHeap&lt;T&gt;</code></td><td>O(1) peek</td><td>O(log n) push</td><td>O(log n) pop</td><td>O(n)</td></tr>
+    </tbody>
+  </table>
+  <p>Defaults: <code>HashMap</code> for general key-value (uses SipHash; switch to <code>ahash</code>/<code>fxhash</code> in perf-sensitive code). <code>BTreeMap</code> when you need sorted iteration or range queries. <code>Vec</code> for everything sequenced.</p>
+  <div class="callout tip">
+    <span class="callout-label">Senior signal</span>
+    <p>"I default to <code>Vec&lt;T&gt;</code> + linear scan for N&lt;100 — cache locality wins until then." Knowing where the constants matter is a senior tell.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance</a> · <a href="11-coding-problems.html">Next: Coding problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
