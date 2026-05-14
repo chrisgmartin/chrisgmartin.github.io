@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#p1">P1 · Constant-product swap</a>
+    <a href="#p2">P2 · StableSwap getY (Newton)</a>
+    <a href="#p3">P3 · sqrt in Solidity</a>
+    <a href="#p4">P4 · v3 tick → price</a>
+    <a href="#p5">P5 · Detect read-only reentrancy</a>
+    <a href="#p6">P6 · A minimal v4 hook</a>
+    <a href="#p7">P7 · Single-tx flash loan</a>
+    <a href="#p8">P8 · Fees-owed for a position</a>
+    <a href="#p9">P9 · TWAP from observations</a>
+    <a href="#p10">P10 · CREATE2 vanity solver</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Problems</h1>
+  <p class="subtitle">Ten problems that map directly to live-coding rounds for senior smart-contract roles at AMMs and DEXes. Each has a recommended approach, the gotchas, and an alternate framing.</p>
+</header>
+
+<section id="p1">
+  <h2>P1 · Implement constant-product swap</h2>
+  <p><strong>Prompt:</strong> "Given reserves and amountIn (with a 30bps fee), compute amountOut for a CPMM."</p>
+  <p><strong>Approach A — direct formula:</strong></p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+    internal pure returns (uint256 amountOut)
+{
+    if (amountIn == 0) revert ZeroIn();
+    if (reserveIn == 0 || reserveOut == 0) revert NoLiq();
+    uint256 amountInWithFee = amountIn * 997;
+    uint256 numerator       = amountInWithFee * reserveOut;
+    uint256 denominator     = reserveIn * 1000 + amountInWithFee;
+    amountOut               = numerator / denominator;
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>Reserves at <code>type(uint112).max</code> times <code>amountIn</code> can overflow if you're not careful. Use FullMath.mulDiv if your reserves can be large.</li>
+    <li>Floor division is correct here — favors the protocol.</li>
+    <li>The "fee" of 0.3% is encoded as <code>997/1000</code>. Don't be fancy with floats.</li>
+  </ul>
+  <p><strong>Approach B — using FullMath:</strong></p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">uint256 amountInWithFee = amountIn * 997;
+amountOut = FullMath.mulDiv(amountInWithFee, reserveOut, reserveIn * 1000 + amountInWithFee);</code></pre></div>
+</section>
+
+<section id="p2">
+  <h2>P2 · Implement StableSwap getY given x (Newton's method)</h2>
+  <p><strong>Prompt:</strong> "Given the StableSwap invariant and reserves, compute the new <code>y</code> reserve after a deposit of <code>dx</code>."</p>
+  <p><strong>Approach:</strong> Find D first, then iterate Newton on the polynomial in y.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getY(uint256 x, uint256 D, uint256 A) internal pure returns (uint256 y) {
+    uint256 n = 2;
+    uint256 Ann = A * 4;  // n^n = 4 for n=2
+    uint256 c = D * D / (x * n);
+    c = c * D / (Ann * n);
+    uint256 b = x + D / Ann;
+    y = D;
+    for (uint256 i; i &lt; 255; ++i) {
+        uint256 yPrev = y;
+        y = (y * y + c) / (2 * y + b - D);
+        if (y &gt; yPrev) { if (y - yPrev &lt;= 1) return y; }
+        else            { if (yPrev - y &lt;= 1) return y; }
+    }
+    revert("NO_CONVERGE");
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>If you forgot to compute D first, you'll loop forever. State the precondition.</li>
+    <li>For n=2, <code>Ann = A · n^n = 4A</code>. Hardcode the n=2 case if the spec restricts you.</li>
+    <li>The break is on "delta ≤ 1," not equality.</li>
+  </ul>
+</section>
+
+<section id="p3">
+  <h2>P3 · Implement sqrt in Solidity</h2>
+  <p><strong>Prompt:</strong> "Implement integer sqrt for uint256."</p>
+  <p><strong>Approach A — Babylonian, simple:</strong></p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function sqrt(uint256 x) internal pure returns (uint256 z) {
+    if (x == 0) return 0;
+    z = (x + 1) / 2;
+    uint256 y = x;
+    while (z &lt; y) {
+        y = z;
+        z = (x / z + z) / 2;
+    }
+    return y;
+}</code></pre></div>
+  <p><strong>Approach B — Solady-style (faster):</strong> Bit-shift to a normalized range to get a great initial guess, then 7 Newton iterations.</p>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>Babylonian converges but isn't gas-optimal. Solady is ~2× faster.</li>
+    <li>Test <code>sqrt(0)</code>, <code>sqrt(1)</code>, <code>sqrt(2²⁵⁶ − 1)</code>. The last one stresses the largest input.</li>
+    <li>Property: <code>sqrt(x)² ≤ x &lt; (sqrt(x)+1)²</code>. Use this as your invariant test.</li>
+  </ul>
+</section>
+
+<section id="p4">
+  <h2>P4 · v3 tick → price conversion</h2>
+  <p><strong>Prompt:</strong> "Given a tick <code>i</code>, return <code>sqrtPriceX96 = (√1.0001)^i · 2^96</code>."</p>
+  <p><strong>Approach:</strong> Bit-decomposition of the tick. Precompute magic constants for each bit.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
+    uint256 absTick = tick &lt; 0 ? uint256(-int256(tick)) : uint256(int256(tick));
+    require(absTick &lt;= 887272, "T");
+
+    uint256 ratio = (absTick &amp; 0x1) != 0
+        ? 0xfffcb933bd6fad37aa2d162d1a594001
+        : 0x100000000000000000000000000000000;
+    if (absTick &amp; 0x2 != 0)     ratio = (ratio * 0xfff97272373d413259a46990580e213a) &gt;&gt; 128;
+    if (absTick &amp; 0x4 != 0)     ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) &gt;&gt; 128;
+    // ... up to absTick &amp; 0x80000
+
+    if (tick &gt; 0) ratio = type(uint256).max / ratio;
+    sqrtPriceX96 = uint160((ratio &gt;&gt; 32) + (ratio % (1 &lt;&lt; 32) == 0 ? 0 : 1));
+}</code></pre></div>
+  <p><strong>Note:</strong> In a real interview, cite the algorithm by name (Uniswap v3 TickMath) and explain the bit-decomposition. Implementing every constant from memory is unreasonable.</p>
+</section>
+
+<section id="p5">
+  <h2>P5 · Detect read-only reentrancy in a 30-line slot0 read</h2>
+  <p><strong>Prompt:</strong> Here is a price-reading function from an integrator. What's wrong?</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Integrator's price reader — buggy
+function getPriceFromPool(IPool pool) external view returns (uint256 price) {
+    (uint160 sqrtP, , , , , , ) = pool.slot0();
+    price = (uint256(sqrtP) * uint256(sqrtP)) &gt;&gt; (96 * 2);
+}</code></pre></div>
+  <p><strong>The bug:</strong> If this is called during a callback that has temporarily put the pool in an inconsistent state, <code>sqrtP</code> is stale or mid-update. The integrator gets a price that doesn't reflect a real market state.</p>
+  <p><strong>Fix:</strong></p>
+  <ol>
+    <li>Verify the pool's reentrancy lock is not held (some pools expose this — call a function the pool guards with its lock).</li>
+    <li>Or use a TWAP — <code>pool.observe([10])</code> over a window — which gives a price that's resilient to single-block manipulation.</li>
+    <li>Or use a snapshot-based oracle that updates only outside of swap context.</li>
+  </ol>
+</section>
+
+<section id="p6">
+  <h2>P6 · Build a minimal v4 hook that takes a fee on swaps</h2>
+  <p><strong>Prompt:</strong> "Write a v4 hook that takes 5 bps of every swap and sends it to a recipient."</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract FeeHook is BaseHook {
+    address public immutable recipient;
+    uint128 public constant HOOK_FEE_BPS = 5;
+
+    constructor(IPoolManager _pm, address _recipient) BaseHook(_pm) {
+        recipient = _recipient;
+    }
+
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeSwap: true,
+            afterSwap: false,
+            // ...all others false
+            beforeSwapReturnDelta: true
+        });
+    }
+
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
+        external override returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        // skim 5 bps from the input
+        Currency input = params.zeroForOne ? key.currency0 : key.currency1;
+        uint256 amount = uint256(int256(params.amountSpecified &lt; 0 ? -params.amountSpecified : params.amountSpecified));
+        uint128 fee    = uint128(amount * HOOK_FEE_BPS / 10_000);
+        poolManager.take(input, recipient, fee);
+        return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(int128(fee), 0), 0);
+    }
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>Hook contract must be deployed to an address whose low bits match its permissions (v4 encodes permissions into the address). Use CREATE2 with a precomputed salt.</li>
+    <li>Returning the right <code>BeforeSwapDelta</code> requires understanding how the PoolManager nets the deltas.</li>
+    <li>Test that the user's effective swap output is reduced by exactly the fee.</li>
+  </ul>
+</section>
+
+<section id="p7">
+  <h2>P7 · Single-tx flash loan from an AMM pool</h2>
+  <p><strong>Prompt:</strong> "Use a v2-style flash swap to borrow a token, do something with it, repay in the same transaction."</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">interface IV2Pair { function swap(uint256, uint256, address, bytes calldata) external; }
+
+contract FlashBorrower {
+    address immutable pair;
+    address immutable token0;
+    address immutable token1;
+
+    function borrow0(uint256 amount0) external {
+        IV2Pair(pair).swap(amount0, 0, address(this), abi.encode(amount0));  // non-empty data triggers callback
+    }
+
+    function uniswapV2Call(address sender, uint256 a0, uint256 a1, bytes calldata data) external {
+        require(msg.sender == pair, "BAD_SENDER");
+        require(sender == address(this), "BAD_INITIATOR");
+
+        // ...do something with a0 tokens that arrived in this contract...
+        _doStuff(a0);
+
+        // Repay: borrow has implicit fee — for v2 it's ~30 bps
+        uint256 fee  = (a0 * 3) / 997 + 1;
+        uint256 owe = a0 + fee;
+        IERC20(token0).transfer(pair, owe);
+    }
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>Caller must be the pair contract — verify <code>msg.sender</code>.</li>
+    <li>The fee math for repayment is <em>asymmetric</em> — pay enough to keep <code>K</code> from decreasing.</li>
+    <li>Use a callback-data payload to pass state across the boundary.</li>
+  </ul>
+</section>
+
+<section id="p8">
+  <h2>P8 · Fees-owed for a position</h2>
+  <p><strong>Prompt:</strong> "Given a v3-style position and the pool's current feeGrowth globals, compute the fees owed to the position since last collection."</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function feesOwed(
+    Position memory pos,
+    uint256 feeGrowthGlobal0X128,
+    uint256 feeGrowthGlobal1X128,
+    uint256 feeGrowthOutsideLower0X128,
+    uint256 feeGrowthOutsideUpper0X128,
+    int24   tickCurrent
+) internal pure returns (uint256 owed0, uint256 owed1) {
+    // 1. Compute feeGrowthInside since position's lastSnapshot
+    uint256 inside0;
+    if (tickCurrent &gt;= pos.tickUpper) {
+        inside0 = feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
+    } else if (tickCurrent &lt; pos.tickLower) {
+        inside0 = feeGrowthOutsideUpper0X128 - feeGrowthOutsideLower0X128;
+    } else {
+        inside0 = feeGrowthGlobal0X128 - feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
+    }
+
+    // 2. Delta against position's stored snapshot
+    uint256 delta = inside0 - pos.feeGrowthInside0LastX128;   // unchecked wraparound is intentional
+
+    // 3. Multiply by liquidity, downshift Q128
+    owed0 = FullMath.mulDiv(delta, pos.liquidity, 1 &lt;&lt; 128);
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>The subtraction <em>wraps</em> intentionally — feeGrowth values can overflow over time, but the delta is meaningful modulo 2²⁵⁶.</li>
+    <li>The three cases (above/below/inside range) are easy to get wrong. Draw the diagram.</li>
+    <li>Q128 fixed-point — downshift by 128 at the end, not earlier.</li>
+  </ul>
+</section>
+
+<section id="p9">
+  <h2>P9 · TWAP from observation cardinality</h2>
+  <p><strong>Prompt:</strong> "Given a circular buffer of (timestamp, tickCumulative) observations, compute a TWAP over the last N seconds."</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function twap(Observation[] storage obs, uint16 idx, uint16 card, uint32 secondsAgo)
+    internal view returns (int24 tickTwap)
+{
+    int56 tickCumNow  = _observeAt(obs, idx, card, 0);
+    int56 tickCumThen = _observeAt(obs, idx, card, secondsAgo);
+    int56 tickDelta   = tickCumNow - tickCumThen;
+    tickTwap = int24(tickDelta / int56(uint56(secondsAgo)));
+}
+
+function _observeAt(Observation[] storage obs, uint16 idx, uint16 card, uint32 secondsAgo)
+    private view returns (int56 cum)
+{
+    uint32 target = uint32(block.timestamp) - secondsAgo;
+    // Binary search the circular buffer for the observation pair surrounding `target`,
+    // then interpolate linearly.
+    (Observation memory before_, Observation memory after_) = _binarySearch(obs, idx, card, target);
+    if (target == before_.timestamp)      cum = before_.tickCumulative;
+    else if (target == after_.timestamp)  cum = after_.tickCumulative;
+    else {
+        uint32 dt        = after_.timestamp - before_.timestamp;
+        uint32 dtTarget  = target - before_.timestamp;
+        int56  perSecond = (after_.tickCumulative - before_.tickCumulative) / int56(uint56(dt));
+        cum = before_.tickCumulative + perSecond * int56(uint56(dtTarget));
+    }
+}</code></pre></div>
+  <p><strong>Gotchas:</strong></p>
+  <ul>
+    <li>The buffer is circular. Indexing is modular.</li>
+    <li>Linear interpolation between observations is correct only because <code>tickCumulative</code> is linear-in-time at constant tick.</li>
+    <li>Watch the signed types — <code>int56</code> can hold tickCumulative deltas for ~years, but cast carefully.</li>
+  </ul>
+</section>
+
+<section id="p10">
+  <h2>P10 · CREATE2 vanity solver</h2>
+  <p><strong>Prompt:</strong> "Find a salt that gives a deployed contract an address starting with eight zero nibbles."</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// On-chain prediction
+function predict(address deployer, bytes32 salt, bytes32 initCodeHash) pure returns (address) {
+    return address(uint160(uint256(keccak256(
+        abi.encodePacked(bytes1(0xff), deployer, salt, initCodeHash)
+    ))));
+}</code></pre></div>
+  <p>The off-chain solver is the interesting part — try random salts and check the prefix. Reasoning on the math: each random salt gives a ~16⁻⁸ ≈ 2.3 × 10⁻¹⁰ chance of an 8-nibble-zero prefix. ~4B trials expected. A modern GPU does this in seconds.</p>
+  <p><strong>Why this matters:</strong> v4 hook permissions are encoded in the low bits of the hook's contract address. You <em>must</em> CREATE2-mine your hook to a valid permission-encoding address. This isn't optional.</p>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Coding fundamentals</a> · <a href="12-data-pipelines.html">Next: Data &amp; pipelines →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

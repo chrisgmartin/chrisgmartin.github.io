@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — Formal Verification — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-fv">Why formal verification</a>
+    <a href="#certora">Certora and CVL</a>
+    <a href="#cvl-syntax">CVL syntax that matters</a>
+    <a href="#ghosts">Ghosts and hooks</a>
+    <a href="#solver">The SMT solver model</a>
+    <a href="#state-explosion">Managing state explosion</a>
+    <a href="#economics">When FV wins, when it doesn't</a>
+    <a href="#first-20">The first 20 invariants</a>
+    <a href="#halmos">Halmos — symbolic Foundry</a>
+    <a href="#kontrol">Kontrol — K-framework</a>
+    <a href="#tradeoffs">Tradeoffs between tools</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Primary</span>
+  <h1>Deep Dive — Formal Verification</h1>
+  <p class="subtitle">Certora CVL is the dominant commercial tool; Halmos and Kontrol are the open-source alternatives. This chapter is what you actually need to discuss them fluently.</p>
+</header>
+
+<section id="why-fv">
+  <h2>Why formal verification</h2>
+  <p>Unit tests and fuzzing sample the input space. Formal verification reasons about it. The win:</p>
+  <ul>
+    <li>A unit test that passes on 1000 inputs proves nothing about input 1001.</li>
+    <li>An invariant proven by an SMT solver proves the property holds for <em>all</em> reachable states under the rule's assumptions.</li>
+    <li>For protocol-critical properties — "no bad debt," "shares conserved across deposits/withdraws," "rate bounded" — that's the difference between "we tested" and "we proved."</li>
+  </ul>
+  <p>FV doesn't replace audits, fuzzing, or testing. It's the highest tier of a defense-in-depth pyramid. Most senior security engineers spend 30-60% of their week here.</p>
+</section>
+
+<section id="certora">
+  <h2>Certora and CVL</h2>
+  <p>Certora is a commercial SaaS formal verification product. You write specifications in <strong>CVL</strong> (Certora Verification Language), upload them with the source, and Certora's Prover lowers everything to SMT (typically z3 or cvc5) and either:</p>
+  <ol>
+    <li>Proves the property holds on all paths (✓), or</li>
+    <li>Returns a counterexample — a sequence of calls that violates it, or</li>
+    <li>Times out / returns "unknown" — the solver couldn't decide within the budget.</li>
+  </ol>
+  <p>The product also includes a hosted run interface (the "Prover Dashboard") where you see verification reports, call traces for counterexamples, and the SMT model. Pricing is commercial; most serious DeFi teams have a license.</p>
+</section>
+
+<section id="cvl-syntax">
+  <h2>CVL syntax that matters</h2>
+  <p>CVL syntax echoes Solidity but is its own DSL. The core constructs:</p>
+
+  <h3>Rules</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">rule depositIncreasesShares(uint256 assets, address receiver) {
+    env e;
+    require receiver != 0;
+    uint256 sharesBefore = balanceOf(receiver);
+    uint256 shares = deposit(e, assets, receiver);
+    uint256 sharesAfter = balanceOf(receiver);
+    assert sharesAfter == sharesBefore + shares;
+}</code></pre></div>
+  <p>A <code>rule</code> is a single property that should hold after one method call. CVL checks it on every public function unless you scope.</p>
+
+  <h3>Parametric rules</h3>
+  <p>One of the most powerful idioms — quantify over all public methods:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">rule onlyOwnerCanPause(method f, env e, calldataarg args) {
+    require !paused();
+    f(e, args);
+    assert paused() =&gt; e.msg.sender == owner();
+}</code></pre></div>
+  <p>Certora explodes <code>f</code> across every public function, so a single rule like this checks the entire access-control surface.</p>
+
+  <h3>Invariants</h3>
+  <p>Invariants are properties that hold in every reachable state. CVL proves them inductively — true at construction, preserved by every function.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">invariant totalSupplyEqualsSumOfBalances()
+    totalSupply() == sumOfBalances()
+    {
+        preserved transfer(address to, uint256 amount) with (env e) {
+            require balanceOf(e.msg.sender) &gt;= amount;
+        }
+    }</code></pre></div>
+
+  <h3>Definitions and functions</h3>
+  <p><code>definition</code> declares a reusable predicate. <code>function</code> declares helper code (in CVL or via summarization of Solidity).</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">definition isInitialized(address market) returns bool =
+    lastUpdate(market) != 0;
+
+function setupHealthyMarket(address m) {
+    require isInitialized(m);
+    require totalSupplyAssets(m) &gt;= totalBorrowAssets(m);
+}</code></pre></div>
+</section>
+
+<section id="ghosts">
+  <h2>Ghost variables and hooks</h2>
+  <p>Ghost state is invisible to the contract but tracked by the Prover. Used to express properties that aren't directly visible in storage — sums, counts, "this thing happened" flags.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">ghost mathint sumBalances {
+    init_state axiom sumBalances == 0;
+}
+
+hook Sstore _balances[KEY address k] uint256 newVal (uint256 oldVal) STORAGE {
+    sumBalances = sumBalances + newVal - oldVal;
+}
+
+invariant totalSupplyEqSumBalances()
+    totalSupply() == sumBalances;</code></pre></div>
+  <p>Hooks fire on storage reads/writes, function entry/exit, opcodes. They're how you keep ghost state in sync. They're also the part of CVL that takes the longest to internalize.</p>
+</section>
+
+<section id="solver">
+  <h2>The SMT solver model</h2>
+  <p>What the Prover actually does under the hood:</p>
+  <ol>
+    <li>Symbolically execute every path through the function.</li>
+    <li>Encode the program semantics + your assertion as an SMT formula in (typically) the theory of arrays, bitvectors, and uninterpreted functions.</li>
+    <li>Negate the assertion; ask the solver "is there a model where the program runs and the property fails?"</li>
+    <li>If UNSAT — the property holds. If SAT — the model is your counterexample. If timeout — solver gave up.</li>
+  </ol>
+  <p>Practical consequences:</p>
+  <ul>
+    <li>Nonlinear arithmetic (multiplication, division of two symbolic values) is hard for solvers. You'll see timeouts.</li>
+    <li>Loops are unrolled or summarized. Unbounded loops require a <code>loop_iter</code> setting.</li>
+    <li>External calls are summarized — you give the Prover a model of what they return.</li>
+    <li>Storage is modeled as an array with uninterpreted keys. Mappings work fine; complex nested encodings can confuse the solver.</li>
+  </ul>
+</section>
+
+<section id="state-explosion">
+  <h2>Managing state explosion</h2>
+  <p>The single most common reason CVL specs time out: the model has too many paths or too much symbolic state. The standard moves to control it:</p>
+
+  <h3>Linking</h3>
+  <p>Tell the Prover which deployed contract address corresponds to which Solidity contract type. Without linking, an external call to <code>IERC20(token).balanceOf(x)</code> is fully symbolic — the solver has to consider every possible token contract.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">using ERC20 as token;
+methods {
+    function token.balanceOf(address) external returns uint256 envfree;
+}</code></pre></div>
+
+  <h3>Summarization</h3>
+  <p>Replace a complex function with a simpler model the solver can handle.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">methods {
+    function _._convertToShares(uint256 a, MathRoundingLib.Rounding r) internal
+        returns (uint256) =&gt; CVLConvertToShares(a, r);
+}
+
+function CVLConvertToShares(uint256 a, MathRoundingLib.Rounding r) returns uint256 {
+    uint256 result;
+    require result &lt;= a; // approximate but sound for our property
+    return result;
+}</code></pre></div>
+  <p>Summaries trade fidelity for tractability. The risk: an over-loose summary lets bugs through; an over-tight one makes the spec vacuous. This is a craft skill.</p>
+
+  <h3><code>requireInvariant</code></h3>
+  <p>Carry a proven invariant into a new rule as an assumption, so you're not re-proving global facts inside every rule.</p>
+
+  <h3>Splitting</h3>
+  <p>If a parametric rule times out on one method, scope it: <code>filtered { f -&gt; f.selector != sig:harderFunction().selector }</code> and prove that one separately with a different config.</p>
+</section>
+
+<section id="economics">
+  <h2>When FV wins, when it doesn't</h2>
+  <p>Wins:</p>
+  <ul>
+    <li><strong>Core conservation laws.</strong> "Total supply = sum of balances." "No bad debt." "Position health monotonic in collateral."</li>
+    <li><strong>Access control.</strong> "Only the role-X address can call function Y."</li>
+    <li><strong>Math invariants.</strong> "Shares-to-assets rounding always favors the protocol."</li>
+    <li><strong>Upgrade safety.</strong> "Storage layout unchanged across upgrade."</li>
+  </ul>
+  <p>Doesn't win (cleanly):</p>
+  <ul>
+    <li><strong>Economic / game-theoretic properties.</strong> "An attacker can't profitably manipulate the oracle." Solver can't reason about external markets.</li>
+    <li><strong>Cross-protocol composition.</strong> If your protocol composes with three others, you can't model all of them.</li>
+    <li><strong>Gas-related properties.</strong> Solver doesn't reason about gas.</li>
+    <li><strong>MEV.</strong> Out of model.</li>
+  </ul>
+  <p>The economic things still need adversarial review and incident-response design. FV is one pillar, not the building.</p>
+</section>
+
+<section id="first-20">
+  <h2>The first 20 invariants you'd write for a lending market</h2>
+  <p>A common interview prompt: "you arrive at a lending protocol with no FV. What do you spec first?" A defensible list:</p>
+  <ol>
+    <li>Total borrow shares = sum of user borrow shares.</li>
+    <li>Total supply shares = sum of user supply shares.</li>
+    <li>Total borrow assets ≤ total supply assets (no bad debt).</li>
+    <li>Conversion: shares-to-assets rounds <em>down</em> on user-favoring operations, <em>up</em> on protocol-favoring.</li>
+    <li>A user's borrow position has a non-zero collateral.</li>
+    <li>After borrow, the user is healthy (collateral × LTV ≥ debt).</li>
+    <li>Liquidation reduces total debt.</li>
+    <li>Liquidation cannot increase a user's health below threshold (no over-liquidation).</li>
+    <li>Interest rate monotonic in utilization.</li>
+    <li>Interest accrual is monotonic in time (rate ≥ 0 always).</li>
+    <li>Cumulative borrow index only increases.</li>
+    <li>Only owner / role X can change market parameters.</li>
+    <li>Initialized markets cannot be re-initialized.</li>
+    <li>Paused markets reject deposits / borrows.</li>
+    <li>Total assets in vault = idle + sum of supplied across markets.</li>
+    <li>Withdraw cannot increase the caller's borrow.</li>
+    <li>Repay decreases the caller's borrow by at most the principal owed.</li>
+    <li>Liquidation bonus paid ≤ configured cap.</li>
+    <li>Oracle staleness check rejects updates older than threshold.</li>
+    <li>Re-entrancy lock prevents nested calls on state-modifying entries.</li>
+  </ol>
+</section>
+
+<section id="halmos">
+  <h2>Halmos — symbolic execution of Foundry tests</h2>
+  <p>Halmos is an open-source symbolic execution engine from a16z. The pitch: write Foundry tests as usual, but the runner replaces concrete inputs with symbolic ones and explores all paths.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// In a Foundry test
+function check_NoBadDebt(uint256 amount, address user) public {
+    vm.assume(amount &gt; 0);
+    vm.assume(user != address(0));
+    market.deposit(amount, user);
+    uint256 totalBorrow = market.totalBorrowAssets();
+    uint256 totalSupply = market.totalSupplyAssets();
+    assert(totalBorrow &lt;= totalSupply);
+}</code></pre></div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">halmos --function check_NoBadDebt</code></pre></div>
+  <p>Advantages: no separate spec language; tests are portable; free. Limitations: less mature than Certora at non-linear math, summarization, and complex codebases. Halmos shines on small, well-scoped properties.</p>
+</section>
+
+<section id="kontrol">
+  <h2>Kontrol — K-framework based</h2>
+  <p>Kontrol (from Runtime Verification) builds on the K framework — a semantics-engineering platform that gives you an executable model of the EVM. The pitch: you can prove properties at the EVM bytecode level, which catches compiler bugs and inline-assembly mistakes that source-level tools miss.</p>
+  <p>Used heavily on protocols where Yul / inline-assembly is load-bearing (e.g., some optimizers, custom precompile-like contracts). Steeper learning curve than CVL; smaller community; high ceiling.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>Tradeoffs between tools</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Cost</th><th>Language</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+    <tbody>
+      <tr><td>Certora</td><td>Commercial</td><td>CVL</td><td>Mature, hosted infra, support team, hooks/ghosts</td><td>Closed, license cost, learning curve</td></tr>
+      <tr><td>Halmos</td><td>OSS</td><td>Solidity (Foundry)</td><td>Zero ceremony, reuses tests, easy onboarding</td><td>Weaker at nonlinear math and large state</td></tr>
+      <tr><td>Kontrol</td><td>OSS (commercial support)</td><td>K-spec + Foundry</td><td>Bytecode-level, EVM semantics complete</td><td>Steep learning curve</td></tr>
+      <tr><td>SMTChecker</td><td>OSS (builtin)</td><td>Solidity asserts</td><td>Built into solc, no setup</td><td>Limited expressiveness</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Interview soundbite</span>
+    <p>"Certora is the default in commercial DeFi because the support and tooling reduce time-to-first-proof. Halmos and Kontrol are growing where teams want open-source or bytecode-level assurance. A serious protocol often uses Certora as the main spec store and Halmos as a CI-friendly check on a subset of properties."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core Fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: Audit Methodology →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#gates">Deployment-time security gates</a>
+    <a href="#diff">Diff: audited vs deployed</a>
+    <a href="#verification">Verification on deploy</a>
+    <a href="#create2">CREATE2 prediction and front-running</a>
+    <a href="#multisig">Multi-sig + timelock + guardian</a>
+    <a href="#incident">Incident response runbook</a>
+    <a href="#drills">Disaster drills</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Ops</h1>
+  <p class="subtitle">Security at deploy time and after. The window between "code is audited" and "code is live" is where many incidents are born; the window between "we know we're being attacked" and "we've responded" is where reputations are made.</p>
+</header>
+
+<section id="gates">
+  <h2>Deployment-time security gates</h2>
+  <p>The default protocol-team checklist for "is this ready to deploy" should include security gates that block deploys, not advise on them.</p>
+  <ul>
+    <li><strong>Commit hash matches audited.</strong> Every deployable artifact tied to a specific commit. Deploy script verifies the hash.</li>
+    <li><strong>All audit findings closed or explicitly accepted.</strong> No "we'll fix that later." A signed-off acceptance with rationale is fine.</li>
+    <li><strong>CVL spec passes.</strong> No proven invariants regressed.</li>
+    <li><strong>Foundry invariant tests pass.</strong> Long-running fuzz campaign completed.</li>
+    <li><strong>Storage layout snapshot diff.</strong> For upgrades: zero unexpected changes; only additions at the bottom.</li>
+    <li><strong>Slither clean</strong> (or all detectors triaged with rationale).</li>
+    <li><strong>Bytecode diff.</strong> Compiled bytecode matches the bytecode previously deployed to a staging chain — bit-for-bit if possible.</li>
+    <li><strong>Multi-sig signers verified.</strong> Required signers' machines updated; ledger firmware current.</li>
+    <li><strong>Pause / breaker functional.</strong> Tested on testnet before mainnet deploy.</li>
+    <li><strong>Monitoring configured.</strong> Forta bots / Tenderly alerts on the new addresses before they go live.</li>
+  </ul>
+</section>
+
+<section id="diff">
+  <h2>Diff between audited code and deployed code</h2>
+  <p>The most insidious post-audit incident: code is audited at commit X, but commit Y is deployed. Auditors don't know about the changes in X..Y. The bug exists in those changes.</p>
+  <p>Standard countermeasures:</p>
+  <ul>
+    <li><strong>Pin the audited commit in the audit report.</strong> Every report has a commit hash on the cover page.</li>
+    <li><strong>Tag the audited commit in git.</strong> <code>git tag audit-2026-q2</code>.</li>
+    <li><strong>If you change post-audit:</strong> diff against the tag, list every change, send the diff to the auditor for re-review even if small. Many incidents have shipped because "we just added a small thing post-audit."</li>
+    <li><strong>Pre-deploy ceremony.</strong> Whoever runs the deploy script reads aloud "deploying commit X, audited by Y on date Z, fix-commits A,B,C re-reviewed on date Q" to a second person.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># In your deploy script
+AUDITED=$(git rev-parse audit-2026-q2)
+CURRENT=$(git rev-parse HEAD)
+if [ "$AUDITED" != "$CURRENT" ]; then
+  echo "WARNING: HEAD != audited commit"
+  git log $AUDITED..$CURRENT --stat
+  read -p "Continue? "
+fi</code></pre></div>
+</section>
+
+<section id="verification">
+  <h2>Verification on deploy</h2>
+  <p>Contract verification (on Etherscan / Sourcify / Blockscout) is non-negotiable for any user-facing contract. Without it, users can't read the source they're interacting with. Standard workflow:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge script script/Deploy.s.sol \
+    --rpc-url $RPC \
+    --broadcast \
+    --verify \
+    --etherscan-api-key $ETHERSCAN_KEY
+
+# Or after the fact:
+forge verify-contract $ADDR src/Market.sol:Market \
+    --chain-id 1 \
+    --etherscan-api-key $ETHERSCAN_KEY</code></pre></div>
+  <p>Things to verify beyond the source:</p>
+  <ul>
+    <li>Compiler version matches audit.</li>
+    <li>Optimizer settings match (runs count, via_ir flag).</li>
+    <li>Constructor arguments correct.</li>
+    <li>Source verified on multiple explorers if multi-chain.</li>
+  </ul>
+</section>
+
+<section id="create2">
+  <h2>CREATE2 prediction and front-running of deploys</h2>
+  <p>CREATE2 lets you predict a contract's address before deploy: <code>address = keccak256(0xff ++ deployer ++ salt ++ keccak256(initcode))[12:]</code>. Useful for cross-chain consistent addresses (factory pattern).</p>
+  <p>Security implications:</p>
+  <ul>
+    <li><strong>Address front-running.</strong> If a salt is predictable, an attacker can deploy <em>at the same address</em> on a chain where you haven't deployed yet, with malicious initcode. When users then interact with that address on the new chain, they hit attacker code. Mitigation: use non-trivial, hash-of-something salts, and deploy on all chains before announcing.</li>
+    <li><strong>Initcode mismatch.</strong> If the deployed initcode differs from what was simulated/predicted (e.g., different compiler), the address diverges silently.</li>
+    <li><strong>Self-destruct rebirth.</strong> Pre-Cancun, you could SELFDESTRUCT and redeploy fresh code at the same address via CREATE2. Post-Cancun, SELFDESTRUCT no longer clears the contract (EIP-6780), eliminating this vector for newly-deployed contracts.</li>
+  </ul>
+</section>
+
+<section id="multisig">
+  <h2>Multi-sig + timelock + guardian configurations</h2>
+  <p>The standard configuration for a privileged action:</p>
+  <ol>
+    <li><strong>Multi-sig</strong> proposes the action (N-of-M Safe; typically 3-of-5 to 5-of-9).</li>
+    <li><strong>Timelock</strong> queues the action with a delay (24h - 7d depending on action class).</li>
+    <li><strong>Guardian</strong> can cancel the queued action during the delay if it looks malicious.</li>
+    <li><strong>Multi-sig</strong> executes after the delay passes.</li>
+  </ol>
+  <p>The security properties:</p>
+  <ul>
+    <li>No single key compromise = exploit (multi-sig).</li>
+    <li>Any malicious proposal is publicly visible for the timelock window (community can scream).</li>
+    <li>Guardian acts as fast-path veto without requiring full re-vote.</li>
+    <li>Guardian compromise = grief only (can cancel but not execute).</li>
+  </ul>
+  <p>What to ask in the loop: "what's the timelock window for upgrades vs parameter changes; who's on the multi-sig and how are they geo-distributed; what's the guardian's mandate and how is it monitored?"</p>
+</section>
+
+<section id="incident">
+  <h2>Incident response runbook</h2>
+  <p>The 6-phase incident model (also covered in <a href="09-governance-and-audit.html">09</a>):</p>
+  <ol>
+    <li><strong>Detection</strong> — alert fires (monitor / bounty / community report / direct exploit).</li>
+    <li><strong>Triage</strong> — validate, scope, estimate funds at risk, decide if war room.</li>
+    <li><strong>War room</strong> — coordinate technical response, comms, multi-sig.</li>
+    <li><strong>Patch</strong> — fix in branch, re-review, deploy via timelock or emergency pathway.</li>
+    <li><strong>Comms</strong> — public statements at appropriate cadence, transparent about what's known and unknown.</li>
+    <li><strong>Postmortem</strong> — public writeup within weeks. Internal lessons-learned doc, taxonomy update.</li>
+  </ol>
+  <p>Each phase has its own runbook with named owners. The named owner for "comms" must not be the named owner for "patch" — different cognitive loads.</p>
+</section>
+
+<section id="drills">
+  <h2>Disaster drills (chaos engineering for protocols)</h2>
+  <p>A drill is a rehearsal of the incident response process. You should be running at least one per quarter. Format:</p>
+  <ol>
+    <li><strong>Scenario.</strong> A specific incident (e.g., "Chainlink ETH/USD reads $0 for 10 blocks"; "a multi-sig signer's machine is compromised"; "a critical bounty report lands on a public weekend").</li>
+    <li><strong>No-notice or low-notice.</strong> Some team members know it's a drill; others learn at trigger time.</li>
+    <li><strong>Run the SOP.</strong> Page, war-room, comms, patch — all the motions, on testnet or against a fork.</li>
+    <li><strong>Stopwatch.</strong> Time to acknowledge, time to first comms, time to mitigation. Track over drills.</li>
+    <li><strong>Retrospective.</strong> What didn't go smoothly? Update the SOP.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Why drills earn their cost</span>
+    <p>The most expensive moment in DeFi security is the third hour of a real incident where everyone is realizing they've never done this before. Drilling removes that surprise.</p>
+  </div>
+  <h3>Sample drill scenarios</h3>
+  <details class="collapse-card">
+    <summary><strong>Scenario library</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li>Oracle outage: feed stops updating for 2 hours during high volatility.</li>
+        <li>Compromised admin key: a signer reports phishing.</li>
+        <li>Governance attack: malicious proposal slips through during a holiday.</li>
+        <li>Bridge halt: cross-chain messages stop confirming; user funds locked.</li>
+        <li>Public exploit disclosure on Twitter at 2am UTC.</li>
+        <li>Bounty researcher disagreement: researcher disputes severity, threatens to publish.</li>
+        <li>RPC provider outage: all your monitoring goes dark.</li>
+        <li>L2 sequencer halt: your protocol can't process txs.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Data &amp; Pipelines</a> · <a href="14-domain-context.html">Next: Domain Context →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

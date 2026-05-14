@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#taxonomy">The bug taxonomy</a>
+    <a href="#reentrancy">Reentrancy, all flavors</a>
+    <a href="#oracle">Oracle manipulation</a>
+    <a href="#math">Math bugs</a>
+    <a href="#access">Access control</a>
+    <a href="#donation">Donation / first-depositor</a>
+    <a href="#mev">MEV-induced griefing</a>
+    <a href="#crosschain">Cross-chain ordering</a>
+    <a href="#workflow">For each: find, prove, design out</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">The bug catalogue every senior security engineer carries in their head. For each: the shapes it takes, how to find it, how to formally rule it out, how to design it out.</p>
+</header>
+
+<section id="taxonomy">
+  <h2>The bug taxonomy</h2>
+  <p>You should be able to recite the high-impact bug classes cold. The eight categories below cover roughly 90% of DeFi incidents over the past decade:</p>
+  <ol>
+    <li>Reentrancy (classic + variants)</li>
+    <li>Oracle manipulation</li>
+    <li>Math / rounding / precision</li>
+    <li>Access control failures</li>
+    <li>Donation / share-dilution / first-depositor</li>
+    <li>MEV-induced griefing</li>
+    <li>Cross-chain message ordering</li>
+    <li>Upgradeability / storage layout / initialization</li>
+  </ol>
+</section>
+
+<section id="reentrancy">
+  <h2>Reentrancy — all the flavors</h2>
+
+  <h3>Classic reentrancy</h3>
+  <p>External call before state update; callee re-enters and exploits stale state. The DAO hack. Solved by CEI or <code>nonReentrant</code>.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// VULNERABLE
+function withdraw() external {
+    uint256 bal = balances[msg.sender];
+    (bool ok,) = msg.sender.call{value: bal}(""); // external call
+    require(ok);
+    balances[msg.sender] = 0;                      // state update after
+}</code></pre></div>
+
+  <h3>Cross-function reentrancy</h3>
+  <p>Function A makes external call. Callee re-enters via function B (not A). A's <code>nonReentrant</code> doesn't help if B is on a different lock. Fix: shared lock across all state-touching functions.</p>
+
+  <h3>Cross-contract reentrancy</h3>
+  <p>Contract A calls Contract B. B re-enters A via a third contract that calls A. Cascading. Requires reasoning across multiple contracts.</p>
+
+  <h3>Read-only reentrancy</h3>
+  <p>The callee re-enters a <em>view</em> function on the original contract that other protocols depend on. The view returns stale state mid-call. Curve's 2023 incident hit several protocols this way. Mitigation: the view function should also revert if a reentrancy is in progress, or consumers should not call views from within state-modifying paths.</p>
+
+  <h3>ERC-777 callback reentrancy</h3>
+  <p>ERC-777 tokens trigger <code>tokensReceived</code> hooks on the recipient. If your contract receives such a token, the sender's <code>send()</code> call hands execution to the recipient's hook before your contract's internal state has been updated. Mitigation: avoid ERC-777 support without explicit guards, or use OpenZeppelin's pull-pattern.</p>
+
+  <h3>ERC-721 onERC721Received</h3>
+  <p>Safe transfers call <code>onERC721Received</code> on the recipient. Same pattern; same hazard. Marketplaces and lending protocols have shipped reentrancy bugs through this hook.</p>
+
+  <h3>How to prove it out (CVL)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">// rule: state updates happen before external calls (CEI)
+rule effectsBeforeInteractions(method f) filtered { f -&gt; !f.isView } {
+    env e;
+    calldataarg args;
+    // Track that no external call has been observed before any state modification
+    // (in practice: use hooks on Sstore / Call opcodes and ghost state)
+    // Sketch only — full proof requires hook scaffolding
+    f(e, args);
+    assert true; // placeholder
+}</code></pre></div>
+</section>
+
+<section id="oracle">
+  <h2>Oracle manipulation</h2>
+  <h3>Single-block manipulation</h3>
+  <p>Attacker takes a flash loan, swaps in a target AMM pool, reads the manipulated mid-price, exploits a protocol that uses that price as oracle, swaps back. All in one block. Cream Finance, bZx variants, many others.</p>
+  <p>Mitigation: don't use spot AMM price as oracle. Use Chainlink, or use a TWAP (time-weighted average) which is much harder to manipulate over a window.</p>
+
+  <h3>Multi-block manipulation</h3>
+  <p>Attacker controls block production for N consecutive blocks (rare on Ethereum, more plausible on validator-light L2s) and pushes a TWAP. Mitigation: longer TWAP windows; cross-source validation.</p>
+
+  <h3>Donation manipulation</h3>
+  <p>Attacker donates tokens directly to a pool (transfer, not deposit). Pool's internal accounting and on-chain balance diverge. Code that reads <code>balanceOf(address(this))</code> as a proxy for "deposits" gets fooled. Mitigation: track deposits in storage explicitly; don't use raw balanceOf as accounting.</p>
+
+  <h3>Flash-loan amplified manipulation</h3>
+  <p>Flash loans give an attacker effectively-unlimited working capital within one block. Any oracle that's manipulable with capital becomes manipulable for free. Mitigation: oracle sources should be either off-chain (Chainlink) or TWAP-based with windows &gt; 1 block.</p>
+
+  <h3>How to design it out</h3>
+  <p>Use Chainlink (with hardened wrapper from <a href="06-applied-patterns.html">06</a>) for asset prices. Use protocol-internal exchange rates (vault.totalAssets() / vault.totalSupply()) only when these can't be manipulated within the call. Pin oracle reads to the start of the call; don't re-read after state changes.</p>
+</section>
+
+<section id="math">
+  <h2>Math bugs</h2>
+  <h3>Rounding direction</h3>
+  <p>Convert assets-to-shares: round down. Convert shares-to-assets for withdrawal: round down (user receives less, protocol keeps the dust). For repayment / borrow tracking: round up against the user. The wrong direction lets users extract value via repeated tiny operations.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// OpenZeppelin ERC4626 standard pattern
+function convertToShares(uint256 assets) public view returns (uint256) {
+    return assets.mulDiv(totalSupply() + 10**decimalsOffset, totalAssets() + 1, Math.Rounding.Floor);
+}
+function convertToAssets(uint256 shares) public view returns (uint256) {
+    return shares.mulDiv(totalAssets() + 1, totalSupply() + 10**decimalsOffset, Math.Rounding.Floor);
+}</code></pre></div>
+
+  <h3>Share inflation / first depositor</h3>
+  <p>Empty vault, attacker deposits 1 wei → gets 1 share. Donates 10000 underlying → vault has 10001 assets, 1 share. Next depositor's 9999 wei rounds to 0 shares → attacker captures the deposit. Mitigation: <strong>virtual shares / dead shares / decimal offset</strong>.</p>
+
+  <h3>Overflow (pre-0.8)</h3>
+  <p>Pre-Solidity-0.8, <code>uint256</code> wraps around on overflow. SafeMath was required. Modern code uses 0.8+, which reverts. But <code>unchecked {}</code> blocks disable checks; review them carefully.</p>
+
+  <h3>Precision loss in fixed-point</h3>
+  <p>DeFi typically uses fixed-point with 18 decimals (WAD) or 27 (RAY). The classic mistake: <code>(a * b) / c</code> if <code>a*b</code> overflows; or <code>a / c * b</code> which truncates before multiplying. Use <code>mulDiv</code> from OpenZeppelin or Solady.</p>
+
+  <h3>How to prove it (CVL)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">rule conversionRoundsAgainstUser() {
+    uint256 assets;
+    uint256 shares = convertToShares(assets);
+    uint256 backToAssets = convertToAssets(shares);
+    assert backToAssets &lt;= assets; // user never extracts more than they deposited
+}</code></pre></div>
+</section>
+
+<section id="access">
+  <h2>Access control failures</h2>
+  <h3>Missing modifier</h3>
+  <p>A privileged function ships without <code>onlyOwner</code>. Anyone calls it; protocol drained. This still happens. Defense: a CVL parametric rule that every state-changing function either reverts for non-admin or doesn't touch admin storage.</p>
+
+  <h3>Wrong msg.sender in delegatecall</h3>
+  <p>Implementation behind a proxy: <code>msg.sender</code> is the proxy caller, not the proxy. A check like <code>require(msg.sender == owner)</code> in a library called via <code>delegatecall</code> works because the storage and context are the proxy's. But a library called via <code>call</code> gets a different sender. Confusion here ships bugs.</p>
+
+  <h3>Frontrunnable initialize</h3>
+  <p>Proxy deployed; implementation has an <code>initialize()</code> not yet called; an attacker calls it first, becomes owner. Mitigation: deploy + initialize in the same tx (factory pattern), or use OpenZeppelin's <code>_disableInitializers()</code> in the implementation constructor.</p>
+
+  <h3>Privileged-role grant</h3>
+  <p>Role-based access control (OZ AccessControl). Granting a powerful role through governance is normal; granting it through a less-protected function is a bug. Audit every <code>grantRole</code> path.</p>
+</section>
+
+<section id="donation">
+  <h2>Donation / first-depositor share dilution</h2>
+  <p>Already covered under math, but worth its own callout: this single bug class has cost DeFi nine figures cumulatively. Cream, Hundred Finance, several smaller vault protocols. Mitigation patterns:</p>
+  <ul>
+    <li><strong>Virtual shares / decimal offset</strong> (OpenZeppelin ERC4626 default).</li>
+    <li><strong>Dead shares</strong> minted to address(0) on first deposit.</li>
+    <li><strong>Minimum first deposit</strong> enforced in the contract.</li>
+    <li><strong>Track deposits internally</strong> instead of reading balanceOf.</li>
+  </ul>
+  <p>For new vault designs, default to the OpenZeppelin pattern. Audit how it composes with your fee logic — fee accounting can re-introduce the bug.</p>
+</section>
+
+<section id="mev">
+  <h2>MEV-induced griefing</h2>
+  <p>Not always loss-of-funds, but griefing through ordering. Examples:</p>
+  <ul>
+    <li><strong>Sandwich attacks on AMM swaps.</strong> Attacker frontruns your swap, backruns it; you pay worse price.</li>
+    <li><strong>Liquidation MEV.</strong> Multiple liquidators race for the same position; protocol gets liquidated, healthy users see gas spikes.</li>
+    <li><strong>Just-in-time liquidity.</strong> Concentrated-liquidity AMMs see attackers add LP just before a known swap, capture fees, remove.</li>
+    <li><strong>Initialize / first-action front-running.</strong> Already covered.</li>
+  </ul>
+  <p>Mitigations: slippage tolerance on user-facing calls; private mempool / order flow; commit-reveal for sensitive operations; auction mechanisms (intents, MEV-share).</p>
+</section>
+
+<section id="crosschain">
+  <h2>Cross-chain message ordering</h2>
+  <p>When messages cross between chains (LayerZero, Wormhole, native bridges, Hyperlane, Axelar), ordering and replay become first-class concerns:</p>
+  <ul>
+    <li><strong>Replay.</strong> Same message delivered twice; same effect applied twice. Mitigation: per-message nonces stored on receiving chain.</li>
+    <li><strong>Out-of-order delivery.</strong> Message B (decrement) arrives before message A (deposit). Mitigation: causal ordering or commutative-only operations.</li>
+    <li><strong>Message forging.</strong> Validators / oracles compromised; arbitrary message forged. Wormhole 2022 was here. Mitigation: validator-set audit, threshold signatures, on-chain proof verification.</li>
+    <li><strong>Source-chain rollback.</strong> Optimistic rollups have a 7-day window; a finalized message on L2 might not be finalized on L1.</li>
+  </ul>
+</section>
+
+<section id="workflow">
+  <h2>Worked example: for each bug class, the three motions</h2>
+  <p>The triad every senior security engineer should be able to apply:</p>
+  <ol>
+    <li><strong>How to find it</strong> — what does it look like in code? What's the signature pattern?</li>
+    <li><strong>How to formally rule it out</strong> — what CVL invariant / Foundry invariant test proves you don't have it?</li>
+    <li><strong>How to design it out</strong> — what architectural pattern makes the bug class unrepresentable?</li>
+  </ol>
+  <p>Worked: <strong>donation attack</strong></p>
+  <ul>
+    <li><em>Find:</em> Vault contract; first-deposit handler; ratio of shares to assets calculated from balanceOf; no virtual shares.</li>
+    <li><em>Prove:</em> CVL invariant: <code>forall users: convertToAssets(convertToShares(x)) &lt;= x</code>; AND <code>totalSupply &gt; 0 =&gt; totalAssets &gt; 0</code>.</li>
+    <li><em>Design out:</em> Apply OpenZeppelin ERC4626 with decimal offset; track deposits internally; mint 1000 wei of dead shares on first deposit.</li>
+  </ul>
+  <p>Worked: <strong>read-only reentrancy</strong></p>
+  <ul>
+    <li><em>Find:</em> A view function whose return value is consumed by an external protocol. State updated after the call. The view returns a value derived from in-flight state.</li>
+    <li><em>Prove:</em> Hard to prove without modeling external callers. CVL hook on Sstore + Call: assert no external call within a function body modifies the view's storage between callers' reads.</li>
+    <li><em>Design out:</em> View function reverts under lock; or expose a "checkpoint" view that's only updated at end-of-tx; or use transient storage to expose only post-update values.</li>
+  </ul>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; Audit Lifecycle →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

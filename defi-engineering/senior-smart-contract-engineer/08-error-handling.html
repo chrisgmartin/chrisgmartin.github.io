@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#catalog">The DEX bug catalog</a>
+    <a href="#fee-on-transfer">Fee-on-transfer breakage</a>
+    <a href="#bad-math">Math under extreme prices</a>
+    <a href="#reentrancy">Reentrancy via callbacks</a>
+    <a href="#mev">MEV — sandwich, JIT, frontrun</a>
+    <a href="#twap">Oracle TWAP manipulation</a>
+    <a href="#init">Pool initialization races</a>
+    <a href="#approvals">Token approval vulns</a>
+    <a href="#selectors">Selector collisions</a>
+    <a href="#storage-collision">Storage collisions</a>
+    <a href="#ror">Read-only reentrancy</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">The DEX-specific bug catalog. Every one of these has lost real money in production. Internalize the patterns, the defenses, and the test you would write to catch the regression.</p>
+</header>
+
+<section id="catalog">
+  <h2>The DEX bug catalog</h2>
+  <p>Most DEX-flavored bugs cluster into 10 categories. A senior interview tests fluency across all of them.</p>
+  <table>
+    <thead><tr><th>Category</th><th>Famous instances</th></tr></thead>
+    <tbody>
+      <tr><td>Fee-on-transfer breakage</td><td>numerous router exploits 2020-21</td></tr>
+      <tr><td>Math at extreme prices</td><td>v3 tick boundary bugs in forks</td></tr>
+      <tr><td>Reentrancy via callbacks</td><td>imBTC / Lendf.Me 2020 ($25M)</td></tr>
+      <tr><td>Sandwich/MEV</td><td>ongoing structural</td></tr>
+      <tr><td>TWAP manipulation</td><td>Mango Markets 2022 ($110M), Inverse Finance ($15M)</td></tr>
+      <tr><td>Pool init races</td><td>numerous v3 first-LP scams</td></tr>
+      <tr><td>Approval-related</td><td>InfiniteAllowance exploits</td></tr>
+      <tr><td>Selector collisions</td><td>Curve / Vyper Reentrancy 2023 ($60M)</td></tr>
+      <tr><td>Storage collisions (proxies)</td><td>Audius 2022 ($6M)</td></tr>
+      <tr><td>Read-only reentrancy</td><td>Curve 2022 (multiple integrators affected)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="fee-on-transfer">
+  <h2>Fee-on-transfer breakage</h2>
+  <p>The pattern: token charges 1-10% on every transfer. A router calls <code>transferFrom(user, pool, 100)</code> expecting the pool to receive 100. The pool actually receives 95. Subsequent math (k-check, mint) uses 100 and breaks.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// BAD
+function swap(uint256 in_) external returns (uint256 out) {
+    token.transferFrom(msg.sender, address(this), in_);
+    uint256 amountInWithFee = in_ * 997;  // wrong — `in_` may not have arrived
+    // ...
+}
+
+// GOOD — measure what arrived
+function swap(uint256 in_) external returns (uint256 out) {
+    uint256 before = token.balanceOf(address(this));
+    token.transferFrom(msg.sender, address(this), in_);
+    uint256 actualIn = token.balanceOf(address(this)) - before;
+    uint256 amountInWithFee = actualIn * 997;
+    // ...
+}</code></pre></div>
+  <p>Better still — separate "supportsFeeOnTransfer" variants and force users to opt in. Uniswap v2 router has <code>swapExactTokensForTokensSupportingFeeOnTransferTokens</code> for exactly this reason.</p>
+</section>
+
+<section id="bad-math">
+  <h2>Bad math under extreme prices</h2>
+  <p>Concentrated liquidity math involves <code>sqrtPriceX96</code> values up to <code>2¹⁶⁰</code>. Multiplying two such values overflows <code>uint256</code>. Real-world tick boundaries push prices to ranges where naive implementations silently truncate.</p>
+  <p>Defenses:</p>
+  <ul>
+    <li>Use <code>FullMath.mulDiv</code> — 512-bit intermediate.</li>
+    <li>Use <code>SafeCast.toUint160</code> at the boundary; revert on overflow.</li>
+    <li>Test the math at <code>MIN_TICK</code> and <code>MAX_TICK</code> explicitly. Don't rely on fuzz finding them.</li>
+    <li>Use the canonical <code>TickMath</code> helpers; don't reimplement.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Test the boundaries by name, not just by fuzz
+function test_TickMath_MIN() public {
+    uint160 sp = TickMath.getSqrtRatioAtTick(TickMath.MIN_TICK);
+    assertEq(sp, TickMath.MIN_SQRT_RATIO);
+}
+function test_TickMath_MAX() public {
+    uint160 sp = TickMath.getSqrtRatioAtTick(TickMath.MAX_TICK);
+    assertEq(sp, TickMath.MAX_SQRT_RATIO);
+}</code></pre></div>
+</section>
+
+<section id="reentrancy">
+  <h2>Reentrancy via callbacks</h2>
+  <p>Modern AMMs are reentrancy-aware by design — flash swap callbacks <em>are</em> a designed reentrancy. The risk is when:</p>
+  <ul>
+    <li>Token transfer (ERC-777, ERC-1363, native ETH) invokes user code, which re-enters before the original transfer's state effect.</li>
+    <li>Hook lifecycle (v4) allows hooks to call back into PoolManager while a swap is mid-flight.</li>
+  </ul>
+  <p>Defenses:</p>
+  <ul>
+    <li><strong>Locks.</strong> Pre-Cancun: storage-bool lock. Post-Cancun: <code>TSTORE</code>-based lock (~20× cheaper).</li>
+    <li><strong>Checks-Effects-Interactions.</strong> Update state before any external call.</li>
+    <li><strong>Lock the read paths too.</strong> Mid-swap, the pool's reported price is inconsistent. Read-only callers must respect the lock (see read-only reentrancy below).</li>
+  </ul>
+</section>
+
+<section id="mev">
+  <h2>MEV — sandwich, JIT, frontrun, backrun</h2>
+  <table>
+    <thead><tr><th>Attack</th><th>Mechanism</th><th>Defense</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Sandwich</strong></td><td>Attacker trades same direction before victim, opposite direction after. Profits from slippage.</td><td>Slippage limits, batch auctions, private flow</td></tr>
+      <tr><td><strong>JIT liquidity</strong></td><td>Searcher adds concentrated LP right before a large swap, captures fee, removes</td><td>Hook with min-lockup, fee surcharge on hot liquidity</td></tr>
+      <tr><td><strong>Frontrun</strong></td><td>Copy victim's tx with higher gas; e.g. govt-action arb, initialization race</td><td>Commit-reveal, encrypted mempool</td></tr>
+      <tr><td><strong>Backrun</strong></td><td>Right-after-victim arb — mostly benign; rebalances the pool</td><td>Often desired; some protocols capture it via MEV-Share</td></tr>
+      <tr><td><strong>Liquidation backrun</strong></td><td>Place own liquidation right after price-update tx</td><td>Same; or auction the liquidation</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="twap">
+  <h2>Oracle TWAP manipulation</h2>
+  <p>Uniswap v2 introduced an on-chain TWAP. v3 made it cheaper. But a TWAP is only as resistant as its observation window and the depth of the pool it watches.</p>
+  <p>Attack: low-liquidity pool, attacker pushes price for one block (or several), inflated TWAP feeds into a lending protocol that uses it for collateral valuation. Mango Markets, Inverse Finance, and many others lost real money this way.</p>
+  <p>Defenses:</p>
+  <ul>
+    <li><strong>Long enough window.</strong> 30-minute TWAP across high-TVL pools.</li>
+    <li><strong>Pool selection.</strong> Use a primary pool with depth sufficient that single-block manipulation costs more than it earns.</li>
+    <li><strong>Multi-source.</strong> Combine on-chain TWAP with Chainlink / Pyth and require agreement within tolerance.</li>
+    <li><strong>Liquidity floor.</strong> Don't accept the TWAP if observed liquidity drops below a threshold.</li>
+  </ul>
+</section>
+
+<section id="init">
+  <h2>Pool initialization races</h2>
+  <p>Anyone can be first to <code>createPool(tokenA, tokenB, fee)</code>. The first initializer sets the starting price. Two failure modes:</p>
+  <ul>
+    <li><strong>Wrong-price init.</strong> First LP sets a wildly off-market price; their first liquidity gets arbed away. Mitigation: front-end checks; permissionless arbitrageurs are usually fast enough.</li>
+    <li><strong>Init grief / squatting.</strong> Someone initializes with attacker-favorable price right before your protocol launch. Mitigation: deploy the pool yourself as part of your launch tx.</li>
+    <li><strong>v2-specific:</strong> the first LP gets a slightly larger initial-share allocation, which can be exploited via the "donation attack" by the first liquidity provider. v2 mints 1000 dead shares to address(0) to mitigate; you must respect that pattern in clones.</li>
+  </ul>
+</section>
+
+<section id="approvals">
+  <h2>Token approval-tied vulnerabilities</h2>
+  <ul>
+    <li><strong>Infinite approval drains.</strong> Users approve <code>max uint256</code> to a router; router contract is later upgraded or has a bug; approval is now a key to user funds. Mitigation: Permit2 (per-swap signatures, no standing allowance).</li>
+    <li><strong>USDT approve-front-run.</strong> USDT requires zero-first when changing allowance. Approvals to mid-stack contracts that don't know this break.</li>
+    <li><strong>Allowance race.</strong> An attacker watching for an upcoming allowance reduction can spend the old allowance first, then the new one. ERC-20 spec describes this; permit-based flows sidestep it.</li>
+  </ul>
+</section>
+
+<section id="selectors">
+  <h2>Selector collisions (4-byte clashes)</h2>
+  <p>Function selectors are 4 bytes of keccak256 of the signature. With ~4 billion possible selectors, collisions are findable by brute force.</p>
+  <p>The Vyper-reentrancy / Curve incident in July 2023 wasn't a selector collision per se, but selector collisions are a real attack surface for:</p>
+  <ul>
+    <li><strong>Proxies.</strong> If a proxy's admin function shares a selector with an implementation function, calls can be misrouted. OpenZeppelin transparent proxies handle this; UUPS proxies require care.</li>
+    <li><strong>Function dispatch in custom Yul.</strong> Hand-rolled dispatchers must validate selectors carefully.</li>
+    <li><strong>Spoofed callbacks.</strong> If <code>uniswapV3SwapCallback</code> and some other 4-byte function clash, attackers can confuse callback-trusting code.</li>
+  </ul>
+</section>
+
+<section id="storage-collision">
+  <h2>Storage collisions in upgradeable patterns</h2>
+  <p>Upgradeable contracts use a proxy + implementation. The proxy holds state at slot N; the implementation reads/writes slot N. If a new implementation reorders variables, slots shift and existing data is misinterpreted.</p>
+  <p>Defenses:</p>
+  <ul>
+    <li><strong>Storage gaps</strong> (<code>uint256[50] private __gap;</code>) at the end of every base contract.</li>
+    <li><strong>Diamond / namespaced storage</strong> via ERC-7201 — each module gets a deterministic slot region.</li>
+    <li><strong>Upgrade-safe linters</strong> like <code>openzeppelin-upgrades</code> that compare storage layouts.</li>
+    <li><strong>The simpler answer:</strong> don't make core contracts upgradeable. Most AMM cores are immutable; periphery is replaced wholesale.</li>
+  </ul>
+</section>
+
+<section id="ror">
+  <h2>Read-only reentrancy in price calculations</h2>
+  <p>Mid-callback, the pool's state may be inconsistent. A view function called during a callback might return a stale or unphysical price. Integrators (lending markets, liquidators) that read this price get fooled into bad collateral decisions.</p>
+  <p>Curve's 2022 read-only reentrancy is the canonical example. The pool's <code>get_virtual_price</code> could be called mid-remove-liquidity and return inflated values.</p>
+  <p>Defenses:</p>
+  <ul>
+    <li><strong>Lock the read paths.</strong> Inside the pool, view functions check the reentrancy lock and revert if held.</li>
+    <li><strong>Snapshot pricing.</strong> Compute the price into a separate cached value that's stable across reentrancy.</li>
+    <li><strong>For integrators:</strong> assume any price-read can be malicious. Verify lock state, or wrap the call in a try/catch on a known-reentrancy-checked function.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Pool defends its own view functions
+modifier checkReentrancy() {
+    require(_unlocked == 1, "REENTRANT");  // same lock as the mutating path
+    _;
+}
+
+function getPrice() external view checkReentrancy returns (uint256) {
+    return _spotPrice();
+}</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">Senior signal</span>
+    <p>Being able to enumerate these ten categories cold — with one paragraph of defense each — is a near-certain pass on the "what could go wrong" portion of a design round.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; audit →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

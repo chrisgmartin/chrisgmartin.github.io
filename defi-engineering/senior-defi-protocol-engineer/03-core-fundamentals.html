@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#storage">Storage layout</a>
+    <a href="#calldata-memory">Calldata vs memory vs storage</a>
+    <a href="#transient">Transient storage (EIP-1153)</a>
+    <a href="#errors">Custom errors, require, revert</a>
+    <a href="#immutable">Immutable vs constant</a>
+    <a href="#packing">Packing and slot economics</a>
+    <a href="#opcodes">EVM opcodes — the mental model</a>
+    <a href="#fixed-point">Fixed-point math</a>
+    <a href="#reentrancy">Reentrancy primitives</a>
+    <a href="#cei">Checks-Effects-Interactions</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The Solidity, EVM, and arithmetic primitives every senior protocol engineer should be able to discuss without notes. The stuff every later chapter assumes you breathe.</p>
+</header>
+
+<section id="storage">
+  <h2>Storage layout</h2>
+  <p>The EVM gives each contract 2^256 storage slots, each 32 bytes. Every state variable maps to one or more slots; the compiler decides where, deterministically, in declaration order. A senior engineer should be able to predict the storage layout of a contract just by reading the source.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Market {
+    address public loanToken;    // slot 0, lower 20 bytes
+    address public collateral;   // slot 1, lower 20 bytes
+    uint128 public totalBorrow;  // slot 2, lower 16 bytes  ┐ packed
+    uint128 public totalSupply;  // slot 2, upper 16 bytes  ┘
+    uint256 public lastAccrual;  // slot 3
+    mapping(address =&gt; uint256) public balance;  // keccak256(addr . 4) =&gt; slot
+}
+</code></pre></div>
+
+  <p>Three things to know cold:</p>
+  <ul>
+    <li><strong>Mappings</strong> live at <code>keccak256(abi.encode(key, slotIndex))</code>. There is no enumeration; you cannot list keys without indexing events.</li>
+    <li><strong>Dynamic arrays</strong> store length at the slot, and elements at <code>keccak256(slotIndex) + i</code>.</li>
+    <li><strong>Structs</strong> are laid out inline, slot-by-slot in declaration order, packing within each slot when fields permit.</li>
+  </ul>
+  <p>Inspect any contract with <code>forge inspect &lt;Name&gt; storage</code> — the output is the source of truth.</p>
+</section>
+
+<section id="calldata-memory">
+  <h2>Calldata vs memory vs storage</h2>
+  <p>Three locations, three gas profiles, three reasons to choose each:</p>
+  <table>
+    <thead><tr><th>Location</th><th>Lifetime</th><th>Mutability</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><code>calldata</code></td><td>Function call</td><td>Read-only</td><td>~3 gas per word read</td></tr>
+      <tr><td><code>memory</code></td><td>Function call</td><td>Read/write</td><td>~3 gas + quadratic expansion</td></tr>
+      <tr><td><code>storage</code></td><td>Persistent</td><td>Read/write</td><td>SLOAD 2100 cold / 100 warm; SSTORE 20k zero→non-zero, 5k change, 0 same</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Pass arrays as calldata when you only read them.
+function sumAll(uint256[] calldata xs) external pure returns (uint256 s) {
+    for (uint256 i; i &lt; xs.length; ++i) s += xs[i];
+}
+
+// Cache storage to a local stack variable inside loops.
+function accrueAll(uint256 marketCount) external {
+    for (uint256 i; i &lt; marketCount; ++i) {
+        Market storage m = markets[i];           // pointer, free
+        uint256 last = m.lastAccrual;            // SLOAD once
+        if (last == block.timestamp) continue;
+        // ... compute ...
+        m.lastAccrual = uint128(block.timestamp); // SSTORE once
+    }
+}
+</code></pre></div>
+
+  <div class="callout tip">
+    <span class="callout-label">Heuristic</span>
+    <p>If you find yourself reading the same storage slot twice in a function, cache it to a local. If you mutate a struct field three times, mutate a memory copy and SSTORE the whole struct once at the end (only when storage layout permits — careful with reentrancy).</p>
+  </div>
+</section>
+
+<section id="transient">
+  <h2>Transient storage (EIP-1153)</h2>
+  <p>Introduced in Cancun (Ethereum, March 2024). Two opcodes: <code>TSTORE</code> and <code>TLOAD</code>. Same key-value semantics as storage, but the values <strong>reset at the end of the transaction</strong>. Cheap (100 gas). Designed for cross-call state that does not need to persist.</p>
+  <p>Canonical use case: a per-transaction reentrancy lock, or a per-transaction price cache.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract TransientLock {
+    bytes32 private constant LOCK_SLOT = keccak256("lock");
+
+    modifier nonReentrant() {
+        bytes32 slot = LOCK_SLOT;
+        assembly { if tload(slot) { revert(0, 0) } tstore(slot, 1) }
+        _;
+        assembly { tstore(slot, 0) }
+    }
+}
+</code></pre></div>
+
+  <p>In Solidity 0.8.24+, you can use the <code>transient</code> data location: <code>uint256 transient locked;</code>. This compiles down to TLOAD/TSTORE.</p>
+  <div class="callout warn">
+    <span class="callout-label">Watch out</span>
+    <p>Transient storage is per-transaction, not per-call. If you set a transient flag in call A and forget to clear it before call B in the same transaction, B sees the stale value. Always clear in a <code>finally</code>-equivalent path (the postfix of your modifier).</p>
+  </div>
+</section>
+
+<section id="errors">
+  <h2>Custom errors, require, revert</h2>
+  <p>Custom errors (introduced in 0.8.4) are dramatically cheaper than revert strings and self-document the error in the ABI.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Bad — ~50 gas/character to deploy, expensive to revert.
+require(amount &lt;= balance, "Market: insufficient balance");
+
+// Better.
+error InsufficientBalance(uint256 requested, uint256 available);
+if (amount &gt; balance) revert InsufficientBalance(amount, balance);
+</code></pre></div>
+
+  <p>The 4-byte selector of a custom error appears in the revert data, followed by ABI-encoded arguments. Off-chain consumers can decode it; tools like <code>cast 4byte</code> resolve selectors.</p>
+  <p>Senior-protocol idiom: define all errors at the top of the contract or in a separate library. Group them by domain.</p>
+</section>
+
+<section id="immutable">
+  <h2>Immutable vs constant</h2>
+  <table>
+    <thead><tr><th>Keyword</th><th>Set when</th><th>Stored where</th><th>Read cost</th></tr></thead>
+    <tbody>
+      <tr><td><code>constant</code></td><td>Compile time</td><td>Inlined into bytecode</td><td>3 gas (PUSH)</td></tr>
+      <tr><td><code>immutable</code></td><td>Constructor</td><td>Inlined post-deploy at fixed offsets</td><td>~3 gas (PUSH)</td></tr>
+      <tr><td>regular state</td><td>Anytime</td><td>Storage slot</td><td>2100 cold / 100 warm</td></tr>
+    </tbody>
+  </table>
+  <p>Use <code>immutable</code> for any value known at deploy time but not at compile time — token addresses, chain ID at construction, deployer-set parameters. Use <code>constant</code> for literals that never change.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Pool {
+    IERC20 public immutable asset;       // set in constructor
+    uint256 public constant FEE_BPS = 30; // hard-coded
+    constructor(IERC20 _asset) { asset = _asset; }
+}
+</code></pre></div>
+</section>
+
+<section id="packing">
+  <h2>Packing and slot economics</h2>
+  <p>The compiler packs sequential state variables into the same 32-byte slot when they fit. Order matters.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Unpacked: 3 slots
+contract Bad {
+    uint128 a;
+    uint256 b;   // forces b into its own slot, a leaves slot 0 half-used
+    uint128 c;   // its own slot
+}
+
+// Packed: 2 slots
+contract Good {
+    uint128 a;   // slot 0, lower 16 bytes
+    uint128 c;   // slot 0, upper 16 bytes
+    uint256 b;   // slot 1
+}
+</code></pre></div>
+
+  <p>Three subtleties:</p>
+  <ul>
+    <li>Packing helps reads only when both fields are touched in the same call. SSTORE on a packed slot still costs a full SSTORE.</li>
+    <li>Reading one field of a packed slot still loads the full word and masks; cost is identical to reading an unpacked uint256.</li>
+    <li>Beware of "false packing" — three uint96s pack into one slot, but if you only ever touch one at a time, you have not saved gas, only complicated the layout.</li>
+  </ul>
+</section>
+
+<section id="opcodes">
+  <h2>EVM opcodes — the mental model</h2>
+  <p>You do not need to memorize all 140 opcodes, but you should hold a model of the categories:</p>
+  <table>
+    <thead><tr><th>Category</th><th>Examples</th><th>Cost class</th></tr></thead>
+    <tbody>
+      <tr><td>Arithmetic</td><td>ADD, MUL, DIV, MOD, EXP</td><td>3-10 gas</td></tr>
+      <tr><td>Comparison/bitwise</td><td>LT, GT, EQ, AND, OR</td><td>3 gas</td></tr>
+      <tr><td>Stack/memory</td><td>PUSH, POP, MLOAD, MSTORE</td><td>3 gas + memory expansion</td></tr>
+      <tr><td>Storage</td><td>SLOAD, SSTORE, TLOAD, TSTORE</td><td>2100/20k cold; 100 warm; TSTORE 100</td></tr>
+      <tr><td>Control flow</td><td>JUMP, JUMPI, JUMPDEST, RETURN, REVERT</td><td>8-10 gas</td></tr>
+      <tr><td>External</td><td>CALL, STATICCALL, DELEGATECALL, CREATE, CREATE2</td><td>2600 cold; 100 warm + gas forwarded</td></tr>
+      <tr><td>Crypto</td><td>KECCAK256, ECRECOVER (precompile)</td><td>30 + 6/word; precompile fixed</td></tr>
+      <tr><td>Context</td><td>CALLER, ORIGIN, TIMESTAMP, NUMBER, CHAINID</td><td>2 gas</td></tr>
+    </tbody>
+  </table>
+  <p>Rules of thumb that survive most interviews:</p>
+  <ul>
+    <li>SSTORE dominates almost any function's gas cost.</li>
+    <li>External calls are not free even cold; warm-access discount applies after first touch.</li>
+    <li>Loops over storage are death; cache or denormalize.</li>
+    <li>Memory expansion is quadratic past 724 bytes — building large arrays in memory is not free.</li>
+  </ul>
+</section>
+
+<section id="fixed-point">
+  <h2>Fixed-point math</h2>
+  <p>The EVM has no native floating-point. DeFi math is integer arithmetic with scaling factors:</p>
+  <table>
+    <thead><tr><th>Convention</th><th>Scale</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>WAD</td><td>1e18 = 1.0</td><td>MakerDAO, Aave, most lending</td></tr>
+      <tr><td>RAY</td><td>1e27 = 1.0</td><td>Aave (for rate accumulators)</td></tr>
+      <tr><td>RAD</td><td>1e45 = 1.0</td><td>Maker (for currency × rate)</td></tr>
+      <tr><td>Q64.96</td><td>2^96 = 1.0</td><td>Uniswap v3 sqrt price</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// WadRayMath-style
+uint256 constant WAD = 1e18;
+
+function wadMul(uint256 a, uint256 b) pure returns (uint256) {
+    return (a * b + WAD / 2) / WAD;   // round-half-up
+}
+
+function wadDiv(uint256 a, uint256 b) pure returns (uint256) {
+    return (a * WAD + b / 2) / b;
+}
+
+// Rounding-down variants for protocol-favor:
+function wadMulDown(uint256 a, uint256 b) pure returns (uint256) {
+    return (a * b) / WAD;
+}
+</code></pre></div>
+
+  <p>Production libraries worth knowing by name:</p>
+  <ul>
+    <li><strong>WadRayMath / PercentageMath</strong> — Aave's canonical math lib.</li>
+    <li><strong>PRBMath</strong> — Paul Berg's fixed-point lib; SD59x18 (signed 18-decimal) and UD60x18 (unsigned).</li>
+    <li><strong>FixedPointMathLib</strong> — Solmate/Solady; tight, fast.</li>
+    <li><strong>SignedMath / Math</strong> — OpenZeppelin's abs, max, min, ceilDiv.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Round in protocol favor</span>
+    <p>When computing shares from assets on deposit, round down (user gets fewer shares). When computing assets to repay from debt shares, round up (user pays more). Get this wrong and you donate value to the first attacker who finds the asymmetry.</p>
+  </div>
+</section>
+
+<section id="reentrancy">
+  <h2>Reentrancy primitives</h2>
+  <p>Reentrancy is when an external call hands control to attacker-controlled code, which calls back into your contract before your state has been finalized. The canonical fix is to update state <em>before</em> the external call (CEI), or to lock against re-entry.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// OZ ReentrancyGuard — pre-Cancun
+abstract contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status = _NOT_ENTERED;
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "REENTRANT");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Cancun+ — transient storage lock, much cheaper
+abstract contract TransientReentrancyGuard {
+    bool transient _entered;
+
+    modifier nonReentrant() {
+        require(!_entered, "REENTRANT");
+        _entered = true;
+        _;
+        _entered = false;
+    }
+}
+</code></pre></div>
+
+  <p>Three reentrancy flavors to recognize:</p>
+  <ul>
+    <li><strong>Classic</strong> — DAO-era. State updated after external call.</li>
+    <li><strong>Cross-function</strong> — function A makes a call; attacker calls function B which observes stale state.</li>
+    <li><strong>Read-only</strong> — view function returns stale state mid-update; another protocol reads it as oracle and gets fooled.</li>
+  </ul>
+</section>
+
+<section id="cei">
+  <h2>Checks-Effects-Interactions</h2>
+  <p>The order:</p>
+  <ol>
+    <li><strong>Checks</strong> — validate inputs, permissions, invariants.</li>
+    <li><strong>Effects</strong> — update local storage.</li>
+    <li><strong>Interactions</strong> — make external calls (transfers, callbacks).</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw(uint256 amount) external nonReentrant {
+    // Checks
+    if (balance[msg.sender] &lt; amount) revert Insufficient();
+
+    // Effects
+    balance[msg.sender] -= amount;
+    totalSupply -= amount;
+
+    // Interactions
+    asset.safeTransfer(msg.sender, amount);
+}
+</code></pre></div>
+
+  <p>If a callback is essential (flash loans, liquidations with hook), CEI is not enough on its own — you need a transient lock <em>and</em> careful invariant-after-callback checks. See <a href="06-applied-patterns.html">chapter 06</a>.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The senior reflex</span>
+    <p>When you read someone else's contract, your eye should naturally check: is the external call the last thing? Is there a nonReentrant? Is there any state mutation after the call? If yes, your alarm fires automatically. Build this reflex.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Positioning</a> · <a href="04-deep-dive-primary.html">Next: Lending Mechanism Design →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

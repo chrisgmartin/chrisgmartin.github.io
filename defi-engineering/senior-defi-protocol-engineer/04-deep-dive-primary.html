@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lending Mechanism Design — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#invariants">Lending invariants</a>
+    <a href="#ltv-lltv">LTV, LLTV, health</a>
+    <a href="#irm">Interest rate models</a>
+    <a href="#topology">Market topology</a>
+    <a href="#liquidation">Liquidation mechanics</a>
+    <a href="#variants">Liquidation variants</a>
+    <a href="#bad-debt">Bad debt and socialization</a>
+    <a href="#worked">Worked example: derive a market</a>
+    <a href="#tradeoffs">Trade-offs to defend</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Primary</span>
+  <h1>Lending Protocol Mechanism Design</h1>
+  <p class="subtitle">The deep dive interviewers will spend the most time on. Derive a lending market from first principles, then argue every trade-off.</p>
+</header>
+
+<section id="invariants">
+  <h2>Lending invariants — the things that must always hold</h2>
+  <p>Before any line of Solidity, a senior protocol engineer thinks in invariants. A minimal lending market has perhaps five:</p>
+  <table>
+    <thead><tr><th>#</th><th>Invariant</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>I1</td><td>Total supply &ge; total borrow at all times (modulo socialized bad debt)</td><td>If borrow exceeds supply, suppliers cannot withdraw — protocol-level insolvency.</td></tr>
+      <tr><td>I2</td><td>No position is borrowing more than allowed by its collateral × LLTV × oracle price</td><td>The "healthy positions stay healthy" property after every transaction.</td></tr>
+      <tr><td>I3</td><td>Sum of position debts &equiv; total borrow (in shares)</td><td>Bookkeeping invariant — share/asset conversions are consistent.</td></tr>
+      <tr><td>I4</td><td>Interest accrues monotonically; no negative rates</td><td>Accumulator math never decreases.</td></tr>
+      <tr><td>I5</td><td>A user cannot affect another user's position without explicit authorization</td><td>The "permissions" invariant — modulo liquidations on unhealthy positions.</td></tr>
+    </tbody>
+  </table>
+  <p>If you can name these unprompted in an interview, you have set the frame for the whole conversation.</p>
+</section>
+
+<section id="ltv-lltv">
+  <h2>LTV, LLTV, and the health factor</h2>
+  <p>Three numbers govern collateralization:</p>
+  <ul>
+    <li><strong>LTV (Loan-to-Value)</strong> — instantaneous ratio of borrow value to collateral value.</li>
+    <li><strong>LLTV / Liquidation LTV</strong> — the threshold above which a position becomes liquidatable. Sometimes called the liquidation threshold.</li>
+    <li><strong>Max borrow LTV</strong> — the threshold above which the protocol refuses to let a user borrow more. Sometimes equal to LLTV (simpler), sometimes lower (buffered, safer).</li>
+  </ul>
+  <p>Healthy means: <code>borrow × price &le; collateral × LLTV</code>. In WAD:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function isHealthy(Position memory p, MarketParams memory params, uint256 price)
+    internal pure returns (bool)
+{
+    // collateral.value * LLTV  &gt;=  borrow.assets
+    uint256 collateralValue = (p.collateral * price) / ORACLE_SCALE;     // 1e18-scaled
+    uint256 maxBorrow = (collateralValue * params.lltv) / WAD;
+    return p.borrowAssets &lt;= maxBorrow;
+}
+</code></pre></div>
+
+  <p>Subtleties:</p>
+  <ul>
+    <li>The price units have to be exactly right. Most production code uses an <em>oracle scale</em> that aligns price units with token decimals so the math reduces to one division. Get this wrong and the protocol breaks across decimal mismatches.</li>
+    <li>Health is computed <em>after</em> interest accrual. If you check health before accruing, you may let a borrow happen on a position that is already underwater.</li>
+    <li>Rounding direction: when computing <em>max borrow</em> from collateral, round <strong>down</strong>. When computing <em>collateral required</em> for a given borrow, round <strong>up</strong>.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Pre-liquidations and gap LTVs</span>
+    <p>Several modern designs add a <em>pre-LLTV</em> below the LLTV. Between pre-LLTV and LLTV, the position is liquidatable at a discounted incentive (or via a Dutch auction). The intuition: smaller, gentler liquidations close the gap before a market-wide cascade.</p>
+  </div>
+</section>
+
+<section id="irm">
+  <h2>Interest rate models</h2>
+  <p>The IRM maps <strong>utilization</strong> (= total borrow / total supply) to a per-second borrow rate. The supply rate is then derived as <code>borrowRate × utilization × (1 - reserveFactor)</code>.</p>
+  <p>The canonical curve is the <strong>kinked linear</strong>:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Aave-style kinked IRM
+function borrowRate(uint256 U) internal view returns (uint256 r) {
+    if (U &lt;= OPTIMAL_U) {
+        // slope1 segment
+        r = BASE_RATE + (U * SLOPE_1) / OPTIMAL_U;
+    } else {
+        // slope2 segment — steep above the kink
+        uint256 excess = U - OPTIMAL_U;
+        r = BASE_RATE + SLOPE_1 + (excess * SLOPE_2) / (WAD - OPTIMAL_U);
+    }
+}
+</code></pre></div>
+
+  <p>Three production IRM families:</p>
+  <table>
+    <thead><tr><th>Family</th><th>How it works</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Kinked linear</td><td>Two slopes, breakpoint at an optimal utilization (often 80-90%)</td><td>Aave, Compound, Spark</td></tr>
+      <tr><td>Adaptive (PID)</td><td>Targets a utilization; rate drifts up if utilization is high, down if low</td><td>Morpho Blue's adaptive IRM</td></tr>
+      <tr><td>Jump rate / step</td><td>Discrete tiers</td><td>Older Compound v2</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Adaptive curve — simplified. Rate moves towards equilibrium driven by deviation
+// from target utilization. dr/dt = k * (U - U_target).
+function newRate(uint256 currentRate, uint256 U, uint256 U_target, uint256 dt)
+    internal pure returns (uint256)
+{
+    int256 deviation = int256(U) - int256(U_target);   // signed
+    int256 delta = (deviation * int256(K) * int256(dt)) / int256(WAD);
+    int256 newR = int256(currentRate) + delta;
+    if (newR &lt; int256(MIN_RATE)) newR = int256(MIN_RATE);
+    if (newR &gt; int256(MAX_RATE)) newR = int256(MAX_RATE);
+    return uint256(newR);
+}
+</code></pre></div>
+
+  <p>Two senior-level questions:</p>
+  <ul>
+    <li><strong>Why a kink?</strong> Suppliers need an incentive to leave headroom for withdrawals. The steep slope above kink punishes high utilization and pulls in fresh supply.</li>
+    <li><strong>Why adaptive?</strong> Different assets have different "ideal" rates, and ideal varies with macro conditions. Adaptive IRMs let the market discover the rate rather than the protocol picking it.</li>
+  </ul>
+</section>
+
+<section id="topology">
+  <h2>Market topology — isolated vs cross-collateral</h2>
+  <table>
+    <thead><tr><th>Axis</th><th>Isolated (single-collateral per market)</th><th>Cross-collateral pool</th></tr></thead>
+    <tbody>
+      <tr><td>Risk isolation</td><td>Strong — bad debt in one market does not touch others</td><td>Weak — one toxic asset can spread</td></tr>
+      <tr><td>Capital efficiency</td><td>Lower — same collateral cannot back multiple borrows simultaneously</td><td>Higher — single account, multiple collaterals</td></tr>
+      <tr><td>Curation cost</td><td>Low — markets can be permissionless; vaults curate</td><td>High — every listing is a protocol-wide risk decision</td></tr>
+      <tr><td>UX</td><td>Fragmented — many small markets</td><td>Unified — one borrowing account</td></tr>
+      <tr><td>Example</td><td>Morpho Blue, Euler v2 vault-pair</td><td>Aave v3, Compound v2</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">The senior framing</span>
+    <p>Isolated markets push <em>risk curation</em> off the core protocol and into a market for curators (ERC-4626 vaults that allocate across markets). The core stays minimal and immutable; risk is a separate, competitive layer above. This is the single most important architectural shift in lending in the last few years.</p>
+  </div>
+</section>
+
+<section id="liquidation">
+  <h2>Liquidation mechanics</h2>
+  <p>When a position falls below LLTV, anyone (the "liquidator") may repay some or all of its debt in exchange for collateral at a discount. Three knobs:</p>
+  <ul>
+    <li><strong>Close factor</strong> — the maximum fraction of debt repayable in a single liquidation (e.g., 50% in Aave, 100% in some isolated designs).</li>
+    <li><strong>Liquidation Incentive (LI)</strong> — the discount on collateral the liquidator receives. Often 5-10%, sometimes a function of how unhealthy the position is.</li>
+    <li><strong>Bonus split</strong> — how the incentive is divided between liquidator and protocol (e.g., 95% to liquidator, 5% to a treasury).</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function liquidate(
+    Market storage m,
+    Position storage p,
+    uint256 seizedCollateral,
+    uint256 price
+) internal returns (uint256 repaid) {
+    if (isHealthy(p, m.params, price)) revert HealthyPosition();
+
+    // Liquidator receives `seizedCollateral`, must repay corresponding debt.
+    // debtToRepay = seizedCollateral * price / (1 + LI)    (in WAD)
+    uint256 collateralValue = (seizedCollateral * price) / ORACLE_SCALE;
+    repaid = (collateralValue * WAD) / (WAD + m.params.liquidationIncentive);
+
+    if (repaid &gt; p.borrowAssets) revert OverRepay();
+
+    p.collateral     -= seizedCollateral;
+    p.borrowAssets   -= repaid;
+    m.totalBorrow    -= repaid;
+
+    // Pull repay, push collateral
+    m.loanToken.safeTransferFrom(msg.sender, address(this), repaid);
+    m.collateralToken.safeTransfer(msg.sender, seizedCollateral);
+}
+</code></pre></div>
+</section>
+
+<section id="variants">
+  <h2>Liquidation variants</h2>
+  <table>
+    <thead><tr><th>Style</th><th>Mechanism</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Fixed-incentive partial</td><td>Liquidator repays up to close-factor debt at fixed LI%</td><td>Simple, predictable</td><td>Crude — incentive does not adapt to severity</td></tr>
+      <tr><td>Full liquidation</td><td>Whole position closed at once</td><td>Cleans bad debt fast</td><td>Punitive to borrowers; concentrates MEV competition</td></tr>
+      <tr><td>Dutch auction</td><td>Discount starts at 0, increases over time/blocks until a keeper bids</td><td>Price-discovers the LI; MEV-resistant</td><td>Slow — large positions may not be cleared in time</td></tr>
+      <tr><td>Pre-liquidation</td><td>Below pre-LLTV but above LLTV; smaller, opt-in, cheaper</td><td>Smooths cascades; better for the borrower</td><td>Adds complexity; requires user opt-in or vault curation</td></tr>
+      <tr><td>Gradual / continuous</td><td>Position auto-deleverages over time when unhealthy</td><td>Borrower-friendly, smoother on cascades</td><td>Very protocol-specific; harder to keep gas low</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">MEV reality</span>
+    <p>In practice, liquidations are a heavily MEV-competitive market. The first searcher to land a profitable liquidation gets it. Fixed-LI partials are won by the highest priority-fee bidder; Dutch auctions move the competition from priority-gas to timing patience; pre-liquidations can be auctioned to a curated keeper. Design the auction <em>knowing</em> a sophisticated searcher market will play it.</p>
+  </div>
+</section>
+
+<section id="bad-debt">
+  <h2>Bad debt and socialization</h2>
+  <p>If a position goes underwater faster than liquidators can clear it (price gaps down through LLTV in a single block; oracle outage; insufficient liquidity), there is <strong>bad debt</strong>: borrowed assets that the collateral cannot cover.</p>
+  <p>Three responses:</p>
+  <ol>
+    <li><strong>Socialize.</strong> Reduce every supplier's claim proportionally. Suppliers wake up to a haircut. This is the Maker "smip" / Morpho Blue approach: bad debt is realized immediately as a downward write of the supply index.</li>
+    <li><strong>Treasury absorbs.</strong> A protocol-owned insurance fund repays the shortfall. Aave's Safety Module is a partial example.</li>
+    <li><strong>Defer.</strong> Treat the debt as written-off and continue. Borrowers and suppliers find out at withdrawal time. This is the worst option — it generates bank-run dynamics.</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Bad-debt socialization — write down totalSupplyAssets to reflect loss.
+function _socializeBadDebt(Market storage m, uint256 position) internal {
+    uint256 collateral = positions[position].collateral;
+    if (collateral != 0) return;          // only if collateral is zero
+
+    uint256 outstandingDebt = positions[position].borrowAssets;
+    m.totalBorrowAssets -= outstandingDebt;
+    m.totalSupplyAssets -= outstandingDebt;   // suppliers eat the loss
+    positions[position].borrowAssets = 0;
+    emit BadDebtSocialized(position, outstandingDebt);
+}
+</code></pre></div>
+
+  <p>This is one of those design choices where there is no clean answer. Pure socialization is honest but causes user pain on rare events. Treasury absorption requires the treasury to be capitalized and managed. Deferral is a fiction that eventually breaks.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example — derive a minimal lending market</h2>
+  <p>An interviewer says: "Whiteboard a minimal lending market. State, invariants, transitions." A senior answer:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">struct MarketParams {
+    address loanToken;
+    address collateralToken;
+    address oracle;
+    address irm;
+    uint256 lltv;          // WAD, e.g. 0.86e18
+}
+
+struct Market {
+    uint128 totalSupplyAssets;
+    uint128 totalSupplyShares;
+    uint128 totalBorrowAssets;
+    uint128 totalBorrowShares;
+    uint128 lastUpdate;
+    uint128 fee;             // accumulated to treasury, WAD
+}
+
+struct Position {
+    uint256 supplyShares;
+    uint128 borrowShares;
+    uint128 collateral;
+}
+
+// Transitions (each takes MarketParams + acts on Market and Position)
+function supply(MarketParams calldata m, uint256 assets) external;
+function withdraw(MarketParams calldata m, uint256 shares) external;
+function supplyCollateral(MarketParams calldata m, uint256 amount) external;
+function withdrawCollateral(MarketParams calldata m, uint256 amount) external;
+function borrow(MarketParams calldata m, uint256 assets) external;
+function repay(MarketParams calldata m, uint256 shares) external;
+function liquidate(MarketParams calldata m, address borrower, uint256 seized) external;
+function accrueInterest(MarketParams calldata m) public;
+</code></pre></div>
+
+  <p>The walk-through to give:</p>
+  <ol>
+    <li><strong>Singleton.</strong> One contract, all markets in a mapping keyed by <code>keccak256(abi.encode(params))</code>.</li>
+    <li><strong>Permissionless markets.</strong> Anyone can create a market by calling <code>createMarket(params)</code>; the LLTV, IRM, oracle, and tokens are baked in and immutable.</li>
+    <li><strong>Accrue first.</strong> Every state-changing function calls <code>accrueInterest</code> at the top, before any other state read.</li>
+    <li><strong>Round in protocol favor.</strong> Down on supply→shares; up on shares→assets on repay.</li>
+    <li><strong>Liquidate when unhealthy.</strong> No close-factor restriction necessary in an isolated design — full or partial allowed.</li>
+    <li><strong>Socialize on zero collateral.</strong> If after a liquidation the position has zero collateral but residual debt, write it down.</li>
+    <li><strong>Callbacks for composability.</strong> Borrow / liquidate accept an optional callback that fires before the transfer-in, enabling "flash" semantics.</li>
+  </ol>
+
+  <p>Bonus: if asked to extend it for fixed-rate loans, the senior answer outlines a <em>maturity-bucketed</em> overlay (suppliers commit liquidity to a tenor; rates fix at deal time) or a <em>perpetual fixed-rate via IRS</em> overlay rather than reworking the core.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs you should be able to defend either side of</h2>
+  <ul>
+    <li><strong>Singleton vs factory:</strong> singleton wins on gas, composability, invariants. Factory wins on per-market upgradability and isolation of bugs.</li>
+    <li><strong>Permissionless markets vs governed listings:</strong> permissionless wins on speed and minimal core; governed wins on user safety for casual users.</li>
+    <li><strong>Variable rate vs fixed rate:</strong> variable wins on liquidity efficiency; fixed wins on user predictability and matches off-chain finance.</li>
+    <li><strong>Fixed LI vs Dutch auction:</strong> fixed wins on simplicity and gas; Dutch wins on price discovery and MEV resistance.</li>
+    <li><strong>Full liquidation vs close-factor partial:</strong> full simplifies the math; partial is gentler on borrowers.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The winning pattern</span>
+    <p>For each row, the senior answer is the same shape: "Here's the case for A. Here's the case for B. We picked / I would pick [X] because [the dominant constraint], but I'd reach for [Y] if [the constraint flipped]." That's the level. Not "X is right." Not "they're both fine." But: <em>here are the regimes in which each one wins</em>.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core Fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: Oracles &amp; Price Feeds →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

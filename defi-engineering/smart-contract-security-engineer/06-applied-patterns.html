@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#periphery">The periphery pattern</a>
+    <a href="#oracle-wrapper">Hardened oracle wrappers</a>
+    <a href="#circuit-breakers">Circuit breakers</a>
+    <a href="#guardian">Guardian pause patterns</a>
+    <a href="#permit2">Permit2 and signature hardening</a>
+    <a href="#multicall">Multicall and call-depth attacks</a>
+    <a href="#defensive">Defensive primitives</a>
+    <a href="#summary">Quick reference</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">Six security-flavored patterns you'll either build or review. Each is a concrete shape with a failure mode.</p>
+</header>
+
+<section id="periphery">
+  <h2>The periphery pattern</h2>
+  <p>The most important architectural pattern in modern DeFi security. The idea: keep the audited core minimal and immutable; add functionality through <strong>periphery</strong> contracts that wrap the core but never modify it.</p>
+  <ul>
+    <li><strong>Core</strong>: small, audited, formally verified, immutable. Holds the actual user funds. Few external functions. Long-lived.</li>
+    <li><strong>Periphery</strong>: extension contracts. Routers, vault managers, hardened entry points. Replaceable. Carries less risk because if it breaks, the core is untouched.</li>
+  </ul>
+  <p>Examples you should know:</p>
+  <ul>
+    <li>Uniswap V2/V3 Router as periphery over the immutable Pair/Pool core.</li>
+    <li>Lending protocol "bundlers" that compose deposit + borrow + swap in one tx, while the lending core remains untouched.</li>
+    <li>Vault managers that allocate funds across multiple markets, while the markets themselves don't trust the manager.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Interview line</span>
+    <p>"The right question for a new feature isn't 'how do we add this to the core?' It's 'can we deliver this in a periphery contract that doesn't expand the audited surface?' Most yes."</p>
+  </div>
+  <h3>When it fails</h3>
+  <p>If the periphery is trusted by the core — for example, the core grants the periphery an allowance or special role — the periphery's compromise IS the core's compromise. The pattern only works if the core remains adversarial-by-default toward all callers, including the periphery.</p>
+</section>
+
+<section id="oracle-wrapper">
+  <h2>Hardened oracle wrappers</h2>
+  <p>Reading prices directly from a Chainlink feed (or any source) without wrapping is a recurring incident pattern. The pattern: a small wrapper contract that enforces safety properties.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract HardenedChainlinkOracle {
+    AggregatorV3Interface public immutable feed;
+    uint256 public immutable maxStaleness;
+    uint256 public immutable maxDeviationBps;
+    uint256 public lastPrice;
+
+    error StalePrice();
+    error InvalidPrice();
+    error PriceDeviationExceeded();
+
+    function getPrice() external returns (uint256) {
+        (, int256 answer,, uint256 updatedAt, ) = feed.latestRoundData();
+        if (answer &lt;= 0) revert InvalidPrice();
+        if (block.timestamp - updatedAt &gt; maxStaleness) revert StalePrice();
+        uint256 price = uint256(answer);
+        if (lastPrice != 0) {
+            uint256 diff = price &gt; lastPrice ? price - lastPrice : lastPrice - price;
+            if (diff * 10000 / lastPrice &gt; maxDeviationBps) revert PriceDeviationExceeded();
+        }
+        lastPrice = price;
+        return price;
+    }
+}</code></pre></div>
+  <h3>When it fails</h3>
+  <ul>
+    <li>Wrapper too aggressive on deviation → permanent DoS during legitimate volatility.</li>
+    <li>Wrapper too permissive → defeats the purpose; an attacker pushes a slow drift.</li>
+    <li>Wrapper has its own admin → admin compromise is now the oracle compromise.</li>
+    <li>Wrapper writes <code>lastPrice</code> in a way that's race-y between consumers.</li>
+  </ul>
+</section>
+
+<section id="circuit-breakers">
+  <h2>Circuit breakers</h2>
+  <p>The idea: if outflow exceeds a configured rate, halt. Borrowed from traditional finance ("trading halts") and adapted to on-chain. Maker, Aave, and others have variants.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract CircuitBreaker {
+    uint256 public immutable maxOutflowPerEpoch;
+    uint256 public immutable epochLength; // e.g. 1 hours
+    uint256 public currentEpoch;
+    uint256 public outflowThisEpoch;
+    bool public tripped;
+
+    modifier rateLimit(uint256 amount) {
+        if (tripped) revert("BREAKER_TRIPPED");
+        uint256 epoch = block.timestamp / epochLength;
+        if (epoch != currentEpoch) {
+            currentEpoch = epoch;
+            outflowThisEpoch = 0;
+        }
+        outflowThisEpoch += amount;
+        if (outflowThisEpoch &gt; maxOutflowPerEpoch) tripped = true;
+        _;
+    }
+}</code></pre></div>
+  <h3>When it fails</h3>
+  <ul>
+    <li>Threshold too low → trips on legitimate large redemptions; users hate the protocol.</li>
+    <li>Threshold too high → doesn't catch slow drains.</li>
+    <li>Reset mechanism vulnerable to griefing or admin compromise.</li>
+    <li>Breaker only on one path (withdraw) but attacker drains via another (e.g., liquidation).</li>
+  </ul>
+</section>
+
+<section id="guardian">
+  <h2>Guardian pause patterns</h2>
+  <p>A "guardian" is a privileged address — usually a multi-sig or specialized contract — with a narrow, unilateral power: <strong>pause</strong>. Unlike full governance, pausing doesn't require a vote.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Pausable {
+    address public guardian;
+    bool public paused;
+
+    modifier whenNotPaused() {
+        require(!paused, "PAUSED");
+        _;
+    }
+
+    function pause() external {
+        require(msg.sender == guardian, "ONLY_GUARDIAN");
+        paused = true;
+        emit Paused();
+    }
+
+    // Unpause requires governance (asymmetric)
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Unpaused();
+    }
+}</code></pre></div>
+  <p>The asymmetry matters. Pausing is unilateral; unpausing requires full governance. This makes guardian compromise survivable — a malicious guardian can grief by pausing, but can't unilaterally make user funds movable.</p>
+  <h3>When it fails</h3>
+  <ul>
+    <li>Pause covers some functions but not others — partial pause lets attackers exit while users can't.</li>
+    <li>Guardian key compromise → grief campaign; protocol DoSed until governance unpauses.</li>
+    <li>Pause modifier on view function → indexers and frontends break.</li>
+  </ul>
+</section>
+
+<section id="permit2">
+  <h2>Permit2 and signature-replay hardening</h2>
+  <p>EIP-2612 <code>permit()</code> and Uniswap's Permit2 let users sign approvals off-chain instead of submitting an approve transaction. They're standard now. The security pitfalls are well-known and recurring.</p>
+  <ul>
+    <li><strong>Nonce reuse.</strong> Every signed permit must consume a unique nonce. Replay catches.</li>
+    <li><strong>Deadline.</strong> Signatures must have a deadline; otherwise old sigs can be replayed forever.</li>
+    <li><strong>Front-running permit.</strong> Anyone can submit your signed permit. If your contract requires that <code>permit()</code> precede <code>transferFrom()</code> in the same call, a frontrunner can call your permit out-of-band, leaving your tx to revert.</li>
+    <li><strong>Cross-chain replay.</strong> EIP-712 domain separator must include chain ID; otherwise a sig on chain A is valid on chain B.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Defensive wrapper: try-permit so frontrunning permit doesn't revert downstream
+function depositWithPermit(uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+    try IERC20Permit(token).permit(msg.sender, address(this), amount, deadline, v, r, s) {} catch {}
+    // Proceed; allowance might have already been set
+    token.transferFrom(msg.sender, address(this), amount);
+    _deposit(amount);
+}</code></pre></div>
+</section>
+
+<section id="multicall">
+  <h2>Multicallable contracts and call-depth attacks</h2>
+  <p>Multicall lets users batch operations: <code>multicall([deposit(...), borrow(...), swap(...)])</code>. Common idiom; subtle bugs.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+    results = new bytes[](data.length);
+    for (uint256 i = 0; i &lt; data.length; i++) {
+        (bool success, bytes memory ret) = address(this).delegatecall(data[i]);
+        require(success, "CALL_FAIL");
+        results[i] = ret;
+    }
+}</code></pre></div>
+  <h3>When it fails</h3>
+  <ul>
+    <li><strong>msg.sender persistence.</strong> Within delegatecall multicall, <code>msg.sender</code> is the outer caller — useful, but a footgun if any sub-function trusts <code>address(this)</code>.</li>
+    <li><strong>msg.value persistence.</strong> Each sub-call sees the same <code>msg.value</code>. If sub-calls treat msg.value as transferred-this-call, the same ETH appears to be "spent" multiple times. <strong>This is a real bug class</strong> — many multicall implementations need to ban payable sub-calls.</li>
+    <li><strong>Reentrancy via batched calls.</strong> A reentrancy guard scoped per function gets bypassed when the same lock is touched across batched delegatecalls.</li>
+    <li><strong>Storage write conflicts.</strong> If sub-calls assume single-tx isolation, batched calls may break that.</li>
+  </ul>
+</section>
+
+<section id="defensive">
+  <h2>Defensive primitives</h2>
+  <h3>ReentrancyGuard (classic)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">uint256 private constant _NOT_ENTERED = 1;
+uint256 private constant _ENTERED = 2;
+uint256 private _status = _NOT_ENTERED;
+
+modifier nonReentrant() {
+    require(_status == _NOT_ENTERED, "REENTRY");
+    _status = _ENTERED;
+    _;
+    _status = _NOT_ENTERED;
+}</code></pre></div>
+
+  <h3>Transient reentrancy lock (EIP-1153)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">bytes32 constant LOCK = keccak256("reentrancy.lock");
+
+modifier nonReentrantTransient() {
+    assembly {
+        if tload(LOCK) { revert(0, 0) }
+        tstore(LOCK, 1)
+    }
+    _;
+    assembly { tstore(LOCK, 0) }
+}</code></pre></div>
+  <p>Transient storage is cleared at end-of-tx, so no SLOAD/SSTORE cost. Available post-Cancun.</p>
+
+  <h3>Checks-Effects-Interactions (CEI)</h3>
+  <p>Order operations:</p>
+  <ol>
+    <li><strong>Checks.</strong> All input validation and state preconditions first.</li>
+    <li><strong>Effects.</strong> All state changes second.</li>
+    <li><strong>Interactions.</strong> External calls last.</li>
+  </ol>
+  <p>Following CEI eliminates classic reentrancy without a guard. Doesn't help with cross-function reentrancy if a different function modifies the state you depend on.</p>
+
+  <h3>Pull-don't-push</h3>
+  <p>Instead of <em>pushing</em> tokens/ETH to a recipient (and risking their fallback), <em>credit</em> them on-chain and let them <em>pull</em> later.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">mapping(address =&gt; uint256) public pending;
+
+// instead of: payable(to).transfer(amount);
+function _credit(address to, uint256 amount) internal {
+    pending[to] += amount;
+}
+
+function claim() external nonReentrant {
+    uint256 amount = pending[msg.sender];
+    pending[msg.sender] = 0;
+    (bool ok,) = msg.sender.call{value: amount}("");
+    require(ok, "TRANSFER_FAIL");
+}</code></pre></div>
+
+  <h3>Two-step admin transfer</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">address public owner;
+address public pendingOwner;
+
+function transferOwnership(address newOwner) external onlyOwner {
+    pendingOwner = newOwner;
+}
+function acceptOwnership() external {
+    require(msg.sender == pendingOwner, "NOT_PENDING");
+    owner = pendingOwner;
+    pendingOwner = address(0);
+}</code></pre></div>
+  <p>One-step ownership transfer to a typo'd address bricks the contract. Two-step requires the new owner to accept.</p>
+
+  <h3>SafeERC20</h3>
+  <p>USDT and other non-standard ERC-20s don't return a bool on <code>transfer()</code>. Old contracts wrongly rely on the bool. Use OpenZeppelin's <code>SafeERC20.safeTransfer</code> or equivalent — it checks for either revert or correct bool, and works across token variants.</p>
+</section>
+
+<section id="summary">
+  <h2>Quick reference</h2>
+  <details class="collapse-card">
+    <summary><strong>When to add a guardian pause</strong></summary>
+    <div class="collapse-card-body">
+      <p>Any time fund movements exceed a threshold per block/per hour. Any time external dependencies (oracles, bridges) could fail. The pause is cheaper than building every defensive check inline.</p>
+    </div>
+  </details>
+  <details class="collapse-card">
+    <summary><strong>When to add a circuit breaker</strong></summary>
+    <div class="collapse-card-body">
+      <p>When the protocol allows large outflows and you can express a "normal" outflow envelope. Lending markets, vaults, bridges — yes. AMMs — usually no (they're zero-sum within a swap).</p>
+    </div>
+  </details>
+  <details class="collapse-card">
+    <summary><strong>When NOT to use multicall</strong></summary>
+    <div class="collapse-card-body">
+      <p>When any sub-call is payable. When any sub-call depends on a per-function reentrancy guard. When the protocol relies on <code>msg.sender == tx.origin</code>-style heuristics (which you shouldn't anyway).</p>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Audit Methodology</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; Quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

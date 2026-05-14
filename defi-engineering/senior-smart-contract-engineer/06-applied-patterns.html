@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#singleton-factory">Singleton vs factory</a>
+    <a href="#hooks">The hooks pattern</a>
+    <a href="#callbacks">The callback pattern</a>
+    <a href="#router-core">Router / core separation</a>
+    <a href="#position-nft">Position manager NFTs</a>
+    <a href="#permit-permit2">Permit and Permit2</a>
+    <a href="#erc4626">ERC-4626 vault adapters</a>
+    <a href="#intents">Intent-based architecture</a>
+    <a href="#jit">JIT liquidity</a>
+    <a href="#mev-resistant">MEV-resistant pricing</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">The repertoire of architectural patterns a senior DEX engineer reaches for. None of these is exotic; all of them show up in interview design rounds.</p>
+</header>
+
+<section id="singleton-factory">
+  <h2>Singleton vs factory</h2>
+  <p>Two ways to deploy "N pools":</p>
+  <table>
+    <thead><tr><th></th><th>Factory (v2, v3)</th><th>Singleton (v4, Balancer Vault)</th></tr></thead>
+    <tbody>
+      <tr><td>Pool storage</td><td>One contract per pool</td><td>One contract; all pool state in mappings</td></tr>
+      <tr><td>Deploy cost per pool</td><td>~3-5M gas (full contract deploy)</td><td>~50k gas (just a mapping write)</td></tr>
+      <tr><td>Cross-pool composability</td><td>Hard — token transfers required between calls</td><td>Easy — flash accounting, net deltas</td></tr>
+      <tr><td>Storage cost per swap</td><td>Per-pool slot0 read</td><td>One central state + per-pool sub-slot</td></tr>
+      <tr><td>Upgrade story</td><td>Pool immutable; redeploy whole factory generation</td><td>Same — the singleton itself is immutable</td></tr>
+      <tr><td>Hooks?</td><td>No (or external)</td><td>Native</td></tr>
+    </tbody>
+  </table>
+  <p>The singleton pattern won in v4 because (a) deployments on L1 are expensive and (b) flash accounting unlocks new mechanism designs (MEV-internalizing hooks, in-protocol batching). Be ready to explain both sides in a design round.</p>
+</section>
+
+<section id="hooks">
+  <h2>The hooks pattern</h2>
+  <p>Hooks externalize lifecycle moments to a user-deployed contract. The core pool calls hook functions at well-defined points; the hook returns delta values that can adjust the operation.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Sketch — minimal v4-style hook contract
+interface IHooks {
+    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata data)
+        external returns (bytes4 selector, BeforeSwapDelta delta, uint24 lpFeeOverride);
+    function afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata data)
+        external returns (bytes4 selector, int128 hookDelta);
+    // ... add/remove liquidity, initialize, donate
+}
+
+// Example — a dynamic-fee hook
+contract DynamicFeeHook is IHooks {
+    function beforeSwap(...) external returns (bytes4, BeforeSwapDelta, uint24) {
+        uint24 fee = _computeFee(_volatility());          // higher fee when vol is high
+        return (IHooks.beforeSwap.selector, EMPTY_DELTA, fee);
+    }
+}</code></pre></div>
+  <p>Encoding the hook's permissions into its address (lower bits of the address indicate which hooks it implements) is a v4-specific innovation — saves a storage read per swap.</p>
+  <div class="callout warn">
+    <span class="callout-label">Hook security</span>
+    <p>Hooks are <strong>trust amplifiers</strong>. A malicious or buggy hook can drain a pool. Pools advertise their attached hook; integrators must vet it before using. Some teams curate "approved" hook lists.</p>
+  </div>
+</section>
+
+<section id="callbacks">
+  <h2>The callback pattern</h2>
+  <p>Most modern AMMs are "pull-based" via callback. The pool gives you the output token <em>first</em>, then calls you back. Your callback must repay the input. If it doesn't, the post-call balance check reverts.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Uniswap v3 swap callback contract
+interface IUniswapV3SwapCallback {
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+
+contract MyRouter is IUniswapV3SwapCallback {
+    function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata data) external {
+        // verify caller is a real pool
+        (address payer, address token0, address token1, uint24 fee) = abi.decode(data, (address, address, address, uint24));
+        require(msg.sender == _computePoolAddress(token0, token1, fee), "BAD CALLER");
+
+        if (a0 &gt; 0) IERC20(token0).transferFrom(payer, msg.sender, uint256(a0));
+        if (a1 &gt; 0) IERC20(token1).transferFrom(payer, msg.sender, uint256(a1));
+    }
+}</code></pre></div>
+  <p>Three things you must check in every callback handler:</p>
+  <ol>
+    <li><strong>Caller authentication.</strong> Anyone can call your callback — check <code>msg.sender</code> is a legitimate pool.</li>
+    <li><strong>Authorization carry-over.</strong> Use a transient "unlocked" flag to ensure the callback only fires during your initiated swap.</li>
+    <li><strong>Reentrancy.</strong> The pool is calling you mid-state-mutation. Don't re-enter the pool.</li>
+  </ol>
+</section>
+
+<section id="router-core">
+  <h2>Router / core separation</h2>
+  <p>Routers do five things the core doesn't:</p>
+  <ol>
+    <li>Multi-hop path resolution</li>
+    <li>Slippage protection (the core does no slippage check)</li>
+    <li>Deadline enforcement</li>
+    <li>Token unwrapping (ETH/WETH)</li>
+    <li>Permit / signed-approval forwarding</li>
+  </ol>
+  <p>This separation is a load-bearing design choice:</p>
+  <ul>
+    <li><strong>Core stays small.</strong> Less code, easier to audit, immutable.</li>
+    <li><strong>Routers evolve.</strong> v3 has shipped multiple routers; v4 will ship even more.</li>
+    <li><strong>Custom routers compose.</strong> Aggregators (1inch, 0x, ParaSwap) build their own routers that talk directly to pool cores.</li>
+  </ul>
+  <p>In an interview, "where would you put this logic — core or periphery?" is a frequent forking question. Default: anything mutable, anything UX-sugar, anything chain-specific → periphery. The invariant lives in core, and only the invariant.</p>
+</section>
+
+<section id="position-nft">
+  <h2>Position manager NFTs</h2>
+  <p>v3 wraps LP positions in <code>NonfungiblePositionManager</code> (ERC-721). Each token represents <code>(pool, tickLower, tickUpper, liquidity)</code> plus collected-fee accounting.</p>
+  <p>Why NFTs not ERC-20?</p>
+  <ul>
+    <li>Positions are non-fungible by construction — same range and same pool yes, but <em>different deposit times</em> earn different fees.</li>
+    <li>NFT semantics give a clean approval/transfer story.</li>
+    <li>Composability — other protocols accept the NFT as collateral, wrap it in vaults, etc.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">struct Position {
+    uint96  nonce;
+    address operator;
+    uint80  poolId;          // packed pool reference
+    int24   tickLower;
+    int24   tickUpper;
+    uint128 liquidity;
+    uint256 feeGrowthInside0LastX128;
+    uint256 feeGrowthInside1LastX128;
+    uint128 tokensOwed0;
+    uint128 tokensOwed1;
+}
+mapping(uint256 =&gt; Position) private _positions;</code></pre></div>
+</section>
+
+<section id="permit-permit2">
+  <h2>Permit and Permit2</h2>
+  <p><strong>EIP-2612 permit</strong>: a token-side signed approval. Avoids the two-tx "approve then transferFrom" UX. Token must implement it.</p>
+  <p><strong>Permit2</strong>: a single canonical allowance manager deployed at the same address across all chains (<code>0x000000000022D473030F116dDEE9F6B43aC78BA3</code>). Users approve Permit2 once for a token; then sign per-spender, per-amount, per-deadline permits.</p>
+  <table>
+    <thead><tr><th></th><th>EIP-2612 permit</th><th>Permit2</th></tr></thead>
+    <tbody>
+      <tr><td>Token must implement?</td><td>Yes — most don't</td><td>No — wraps any ERC-20</td></tr>
+      <tr><td>Approval state</td><td>Per token, per spender</td><td>Per token to Permit2 (once); then sigs per spender</td></tr>
+      <tr><td>Replay protection</td><td>Nonce on token</td><td>Nonce on Permit2</td></tr>
+      <tr><td>Batch?</td><td>No</td><td>Yes — PermitBatch struct</td></tr>
+    </tbody>
+  </table>
+  <p>Modern DEX routers default to Permit2 because most real tokens (USDC, WETH at launch) didn't ship EIP-2612.</p>
+</section>
+
+<section id="erc4626">
+  <h2>ERC-4626 vault adapters that wrap AMM positions</h2>
+  <p>ERC-4626 is the standard vault interface (deposit, withdraw, mint, redeem, totalAssets). Wrapping an AMM position in a 4626 vault makes it integrable with money markets and yield aggregators.</p>
+  <p>Patterns:</p>
+  <ul>
+    <li><strong>Single-LP 4626</strong> — vault holds one v3 position. Auto-compounds fees. Shares are fungible. Examples: Gamma, Arrakis, Steer.</li>
+    <li><strong>Strategy 4626</strong> — vault dynamically rebalances between multiple ranges/pools.</li>
+    <li><strong>Wrapper 4626</strong> — turn a Curve LP token into a 4626 with auto-claim.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">4626 inflation attack</span>
+    <p>The classic ERC-4626 vulnerability: a first attacker deposits 1 wei to get 1 share, donates a million tokens to the vault, then subsequent depositors round to zero shares. Mitigation: virtual shares + virtual assets (OpenZeppelin's default). Know this — it shows up in interviews.</p>
+  </div>
+</section>
+
+<section id="intents">
+  <h2>Intent-based architecture</h2>
+  <p>The latest design movement. Instead of users signing transactions ("call this router with this calldata"), they sign <em>intents</em> ("I'll trade X for at least Y by deadline Z"). Off-chain solvers compete to fulfill the intent.</p>
+  <p>Notable systems:</p>
+  <ul>
+    <li><strong>CoW Protocol</strong> — batch auctions; solvers compete on a uniform clearing price.</li>
+    <li><strong>UniswapX</strong> — Dutch auction over fillers. Cross-chain extension via 7683.</li>
+    <li><strong>1inch Fusion</strong> — resolver-based filling with private mempool option.</li>
+    <li><strong>0x v2 / Settler</strong> — meta-aggregation with calldata compression.</li>
+  </ul>
+  <p>The smart-contract layer is small: an order-verifier, a callback-to-filler, a settle step. The complexity lives off-chain. You should know:</p>
+  <ul>
+    <li><strong>EIP-712 typed signatures</strong> for the order format.</li>
+    <li><strong>Nonce schemes</strong> (per-user counter vs per-order salt vs partial fills).</li>
+    <li><strong>Filler authentication</strong> — pre-approved set vs open competition.</li>
+    <li><strong>Reactor / settler contracts</strong> — the on-chain handler that pulls user tokens via Permit2, calls filler, verifies output, pays out.</li>
+  </ul>
+</section>
+
+<section id="jit">
+  <h2>JIT liquidity</h2>
+  <p>"Just-in-time" liquidity: an MEV searcher sees a large swap in the mempool, adds concentrated liquidity directly around the current price right before the swap, captures the fee, and removes immediately after.</p>
+  <p>Why it matters:</p>
+  <ul>
+    <li>JIT compresses fees that should have gone to long-term LPs.</li>
+    <li>It's not strictly evil — the user gets slightly better execution (more depth at-price) — but it cannibalizes passive LP returns.</li>
+    <li>v4 hooks can implement JIT-resistance: e.g. require a min lockup, or skim a portion of fees if liquidity was added recently.</li>
+  </ul>
+  <p>Interview question: <em>"design a hook that resists JIT but preserves market depth."</em> One answer: a fee surcharge on liquidity additions made in the last N blocks, refunded if it stays past M blocks.</p>
+</section>
+
+<section id="mev-resistant">
+  <h2>MEV-resistant pricing</h2>
+  <p>Categories of defense:</p>
+  <ul>
+    <li><strong>Batch auctions</strong> — clear all orders at one price per block. Sandwich attacks become structurally impossible. CoW is the canonical example.</li>
+    <li><strong>Rate-limited oracles</strong> — TWAPs over N seconds resist single-block manipulation.</li>
+    <li><strong>Commit-reveal</strong> — too slow for swaps, used in NFT mints.</li>
+    <li><strong>Threshold encryption / shielded mempools</strong> — orders are encrypted until inclusion. Examples: Shutter, Aztec.</li>
+    <li><strong>Private flow</strong> — Flashbots private, MEV-Share, MEV-Blocker. Send transactions through searchers who don't frontrun.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Senior signal</span>
+    <p>"How would you defend an AMM against sandwich attacks?" is a near-certain interview question. A strong answer enumerates 3-4 categories above, picks one, and discusses tradeoffs. A weak answer says "use a slippage limit."</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Gas &amp; EVM</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; quality →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

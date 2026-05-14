@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oracles &amp; Price Feeds — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#categories">Oracle categories</a>
+    <a href="#push-pull">Push vs pull</a>
+    <a href="#twap">TWAP construction</a>
+    <a href="#attacks">Oracle attack vectors</a>
+    <a href="#hardening">Hardening patterns</a>
+    <a href="#cross-chain">Cross-chain considerations</a>
+    <a href="#lending-integration">Integrating into a lending market</a>
+    <a href="#tradeoffs">Trade-offs to defend</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Secondary</span>
+  <h1>Oracles &amp; Price Feeds</h1>
+  <p class="subtitle">The second pillar of every lending interview. How prices reach the chain, how attackers manipulate them, and how to integrate them without making your protocol the next post-mortem.</p>
+</header>
+
+<section id="categories">
+  <h2>Oracle categories</h2>
+  <p>"Oracle" covers several distinct designs. A senior engineer distinguishes between them automatically.</p>
+  <table>
+    <thead><tr><th>Category</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Push (e.g., Chainlink Price Feeds)</td><td>Off-chain network signs prices; an on-chain aggregator stores the latest one when deviation/heartbeat triggers</td><td>Always-on read; simple integration</td><td>Heartbeat lag; updates only on threshold</td></tr>
+      <tr><td>Pull (e.g., Pyth)</td><td>Signed price updates served via a relay; consumer posts an update at use time</td><td>Fresh price on demand; cheaper publisher infra</td><td>UX/keeper burden; staleness on the wire</td></tr>
+      <tr><td>On-chain TWAP (e.g., Uniswap v3 oracle)</td><td>Geometric mean of price observations stored on-chain by the DEX itself</td><td>Manipulation-resistant over windows; no off-chain trust</td><td>Lags real price; expensive to query deeply; thin pools are still vulnerable</td></tr>
+      <tr><td>Off-chain attested (e.g., RedStone, API3, Chronicle)</td><td>Prices signed off-chain; consumer verifies signatures at use time</td><td>Many sources; flexible</td><td>Liveness and signature trust assumptions</td></tr>
+      <tr><td>Optimistic (e.g., UMA OO)</td><td>Anyone proposes a price; disputable during a window</td><td>Strong for tail / exotic assets</td><td>Latency in hours/days; not for hot path</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="push-pull">
+  <h2>Push vs pull — the integration shape</h2>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Push — Chainlink AggregatorV3 read
+interface AggregatorV3 {
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+    function decimals() external view returns (uint8);
+}
+
+function getPrice(AggregatorV3 feed) internal view returns (uint256) {
+    (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
+    if (answer &lt;= 0)                       revert BadOraclePrice();
+    if (block.timestamp - updatedAt &gt; MAX_STALENESS) revert StaleOracle();
+    return uint256(answer);
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Pull — Pyth-style update-then-read
+interface IPyth {
+    function updatePriceFeeds(bytes[] calldata updateData) external payable;
+    function getPriceUnsafe(bytes32 id) external view returns (PythStructs.Price memory);
+    function getUpdateFee(bytes[] calldata) external view returns (uint256);
+}
+
+function borrowWithFreshPrice(bytes[] calldata pythUpdate, uint256 amount) external payable {
+    uint256 fee = pyth.getUpdateFee(pythUpdate);
+    pyth.updatePriceFeeds{value: fee}(pythUpdate);
+
+    PythStructs.Price memory p = pyth.getPriceUnsafe(PYTH_ETH_USD);
+    if (block.timestamp - p.publishTime &gt; MAX_STALENESS) revert StaleOracle();
+    if (p.price &lt;= 0) revert BadOraclePrice();
+    // ... use p.price ...
+}
+</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">The senior framing</span>
+    <p>Push oracles externalize the freshness problem to the publisher network. Pull oracles externalize it to the transaction sender. Neither makes staleness go away — they just decide who pays for it. Your protocol still has to check the timestamp it ends up reading.</p>
+  </div>
+</section>
+
+<section id="twap">
+  <h2>TWAP construction</h2>
+  <p>The Uniswap v3 oracle stores a circular buffer of <em>cumulative tick</em> observations. Reading a TWAP over <code>[t-Δ, t]</code> is two lookups and an arithmetic mean of ticks (geometric mean of prices, because tick is log-price).</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Read a TWAP from a Uniswap v3 pool
+function consult(address pool, uint32 secondsAgo) internal view returns (int24 avgTick) {
+    uint32[] memory secondsAgos = new uint32[](2);
+    secondsAgos[0] = secondsAgo;
+    secondsAgos[1] = 0;
+    (int56[] memory tickCumulatives, ) = IUniswapV3Pool(pool).observe(secondsAgos);
+    int56 delta = tickCumulatives[1] - tickCumulatives[0];
+    avgTick = int24(delta / int56(uint56(secondsAgo)));
+    // Round towards negative infinity (Solidity rounds towards zero by default)
+    if (delta &lt; 0 &amp;&amp; delta % int56(uint56(secondsAgo)) != 0) avgTick--;
+}
+
+// Convert tick to a price (token1/token0 in Q64.96 form)
+function tickToSqrtPrice(int24 tick) internal pure returns (uint160) {
+    return TickMath.getSqrtRatioAtTick(tick);
+}
+</code></pre></div>
+
+  <p>Subtleties senior interviewers will probe:</p>
+  <ul>
+    <li><strong>Cardinality.</strong> Pools default to cardinality 1 (only the latest observation). You must <code>increaseObservationCardinalityNext(N)</code> to support a longer window. Forget this and your TWAP reverts on long lookbacks.</li>
+    <li><strong>Geometric vs arithmetic.</strong> Ticks are log-prices; the average tick is the <em>geometric</em> mean of prices, which is what you want for symmetric returns.</li>
+    <li><strong>Window choice.</strong> Short windows (≤5 min) are cheap to manipulate. Long windows (≥30 min) lag the real price during fast moves. Lending protocols typically pick something like 10-30 min.</li>
+    <li><strong>Inverted pairs.</strong> If your pool is WETH/USDC vs USDC/WETH, the price math inverts. Check token0/token1 ordering.</li>
+  </ul>
+</section>
+
+<section id="attacks">
+  <h2>Oracle attack vectors</h2>
+  <table>
+    <thead><tr><th>Attack</th><th>How</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Spot manipulation</td><td>Attacker uses flash loan to imbalance an AMM, reads the manipulated spot, profits</td><td>Use TWAP or non-AMM oracle</td></tr>
+      <tr><td>Donation / first-supplier inflation</td><td>Attacker mints 1 share, donates large amount to inflate share price, victim deposit rounds down to 0 shares</td><td>Virtual shares / dead shares pattern (see ch. 08)</td></tr>
+      <tr><td>Stale-price arb</td><td>Oracle has not updated; real price moved; attacker borrows/repays at stale price</td><td>Strict staleness check; fallback oracle</td></tr>
+      <tr><td>Oracle outage</td><td>Source feed pauses (sequencer down, off-chain network outage)</td><td>Pause protocol or freeze liquidations during outage</td></tr>
+      <tr><td>Liquidity squeeze</td><td>Attacker drains DEX liquidity so TWAP moves easily</td><td>Cross-check with second oracle source</td></tr>
+      <tr><td>Sequencer downtime (L2)</td><td>L2 sequencer halts; on-chain price stuck; users cannot react</td><td>Grace period check via Chainlink L2 sequencer feed</td></tr>
+      <tr><td>Confidence-interval games (Pyth)</td><td>Attacker uses a moment when confidence is wide</td><td>Reject prices when <code>conf / price &gt; threshold</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardening">
+  <h2>Hardening patterns</h2>
+  <p>A production oracle adapter typically composes several of these:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract HardenedOracle {
+    AggregatorV3 public immutable primary;
+    AggregatorV3 public immutable fallback_;
+    IUniswapV3Pool public immutable twapPool;
+    uint256 public constant MAX_STALENESS = 1 hours;
+    uint256 public constant MAX_DEVIATION_BPS = 200;  // 2%
+    uint32  public constant TWAP_WINDOW = 30 minutes;
+    AggregatorV3 public immutable sequencerUptime;   // L2 only
+
+    function readPrice() external view returns (uint256 price) {
+        // 1) L2 sequencer grace check
+        if (address(sequencerUptime) != address(0)) {
+            (, int256 answer, uint256 startedAt,,) = sequencerUptime.latestRoundData();
+            if (answer == 1) revert SequencerDown();
+            if (block.timestamp - startedAt &lt; 1 hours) revert SequencerGrace();
+        }
+
+        // 2) Primary
+        uint256 p1 = _read(primary);
+        // 3) TWAP cross-check
+        uint256 pTwap = _twap(twapPool, TWAP_WINDOW);
+        if (_deviation(p1, pTwap) &gt; MAX_DEVIATION_BPS) {
+            // 4) Disagree -&gt; fall back
+            uint256 p2 = _read(fallback_);
+            if (_deviation(p1, p2) &gt; MAX_DEVIATION_BPS) revert OracleDisagreement();
+            return p2;
+        }
+        return p1;
+    }
+}
+</code></pre></div>
+
+  <p>The standard checklist:</p>
+  <ul>
+    <li><strong>Staleness check.</strong> Reject prices older than a sane bound for the asset (volatile asset: ~hour; stable: ~day).</li>
+    <li><strong>Positivity check.</strong> Reject ≤ 0 prices.</li>
+    <li><strong>Sanity bounds.</strong> Hard min/max prices catch catastrophic feed corruption.</li>
+    <li><strong>Cross-check.</strong> Compare against a second source; revert or fall back on large deviation.</li>
+    <li><strong>L2 sequencer check.</strong> On Arbitrum, Optimism, Base — read the official sequencer-uptime feed and apply a grace period.</li>
+    <li><strong>Pause mechanism.</strong> A guardian role that can freeze borrows / liquidations during an outage.</li>
+    <li><strong>Per-market oracle binding.</strong> The market commits to an oracle at creation; the oracle cannot be changed under the market.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The classic mistake</span>
+    <p>"I'll just use Chainlink and trust it." Chainlink is robust but not infallible — it has deviation thresholds, heartbeats, and L2 sequencer dependencies. A senior engineer treats every oracle as a defense-in-depth problem: primary + cross-check + staleness + outage path.</p>
+  </div>
+</section>
+
+<section id="cross-chain">
+  <h2>Cross-chain oracle considerations</h2>
+  <p>Multi-chain protocols inherit the oracle properties of each chain. A few wrinkles:</p>
+  <ul>
+    <li><strong>Different feed addresses per chain.</strong> The oracle interface is the same but the deployed address differs. Bake addresses into immutables at deploy time, never hard-code in shared logic.</li>
+    <li><strong>Different heartbeats / deviation thresholds.</strong> ETH/USD on Ethereum mainnet has a different update profile than on Base. Your staleness bounds need to vary.</li>
+    <li><strong>L2-specific risks.</strong> Sequencer outages are real. Centralized sequencers create a window where users cannot transact but on-chain price might also be stale.</li>
+    <li><strong>Cross-chain price (e.g., LST on L2 priced via L1 redemption rate).</strong> You may need a bridge or an attested rate. Treat the bridge as part of the trust surface.</li>
+    <li><strong>Wrapped / synthetic assets.</strong> Be explicit about whether you price the wrapper or the underlying. The two diverge in stress.</li>
+  </ul>
+</section>
+
+<section id="lending-integration">
+  <h2>Integrating an oracle into a lending market</h2>
+  <p>In a minimal isolated-market design, the oracle is part of the market parameters and immutable for the life of the market:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">interface IOracle {
+    /// @return price collateral price expressed in loan-token units, scaled to ORACLE_SCALE
+    function price() external view returns (uint256);
+}
+
+uint256 constant ORACLE_SCALE = 1e36;   // chosen so that:
+// collateralValue (loan-token units, scaled to loanDecimals)
+//   = collateral * price / ORACLE_SCALE
+// regardless of the decimals of collateral or loan token.
+</code></pre></div>
+
+  <p>Two design implications:</p>
+  <ol>
+    <li><strong>Oracle as a contract per market.</strong> Each market commits to its own oracle adapter — typically a per-pair deployment of a factory. This makes oracle choice a permissionless decision (anyone can deploy an adapter), but the market is locked to one for its life.</li>
+    <li><strong>No oracle, no liquidation.</strong> If the oracle reverts (staleness, bad price), liquidations cannot happen. This is usually the right default: better to freeze a market than to liquidate at a wrong price. But it means a malicious or buggy oracle adapter can grief borrowers. Curation by vaults / risk teams matters.</li>
+  </ol>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs to defend either side of</h2>
+  <ul>
+    <li><strong>Push vs pull:</strong> push wins on UX simplicity; pull wins on freshness and publisher cost.</li>
+    <li><strong>Chainlink-only vs multi-source:</strong> Chainlink-only is simpler and almost always good enough; multi-source adds robustness for high-TVL or exotic markets.</li>
+    <li><strong>Long TWAP vs short TWAP:</strong> long resists manipulation; short tracks real price during sharp moves (which is when you most need accurate liquidations).</li>
+    <li><strong>Immutable oracle per market vs governance-replaceable:</strong> immutable removes a governance attack vector; replaceable lets you fix a bad adapter.</li>
+    <li><strong>Per-asset feeds vs derived (LP, LST) feeds:</strong> per-asset is simpler; derived is necessary for many real collaterals (cbETH, stETH, GLP) and requires careful "manipulation-resistant" derivation logic.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">When asked "what oracle would you use for X?"</span>
+    <p>Answer in three beats: (1) the primary feed I'd reach for, (2) the cross-check, (3) the failure path. "Chainlink ETH/USD as primary. Uniswap v3 30-min TWAP cross-check on the canonical pool. Pause borrows + freeze liquidations if either is stale, with a guardian that can manually unpause once the feed recovers." That answer is correct for ~70% of markets.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← Lending Mechanism Design</a> · <a href="06-applied-patterns.html">Next: Applied Patterns →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

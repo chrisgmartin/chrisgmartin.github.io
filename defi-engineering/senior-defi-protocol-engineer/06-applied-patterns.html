@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Applied Patterns — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#singleton">Singleton vs factory</a>
+    <a href="#erc4626">ERC-4626 vault adapters</a>
+    <a href="#periphery">Periphery / router separation</a>
+    <a href="#callbacks">Callbacks &amp; flash loans</a>
+    <a href="#upgradeable">Upgradeable vs immutable</a>
+    <a href="#governance-knobs">Governed vs trustless params</a>
+    <a href="#permissions">Permissioned vs permissionless market creation</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-deep-dive-secondary.html">← Previous</a>
+    <a href="07-evaluation-quality.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Applied Patterns</h1>
+  <p class="subtitle">Six patterns you'll see again and again in modern DeFi protocols. For each: the shape, where it's used, what the tradeoffs are, what a senior would say when asked to defend it.</p>
+</header>
+
+<section id="singleton">
+  <h2>1. Singleton vs factory</h2>
+  <p>In a <strong>factory</strong> pattern, each market is its own contract; the factory deploys them. In a <strong>singleton</strong>, one contract holds all markets in storage, keyed by market parameters.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Singleton — Morpho Blue / Euler v2 style
+contract LendingCore {
+    mapping(Id =&gt; Market) public market;
+    mapping(Id =&gt; mapping(address =&gt; Position)) public position;
+
+    function createMarket(MarketParams calldata p) external {
+        Id id = p.toId();          // keccak256(abi.encode(p))
+        if (market[id].lastUpdate != 0) revert AlreadyCreated();
+        if (!isLltvEnabled[p.lltv]) revert LltvNotEnabled();
+        if (!isIrmEnabled[p.irm])   revert IrmNotEnabled();
+        market[id].lastUpdate = uint128(block.timestamp);
+        emit CreateMarket(id, p);
+    }
+
+    function supply(MarketParams calldata p, uint256 assets, address onBehalf)
+        external returns (uint256 shares)
+    {
+        Id id = p.toId();
+        _accrueInterest(market[id], p);
+        // ...
+    }
+}
+</code></pre></div>
+
+  <table>
+    <thead><tr><th>Axis</th><th>Singleton</th><th>Factory</th></tr></thead>
+    <tbody>
+      <tr><td>Gas (cross-market ops)</td><td>Cheap — one SLOAD context</td><td>Expensive — external CALL per market</td></tr>
+      <tr><td>Composability</td><td>Strong — multi-market in one call</td><td>Limited — each call to a separate contract</td></tr>
+      <tr><td>Bug blast radius</td><td>All markets — terrifying</td><td>Per-market — bug fixable by deploying new market</td></tr>
+      <tr><td>Storage layout drift</td><td>Cannot change once deployed</td><td>Each new market can use a new contract version</td></tr>
+      <tr><td>Discoverability</td><td>Anyone reads all markets from one address</td><td>Need a registry</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Senior framing</span>
+    <p>Singleton is right when (a) the core can be made small and immutable, (b) markets are isolated by parameters so bug surface is bounded, (c) composability matters. Factory is right when markets need to evolve independently, or when each market is large enough to be its own product.</p>
+  </div>
+</section>
+
+<section id="erc4626">
+  <h2>2. ERC-4626 vault adapters</h2>
+  <p>ERC-4626 is the tokenized-vault standard: deposit an underlying, get shares; redeem shares, get underlying. It is the universal adapter between user-facing capital and protocol-level primitives. Use it everywhere the protocol holds yield-bearing or stakeable assets.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">abstract contract ERC4626 is ERC20 {
+    IERC20 public immutable asset;
+
+    function totalAssets() public view virtual returns (uint256);
+
+    function deposit(uint256 assets, address receiver) public virtual returns (uint256 shares) {
+        shares = previewDeposit(assets);
+        if (shares == 0) revert ZeroShares();
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+        _mint(receiver, shares);
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    function previewDeposit(uint256 assets) public view returns (uint256) {
+        return _convertToShares(assets, MathUpgradeable.Rounding.Down);
+    }
+
+    function _convertToShares(uint256 assets, Rounding r) internal view returns (uint256) {
+        uint256 supply = totalSupply();
+        return supply == 0
+            ? assets
+            : assets.mulDiv(supply, totalAssets(), r);
+    }
+}
+</code></pre></div>
+
+  <p>Production callouts:</p>
+  <ul>
+    <li><strong>Inflation attack.</strong> The first depositor can mint 1 share, donate underlying, and dilute later depositors who round down to 0 shares. Mitigations: virtual shares (OpenZeppelin), dead shares (Solady), or refusing the first deposit below a minimum.</li>
+    <li><strong>Rounding everywhere.</strong> Round shares down on deposit; round assets up on redeem. Round consistently across all <code>preview*</code> / <code>convert*</code> functions.</li>
+    <li><strong>Reentrancy on rebasing or fee-on-transfer underlying.</strong> Use <code>safeTransferFrom</code>, measure balance before/after, and reject tokens that don't conform.</li>
+    <li><strong>Curated risk vaults.</strong> A common pattern in modern lending: a vault holds depositor capital and allocates across multiple isolated markets according to a curator's policy. Users see one share token; risk is curated.</li>
+  </ul>
+</section>
+
+<section id="periphery">
+  <h2>3. Periphery / router separation</h2>
+  <p>The core is small and immutable. User-facing UX — multi-step transactions, slippage protection, permit handling, signature flows, multicall — lives in a <strong>periphery</strong> or <strong>router</strong> contract that the core does not know about.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Periphery — bundles permit + supply + borrow into one user transaction
+contract LendingBundler {
+    LendingCore public immutable core;
+
+    function permitAndBorrow(
+        MarketParams calldata p,
+        uint256 collateral,
+        uint256 borrowAmount,
+        PermitData calldata permit
+    ) external {
+        IERC20Permit(p.collateralToken).permit(
+            msg.sender, address(this),
+            permit.value, permit.deadline,
+            permit.v, permit.r, permit.s
+        );
+        IERC20(p.collateralToken).safeTransferFrom(msg.sender, address(this), collateral);
+        IERC20(p.collateralToken).safeApprove(address(core), collateral);
+        core.supplyCollateral(p, collateral, msg.sender, "");
+        core.borrow(p, borrowAmount, 0, msg.sender, msg.sender);
+    }
+}
+</code></pre></div>
+
+  <p>Trade-offs:</p>
+  <ul>
+    <li>Pro: periphery is upgradable without touching the core; bugs are contained to UX, not protocol.</li>
+    <li>Con: users must approve the periphery, which introduces a "trust the bundler" surface (mitigated by reviewing the bundler code, not granting infinite approvals, or using transient approval patterns).</li>
+    <li>Senior reflex: in interviews, distinguish what belongs in the core (invariants, money) from what belongs in periphery (UX, ergonomics). Never let UX concerns push you to add knobs to the core.</li>
+  </ul>
+</section>
+
+<section id="callbacks">
+  <h2>4. Callbacks &amp; flash loans</h2>
+  <p>A callback hands control to the caller mid-transaction, then expects state to be settled by the time control returns. This is how flash loans, leverage routers, and atomic liquidation-with-swap all work.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Generic callback pattern — borrow with a callback to swap the loan into collateral
+function borrow(
+    MarketParams calldata p,
+    uint256 assets,
+    uint256 shares,
+    address onBehalf,
+    address receiver,
+    bytes calldata data
+) external returns (uint256, uint256) {
+    Id id = p.toId();
+    _accrueInterest(market[id], p);
+
+    // Effects first — credit shares, deduct from market
+    (assets, shares) = _settleBorrow(id, assets, shares, onBehalf);
+
+    // Push loan tokens to receiver
+    IERC20(p.loanToken).safeTransfer(receiver, assets);
+
+    // Optional callback — receiver can use loan tokens, deposit collateral, etc.
+    if (data.length != 0) IMorphoBorrowCallback(msg.sender).onMorphoBorrow(assets, data);
+
+    // Check health AFTER the callback
+    if (!_isHealthy(id, p, onBehalf)) revert UnhealthyPosition();
+    return (assets, shares);
+}
+</code></pre></div>
+
+  <p>The critical pattern: <strong>health check after the callback</strong>. The callback may deposit collateral, swap, or otherwise restore the position. The core trusts only the post-callback invariant.</p>
+
+  <ul>
+    <li><strong>Reentrancy:</strong> callbacks intentionally reenter. The protections are CEI + the post-callback invariant check, not a blanket <code>nonReentrant</code>.</li>
+    <li><strong>Read-only reentrancy:</strong> while a callback is in flight, view functions may return inconsistent state. Other protocols reading you as an oracle can be fooled. Either expose a "do not read me right now" flag, or guarantee all views are consistent across the callback boundary.</li>
+    <li><strong>Authorization in callback:</strong> the callback runs as <code>onBehalf</code> of the original caller; make sure permissions are checked at entry, not delegated.</li>
+  </ul>
+</section>
+
+<section id="upgradeable">
+  <h2>5. Upgradeable vs immutable</h2>
+  <p>The DeFi community has been moving away from upgradeable cores. The fashion in 2026 is <em>immutable core + upgradeable periphery</em>. But the trade-off is real.</p>
+
+  <table>
+    <thead><tr><th>Pattern</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Immutable</td><td>Deploy once, never upgrade. Bugs require redeploy + migrate.</td><td>No upgrade-key attack surface; users trust the address forever.</td><td>Bugs are permanent; migrations are painful.</td></tr>
+      <tr><td>Transparent proxy</td><td>Proxy delegatecalls into implementation. Admin can replace.</td><td>Battle-tested; clear admin separation.</td><td>Larger contract; admin power is real.</td></tr>
+      <tr><td>UUPS</td><td>Upgrade logic lives in implementation, not proxy.</td><td>Smaller proxy; cheaper deploys.</td><td>Forget to include upgrade logic → bricked.</td></tr>
+      <tr><td>Beacon</td><td>Many instances share one implementation pointer.</td><td>Mass upgrades across N markets in one tx.</td><td>Mass blast radius if upgrade is bad.</td></tr>
+      <tr><td>Diamond (EIP-2535)</td><td>Modular facets, each with its own selectors.</td><td>Can grow past contract-size limit.</td><td>Complex; storage collisions are nasty.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">The senior position</span>
+    <p>For a small core that has been audited heavily, immutable is the strongest signal of trust you can offer users. Move all upgradability to vaults and periphery. If you must upgrade the core, use a transparent proxy with a long timelock, and accept that you have just made your governance key the most valuable target on chain.</p>
+  </div>
+</section>
+
+<section id="governance-knobs">
+  <h2>6. Governance-gated knobs vs trustless parameters</h2>
+  <p>Every parameter is either <em>set at construction and frozen</em> (trustless), <em>changeable via governance vote behind a timelock</em> (governed), or <em>changeable by a guardian for emergencies</em> (privileged).</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Trustless — set in market params, immutable for life of market
+struct MarketParams {
+    address loanToken;
+    address collateralToken;
+    address oracle;
+    address irm;
+    uint256 lltv;
+}
+
+// Governed — list of allowed values, owner-controlled, behind timelock
+mapping(address =&gt; bool) public isIrmEnabled;
+mapping(uint256 =&gt; bool) public isLltvEnabled;
+
+function enableIrm(address irm) external onlyOwner {
+    isIrmEnabled[irm] = true;
+    emit EnableIrm(irm);
+}
+
+// Emergency — guardian can pause without timelock
+modifier whenNotPaused() {
+    if (paused) revert Paused();
+    _;
+}
+function pause() external onlyGuardian { paused = true; }
+</code></pre></div>
+
+  <p>The senior taxonomy:</p>
+  <ul>
+    <li><strong>Trustless:</strong> LLTV, oracle, IRM <em>for a given market</em>. Once a user supplies, the rules cannot move under them.</li>
+    <li><strong>Allow-list governance:</strong> the set of LLTVs / IRMs / fee recipients that <em>any</em> market may use. Slow, deliberate, timelocked.</li>
+    <li><strong>Guardian emergency:</strong> pause / unpause. Fast, narrow, with no economic upside (a guardian who pauses cannot steal — they can only stop things).</li>
+  </ul>
+
+  <p>A clean separation between these three is one of the cleanest signals of senior protocol design. Conversely, a single owner key that can change LLTV on a live market is the kind of red flag that gets a protocol rejected by serious LPs.</p>
+</section>
+
+<section id="permissions">
+  <h2>7. Permissioned vs permissionless market creation</h2>
+  <p>Who is allowed to create a new market on the protocol?</p>
+  <table>
+    <thead><tr><th>Model</th><th>Mechanics</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Fully permissionless</td><td>Anyone can call <code>createMarket</code> with any allowed params (from the governance allow-list).</td><td>Morpho Blue, Euler v2 vault-pairs</td></tr>
+      <tr><td>Curator-permissioned</td><td>Markets exist on-chain but capital is only routed via curated vaults that choose which to allocate to.</td><td>Risk vaults atop permissionless cores</td></tr>
+      <tr><td>Governance-listed</td><td>Each market is a governance proposal.</td><td>Aave v3, Compound v2</td></tr>
+      <tr><td>Hybrid</td><td>Permissionless creation; risk parameters set per market by a risk DAO.</td><td>Some isolated-pool markets</td></tr>
+    </tbody>
+  </table>
+
+  <p>The deeper question: where does <strong>risk curation</strong> live? Permissionless creation does not eliminate the need for risk curation — it relocates it. Vaults that allocate across markets compete on returns and risk; users pick a vault, not a market. This pushes a complex, opinionated job out of the protocol core and into a competitive market.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The frame</span>
+    <p>"Permissionless markets + curated vaults" is the dominant new design pattern in lending. Defend it by noting: (a) it shrinks the core, (b) it makes curation economically incentivized, (c) it lets the protocol stay neutral while users still get curated UX. Defend the alternative by noting: (a) most users do not pick vaults thoughtfully, (b) protocol reputation suffers from every bad market on it, (c) governance-listed markets are easier to communicate.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="05-deep-dive-secondary.html">← Oracles</a> · <a href="07-evaluation-quality.html">Next: Evaluation &amp; Quality →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

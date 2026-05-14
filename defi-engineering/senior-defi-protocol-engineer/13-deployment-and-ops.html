@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#scripts">Foundry deployment scripts</a>
+    <a href="#create2">Deterministic deploys — CREATE2 / CREATE3</a>
+    <a href="#multichain">Multi-chain deploys</a>
+    <a href="#verify">Verification — Etherscan &amp; Sourcify</a>
+    <a href="#hygiene">Mainnet ops hygiene</a>
+    <a href="#dry-run">Dry-run on fork</a>
+    <a href="#incident">Incident response cadence</a>
+    <a href="#checklist">A pre-deploy checklist</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Ops</h1>
+  <p class="subtitle">From "merged to main" to "live on mainnet at the same address on 12 chains" — and the discipline that keeps it boring.</p>
+</header>
+
+<section id="scripts">
+  <h2>Foundry deployment scripts</h2>
+  <p>Foundry's <code>forge script</code> is the de-facto deployment tool. A script is a Solidity contract that uses cheatcodes to broadcast transactions.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// script/Deploy.s.sol
+import {Script} from "forge-std/Script.sol";
+import {LendingCore} from "../src/LendingCore.sol";
+
+contract Deploy is Script {
+    function run() external {
+        uint256 pk = vm.envUint("DEPLOYER_PK");
+        address owner = vm.envAddress("OWNER");
+
+        vm.startBroadcast(pk);
+        LendingCore core = new LendingCore(owner);
+        vm.stopBroadcast();
+
+        console2.log("LendingCore deployed at:", address(core));
+    }
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Dry-run (simulation)
+forge script script/Deploy.s.sol --rpc-url $RPC
+
+# Live broadcast
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --verify --etherscan-api-key $KEY
+
+# Multi-chain dry-run
+forge script script/Deploy.s.sol --rpc-url $BASE_RPC --sender $DEPLOYER
+forge script script/Deploy.s.sol --rpc-url $ARB_RPC  --sender $DEPLOYER
+</code></pre></div>
+
+  <p>Conventions worth following:</p>
+  <ul>
+    <li><strong>Env-driven config.</strong> Never hard-code addresses, keys, chain IDs. Use <code>vm.envUint</code>, <code>vm.envAddress</code>.</li>
+    <li><strong>One script per deployment unit.</strong> Don't deploy 10 contracts in one script unless they truly belong together.</li>
+    <li><strong>Log every deployed address.</strong> Foundry also writes a <code>broadcast/</code> directory with full receipts; check it into a separate ops repo.</li>
+    <li><strong>Two-step ownership.</strong> Deploy with a temporary deployer EOA; transfer ownership to the timelocked multisig in a separate script.</li>
+  </ul>
+</section>
+
+<section id="create2">
+  <h2>Deterministic deploys — CREATE2 / CREATE3</h2>
+  <p>By default <code>CREATE</code> produces an address that depends on <code>(deployer, nonce)</code>. <code>CREATE2</code> (EIP-1014) computes the address from <code>(deployer, salt, bytecode_hash)</code>. <code>CREATE3</code> is a community pattern that drops the bytecode dependency, giving <code>(deployer, salt)</code> only.</p>
+
+  <table>
+    <thead><tr><th>Opcode</th><th>Address formula</th><th>Same address across chains?</th></tr></thead>
+    <tbody>
+      <tr><td>CREATE</td><td><code>keccak256(rlp([deployer, nonce]))</code></td><td>No — nonce drifts</td></tr>
+      <tr><td>CREATE2</td><td><code>keccak256(0xff, deployer, salt, code_hash)</code></td><td>Yes, if deployer + salt + bytecode are identical</td></tr>
+      <tr><td>CREATE3</td><td><code>keccak256(0xff, deployer, salt, INIT_CODE_HASH_OF_PROXY)</code></td><td>Yes, even with different bytecode</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Using the canonical Singleton Factory (0x4e59...)
+address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+// Deploying:
+bytes32 salt = keccak256("LendingCore.v1");
+bytes memory init = abi.encodePacked(type(LendingCore).creationCode, abi.encode(owner));
+(bool ok, bytes memory ret) = CREATE2_DEPLOYER.call(abi.encodePacked(salt, init));
+require(ok, "CREATE2_FAIL");
+address deployed = address(bytes20(ret));
+
+// Predicting address (off-chain or in a verify step):
+bytes32 hash = keccak256(abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, salt, keccak256(init)));
+address predicted = address(uint160(uint256(hash)));
+</code></pre></div>
+
+  <div class="callout tip">
+    <span class="callout-label">When to use which</span>
+    <p>Use CREATE2 when you want the same address across chains and your bytecode is identical. Use CREATE3 when bytecode might differ per chain (e.g., chain-specific immutables) but you want the same address everywhere. Use plain CREATE when neither matters.</p>
+  </div>
+
+  <p>Edge cases:</p>
+  <ul>
+    <li>Constructor arguments must be identical across chains or CREATE2 addresses diverge.</li>
+    <li>Compiler version, optimizer settings, and imports all bake into the bytecode hash.</li>
+    <li><code>CHAINID</code> baked as an immutable changes per chain — use CREATE3, or pass it as a constructor arg that is identical across chains and read it from chain itself in code.</li>
+  </ul>
+</section>
+
+<section id="multichain">
+  <h2>Multi-chain deploys</h2>
+  <p>Deploying to N chains is a project-management exercise as much as a technical one. The senior playbook:</p>
+  <ol>
+    <li><strong>Bake everything into immutables.</strong> Chain-specific data (oracle addresses, sequencer feeds, native wrapper) goes into constructor args, captured at deploy time.</li>
+    <li><strong>Use a deterministic deployer.</strong> The same address everywhere is a major UX and security win.</li>
+    <li><strong>Deploy in a strict order.</strong> Dependencies first (oracle adapters), core next, periphery last.</li>
+    <li><strong>Verify on each chain.</strong> Etherscan + Sourcify + Routescan + whatever the L2's explorer wants.</li>
+    <li><strong>Document the canonical address.</strong> Maintain a single source of truth (<code>addresses.json</code> in a public repo).</li>
+    <li><strong>Run an end-to-end smoke test on each chain.</strong> Deposit-borrow-repay-withdraw on a tiny amount, validate events match.</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-json">{
+  "ethereum": {
+    "chainId": 1,
+    "core": "0x...",
+    "factory": "0x...",
+    "deployedAt": 19000000
+  },
+  "base": {
+    "chainId": 8453,
+    "core": "0x...",
+    "factory": "0x...",
+    "deployedAt": 11000000
+  },
+  "arbitrum": {
+    "chainId": 42161,
+    "core": "0x...",
+    "factory": "0x...",
+    "deployedAt": 200000000
+  }
+}
+</code></pre></div>
+</section>
+
+<section id="verify">
+  <h2>Verification — Etherscan, Sourcify, and friends</h2>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Etherscan (in-flight, via foundry)
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast \
+  --verify --etherscan-api-key $ETHERSCAN_KEY
+
+# Etherscan after the fact
+forge verify-contract $ADDR src/LendingCore.sol:LendingCore \
+  --chain-id 1 --etherscan-api-key $ETHERSCAN_KEY \
+  --constructor-args $(cast abi-encode "constructor(address)" $OWNER)
+
+# Sourcify
+forge verify-contract $ADDR src/LendingCore.sol:LendingCore \
+  --chain-id 1 --verifier sourcify
+
+# Blockscout (many L2s use this)
+forge verify-contract $ADDR src/LendingCore.sol:LendingCore \
+  --chain-id 8453 --verifier blockscout \
+  --verifier-url https://base.blockscout.com/api/
+</code></pre></div>
+
+  <p>Verification matters for trust and discoverability — and for users, since dapps and wallets read verified ABIs. A protocol with unverified contracts on mainnet signals "we shipped sloppy." Verify <strong>everywhere</strong>.</p>
+</section>
+
+<section id="hygiene">
+  <h2>Mainnet ops hygiene</h2>
+  <ul>
+    <li><strong>Never sign a tx you haven't simulated.</strong> Use Tenderly simulation or <code>cast estimate / call</code> first.</li>
+    <li><strong>Hardware-backed keys for any privileged role.</strong> Ledger / Trezor / Fireblocks. Hot keys are for dev only.</li>
+    <li><strong>Multi-sig for everything privileged.</strong> Single-sig is malpractice for owner / admin / guardian.</li>
+    <li><strong>Timelock for owner-level actions.</strong> Even with multisig, delay window for community to react.</li>
+    <li><strong>Separate guardian role for emergencies.</strong> Lower bar (smaller multisig, faster) but only "pause" power.</li>
+    <li><strong>Document every privileged tx.</strong> Pre-tx Slack post, post-tx confirmation, tx hash in ops channel.</li>
+    <li><strong>Two-person review</strong> before any privileged tx is signed.</li>
+    <li><strong>Drill the guardian playbook.</strong> Quarterly tabletop exercise where someone "calls" the pause.</li>
+  </ul>
+</section>
+
+<section id="dry-run">
+  <h2>Dry-run on fork</h2>
+  <p>Every significant on-chain action — deploys, upgrades, migrations, large governance proposals — gets a fork dry-run first.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Start an anvil fork pinned to current block
+anvil --fork-url $MAINNET_RPC --fork-block-number $BLOCK
+
+# Replay your script against the fork
+forge script script/Upgrade.s.sol --rpc-url http://localhost:8545 --broadcast \
+  --private-key $ANVIL_KEY
+
+# Verify the state changes are as expected
+cast call $CORE "totalSupplyAssets()(uint256)" --rpc-url http://localhost:8545
+</code></pre></div>
+
+  <p>Variations:</p>
+  <ul>
+    <li><strong>Replay against historical state.</strong> Pin to a past block and simulate "what would have happened with this fix." Useful for post-mortems.</li>
+    <li><strong>Impersonate accounts.</strong> <code>cast rpc anvil_impersonateAccount &lt;multisig&gt;</code> lets you simulate signing without keys.</li>
+    <li><strong>Time travel.</strong> <code>cast rpc anvil_setNextBlockTimestamp &lt;t&gt;</code> to test time-dependent behavior (timelocks, interest accrual).</li>
+  </ul>
+</section>
+
+<section id="incident">
+  <h2>Incident response cadence</h2>
+  <p>Roles in a typical lending-protocol incident:</p>
+  <table>
+    <thead><tr><th>Role</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td>On-call protocol engineer</td><td>Triage; coordinate fix</td></tr>
+      <tr><td>Guardian signer(s)</td><td>Sign pause tx if needed</td></tr>
+      <tr><td>Owner / DAO multisig signers</td><td>Sign upgrade / parameter change post-pause</td></tr>
+      <tr><td>Comms lead</td><td>Public communication, post-mortem coordination</td></tr>
+      <tr><td>Auditor liaison</td><td>Loop in audit partners for fix review</td></tr>
+    </tbody>
+  </table>
+
+  <p>Response SLA (typical):</p>
+  <ul>
+    <li>Alert fires → on-call ack in &lt; 5 min.</li>
+    <li>Triage call up in &lt; 15 min.</li>
+    <li>Decision to pause / not in &lt; 30 min.</li>
+    <li>Initial public statement in &lt; 4 hours (if user-facing).</li>
+    <li>Detailed post-mortem within 7 days.</li>
+  </ul>
+</section>
+
+<section id="checklist">
+  <h2>A pre-deploy checklist</h2>
+  <details class="collapse-card" open>
+    <summary><strong>Walk this list before every mainnet broadcast</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li>All tests green on the exact commit being deployed?</li>
+        <li>Gas snapshot diffed; no surprising regressions?</li>
+        <li>Storage layout diffed (for upgrades); no shifts?</li>
+        <li>Audit complete on this commit (not a different one)?</li>
+        <li>Fork dry-run succeeded with expected state changes?</li>
+        <li>Deployer EOA funded with sufficient ETH + buffer?</li>
+        <li>Deterministic address pre-computed and recorded?</li>
+        <li>Verification args (constructor encoding) prepared?</li>
+        <li>Initial parameters reviewed by risk team?</li>
+        <li>Owner / guardian addresses correct and tested?</li>
+        <li>Subgraph manifest updated with new addresses?</li>
+        <li>Monitoring alerts configured for new addresses?</li>
+        <li>Comms post drafted?</li>
+        <li>Two engineers on the call during broadcast?</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Data &amp; Pipelines</a> · <a href="14-domain-context.html">Next: Domain Context →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

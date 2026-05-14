@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#foundry">Foundry — forge / cast / anvil / chisel</a>
+    <a href="#style">Solidity coding style for interviews</a>
+    <a href="#storage-model">Mental model: storage slots</a>
+    <a href="#calldata-model">Mental model: calldata layout</a>
+    <a href="#gas">Mental model: gas estimation</a>
+    <a href="#dsa">DSA patterns common in interviews</a>
+    <a href="#assembly">Inline assembly — when and why</a>
+    <a href="#snippets">Reusable snippets</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">The Foundry toolchain, Solidity idioms for live-coding rounds, and the EVM mental models you should hold without reaching for docs.</p>
+</header>
+
+<section id="foundry">
+  <h2>Foundry — forge / cast / anvil / chisel</h2>
+  <p>Modern Solidity work is Foundry-first. You should know each tool by reflex.</p>
+
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th><th>You use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>forge</code></td><td>Build, test, snapshot, deploy</td><td>Compilation, test runs, deployments, gas snapshots</td></tr>
+      <tr><td><code>cast</code></td><td>RPC client and calldata utilities</td><td>Call mainnet contracts, decode calldata, derive selectors</td></tr>
+      <tr><td><code>anvil</code></td><td>Local EVM node</td><td>Local fork of mainnet, time travel, impersonation</td></tr>
+      <tr><td><code>chisel</code></td><td>REPL</td><td>One-off Solidity expressions, quick math checks</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Forge
+forge build
+forge test -vvv
+forge test --match-contract Liquidate --fuzz-runs 5000
+forge snapshot                         # gas snapshot diff vs main
+forge inspect MarketCore storage       # storage layout
+forge coverage --report summary
+
+# Cast
+cast call $MORPHO_ADDR "totalSupplyAssets(bytes32)(uint256)" $MARKET_ID
+cast balance $USER
+cast 4byte 0xa9059cbb                  # transfer(address,uint256)
+cast --abi-decode "f(uint256)" 0x...
+
+# Anvil
+anvil --fork-url $MAINNET_RPC --fork-block-number 19000000
+cast rpc anvil_impersonateAccount $WHALE
+cast send $TOKEN "transfer(address,uint256)" $ME 1e18 --from $WHALE --unlocked
+
+# Chisel
+chisel                                  # REPL
+&gt; uint256 a = 5e18 * 1e18 / 1e18; a    # 5_000000000000000000
+</code></pre></div>
+
+  <div class="callout tip">
+    <span class="callout-label">In a live round</span>
+    <p>If they give you a Foundry project and ask you to fix a bug, the first three things you do: <code>forge build</code> to confirm it compiles, <code>forge test</code> to see the existing tests, <code>forge test --match-test &lt;the failing one&gt; -vvv</code> to read the trace. Talk through what you're doing. Interviewers love seeing the loop.</p>
+  </div>
+</section>
+
+<section id="style">
+  <h2>Solidity coding style for interviews</h2>
+  <p>Some style choices read as "this person ships." Some read as "this person learned in 2020 and stopped." Use the modern set:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;     // enables transient storage, etc.
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/// @title  IsolatedMarket
+/// @notice Single-collateral lending market.
+/// @author you
+contract IsolatedMarket {
+    using SafeERC20 for IERC20;
+
+    /* ============ Errors ============ */
+    error Unauthorized();
+    error ZeroAssets();
+    error InsufficientCollateral(uint256 requested, uint256 max);
+
+    /* ============ Events ============ */
+    event Supply(address indexed user, uint256 assets, uint256 shares);
+    event Borrow(address indexed user, uint256 assets, uint256 shares);
+
+    /* ============ Immutables ============ */
+    IERC20 public immutable LOAN;
+    IERC20 public immutable COLLATERAL;
+    address public immutable ORACLE;
+    uint256 public immutable LLTV;
+
+    /* ============ Storage ============ */
+    uint128 public totalSupplyAssets;
+    uint128 public totalSupplyShares;
+    uint128 public totalBorrowAssets;
+    uint128 public totalBorrowShares;
+    uint128 public lastUpdate;
+
+    mapping(address =&gt; Position) public position;
+
+    /* ============ Constructor ============ */
+    constructor(IERC20 loan, IERC20 collateral, address oracle, uint256 lltv) {
+        LOAN = loan;
+        COLLATERAL = collateral;
+        ORACLE = oracle;
+        LLTV = lltv;
+        lastUpdate = uint128(block.timestamp);
+    }
+
+    /* ============ External ============ */
+    function supply(uint256 assets, address onBehalf) external returns (uint256 shares) {
+        if (assets == 0) revert ZeroAssets();
+        _accrue();
+        shares = _toSharesDown(assets, totalSupplyAssets, totalSupplyShares);
+        totalSupplyAssets += uint128(assets);
+        totalSupplyShares += uint128(shares);
+        position[onBehalf].supplyShares += shares;
+        LOAN.safeTransferFrom(msg.sender, address(this), assets);
+        emit Supply(onBehalf, assets, shares);
+    }
+}
+</code></pre></div>
+
+  <p>Style markers a senior would notice:</p>
+  <ul>
+    <li><strong>Pragma <code>^0.8.24</code></strong> or newer (transient storage, etc.).</li>
+    <li><strong>Named imports</strong> — <code>import {SafeERC20} from "..."</code> not <code>import "..."</code>.</li>
+    <li><strong>NatSpec on the contract and on external functions.</strong></li>
+    <li><strong>Custom errors, not strings.</strong></li>
+    <li><strong>Events for every state change.</strong></li>
+    <li><strong>Immutables in UPPER_SNAKE_CASE</strong> by convention (consistent with Solady / Solmate).</li>
+    <li><strong>Section banners</strong> for navigation.</li>
+    <li><strong>Internal functions prefixed with <code>_</code></strong>.</li>
+    <li><strong>Round in protocol favor</strong> by default (<code>_toSharesDown</code>, <code>_toAssetsUp</code>).</li>
+    <li><strong>Cache storage to memory</strong> inside loops.</li>
+  </ul>
+</section>
+
+<section id="storage-model">
+  <h2>Mental model: storage slots</h2>
+  <p>You should be able to look at any contract and predict <code>forge inspect storage</code>.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Demo {
+    address owner;        // slot 0, bytes 0-19
+    uint64  nonce;        // slot 0, bytes 20-27 (packed)
+    uint32  flags;        // slot 0, bytes 28-31 (packed)
+    uint256 total;        // slot 1
+    mapping(address =&gt; uint256) bal;  // virtual, base slot 2
+    uint256[] queue;      // length at slot 3, elements at keccak256(3) + i
+    bytes data;           // similar to dynamic array
+}
+</code></pre></div>
+
+  <p>Mapping value lookup:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// bal[user] lives at:
+bytes32 slot = keccak256(abi.encode(user, uint256(2)));
+uint256 value = uint256(vm.load(address(demo), slot));
+</code></pre></div>
+
+  <p>Nested mapping:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// mapping(a =&gt; mapping(b =&gt; uint256)) at base slot N
+// inner[a] lives at keccak256(abi.encode(a, N))
+// inner[a][b] lives at keccak256(abi.encode(b, keccak256(abi.encode(a, N))))
+</code></pre></div>
+</section>
+
+<section id="calldata-model">
+  <h2>Mental model: calldata layout</h2>
+  <p>Calldata is a contiguous byte array starting with a 4-byte selector, followed by ABI-encoded arguments. Each "head" is 32 bytes; dynamic types use offset + tail.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># cast 4byte resolves selectors
+$ cast 4byte 0xa9059cbb
+transfer(address,uint256)
+
+# decode a full transfer call
+$ cast --abi-decode "transfer(address,uint256)" 0xa9059cbb000000000000000000000000aaaa...0000000000000000000000000000000000000000000000000de0b6b3a7640000
+0xaaaa...
+1000000000000000000
+
+# encode for sending
+$ cast calldata "transfer(address,uint256)" 0xaaaa... 1000000000000000000
+</code></pre></div>
+
+  <p>Hot tip: in any interview where they show you a transaction trace, walk through the calldata selector and arguments. Demonstrates fluency.</p>
+</section>
+
+<section id="gas">
+  <h2>Mental model: gas estimation</h2>
+  <p>Rules of thumb that survive most interview questions:</p>
+  <ul>
+    <li><strong>SSTORE</strong>: 20,000 zero→non-zero; 5,000 non-zero→non-zero; 2,900 non-zero→zero refund.</li>
+    <li><strong>SLOAD</strong>: 2,100 cold; 100 warm.</li>
+    <li><strong>External call</strong>: 2,600 cold address; 100 warm; plus gas forwarded.</li>
+    <li><strong>Memory</strong>: linear up to ~700 bytes; quadratic past that.</li>
+    <li><strong>KECCAK256</strong>: 30 + 6/word.</li>
+    <li><strong>21,000</strong>: base transaction cost.</li>
+    <li><strong>4 / 16</strong>: gas per calldata byte (zero / nonzero).</li>
+  </ul>
+  <p>From these, you can estimate any function: count cold/warm SLOADs, SSTOREs, external calls, and add. Always within ±20%.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge test --gas-report                # function-level gas
+forge snapshot                          # write a .gas-snapshot file
+forge snapshot --diff                   # compare to existing snapshot
+</code></pre></div>
+</section>
+
+<section id="dsa">
+  <h2>DSA patterns common in DeFi interviews</h2>
+
+  <h3>Binary search</h3>
+  <p>Often used to invert a monotone function: find the price at which a position becomes liquidatable, find the share count for a given asset, etc.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">/// @notice Binary search for the largest x in [lo, hi] such that f(x) &lt;= target.
+function search(uint256 lo, uint256 hi, uint256 target, function(uint256) view returns (uint256) f)
+    internal view returns (uint256)
+{
+    while (lo &lt; hi) {
+        uint256 mid = (lo + hi + 1) / 2;     // upper-bias to avoid infinite loop
+        if (f(mid) &lt;= target) lo = mid;
+        else                  hi = mid - 1;
+    }
+    return lo;
+}
+</code></pre></div>
+
+  <h3>Sorted doubly-linked list</h3>
+  <p>Used by Liquity, original Morpho Optimizers, Aave for ordered queues of users by some metric (health factor, supply rate). Insertion is O(N) in the worst case, but with hints, it becomes O(1) average.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">struct Node { address prev; address next; uint96 score; }
+mapping(address =&gt; Node) public node;
+address public head;
+
+function insert(address user, uint96 score, address hint) external {
+    // Walk from hint to find correct position (caller supplies a near-correct one)
+    address cur = hint;
+    while (cur != address(0) &amp;&amp; node[cur].score &gt; score) cur = node[cur].prev;
+    while (node[cur].next != address(0) &amp;&amp; node[node[cur].next].score &lt; score) cur = node[cur].next;
+    // ... link user between cur and node[cur].next ...
+}
+</code></pre></div>
+
+  <h3>Heap (priority queue)</h3>
+  <p>Useful for "next liquidation candidate" if you maintain a heap of users ordered by health-factor. Less common on-chain (O(log N) cost per op multiplied by N users gets expensive); usually delegated off-chain.</p>
+
+  <h3>Fenwick tree / segment tree</h3>
+  <p>Rare on-chain because of gas cost, but you should recognize the pattern if the interviewer asks "how would you track aggregate stats efficiently?" — typically the answer is "off-chain via an indexer."</p>
+</section>
+
+<section id="assembly">
+  <h2>Inline assembly — when and why</h2>
+  <p>Inline Yul assembly is a power tool. Reach for it when:</p>
+  <ul>
+    <li>You need to read/write a specific storage slot directly (e.g., upgradable storage patterns).</li>
+    <li>You need to call a precompile (ecrecover, etc.) optimally.</li>
+    <li>You need bit-level operations on packed structs.</li>
+    <li>You're implementing transient storage primitives before solidity-native syntax matures.</li>
+  </ul>
+  <p>Do not reach for it when:</p>
+  <ul>
+    <li>You can express the same thing in high-level Solidity safely.</li>
+    <li>The gas saving is &lt; 100 gas / call and the readability cost is significant.</li>
+    <li>You're not 100% sure of stack/memory layout.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Read an arbitrary storage slot — used in upgradeable patterns
+function _readSlot(bytes32 slot) internal view returns (bytes32 v) {
+    assembly { v := sload(slot) }
+}
+
+// EFFICIENT mulDiv — Uniswap v3 / Solady style. Full 512-bit precision.
+function mulDiv(uint256 a, uint256 b, uint256 d) internal pure returns (uint256 result) {
+    assembly {
+        let mm := mulmod(a, b, not(0))
+        let prod0 := mul(a, b)
+        let prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        if iszero(prod1) {
+            result := div(prod0, d)
+        }
+        // ...full 512-bit branch elided...
+    }
+}
+</code></pre></div>
+
+  <div class="callout warn">
+    <span class="callout-label">Interview red flag</span>
+    <p>Reaching for inline assembly on a problem that doesn't call for it signals "I want to look smart." Reaching for the simple Solidity solution and explaining "I'd write it this way for clarity; if gas matters I'd benchmark and consider Yul, but my default is readable" signals "I ship."</p>
+  </div>
+</section>
+
+<section id="snippets">
+  <h2>Reusable snippets to memorize</h2>
+
+  <h3>Safe transfer</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">using SafeERC20 for IERC20;
+IERC20(token).safeTransferFrom(from, to, amount);
+IERC20(token).safeTransfer(to, amount);
+IERC20(token).forceApprove(spender, amount);   // OZ v5 — handles USDT-style
+</code></pre></div>
+
+  <h3>Permit + transferFrom in one call</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">try IERC20Permit(token).permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+IERC20(token).safeTransferFrom(msg.sender, address(this), value);
+</code></pre></div>
+
+  <h3>Min / max / abs</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function min(uint256 a, uint256 b) pure returns (uint256) { return a &lt; b ? a : b; }
+function max(uint256 a, uint256 b) pure returns (uint256) { return a &gt; b ? a : b; }
+function abs(int256 a) pure returns (uint256) { return a &gt;= 0 ? uint256(a) : uint256(-a); }
+</code></pre></div>
+
+  <h3>Ceil division</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function ceilDiv(uint256 a, uint256 b) pure returns (uint256) {
+    return a == 0 ? 0 : (a - 1) / b + 1;
+}
+</code></pre></div>
+
+  <h3>Compounded interest</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// linear approximation, suitable for short dt at moderate rates
+function accrueLinear(uint256 total, uint256 rate, uint256 dt) pure returns (uint256) {
+    return total + total * rate * dt / 1e18;
+}
+
+// continuous compounding via Taylor — see WadRayMath or PRBMath for hardened versions
+</code></pre></div>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance &amp; Audit</a> · <a href="11-coding-problems.html">Next: Coding Problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

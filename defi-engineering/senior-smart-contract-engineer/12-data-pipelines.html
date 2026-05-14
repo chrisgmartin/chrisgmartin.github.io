@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why contract engineers care about data</a>
+    <a href="#subgraph">Subgraph design</a>
+    <a href="#events">Event design at the core</a>
+    <a href="#metrics">Volume / TVL / fee accounting</a>
+    <a href="#monitoring">Off-chain monitoring</a>
+    <a href="#aggregators">Aggregator integration</a>
+    <a href="#dune">Dune / Flipside / on-chain SQL</a>
+    <a href="#observability">Observability checklist</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">On-chain data is half the user-visible product. Subgraphs, indexers, event design, and the monitoring stack a senior DEX engineer designs alongside the contracts themselves.</p>
+</header>
+
+<section id="why">
+  <h2>Why smart-contract engineers care about data</h2>
+  <p>Three reasons:</p>
+  <ol>
+    <li><strong>Event design is irreversible.</strong> Once shipped on immutable core, events are forever. Bad event design means bad indexing means bad UX.</li>
+    <li><strong>You will be on call</strong> for monitoring incidents. Knowing the data pipeline matters when something looks wrong at 3am.</li>
+    <li><strong>Front-ends and aggregators consume your event schema.</strong> Backwards-incompatible event changes break the ecosystem.</li>
+  </ol>
+</section>
+
+<section id="subgraph">
+  <h2>Subgraph design</h2>
+  <p>The Graph is the canonical indexing layer. A subgraph defines entities (Pool, Position, Swap, etc.) and event handlers that mutate them.</p>
+  <p>Entity shape for a typical DEX subgraph:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text"># schema.graphql
+type Factory @entity {
+  id: ID!
+  poolCount: BigInt!
+  totalVolumeUSD: BigDecimal!
+}
+
+type Pool @entity {
+  id: ID!                           # pool address
+  token0: Token!
+  token1: Token!
+  feeTier: BigInt!
+  liquidity: BigInt!
+  sqrtPrice: BigInt!
+  tick: BigInt
+  volumeUSD: BigDecimal!
+  totalValueLockedUSD: BigDecimal!
+  feesUSD: BigDecimal!
+}
+
+type Position @entity {
+  id: ID!                           # tokenId or composite
+  owner: Bytes!
+  pool: Pool!
+  tickLower: BigInt!
+  tickUpper: BigInt!
+  liquidity: BigInt!
+  collectedFeesToken0: BigDecimal!
+  collectedFeesToken1: BigDecimal!
+}
+
+type Swap @entity {
+  id: ID!                           # tx hash + log index
+  pool: Pool!
+  sender: Bytes!
+  recipient: Bytes!
+  amount0: BigDecimal!
+  amount1: BigDecimal!
+  amountUSD: BigDecimal!
+  sqrtPriceX96: BigInt!
+  tick: BigInt!
+  timestamp: BigInt!
+}</code></pre></div>
+  <p>Design rules:</p>
+  <ul>
+    <li><strong>Entity IDs must be deterministic.</strong> Don't use sequential counters — they break parallel indexers. Use addresses, txhash+logIndex, or composite keys.</li>
+    <li><strong>Denormalize for query speed.</strong> Store USD values at write time; don't compute at read time.</li>
+    <li><strong>Snapshot at intervals.</strong> Hourly and daily aggregates as separate entities. Don't query 1M swaps to compute volume.</li>
+    <li><strong>Handle reorgs.</strong> The Graph does this for you up to a depth; don't make state changes the subgraph can't unwind.</li>
+  </ul>
+</section>
+
+<section id="events">
+  <h2>Event design at the core</h2>
+  <p>Every state change on a core contract should emit an event. The schema should:</p>
+  <ol>
+    <li><strong>Index the searchable fields.</strong> <code>indexed</code> on user addresses, token addresses, pool IDs.</li>
+    <li><strong>Pack the rest as data.</strong> Up to 3 indexed args; the rest goes in data.</li>
+    <li><strong>Carry derived values when cheap.</strong> Emit the new sqrtPriceX96 and tick on every swap so indexers don't have to recompute.</li>
+    <li><strong>Be backwards-compatible across upgrades.</strong> Once shipped, don't change. Add new events; don't modify old ones.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Canonical v3 swap event — note the careful index choice and the post-swap state
+event Swap(
+    address indexed sender,
+    address indexed recipient,
+    int256  amount0,
+    int256  amount1,
+    uint160 sqrtPriceX96,    // POST-swap
+    uint128 liquidity,       // POST-swap
+    int24   tick             // POST-swap
+);</code></pre></div>
+  <p>Why post-swap state? Because a subgraph that consumes this event in order can reconstruct the entire state of the pool from genesis without ever reading storage.</p>
+</section>
+
+<section id="metrics">
+  <h2>Volume / TVL / fee accounting</h2>
+  <p>The three numbers every DEX dashboard shows:</p>
+  <table>
+    <thead><tr><th>Metric</th><th>How it's actually computed</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Volume</strong></td><td>Sum of <code>abs(amount0)</code> (or amount1) on Swap events, converted to USD. Done daily/hourly.</td></tr>
+      <tr><td><strong>TVL</strong></td><td>Sum of reserves across all pools × USD price per token. v3 needs LP positions aggregated; v2 just reads <code>token.balanceOf(pool)</code>.</td></tr>
+      <tr><td><strong>Fees</strong></td><td>Volume × fee tier, minus protocol fee. Per-pool.</td></tr>
+    </tbody>
+  </table>
+  <p>Pricing tokens is its own problem. Strategies:</p>
+  <ul>
+    <li>Find a path to USDC/USDT/DAI on the same chain; quote through that.</li>
+    <li>Use a TWAP from the highest-TVL pool involving the token.</li>
+    <li>Whitelist a stable set; price everything by routes to that set.</li>
+    <li>For long-tail tokens — accept that USD valuation is fuzzy.</li>
+  </ul>
+</section>
+
+<section id="monitoring">
+  <h2>Off-chain monitoring</h2>
+  <p>What you actually watch in prod:</p>
+  <ul>
+    <li><strong>Position liquidity drift.</strong> If a known whale's position changes outside expected windows, alert.</li>
+    <li><strong>Abnormal slippage events.</strong> A swap that consumed 10× the expected slippage suggests a thin pool or an attack.</li>
+    <li><strong>Fee accumulation health.</strong> Fees should grow roughly with volume. A divergence means math is broken or an integrator is gaming.</li>
+    <li><strong>Protocol-fee invariants.</strong> Treasury accruals match expected % of volume.</li>
+    <li><strong>Oracle staleness.</strong> Last TWAP update vs current time. If observations stop, the oracle has frozen.</li>
+    <li><strong>Hook failures (v4).</strong> Reverts inside hooks have downstream effects — alert.</li>
+    <li><strong>L1 ↔ L2 deployment parity.</strong> Bytecode and selector tables should match across chains for the canonical deployments.</li>
+  </ul>
+  <p>Tools: Tenderly Alerts, OpenZeppelin Defender, Hypernative, Forta, plus in-house Prometheus scrapers fed by a custom indexer.</p>
+</section>
+
+<section id="aggregators">
+  <h2>Aggregator integration</h2>
+  <p>Aggregators consume your contracts. They expect:</p>
+  <ul>
+    <li><strong>Reliable quoter contracts.</strong> Off-chain pricing requires a view function that returns the exact swap result without execution.</li>
+    <li><strong>Stable function signatures.</strong> The aggregator's integration breaks the day you ship a new selector.</li>
+    <li><strong>Callback-friendly interfaces.</strong> Most aggregators call core directly via callbacks; periphery is bypassed.</li>
+    <li><strong>Subgraph or REST availability.</strong> They list-and-rank pools.</li>
+  </ul>
+  <table>
+    <thead><tr><th>Aggregator</th><th>Integration shape</th></tr></thead>
+    <tbody>
+      <tr><td>1inch</td><td>Pathfinder; off-chain routing; on-chain settler. Direct pool calls.</td></tr>
+      <tr><td>0x</td><td>RFQ + AMM hybrid. <code>Settler</code> contract per chain.</td></tr>
+      <tr><td>ParaSwap</td><td>Adapters per DEX type; routes can split across many pools.</td></tr>
+      <tr><td>KyberSwap</td><td>Meta-aggregator with own AMM pools as fallback.</td></tr>
+      <tr><td>CoW Swap</td><td>Batch auction; solvers compete; settles via Vault contract.</td></tr>
+      <tr><td>Odos</td><td>SOR (smart order router); split path optimization.</td></tr>
+      <tr><td>LiFi / Socket / Squid</td><td>Cross-chain DEX aggregators; consume yours per-chain.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="dune">
+  <h2>Dune / Flipside / on-chain SQL</h2>
+  <p>Mature engineers can write basic Dune queries to investigate incidents. Example: find the top 10 swappers in the last 24h:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">-- Dune SQL (Trino dialect)
+SELECT
+  "from" AS swapper,
+  SUM(amount_usd) AS total_volume_usd
+FROM uniswap_v3_ethereum.Pool_evt_Swap s
+JOIN ethereum.transactions t ON s.evt_tx_hash = t.hash
+WHERE s.evt_block_time &gt;= now() - interval '24' hour
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 10</code></pre></div>
+  <p>You're not expected to be a data engineer. But knowing how to pull a quick sanity check from chain data is a senior signal.</p>
+</section>
+
+<section id="observability">
+  <h2>Observability checklist</h2>
+  <p>For a new core deployment, ensure all of:</p>
+  <ul>
+    <li>Subgraph spec drafted alongside contract spec.</li>
+    <li>Events designed before the first PR.</li>
+    <li>Indexer running on testnet before mainnet deploy.</li>
+    <li>Volume + TVL dashboards available at launch.</li>
+    <li>Alert rules wired to PagerDuty / Slack.</li>
+    <li>Anomaly thresholds set conservatively for the first month.</li>
+    <li>Runbooks written for the top 5 expected alert types.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Senior signal</span>
+    <p>When asked "how would you launch a new core release," a complete answer includes the data and monitoring pipeline, not just the contracts. Most candidates omit it.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Coding problems</a> · <a href="13-deployment-and-ops.html">Next: Deployment &amp; ops →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

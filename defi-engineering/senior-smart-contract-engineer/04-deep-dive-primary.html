@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — AMM Math — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#cfmm">CFMMs — the general theory</a>
+    <a href="#cpmm">Constant-product (x·y=k)</a>
+    <a href="#stableswap">StableSwap (Curve)</a>
+    <a href="#clmm">Concentrated liquidity (v3)</a>
+    <a href="#tick-math">Tick math and sqrtPriceX96</a>
+    <a href="#hooks">Hooks &amp; singleton (v4)</a>
+    <a href="#derivation">Worked derivation: v2 → v3</a>
+    <a href="#30-lines">"Implement swap in 30 lines"</a>
+    <a href="#cfmm-vs-clmm">CLMMs vs CFMMs</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-core-fundamentals.html">← Previous</a>
+    <a href="05-deep-dive-secondary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Primary</span>
+  <h1>AMM Math, From x·y=k to Hooks</h1>
+  <p class="subtitle">The single most important technical area for this role. Derive the invariants, understand the rounding, and know each generation of AMM well enough to implement a small version of it in an interview.</p>
+</header>
+
+<section id="cfmm">
+  <h2>CFMMs — the general theory</h2>
+  <p>A <strong>Constant Function Market Maker</strong> is any AMM whose pricing is determined by holding a function of reserves constant.</p>
+  <div class="callout insight">
+    <span class="callout-label">The general form</span>
+    <p>For reserves <code>R = (r₁, r₂, ..., rₙ)</code>, a CFMM pool defines an invariant <code>φ(R) = k</code>. A trade <code>R → R'</code> is admissible iff <code>φ(R') ≥ φ(R)</code> (with equality before fees).</p>
+  </div>
+  <p>Every AMM you've heard of is a choice of <code>φ</code>:</p>
+  <table>
+    <thead><tr><th>Family</th><th>Invariant</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>Constant-product (Uniswap v2, Sushi, Pancake)</td><td><code>x · y = k</code></td><td>General-purpose, any token pair</td></tr>
+      <tr><td>Constant-sum</td><td><code>x + y = k</code></td><td>Pegged pairs, infinite-depth</td></tr>
+      <tr><td>StableSwap (Curve)</td><td><code>An·Σxᵢ + D = A·D·n + D^(n+1)/(n^n·Πxᵢ)</code></td><td>Stable-to-stable pairs</td></tr>
+      <tr><td>Weighted geometric mean (Balancer)</td><td><code>Π xᵢ^wᵢ = k</code></td><td>Multi-token portfolios</td></tr>
+      <tr><td>Concentrated liquidity (Uniswap v3/v4)</td><td><code>(x+L/√P_b)(y+L·√P_a) = L²</code> within range</td><td>Capital-efficient AMM</td></tr>
+      <tr><td>Maverick</td><td>Dynamic-bin concentrated liquidity</td><td>Directional LP</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="cpmm">
+  <h2>Constant-product (x · y = k)</h2>
+  <p>The original. Uniswap v1 and v2. Sushi, Pancake, Aerodrome (v2 pools), and a thousand forks. Master this first; everything else generalizes from it.</p>
+  <h3>The math</h3>
+  <p>Reserves <code>x</code> (token0) and <code>y</code> (token1). Invariant: <code>x · y = k</code>. A user deposits <code>Δx</code> and receives <code>Δy</code>. With a fee <code>f</code> (e.g. 0.003 for 30bps):</p>
+  <pre><code class="language-text">  (x + Δx·(1-f)) · (y - Δy) = k = x·y
+⇒ Δy = y · Δx·(1-f) / (x + Δx·(1-f))</code></pre>
+  <p>That single equation is the most important formula in DeFi. Memorize the derivation, not the result.</p>
+  <h3>The Uniswap v2 implementation</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// UniswapV2Library.getAmountOut — the canonical reference
+function getAmountOut(
+    uint256 amountIn,
+    uint256 reserveIn,
+    uint256 reserveOut
+) internal pure returns (uint256 amountOut) {
+    require(amountIn &gt; 0, "INSUFFICIENT_INPUT_AMOUNT");
+    require(reserveIn &gt; 0 &amp;&amp; reserveOut &gt; 0, "INSUFFICIENT_LIQUIDITY");
+    uint256 amountInWithFee = amountIn * 997;         // 30 bps fee → multiply by 1000-3
+    uint256 numerator       = amountInWithFee * reserveOut;
+    uint256 denominator     = (reserveIn * 1000) + amountInWithFee;
+    amountOut               = numerator / denominator; // floor — protocol-favorable rounding
+}</code></pre></div>
+  <p>Things to notice:</p>
+  <ul>
+    <li><strong>Fee encoded as 997/1000.</strong> Integer math, no fixed-point library needed.</li>
+    <li><strong>Floor division on the last line.</strong> Rounding favors the protocol — user gets at most what the formula says.</li>
+    <li><strong>No <code>k</code> recompute.</strong> The pool's <code>swap</code> later verifies <code>x'·y' ≥ x·y</code> as a single post-condition.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Drill</span>
+    <p>Practice deriving <code>getAmountOut</code> and writing it from memory in under 5 minutes. It is a routine first-coding-round question.</p>
+  </div>
+</section>
+
+<section id="stableswap">
+  <h2>StableSwap — Curve's invariant</h2>
+  <p>For pegged-to-pegged pairs (USDC/USDT/DAI, stETH/ETH), constant-product wastes liquidity. StableSwap blends constant-sum (flat, infinite-depth) with constant-product (curved, robust at extremes).</p>
+  <div class="callout insight">
+    <span class="callout-label">The invariant (n=2)</span>
+    <p><code>A · n · (x+y) + D = A · D · n + D^(n+1) / (n^n · x · y)</code> &nbsp;where <code>A</code> is the amplification factor.</p>
+  </div>
+  <p>Two things you must know:</p>
+  <ol>
+    <li><strong>Finding <code>D</code> given reserves</strong> requires Newton's method. There's no closed form.</li>
+    <li><strong>Finding <code>y</code> given <code>x</code> and <code>D</code></strong> (i.e. computing swap output) <em>also</em> requires Newton's method, on a different polynomial.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Curve get_D — Newton iteration to find invariant D
+function getD(uint256[2] memory xp, uint256 A) internal pure returns (uint256 D) {
+    uint256 S = xp[0] + xp[1];
+    if (S == 0) return 0;
+    D = S;
+    uint256 Ann = A * 2 * 2;  // A · n^n
+    for (uint256 i; i &lt; 255; ++i) {
+        uint256 D_P = (D * D / (xp[0] * 2)) * D / (xp[1] * 2);
+        uint256 D_prev = D;
+        D = (Ann * S + D_P * 2) * D / ((Ann - 1) * D + 3 * D_P);
+        // converged?
+        if (D &gt; D_prev) { if (D - D_prev &lt;= 1) break; }
+        else            { if (D_prev - D &lt;= 1) break; }
+    }
+}</code></pre></div>
+  <p>The Newton loop runs up to 255 iterations but typically converges in &lt;15. The <code>break</code> at delta-of-1 is critical — without it, oscillation costs gas.</p>
+  <details class="collapse-card">
+    <summary><strong>Python reference for differential testing</strong></summary>
+    <div class="collapse-card-body">
+      <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python">def get_D(xp, A, n=2):
+    S = sum(xp)
+    if S == 0: return 0
+    D = S
+    Ann = A * n**n
+    for _ in range(255):
+        D_P = D
+        for x in xp:
+            D_P = D_P * D // (x * n)
+        Dprev = D
+        D = (Ann*S + D_P*n) * D // ((Ann - 1)*D + (n+1)*D_P)
+        if abs(D - Dprev) &lt;= 1: return D
+    raise RuntimeError("did not converge")</code></pre></div>
+    </div>
+  </details>
+</section>
+
+<section id="clmm">
+  <h2>Concentrated liquidity (Uniswap v3)</h2>
+  <p>The conceptual leap of v3: LPs choose a price range <code>[P_a, P_b]</code>. Within range, they earn fees and act like a normal CPMM, but with <em>virtual reserves</em>. Outside range, they earn nothing but also bear no risk.</p>
+  <p>The invariant inside a single range:</p>
+  <pre><code class="language-text">(x + L/√P_b) · (y + L·√P_a) = L²</code></pre>
+  <p>Where <code>L</code> is the position's "liquidity" — a single number that captures the position's depth.</p>
+  <h3>Why √P, not P?</h3>
+  <p>Because the math collapses beautifully. Define <code>√P = √(y/x)</code>. Then:</p>
+  <ul>
+    <li>Real reserves: <code>x = L / √P − L / √P_b</code>, <code>y = L · √P − L · √P_a</code></li>
+    <li>Swapping token0→token1 strictly decreases √P; swapping token1→token0 strictly increases it.</li>
+    <li>Within a tick range, swap amounts are linear in the change of √P. Discrete jumps happen only at tick boundaries.</li>
+  </ul>
+  <h3>The swap step (single tick range)</h3>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Conceptual — computes Δy when √P moves from √P_start to √P_target
+function getAmount1Delta(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
+    internal pure returns (uint256)
+{
+    if (sqrtRatioAX96 &gt; sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+    return FullMath.mulDiv(liquidity, sqrtRatioBX96 - sqrtRatioAX96, FixedPoint96.Q96);
+}</code></pre></div>
+</section>
+
+<section id="tick-math">
+  <h2>Tick math and sqrtPriceX96</h2>
+  <p>Prices are stored as <code>sqrtPriceX96</code> — the square root of price, in <code>Q64.96</code> fixed-point. Ticks are integers <code>i</code> such that <code>price = 1.0001^i</code>. So:</p>
+  <pre><code class="language-text">sqrtPrice = 1.0001^(i/2) = (√1.0001)^i</code></pre>
+  <p>Conversion table:</p>
+  <table>
+    <thead><tr><th>Tick</th><th>Price</th><th>sqrtPriceX96 (hex)</th></tr></thead>
+    <tbody>
+      <tr><td>−887272 (MIN_TICK)</td><td>≈ 2⁻¹²⁸</td><td><code>0x1000276a3</code></td></tr>
+      <tr><td>0</td><td>1</td><td><code>0x1000000000000000000000000</code> (= 2⁹⁶)</td></tr>
+      <tr><td>+887272 (MAX_TICK)</td><td>≈ 2¹²⁸</td><td><code>≈2²⁵⁶/Q96</code></td></tr>
+    </tbody>
+  </table>
+  <p><code>TickMath.getSqrtRatioAtTick</code> is one of the most-tested helpers in DeFi. It's implemented as a sequence of conditional multiplications by precomputed magic constants — a "bit-by-bit" exponentiation. Read it once carefully; it's beautiful.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Excerpt — bit-decomposition of |tick|
+uint256 absTick = uint256(tick &lt; 0 ? -int256(tick) : int256(tick));
+require(absTick &lt;= uint256(MAX_TICK), "T");
+
+uint256 ratio = absTick &amp; 0x1 != 0
+    ? 0xfffcb933bd6fad37aa2d162d1a594001
+    : 0x100000000000000000000000000000000;
+if (absTick &amp; 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) &gt;&gt; 128;
+if (absTick &amp; 0x4 != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) &gt;&gt; 128;
+// ... up to 0x80000
+// invert if positive tick
+if (tick &gt; 0) ratio = type(uint256).max / ratio;
+sqrtPriceX96 = uint160((ratio &gt;&gt; 32) + (ratio % (1 &lt;&lt; 32) == 0 ? 0 : 1));</code></pre></div>
+</section>
+
+<section id="hooks">
+  <h2>Hooks and singleton architecture (v4)</h2>
+  <p>Uniswap v4's two big bets:</p>
+  <ol>
+    <li><strong>Singleton PoolManager</strong> — one contract holds all pools' state. Old v3 had a factory + per-pool deployments. Singleton enables flash-accounting across pools and massive deployment-cost reduction.</li>
+    <li><strong>Hooks</strong> — every pool can attach a hook contract that runs at specific lifecycle moments.</li>
+  </ol>
+  <p>Hook lifecycle (simplified):</p>
+  <table>
+    <thead><tr><th>Hook</th><th>Fires</th><th>Common use</th></tr></thead>
+    <tbody>
+      <tr><td><code>beforeInitialize</code> / <code>afterInitialize</code></td><td>Pool creation</td><td>Validation, registration</td></tr>
+      <tr><td><code>beforeAddLiquidity</code> / <code>afterAddLiquidity</code></td><td>LP joins</td><td>KYC, whitelist, JIT-resist</td></tr>
+      <tr><td><code>beforeRemoveLiquidity</code> / <code>afterRemoveLiquidity</code></td><td>LP exits</td><td>Lock-up enforcement</td></tr>
+      <tr><td><code>beforeSwap</code> / <code>afterSwap</code></td><td>Trade</td><td>Dynamic fees, oracle update, custom curves</td></tr>
+      <tr><td><code>beforeDonate</code> / <code>afterDonate</code></td><td>Donation</td><td>Reward distribution</td></tr>
+    </tbody>
+  </table>
+  <p>Hooks return delta values that can adjust the underlying swap. This is where "invent new paradigms" lives — limit orders, dynamic fees, on-chain MEV capture, all become hook implementations.</p>
+  <div class="callout insight">
+    <span class="callout-label">Singleton + flash accounting</span>
+    <p>Inside a v4 transaction, the PoolManager doesn't transfer tokens after every swap — it tracks net deltas. The caller must <code>settle</code> all deltas to zero before the transaction ends. This is essentially flash accounting: the user can chain swaps, hooks, and external calls and only the net flow moves tokens.</p>
+  </div>
+</section>
+
+<section id="derivation">
+  <h2>Worked derivation: v2 → v3</h2>
+  <p>One of the cleanest interview moves is showing how v3's "virtual reserves" reduce to v2 math when a range covers all prices.</p>
+  <ol>
+    <li><strong>Start</strong> with v2: <code>x · y = k</code>. Let <code>L = √k</code>. Then <code>x·y = L²</code>.</li>
+    <li><strong>Introduce</strong> the price <code>P = y/x</code>. So <code>√P = √(y/x)</code>, and <code>x = L/√P</code>, <code>y = L·√P</code>.</li>
+    <li><strong>Now restrict</strong> the range. Outside <code>[P_a, P_b]</code>, the position holds only one asset. Subtract the "wasted" reserves at the boundary:</li>
+  </ol>
+  <pre><code class="language-text">x_real = L/√P  −  L/√P_b
+y_real = L·√P  −  L·√P_a</code></pre>
+  <p>Plug into <code>x_real·y_real</code> at boundaries: position holds all token0 at <code>P = P_a</code>, all token1 at <code>P = P_b</code>. Within range, behaves like a CPMM with virtual reserves <code>x + L/√P_b</code> and <code>y + L·√P_a</code>.</p>
+  <p>That five-line derivation is enough to anchor every v3 question in an interview.</p>
+</section>
+
+<section id="30-lines">
+  <h2>The "implement swap in 30 lines" exercise</h2>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Minimal CPMM swap. No router, no callback. Two tokens.
+contract MiniPool {
+    IERC20 public immutable token0;
+    IERC20 public immutable token1;
+    uint112 public reserve0;
+    uint112 public reserve1;
+    uint256 private constant FEE_NUM = 997;
+    uint256 private constant FEE_DEN = 1000;
+
+    error K();
+    event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out);
+
+    constructor(IERC20 _t0, IERC20 _t1) { token0 = _t0; token1 = _t1; }
+
+    // Pull-based — user must transfer tokens in before calling
+    function swap(uint256 amount0Out, uint256 amount1Out, address to) external {
+        require(amount0Out &gt; 0 || amount1Out &gt; 0, "OUT");
+        (uint112 r0, uint112 r1) = (reserve0, reserve1);
+        require(amount0Out &lt; r0 &amp;&amp; amount1Out &lt; r1, "LIQ");
+        if (amount0Out &gt; 0) token0.transfer(to, amount0Out);
+        if (amount1Out &gt; 0) token1.transfer(to, amount1Out);
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        uint256 in0 = b0 &gt; r0 - amount0Out ? b0 - (r0 - amount0Out) : 0;
+        uint256 in1 = b1 &gt; r1 - amount1Out ? b1 - (r1 - amount1Out) : 0;
+        require(in0 &gt; 0 || in1 &gt; 0, "IN");
+        // K-check with fee adjusted
+        uint256 adj0 = b0 * FEE_DEN - in0 * (FEE_DEN - FEE_NUM);
+        uint256 adj1 = b1 * FEE_DEN - in1 * (FEE_DEN - FEE_NUM);
+        if (adj0 * adj1 &lt; uint256(r0) * r1 * FEE_DEN * FEE_DEN) revert K();
+        reserve0 = uint112(b0); reserve1 = uint112(b1);
+        emit Swap(msg.sender, in0, in1, amount0Out, amount1Out);
+    }
+}</code></pre></div>
+  <p>This is the bones of UniswapV2Pair.swap, minus the flash callback and mint/sync. Be able to write it without notes.</p>
+</section>
+
+<section id="cfmm-vs-clmm">
+  <h2>CFMMs vs CLMMs — when each wins</h2>
+  <table>
+    <thead><tr><th></th><th>CFMM (v2-style)</th><th>CLMM (v3-style)</th></tr></thead>
+    <tbody>
+      <tr><td>Capital efficiency</td><td>Low — spread thin across all prices</td><td>High — concentrated where volume lives</td></tr>
+      <tr><td>LP complexity</td><td>One-click. Pure passive.</td><td>Active. Range selection, rebalancing.</td></tr>
+      <tr><td>Storage model</td><td>Two reserves, one slot</td><td>Per-tick liquidity net, per-position state</td></tr>
+      <tr><td>Swap gas</td><td>~70k</td><td>~120k+ (more for cross-tick)</td></tr>
+      <tr><td>JIT exposure</td><td>Minimal</td><td>High — MEV bots provide JIT liquidity around swaps</td></tr>
+      <tr><td>Best for</td><td>Long-tail, low-volume pairs</td><td>Major pairs, stable-volatile pairs</td></tr>
+    </tbody>
+  </table>
+  <p>Modern AMMs ship both, often in the same contract surface. v4 hooks make it trivial to support custom curves alongside the default CLMM.</p>
+</section>
+
+<footer>
+  <p><a href="03-core-fundamentals.html">← Core fundamentals</a> · <a href="05-deep-dive-secondary.html">Next: Gas &amp; EVM →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

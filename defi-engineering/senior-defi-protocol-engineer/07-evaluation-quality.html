@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation &amp; Quality — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#layers">The verification pyramid</a>
+    <a href="#unit">Unit and fork tests</a>
+    <a href="#invariant">Foundry invariant testing</a>
+    <a href="#fuzzing">Echidna &amp; Medusa</a>
+    <a href="#symbolic">Halmos &amp; Kontrol</a>
+    <a href="#certora">Certora &amp; CVL</a>
+    <a href="#math">Covering the math</a>
+    <a href="#state-explosion">Managing state explosion</a>
+    <a href="#choice">Which tool when</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-applied-patterns.html">← Previous</a>
+    <a href="08-error-handling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Evaluation &amp; Quality</h1>
+  <p class="subtitle">How protocol engineers prove correctness — the layered toolkit of unit tests, invariants, fuzzers, symbolic execution, and formal verification.</p>
+</header>
+
+<section id="layers">
+  <h2>The verification pyramid</h2>
+  <p>No single tool catches everything. Senior protocol teams stack them:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Tool</th><th>Catches</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Unit tests</td><td>Foundry <code>forge test</code></td><td>Obvious bugs, regressions, happy paths</td><td>Cheap</td></tr>
+      <tr><td>Fork tests</td><td>Foundry with <code>--fork-url</code></td><td>Integration bugs with real deployed contracts</td><td>Cheap</td></tr>
+      <tr><td>Property fuzzing</td><td>Foundry invariant, Echidna, Medusa</td><td>State-machine bugs, invariant violations</td><td>Moderate (hours of CI)</td></tr>
+      <tr><td>Symbolic execution</td><td>Halmos, Kontrol</td><td>Edge cases in bounded scopes; "is this property true for ALL inputs?"</td><td>Moderate</td></tr>
+      <tr><td>Formal verification</td><td>Certora, hevm</td><td>Mathematical guarantees on a formal spec</td><td>Expensive (engineer-weeks)</td></tr>
+      <tr><td>Audit</td><td>Spearbit / Cantina / Code4rena / Sherlock / Trail of Bits</td><td>Anything the above missed; design-level concerns</td><td>Very expensive ($)</td></tr>
+    </tbody>
+  </table>
+  <p>The pyramid: many cheap, fast tests at the base; fewer, slower, more rigorous tools above; eyes-on review at the top.</p>
+</section>
+
+<section id="unit">
+  <h2>Unit and fork tests</h2>
+  <p>Foundry's <code>forge test</code> is the workhorse. A few discipline notes:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract MarketTest is Test {
+    Morpho morpho;
+    address USER = makeAddr("user");
+
+    function setUp() public {
+        morpho = new Morpho(OWNER);
+    }
+
+    function test_supply_mintsExpectedShares() public {
+        deal(address(loanToken), USER, 100e18);
+        vm.prank(USER);
+        loanToken.approve(address(morpho), type(uint256).max);
+        vm.prank(USER);
+        uint256 shares = morpho.supply(marketParams, 100e18, 0, USER, "");
+        assertEq(shares, 100e18 * morpho.SHARES_OFFSET());
+    }
+
+    function test_supply_revertsOnZero() public {
+        vm.expectRevert(ErrorsLib.ZeroAssets.selector);
+        morpho.supply(marketParams, 0, 0, USER, "");
+    }
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge test --match-contract MarketTest -vvv
+forge test --fork-url $MAINNET_RPC --fork-block-number 19000000 --match-test test_realIntegration
+forge coverage --report lcov
+</code></pre></div>
+
+  <ul>
+    <li><strong>Test names tell a story.</strong> <code>test_supply_revertsOnZero</code> reads as a sentence. <code>testSupply2</code> does not.</li>
+    <li><strong>Use <code>vm.prank</code> for the next call only; <code>vm.startPrank</code> for sequences.</strong></li>
+    <li><strong>Use <code>vm.expectRevert(selector)</code> rather than string matching.</strong> Custom errors give you the selector.</li>
+    <li><strong>Fork tests pinned to a block.</strong> Otherwise tests are flaky as mainnet state moves.</li>
+    <li><strong>Coverage is a floor, not a ceiling.</strong> 100% line coverage is meaningless if every test is happy-path.</li>
+  </ul>
+</section>
+
+<section id="invariant">
+  <h2>Foundry invariant testing</h2>
+  <p>Invariant tests assert properties that should hold across <em>any sequence of calls</em>. The fuzzer runs random sequences of "actions" against your contracts and re-checks invariants after each.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract LendingHandler is Test {
+    Morpho morpho;
+    address[] internal actors;
+
+    function supply(uint256 actorSeed, uint256 assets) external {
+        assets = bound(assets, 1, 1e24);
+        address actor = actors[actorSeed % actors.length];
+        deal(address(loanToken), actor, assets);
+        vm.startPrank(actor);
+        loanToken.approve(address(morpho), assets);
+        morpho.supply(marketParams, assets, 0, actor, "");
+        vm.stopPrank();
+        ghost_totalSupplied += assets;
+    }
+
+    uint256 public ghost_totalSupplied;
+}
+
+contract LendingInvariantTest is Test {
+    LendingHandler handler;
+
+    function setUp() public {
+        handler = new LendingHandler();
+        targetContract(address(handler));
+        bytes4[] memory selectors = new bytes4[](3);
+        selectors[0] = LendingHandler.supply.selector;
+        selectors[1] = LendingHandler.borrow.selector;
+        selectors[2] = LendingHandler.repay.selector;
+        targetSelector(FuzzSelector(address(handler), selectors));
+    }
+
+    /// @dev Bookkeeping: total supplied equals sum of users' shares × price.
+    function invariant_supplyAccounting() public view {
+        Market memory m = morpho.market(id);
+        assertGe(m.totalSupplyAssets, m.totalBorrowAssets);
+    }
+
+    /// @dev Solvency: no position is borrowing more than allowed.
+    function invariant_allPositionsHealthy() public view {
+        for (uint256 i; i &lt; handler.actorCount(); ++i) {
+            assertTrue(morpho.isHealthy(marketParams, handler.actor(i)));
+        }
+    }
+}
+</code></pre></div>
+
+  <p>The pieces:</p>
+  <ul>
+    <li><strong>Handler.</strong> The "stateful fuzzer" — bounds inputs, picks actors, mutates ghost variables.</li>
+    <li><strong>Target contracts &amp; selectors.</strong> Tell the fuzzer which functions to call.</li>
+    <li><strong>Ghost variables.</strong> Off-chain bookkeeping the handler maintains so the invariant can cross-check.</li>
+    <li><strong>Invariant.</strong> What must always be true.</li>
+  </ul>
+  <p>Run with <code>forge test --match-contract LendingInvariantTest --fuzz-runs 10000 --depth 200</code>. Senior teams run for hours in CI.</p>
+</section>
+
+<section id="fuzzing">
+  <h2>Echidna and Medusa</h2>
+  <p>Foundry's invariant tester is great but limited. For deeper campaigns, two alternatives have become standard:</p>
+  <ul>
+    <li><strong>Echidna</strong> (Trail of Bits) — Haskell-implemented property-based fuzzer, very fast at finding deep state-machine bugs. Properties defined as Solidity functions returning <code>bool</code>.</li>
+    <li><strong>Medusa</strong> (Trail of Bits) — Go-based, multi-process fuzzer that can run Echidna-style and Foundry-style properties at higher throughput.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract LendingFuzz {
+    Morpho morpho;
+
+    function echidna_supplyGeBorrow() public view returns (bool) {
+        Market memory m = morpho.market(id);
+        return m.totalSupplyAssets &gt;= m.totalBorrowAssets;
+    }
+
+    function echidna_noUnhealthyAfterAccrual() public returns (bool) {
+        morpho.accrueInterest(marketParams);
+        for (uint256 i; i &lt; actors.length; ++i) {
+            if (!morpho.isHealthy(marketParams, actors[i])) {
+                // Healthy now? Maybe it became unhealthy passively from accrual — that's fine.
+                // But this assertion catches "no one became unhealthy due to a state change".
+            }
+        }
+        return true;
+    }
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">echidna . --contract LendingFuzz --config echidna.yaml
+medusa fuzz --config medusa.json
+</code></pre></div>
+
+  <p>Run them overnight in CI for any non-trivial protocol change.</p>
+</section>
+
+<section id="symbolic">
+  <h2>Halmos &amp; Kontrol</h2>
+  <p>Where fuzzers test random concrete inputs, <strong>symbolic execution</strong> reasons about <em>all</em> inputs algebraically. Two open-source tools dominate:</p>
+  <ul>
+    <li><strong>Halmos</strong> (a16z crypto) — symbolic execution on Foundry-style tests. You write a normal test with symbolic inputs and it explores all paths.</li>
+    <li><strong>Kontrol</strong> (Runtime Verification) — based on the K framework; integrates with Foundry tests.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// A symbolic test using Halmos. svm.createUint(...) is symbolic.
+function check_supplyMintsConsistentShares(uint256 assets, uint256 totalAssets, uint256 totalShares) public {
+    vm.assume(totalAssets &gt; 0 &amp;&amp; totalShares &gt; 0);
+    vm.assume(assets &lt;= type(uint128).max);
+
+    uint256 sharesOut = assets * totalShares / totalAssets;
+    uint256 assetsBack = sharesOut * totalAssets / totalShares;
+    assert(assetsBack &lt;= assets);   // round-trip never gains assets
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">halmos --contract LendingSymbolicTest --function check_supplyMintsConsistentShares
+</code></pre></div>
+
+  <p>Symbolic execution is best for <strong>local, mathematical</strong> properties: fixed-point conversions, share <-> asset round-trips, comparison functions, monotonicity of accumulators. It does not scale to whole-protocol reasoning.</p>
+</section>
+
+<section id="certora">
+  <h2>Certora &amp; CVL</h2>
+  <p><strong>Certora Prover</strong> is the commercial formal-verification tool of choice in DeFi. You write specs in <strong>CVL</strong> (Certora Verification Language); the prover discharges proofs against your bytecode using SMT solvers.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">// Conceptual CVL — not Solidity
+methods {
+    function supply(address, uint256, uint256, address, bytes) external returns (uint256, uint256);
+    function totalSupplyAssets() external returns (uint256) envfree;
+    function totalSupplyShares() external returns (uint256) envfree;
+}
+
+invariant supplySharesNonZeroIffAssets()
+    totalSupplyShares() == 0 &lt;=&gt; totalSupplyAssets() == 0;
+
+rule supplyIncreasesAssets(env e, uint256 amount, address user) {
+    uint256 before = totalSupplyAssets();
+    supply(e, amount, 0, user, "");
+    uint256 after = totalSupplyAssets();
+    assert after &gt;= before;
+}
+
+parametric rule noOpDoesNotChangeShares(method f) {
+    uint256 before = totalSupplyShares();
+    env e; calldataarg args;
+    f(e, args);
+    uint256 after = totalSupplyShares();
+    // shares only change on supply/withdraw/etc — check the diff is expected
+}
+</code></pre></div>
+
+  <p>What you should know cold:</p>
+  <ul>
+    <li><strong>Invariants</strong> — properties that hold in every reachable state.</li>
+    <li><strong>Rules</strong> — properties about a specific function call's effect.</li>
+    <li><strong>Parametric rules</strong> — properties that quantify over <em>any</em> function (very powerful, very expensive).</li>
+    <li><strong>Ghost state</strong> — auxiliary state defined only in the spec to make properties expressible.</li>
+    <li><strong>Hooks</strong> — observe storage writes during execution.</li>
+    <li><strong>Summary functions</strong> — replace a function's body with a simpler model when verification cannot handle the real implementation.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">When Certora pays off</span>
+    <p>For protocols holding nine-figure TVL with stable invariants (lending core, vault math, stablecoin). The investment is heavy — engineer-weeks to write specs that pass — but you get mathematical guarantees against an entire class of bugs. Less useful for fast-moving periphery code.</p>
+  </div>
+</section>
+
+<section id="math">
+  <h2>Covering the math</h2>
+  <p>Fuzzing whole protocols is great, but pure mathematical sub-routines deserve dedicated coverage. Examples:</p>
+  <ul>
+    <li><strong>IRM curves.</strong> Closed-form unit tests at every boundary: U=0, U just below kink, U at kink, U just above, U=100%.</li>
+    <li><strong>Fixed-point ops.</strong> Round-trip identities: <code>wadDiv(wadMul(x, y), y) ≤ x</code>, etc.</li>
+    <li><strong>Accumulator math.</strong> Compound-interest accumulator never decreases; matches a Python reference at high precision.</li>
+    <li><strong>Share / asset conversion.</strong> Symmetry, monotonicity, invertibility within rounding tolerance.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function test_irm_atKink() public {
+    // U = OPTIMAL_U should give exactly BASE + SLOPE_1
+    uint256 r = irm.borrowRate(OPTIMAL_U);
+    assertEq(r, BASE_RATE + SLOPE_1);
+}
+
+function test_irm_justAboveKink() public {
+    uint256 r = irm.borrowRate(OPTIMAL_U + 1);
+    // Slope2 is steep — small step above kink should produce
+    // significant rate jump but not overflow.
+    assertGt(r, BASE_RATE + SLOPE_1);
+    assertLt(r, MAX_BORROW_RATE);
+}
+
+function testFuzz_wadMulInverse(uint256 a, uint256 b) public {
+    a = bound(a, 1, 1e36);
+    b = bound(b, 1, 1e36);
+    uint256 product = a.wadMul(b);
+    uint256 back = product.wadDiv(b);
+    assertApproxEqAbs(back, a, 1);   // off by at most 1 wei
+}
+</code></pre></div>
+</section>
+
+<section id="state-explosion">
+  <h2>Managing state explosion</h2>
+  <p>The single hardest thing about whole-protocol verification is the state space. A lending protocol with N markets and M users has roughly <code>O(N · M)</code> independent positions and an enormous reachable state. Tooling cannot brute-force this.</p>
+  <p>Standard reductions:</p>
+  <ul>
+    <li><strong>Symmetry reduction.</strong> If users are interchangeable, verify against 1-3 abstract users. Real users follow the same rules.</li>
+    <li><strong>Market reduction.</strong> Verify invariants on a single market; argue they extend to N (this is often true in isolated-market designs).</li>
+    <li><strong>Summary functions.</strong> Replace gnarly internal logic (e.g., loops, external calls) with an over-approximation that the prover can reason about.</li>
+    <li><strong>Bounded sequences.</strong> "Any sequence of up to K calls" rather than unbounded. K=3-5 catches most bugs.</li>
+    <li><strong>Decompose properties.</strong> Prove local properties about modules; compose the system from proven modules.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Senior reflex</span>
+    <p>If a property is too expensive to prove, that's a design signal — either the property is too strong, or the design is too coupled. Often the answer is to strengthen the locality of the design (make components more independent), which makes verification easier <em>and</em> the protocol cleaner.</p>
+  </div>
+</section>
+
+<section id="choice">
+  <h2>Which tool when</h2>
+  <table>
+    <thead><tr><th>Scenario</th><th>Reach for</th></tr></thead>
+    <tbody>
+      <tr><td>"Does this function do what I think on the happy path?"</td><td>Foundry unit test</td></tr>
+      <tr><td>"Does this protocol stay solvent under random sequences?"</td><td>Foundry invariant / Echidna</td></tr>
+      <tr><td>"Is my fixed-point math correct for all inputs?"</td><td>Halmos symbolic test</td></tr>
+      <tr><td>"Can a parametric rule prove that no function ever causes bad debt?"</td><td>Certora parametric rule</td></tr>
+      <tr><td>"Does integration with an external protocol work at a real block?"</td><td>Foundry fork test</td></tr>
+      <tr><td>"Did anything change in gas usage with this PR?"</td><td><code>forge snapshot</code></td></tr>
+      <tr><td>"Does my code shake out at scale?"</td><td>Public audit contest + bug bounty</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  <p><a href="06-applied-patterns.html">← Applied Patterns</a> · <a href="08-error-handling.html">Next: Error Handling →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

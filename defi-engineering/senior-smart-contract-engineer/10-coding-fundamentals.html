@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#foundry">Foundry workflow</a>
+    <a href="#style">Live-interview coding style</a>
+    <a href="#evm-model">EVM mental model</a>
+    <a href="#fp-libs">Fixed-point math libraries</a>
+    <a href="#newton">Newton's method in Solidity</a>
+    <a href="#bsearch">Binary search in Solidity</a>
+    <a href="#abi-tricks">ABI encode / decode tricks</a>
+    <a href="#guess-gas">"Guess the gas" exercise</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">The tooling, idioms, and mental models you need to walk into a live Solidity round and start writing immediately.</p>
+</header>
+
+<section id="foundry">
+  <h2>Foundry workflow</h2>
+  <p>If you ever switch between Hardhat and Foundry in interviews, switch to Foundry now. Every senior DEX team runs on Foundry.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># From zero
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
+
+# New project
+forge init mini-amm
+cd mini-amm
+
+# Compile
+forge build
+
+# Test (everything)
+forge test -vv
+
+# Test (one fn, max verbosity)
+forge test --mt test_Swap_RoundsInProtocolFavor -vvvv
+
+# Fuzz with explicit runs
+forge test --fuzz-runs 100000
+
+# Invariant
+forge test --mc PoolInvariants
+
+# Gas snapshot
+forge snapshot
+forge snapshot --diff   # vs committed baseline
+
+# Coverage
+forge coverage --report lcov
+
+# Mainnet fork
+forge test --fork-url $RPC_URL --fork-block-number 19_000_000
+
+# Inspect
+forge inspect Pool storage-layout
+forge inspect Pool bytecode
+forge inspect Pool abi</code></pre></div>
+  <p>Things mid-level engineers don't know about Foundry but seniors use:</p>
+  <ul>
+    <li><code>vm.snapshotGasLastCall()</code> for per-line gas measurement.</li>
+    <li><code>vm.cool(address)</code> to artificially cool storage between assertions.</li>
+    <li><code>vm.txGasPrice</code>, <code>vm.fee</code> — control EIP-1559 base fee in tests.</li>
+    <li><code>vm.signCompact</code> — clean EIP-712 signing in fuzz.</li>
+    <li><code>vm.expectEmit(true, true, true, true)</code> — assert events bit-exact.</li>
+    <li><code>vm.makePersistent(addr)</code> — survive cross-chain forks.</li>
+  </ul>
+</section>
+
+<section id="style">
+  <h2>Solidity coding style for live interviews</h2>
+  <p>What graders look for in a 45-minute live round, in order of priority:</p>
+  <ol>
+    <li><strong>Correctness first.</strong> A working naive solution beats an elegant broken one.</li>
+    <li><strong>State the invariant out loud</strong> before writing the function. "I'll maintain that `x · y ≥ k` post-swap…"</li>
+    <li><strong>Inputs validated</strong>. <code>require</code>/custom error on zero amounts, on insufficient liquidity.</li>
+    <li><strong>Rounding direction</strong> explicit. Add a comment.</li>
+    <li><strong>Storage reads cached.</strong> One pattern: read into locals at function top, write back at the end.</li>
+    <li><strong>Events emitted</strong> for any state change.</li>
+    <li><strong>One test case</strong> — show you'd test it.</li>
+    <li><strong>"What I'd change in production"</strong> — list 2-3 things you'd add but won't fit in time.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Idiomatic shape for a swap function
+function swap(uint256 amountIn, uint256 minOut, address to)
+    external
+    nonReentrant
+    returns (uint256 amountOut)
+{
+    if (amountIn == 0) revert ZeroIn();
+
+    (uint256 r0, uint256 r1) = (reserve0, reserve1);  // single SLOAD-pair
+
+    // -- compute --
+    uint256 amountInWithFee = amountIn * FEE_NUM;
+    amountOut = (amountInWithFee * r1) / (r0 * FEE_DEN + amountInWithFee);
+    if (amountOut &lt; minOut) revert Slippage(amountOut, minOut);
+
+    // -- effects --
+    reserve0 = uint128(r0 + amountIn);
+    reserve1 = uint128(r1 - amountOut);
+
+    // -- interactions --
+    token0.safeTransferFrom(msg.sender, address(this), amountIn);
+    token1.safeTransfer(to, amountOut);
+    emit Swap(msg.sender, amountIn, amountOut, to);
+}</code></pre></div>
+</section>
+
+<section id="evm-model">
+  <h2>EVM mental model</h2>
+  <p>The minimum that lets you reason about any opcode question in real time:</p>
+  <ul>
+    <li><strong>Stack-based VM.</strong> 256-bit words. Max 1024 stack depth.</li>
+    <li><strong>Memory:</strong> linear, zero-initialized, paid by-the-word, quadratic expansion.</li>
+    <li><strong>Storage:</strong> 256-bit slots, indexed by 256-bit keys. SLOAD/SSTORE cost dominates.</li>
+    <li><strong>Transient storage:</strong> same shape, tx-scoped, cheap.</li>
+    <li><strong>Calldata:</strong> read-only, externally provided, near-free to read.</li>
+    <li><strong>Code:</strong> read via EXTCODE*. Immutables embedded in deployed bytecode.</li>
+    <li><strong>Logs:</strong> bloom-indexed by topics; topics are SSTORE-cheap but data is byte-priced.</li>
+    <li><strong>Gas refunds:</strong> capped at gas/5 (London). SSTORE-to-zero is the main refund source.</li>
+  </ul>
+</section>
+
+<section id="fp-libs">
+  <h2>Fixed-point math libraries</h2>
+  <p>Know which library does what:</p>
+  <table>
+    <thead><tr><th>Library</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FullMath</strong> (Uniswap)</td><td><code>mulDiv</code> — multiply two uint256s, divide, no overflow. Use everywhere.</td></tr>
+      <tr><td><strong>FixedPoint96 / FixedPoint128</strong></td><td>Q64.96 and Q128.128 constants and helpers. v3-native.</td></tr>
+      <tr><td><strong>TickMath</strong></td><td>Tick ↔ sqrtPriceX96 conversion.</td></tr>
+      <tr><td><strong>SafeCast</strong></td><td>Downcasts that revert on overflow. <code>uint256.toUint128()</code>.</td></tr>
+      <tr><td><strong>PRBMath (UD60x18 / SD59x18)</strong></td><td>Float-like signed/unsigned 18-decimal. Has <code>exp</code>, <code>ln</code>, <code>pow</code>.</td></tr>
+      <tr><td><strong>Solady FixedPointMathLib</strong></td><td>The Yul-optimized successor. Fast <code>sqrt</code>, <code>mulWad</code>, <code>divWad</code>, <code>expWad</code>.</td></tr>
+      <tr><td><strong>ABDKMath64x64</strong></td><td>The original; still used in older Curve contracts.</td></tr>
+      <tr><td><strong>OZ Math</strong></td><td>Average, <code>mulDiv</code>, ceildiv. Conservative.</td></tr>
+    </tbody>
+  </table>
+  <p>For a new DEX project today: Solady's library + Uniswap's FullMath/TickMath where v3-compat matters.</p>
+</section>
+
+<section id="newton">
+  <h2>Newton's method in Solidity</h2>
+  <p>The pattern that solves StableSwap, sqrt, and several v3 helpers. The shape:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function newton(uint256 x) internal pure returns (uint256 y) {
+    y = _initialGuess(x);
+    for (uint256 i; i &lt; MAX_ITER; ++i) {
+        uint256 yNext = _step(y, x);  // y - f(y)/f'(y)
+        if (yNext == y) break;
+        // Optional: clamp / detect oscillation
+        if (yNext &gt; y) { if (yNext - y &lt;= 1) { y = yNext; break; } }
+        else            { if (y - yNext &lt;= 1) { y = yNext; break; } }
+        y = yNext;
+    }
+    require(i &lt; MAX_ITER, "NEWTON_NO_CONVERGE");
+}</code></pre></div>
+  <p>Three things to get right:</p>
+  <ol>
+    <li><strong>Initial guess.</strong> Bad guess → many iterations. For StableSwap D, use the sum-of-reserves. For sqrt, use a bit-width-based starting point.</li>
+    <li><strong>Convergence test.</strong> Don't use equality — use "delta ≤ 1." Floating-point oscillation in integer math is real.</li>
+    <li><strong>Iteration cap.</strong> Always have a max. Always revert if not converged. Never silently return a wrong value.</li>
+  </ol>
+</section>
+
+<section id="bsearch">
+  <h2>Binary search in Solidity</h2>
+  <p>Used for tick lookup, position-list searches, and oracle observation queries.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function findIndex(uint32[] storage arr, uint32 target) internal view returns (uint256) {
+    uint256 lo = 0;
+    uint256 hi = arr.length;
+    while (lo &lt; hi) {
+        uint256 mid = (lo + hi) &gt;&gt; 1;
+        if (arr[mid] &lt; target) lo = mid + 1;
+        else                   hi = mid;
+    }
+    return lo;
+}</code></pre></div>
+  <p>Be careful with cyclic arrays (v3 oracle observations). The classic v3 <code>observe</code> binary search wraps around <code>observationIndex</code> — get the modular indexing right.</p>
+</section>
+
+<section id="abi-tricks">
+  <h2>ABI encoding / decoding tricks</h2>
+  <p>Patterns that show up:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Forward arbitrary calldata to another contract
+function forward(address target, bytes calldata data) external returns (bytes memory) {
+    (bool ok, bytes memory ret) = target.call(data);
+    require(ok, "FORWARD");
+    return ret;
+}
+
+// Decode struct from calldata without copying to memory
+struct SwapParams { address tokenIn; address tokenOut; uint24 fee; uint256 amountIn; uint256 minOut; address to; }
+function swap(SwapParams calldata p) external returns (uint256) {
+    // p is read directly from calldata; no memory copy
+    return _swap(p.tokenIn, p.tokenOut, p.fee, p.amountIn, p.minOut, p.to);
+}
+
+// Pack two addresses + a uint24 into 32 bytes for a callback `data` payload
+bytes memory data = abi.encodePacked(payer, tokenIn, tokenOut, fee);  // 20 + 20 + 20 + 3 = 63 bytes
+// — note: encodePacked is shorter but lossy for variable-length types. Use abi.encode for structs.</code></pre></div>
+  <p>Yul-level shortcuts (for hot paths):</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Read a calldata uint256 at byte offset N without abi.decode
+assembly {
+    let value := calldataload(N)
+}
+
+// Encode and call in one shot, no memory expansion beyond what's needed
+assembly {
+    let p := mload(0x40)
+    mstore(p,     selector)
+    mstore(add(p, 0x04), arg0)
+    let ok := call(gas(), target, 0, p, 0x24, 0, 0)
+    if iszero(ok) { revert(0, 0) }
+}</code></pre></div>
+</section>
+
+<section id="guess-gas">
+  <h2>The "guess the gas" exercise</h2>
+  <p>Interviewer shows a function. "How much gas does this call cost?" The exercise tests your reading speed of the EVM.</p>
+  <p>The mental subroutine:</p>
+  <ol>
+    <li>Base tx: <strong>21,000</strong></li>
+    <li>Calldata bytes: nonzero = 16, zero = 4. A 100-byte calldata payload is ~800-1600.</li>
+    <li>Each cold SLOAD: <strong>+2,100</strong>. Each warm: +100.</li>
+    <li>Each cold SSTORE (new): <strong>+22,100</strong>. Cold modify: +5,000.</li>
+    <li>Each external call: <strong>+2,600 cold</strong>, +100 warm. Token transfers add their own logic cost on top (~30-60k typically).</li>
+    <li>Memory: roughly +3 per word, +1 per ~512 words for expansion.</li>
+    <li>Keccak: +30 + 6/word.</li>
+    <li>The rest (ADD, MUL, etc): ~3-5 each. Ignore unless in a tight loop.</li>
+  </ol>
+  <p>You're not expected to be exact. Be within 20-30%. The reasoning is what's graded.</p>
+  <div class="callout tip">
+    <span class="callout-label">Calibration</span>
+    <p>A v2 swap: ~80-100k. A v3 swap (single tick): ~110-130k. A v3 swap that crosses a tick: ~140-180k. An ERC-20 transfer between EOAs: 21-65k depending on token.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance</a> · <a href="11-coding-problems.html">Next: Coding problems →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

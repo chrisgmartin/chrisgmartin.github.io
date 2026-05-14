@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#evm-model">EVM mental model</a>
+    <a href="#call-types">Call types and their security implications</a>
+    <a href="#storage">Storage layout and proxy collisions</a>
+    <a href="#memory">Memory, calldata, returndata</a>
+    <a href="#solidity-gotchas">Solidity gotchas</a>
+    <a href="#compiler">Compiler version and Solc bugs</a>
+    <a href="#assembly">Reviewing inline assembly</a>
+    <a href="#quick-ref">Quick reference</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The EVM and Solidity mental model from a security review angle — the parts that show up in interviews because the bugs hide in them.</p>
+</header>
+
+<section id="evm-model">
+  <h2>EVM mental model</h2>
+  <p>The EVM is a stack machine with a 256-bit word size. For security work, the parts that earn their keep:</p>
+  <ul>
+    <li><strong>Execution context</strong> — every external call creates a new frame with its own <code>msg.sender</code>, <code>msg.value</code>, <code>address(this)</code>. Except <code>delegatecall</code>, which keeps the caller's context.</li>
+    <li><strong>Storage</strong> — one 2^256 keyspace per contract, accessed by <code>SLOAD</code> / <code>SSTORE</code>. Cold reads are 2100 gas, warm reads 100, cold writes 22100. State persists across transactions.</li>
+    <li><strong>Memory</strong> — per-call scratch, byte-addressable, expansion costs gas quadratically beyond 724 bytes.</li>
+    <li><strong>Calldata</strong> — read-only input region. Cheaper than memory.</li>
+    <li><strong>Stack</strong> — 1024 words max. Overflow is rare in modern Solidity but possible in deeply nested or assembly-heavy code.</li>
+    <li><strong>Transient storage</strong> (EIP-1153, post-Cancun) — cleared at end of transaction. Useful for reentrancy locks and ephemeral state.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Why this matters in security review</span>
+    <p>Most of the high-severity bug taxonomy lives in <em>misunderstanding the context</em> — delegatecall context, storage layout, returndata handling. If you can't draw the call frame on a whiteboard, you'll miss bugs.</p>
+  </div>
+</section>
+
+<section id="call-types">
+  <h2>Call types and their security implications</h2>
+  <p>The four call opcodes — <code>CALL</code>, <code>STATICCALL</code>, <code>DELEGATECALL</code>, <code>CALLCODE</code> (deprecated) — have very different security profiles.</p>
+
+  <h3>CALL</h3>
+  <p>Standard external call. New execution context. <code>msg.sender</code> becomes <code>address(this)</code>. State changes happen in the callee. Returns success bool and returndata.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Classic: not checking return value
+token.transfer(to, amount); // OK for revert-on-fail tokens, BAD for bool-returning tokens
+
+// Safer pattern (SafeTransfer style)
+(bool success, bytes memory data) = address(token).call(
+    abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
+);
+require(success && (data.length == 0 || abi.decode(data, (bool))), "TRANSFER_FAIL");</code></pre></div>
+
+  <h3>STATICCALL</h3>
+  <p>Same as <code>CALL</code> but reverts on any state-modifying opcode (<code>SSTORE</code>, <code>LOG*</code>, <code>CREATE*</code>, <code>SELFDESTRUCT</code>, etc.) — including indirectly through a sub-call. Used for view functions. Security implication: oracle reads via <code>staticcall</code> still consume gas; a malicious oracle can OOG you.</p>
+
+  <h3>DELEGATECALL</h3>
+  <p>This is the one that makes proxies work and security engineers nervous. The callee's code runs <strong>in the caller's storage / context</strong>. <code>msg.sender</code> and <code>msg.value</code> are preserved from the original caller. <code>address(this)</code> is the caller, not the callee.</p>
+  <div class="callout warn">
+    <span class="callout-label">Delegatecall hazards</span>
+    <ul>
+      <li>The callee's storage layout must match the caller's, slot-for-slot. Mismatch = silent corruption.</li>
+      <li>If the callee can be replaced or contains a <code>selfdestruct</code>, your caller's logic disappears.</li>
+      <li>If the callee logs, the log appears as if emitted by the caller.</li>
+      <li>If <code>msg.sender</code> is privileged in the callee, it's the original EOA / contract — not the proxy.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="storage">
+  <h2>Storage layout and proxy collisions</h2>
+  <p>Storage is a flat 256-bit keyspace. Solidity packs state variables starting at slot 0. Mappings hash key+slot. Dynamic arrays put length at slot S and elements at <code>keccak256(S) + i</code>.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Layout {
+    uint256 a;             // slot 0
+    uint256 b;             // slot 1
+    mapping(address =&gt; uint256) m;  // slot 2 (m[k] at keccak256(k, 2))
+    uint256[] arr;         // length at slot 3, arr[i] at keccak256(3) + i
+    address owner;         // slot 4 (20 bytes, padded)
+    bool paused;           // slot 4 (packed with owner — 1 byte after 20-byte address)
+}</code></pre></div>
+  <p>Why a security engineer cares:</p>
+  <ul>
+    <li><strong>Proxy upgrade collisions.</strong> If V2 reorders or inserts a state variable above an existing one, every later slot shifts. Reads return garbage, writes corrupt unrelated state.</li>
+    <li><strong>UUPS / Transparent proxies use EIP-1967</strong> slots (<code>keccak256("eip1967.proxy.implementation") - 1</code>) precisely to avoid collisions with the implementation's slot 0.</li>
+    <li><strong>Diamond storage (EIP-2535)</strong> uses isolated storage structs at hashed pseudo-random slots.</li>
+    <li><strong>Initializer slot</strong> in OpenZeppelin's <code>Initializable</code> is also a fixed offset. Forgetting <code>_disableInitializers()</code> on the implementation contract is a real-world bug (Wormhole, et al).</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge inspect MyContract storage-layout --pretty</code></pre></div>
+</section>
+
+<section id="memory">
+  <h2>Memory, calldata, returndata</h2>
+  <h3>Memory</h3>
+  <p>Per-call scratch space. Expansion costs <code>3*n + n^2/512</code> for <code>n</code> 32-byte words. A malicious external call can return huge returndata to grief gas consumers.</p>
+
+  <h3>Calldata</h3>
+  <p>Read-only. The function selector is the first 4 bytes; arguments follow ABI encoding. Decoding mistakes are a real bug class. <code>abi.decode</code> on attacker-controlled bytes can revert or behave unexpectedly if you don't bound types.</p>
+
+  <h3>Returndata</h3>
+  <p>The most common bug here is "return bomb" — a malicious callee returns huge bytes; the caller's <code>returndatacopy</code> blows up gas.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Vulnerable: returndatacopy reads all of it
+(bool success, bytes memory data) = target.call(payload);
+
+// Safer: cap the returndata you accept
+bool success;
+bytes memory data;
+assembly {
+    success := call(gas(), target, 0, add(payload, 0x20), mload(payload), 0, 0)
+    let size := returndatasize()
+    if gt(size, MAX_RETURN) { size := MAX_RETURN }
+    data := mload(0x40)
+    mstore(data, size)
+    returndatacopy(add(data, 0x20), 0, size)
+    mstore(0x40, add(data, add(0x20, size)))
+}</code></pre></div>
+</section>
+
+<section id="solidity-gotchas">
+  <h2>Solidity gotchas that show up in interviews</h2>
+  <ul>
+    <li><strong>Visibility defaults.</strong> Functions default to <code>public</code> if you forget. State variables default to <code>internal</code>. A missing <code>internal</code> on what should be a helper turns it into <code>public</code>; a missing modifier turns it into a free function call for the world.</li>
+    <li><strong>Shadowing.</strong> A local variable with the same name as a state variable silently shadows. Modern compilers warn; older code doesn't.</li>
+    <li><strong>Integer wraparound.</strong> Solidity 0.8+ checks by default. <code>unchecked {}</code> blocks disable checks. Pre-0.8 code is unchecked everywhere — SafeMath was required.</li>
+    <li><strong>ABI decoding strictness.</strong> <code>abi.decode</code> reverts on malformed data but doesn't tell you why. Custom encoding (assembly) can silently misbehave.</li>
+    <li><strong>Function selectors.</strong> First 4 bytes of <code>keccak256("foo(uint256)")</code>. Selector clashes are theoretical but real in diamond proxies and fallback routing.</li>
+    <li><strong>Constructor vs initializer.</strong> Implementation behind a proxy can't use a constructor for state. Initializer functions need replay protection. Forgetting to lock the implementation initializer is a classic.</li>
+    <li><strong>Receive vs fallback.</strong> <code>receive()</code> handles plain ETH; <code>fallback()</code> handles unknown selectors. A fallback that does anything other than revert can be an attack surface.</li>
+    <li><strong>tx.origin.</strong> The original EOA. Never use for authorization — phishing-trivial.</li>
+    <li><strong>block.timestamp.</strong> Manipulable by miners/proposers within seconds. Don't use for fine-grained ordering.</li>
+    <li><strong>Function-type variables and external calls.</strong> Storing a <code>function</code> selector and calling it without validation is delegatecall-in-disguise.</li>
+  </ul>
+</section>
+
+<section id="compiler">
+  <h2>Compiler version pinning and Solc bugs</h2>
+  <p>Solc itself has had real bugs. A few must-knows:</p>
+  <ul>
+    <li><strong>Storage write to <code>bytes</code></strong> (0.8.13) — optimizer bug, fixed in 0.8.15.</li>
+    <li><strong>ABI re-encoding bug</strong> (0.5.x) — fixed in 0.5.14.</li>
+    <li><strong>Yul optimizer bugs</strong> — historically the optimizer has shipped with bugs that affect bytecode determinism. <code>via_ir</code> increases this surface.</li>
+  </ul>
+  <p>Practice:</p>
+  <ul>
+    <li>Pin a specific patch (<code>pragma solidity 0.8.24;</code>, not <code>^0.8.0</code>).</li>
+    <li>Track the <a href="#">Solidity bugs.json</a> for the version you're on.</li>
+    <li>Be cautious with <code>--via-ir</code>; the optimizer pass set is different and historically buggier.</li>
+    <li>Audit reports should record the exact compiler version and settings used for the audited bytecode.</li>
+  </ul>
+</section>
+
+<section id="assembly">
+  <h2>Reviewing inline assembly</h2>
+  <p>Yul / inline assembly is where the compiler stops protecting you. A few rules of thumb when reviewing:</p>
+  <ol>
+    <li><strong>Memory pointer discipline.</strong> The free memory pointer is at <code>0x40</code>. Anyone writing memory must update it or scope their writes. A missing update creates "memory aliasing" bugs.</li>
+    <li><strong>Scratch space</strong> at <code>0x00 - 0x40</code> is short-term. Don't rely on its persistence across a function call.</li>
+    <li><strong>Selector loading</strong> — many gas-optimized contracts load the function selector with assembly. Make sure the comparison is exact and signed/unsigned correct.</li>
+    <li><strong>Calldata bounds.</strong> <code>calldataload(offset)</code> beyond <code>calldatasize()</code> returns 0 silently. Decoding past the end is a real vuln class.</li>
+    <li><strong>Memory-safe assembly.</strong> <code>assembly ("memory-safe") { ... }</code> tells the Yul optimizer it can rely on standard memory discipline. Mark assembly accurately; lying causes miscompiles.</li>
+    <li><strong>Implicit zero-extension.</strong> Solidity packs small ints in the high-zero portion of a 256-bit word; assembly that loads adjacent memory can pick up bits you didn't intend.</li>
+  </ol>
+  <div class="callout warn">
+    <span class="callout-label">A flag for review</span>
+    <p>Inline assembly should always be commented heavily, scoped narrowly, and ideally cross-checked against a high-level reference implementation. If a review PR adds 200 lines of uncommented Yul, push back.</p>
+  </div>
+</section>
+
+<section id="quick-ref">
+  <h2>Quick reference</h2>
+  <details class="collapse-card">
+    <summary><strong>Storage slot math cheat sheet</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li>Fixed variable at declaration order, packed if &lt; 32 bytes and adjacent.</li>
+        <li>Mapping value at <code>keccak256(abi.encode(key, slot))</code>.</li>
+        <li>Nested mapping: <code>keccak256(abi.encode(k2, keccak256(abi.encode(k1, slot))))</code>.</li>
+        <li>Dynamic array length at slot; element i at <code>keccak256(slot) + i</code>.</li>
+        <li>EIP-1967 implementation slot: <code>0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbf</code> = <code>keccak256("eip1967.proxy.implementation") - 1</code>.</li>
+      </ul>
+    </div>
+  </details>
+  <details class="collapse-card">
+    <summary><strong>Gas opcode costs to know cold</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><code>SSTORE</code> zero→nonzero: 22100; nonzero→nonzero: 5000; clear→refund: 4800.</li>
+        <li><code>SLOAD</code> cold: 2100; warm: 100.</li>
+        <li><code>CALL</code> cold address: 2600; warm: 100. Stipend rules removed post-Berlin for value transfer.</li>
+        <li><code>CREATE2</code>: 32000 + memory expansion + initcode word cost.</li>
+        <li><code>KECCAK256</code>: 30 + 6 per word.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Positioning</a> · <a href="04-deep-dive-primary.html">Next: Formal Verification →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

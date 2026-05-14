@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Fundamentals — Smart Contract Security Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#foundry">Foundry for security work</a>
+    <a href="#forge-test">forge test essentials</a>
+    <a href="#invariant">Invariant testing</a>
+    <a href="#storage-layout">Storage layout inspection</a>
+    <a href="#cast">cast for diagnostics</a>
+    <a href="#echidna">Echidna and Medusa</a>
+    <a href="#slither">Slither analyzers</a>
+    <a href="#adversarial-pr">Reading PRs adversarially</a>
+    <a href="#dsa">DSA patterns to know</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-governance-and-audit.html">← Previous</a>
+    <a href="11-coding-problems.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Fundamentals</h1>
+  <p class="subtitle">The toolchain a senior security engineer uses every day — Foundry, Echidna, Medusa, Slither, Halmos — and the muscle of reading code adversarially.</p>
+</header>
+
+<section id="foundry">
+  <h2>Foundry for security work</h2>
+  <p>Foundry has become the default DeFi toolchain. For security engineers, the value isn't just "Solidity tests" — it's:</p>
+  <ul>
+    <li>Mainnet forking, so you can replay state under attack scenarios.</li>
+    <li>Cheatcodes (<code>vm.prank</code>, <code>vm.warp</code>, <code>vm.deal</code>, <code>vm.expectRevert</code>) that let you simulate adversarial conditions.</li>
+    <li>Native invariant testing via <code>--invariant</code>.</li>
+    <li>Fast iteration — sub-second test runs.</li>
+    <li>Tooling integration: Slither runs on Foundry projects; Halmos consumes Foundry tests; Echidna can target Foundry-compiled artifacts.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge install                          # install deps
+forge build                            # compile
+forge test -vvv                        # run tests, verbose
+forge test --match-test testReentrancy # filter
+forge test --gas-report                # gas usage per function
+forge coverage                         # line/branch coverage
+forge inspect MyContract storage-layout --pretty
+forge inspect MyContract methods       # function selectors</code></pre></div>
+</section>
+
+<section id="forge-test">
+  <h2>forge test essentials</h2>
+  <p>Test patterns a security engineer should write in their sleep:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract MarketTest is Test {
+    Market market;
+    MockToken loanToken;
+    address attacker = address(0x1337);
+
+    function setUp() public {
+        loanToken = new MockToken();
+        market = new Market(address(loanToken));
+        deal(address(loanToken), attacker, 1_000_000e18);
+    }
+
+    function test_DonationAttackDoesNotInflateShares() public {
+        // Pre-mint dead shares (or whatever the mitigation is)
+        market.initialize();
+
+        // Attacker donates directly to market (transfers, doesn't deposit)
+        vm.prank(attacker);
+        loanToken.transfer(address(market), 1000e18);
+
+        // A new depositor should still get fair shares
+        address victim = address(0xBEEF);
+        deal(address(loanToken), victim, 100e18);
+        vm.startPrank(victim);
+        loanToken.approve(address(market), 100e18);
+        uint256 shares = market.deposit(100e18, victim);
+        vm.stopPrank();
+
+        // Assert: shares correspond reasonably to deposit (not zero)
+        assertGt(shares, 0, "Victim got zero shares from donation attack");
+    }
+
+    function test_RevertWhen_NonOwnerPauses() public {
+        vm.prank(attacker);
+        vm.expectRevert("NOT_OWNER");
+        market.pause();
+    }
+}</code></pre></div>
+</section>
+
+<section id="invariant">
+  <h2>Invariant testing</h2>
+  <p>Foundry's invariant fuzzer drives a sequence of random calls and checks invariants after each. Vastly more powerful than unit tests for protocol-level properties.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract MarketInvariantTest is Test {
+    Market market;
+    Handler handler;
+
+    function setUp() public {
+        market = new Market();
+        handler = new Handler(market);
+        targetContract(address(handler));
+        targetSelector(FuzzSelector({
+            addr: address(handler),
+            selectors: handler.getSelectors()
+        }));
+    }
+
+    function invariant_NoBadDebt() public {
+        assertLe(market.totalBorrowAssets(), market.totalSupplyAssets());
+    }
+
+    function invariant_SharesConserved() public {
+        assertEq(market.totalSupplyShares(), handler.ghostSumOfShares());
+    }
+}
+
+contract Handler is Test {
+    Market market;
+    uint256 public ghostSumOfShares;
+
+    function deposit(uint256 amount, uint256 actorSeed) external {
+        address actor = _seedActor(actorSeed);
+        amount = bound(amount, 1, 1e30);
+        deal(address(market.token()), actor, amount);
+        vm.startPrank(actor);
+        market.token().approve(address(market), amount);
+        uint256 shares = market.deposit(amount, actor);
+        vm.stopPrank();
+        ghostSumOfShares += shares;
+    }
+    // ... more handlers
+}</code></pre></div>
+  <p>Configure fuzz depth and runs in <code>foundry.toml</code>:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">[invariant]
+runs = 256
+depth = 500
+fail_on_revert = false</code></pre></div>
+</section>
+
+<section id="storage-layout">
+  <h2>Storage layout inspection</h2>
+  <p>For upgradeable contracts, you should snapshot the storage layout and CI-fail on unexpected changes.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">forge inspect Market storage-layout --pretty
+# Outputs slot, offset, type, name for each state variable
+
+forge inspect Market storage-layout &gt; storage/Market.json
+# Commit storage/Market.json; CI fails on git diff</code></pre></div>
+</section>
+
+<section id="cast">
+  <h2>cast for diagnostics</h2>
+  <p>Foundry's <code>cast</code> is the swiss army knife for on-chain debugging:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Decode a transaction
+cast tx 0xabc... --rpc-url $RPC
+cast 4byte 0xa9059cbb        # function selector → signature
+cast sig "transfer(address,uint256)"
+cast call $CONTRACT "totalSupply()(uint256)" --rpc-url $RPC
+cast storage $CONTRACT 0 --rpc-url $RPC   # raw slot read
+cast run 0xtxhash --quick   # trace a tx
+cast --to-dec 0x...; cast --to-hex 123
+cast wallet new
+cast estimate $CONTRACT "foo(uint256)" 42</code></pre></div>
+  <p><code>cast run</code> with <code>--debug</code> gives you a TUI debugger over the transaction trace — invaluable for incident analysis.</p>
+</section>
+
+<section id="echidna">
+  <h2>Echidna and Medusa</h2>
+  <p><strong>Echidna</strong> (Trail of Bits) is the OG property-based fuzzer for Solidity. Specifications written as Solidity functions returning bool.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract EchidnaMarket is Market {
+    function echidna_no_bad_debt() public view returns (bool) {
+        return totalBorrowAssets() &lt;= totalSupplyAssets();
+    }
+}</code></pre></div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">echidna EchidnaMarket.sol --contract EchidnaMarket --test-mode property</code></pre></div>
+  <p><strong>Medusa</strong> (also Trail of Bits) is the newer Go-based fuzzer. Faster, integrates with Foundry, supports coverage-guided fuzzing. Reaching parity with Echidna and often preferred for new projects.</p>
+</section>
+
+<section id="slither">
+  <h2>Slither analyzers and detectors</h2>
+  <p>Slither (Trail of Bits) is the standard static-analysis tool for Solidity. Run it on every PR.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">slither . --solc-remaps "@openzeppelin=lib/openzeppelin-contracts/contracts"
+slither . --print human-summary
+slither . --print contract-summary
+slither . --detect reentrancy-eth,reentrancy-no-eth,uninitialized-state
+slither . --triage-mode    # interactive triage of findings
+slither-check-upgradeability ProxyContract InitContract  # diff layouts for upgrade</code></pre></div>
+  <p>Most useful detectors to memorize:</p>
+  <ul>
+    <li><code>reentrancy-eth</code>, <code>reentrancy-no-eth</code>, <code>reentrancy-benign</code></li>
+    <li><code>uninitialized-state</code>, <code>uninitialized-storage</code>, <code>uninitialized-local</code></li>
+    <li><code>arbitrary-send-eth</code></li>
+    <li><code>locked-ether</code></li>
+    <li><code>incorrect-equality</code> (e.g., <code>balance == 0</code> on a balance that may dust)</li>
+    <li><code>tx-origin</code></li>
+    <li><code>weak-prng</code></li>
+    <li><code>shadowing-state</code>, <code>shadowing-abstract</code></li>
+  </ul>
+  <p>Custom detectors are also writable — useful if you have protocol-specific patterns to flag.</p>
+</section>
+
+<section id="adversarial-pr">
+  <h2>Reading PRs adversarially</h2>
+  <p>The single highest-leverage daily habit. The motion:</p>
+  <ol>
+    <li><strong>Diff first.</strong> What changed? Don't read the whole file; read what's new.</li>
+    <li><strong>Why does this change exist?</strong> Read the PR description, linked issue. If unclear, ask.</li>
+    <li><strong>What invariants might this break?</strong> For each invariant in your spec, ask if the change could violate it.</li>
+    <li><strong>What new attack surface?</strong> Any new external function, any new external call, any new role.</li>
+    <li><strong>What about the negative cases?</strong> Zero inputs, max inputs, empty state, paused state, post-incident state.</li>
+    <li><strong>Compose with existing.</strong> Does this play nicely with multicall, with batch operations, with re-entrancy guards?</li>
+  </ol>
+  <p>Leave your review as a structured comment. Even if you don't block the PR, leaving an artifact (<em>"I considered X, Y, Z; here's why I think they hold"</em>) builds a paper trail for future audits.</p>
+</section>
+
+<section id="dsa">
+  <h2>DSA patterns to know</h2>
+  <p>You're a user of these, not a researcher in them. The level of fluency you need:</p>
+  <ul>
+    <li><strong>Call graphs.</strong> What functions can call function X? Slither builds this; you should be able to read one.</li>
+    <li><strong>Taint propagation.</strong> If <code>x</code> comes from user input, where does it flow? Useful for tracking trust boundaries.</li>
+    <li><strong>Control-flow graphs.</strong> Per-function CFG; useful for spotting unreachable code or surprising branches.</li>
+    <li><strong>Data-flow analysis.</strong> What state can be modified between A and B?</li>
+    <li><strong>Symbolic execution.</strong> What Halmos/Manticore/Mythril do internally. You should know the concept; you don't have to implement.</li>
+  </ul>
+  <p>If you're asked a coding-interview-style problem (rare in security loops but possible): the most likely shapes are <em>parse a call trace and find the reentrant call</em>, <em>walk a storage layout</em>, <em>compute a 4-byte selector from a function signature</em>. Drill those, not LeetCode.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Compute a function selector from a signature
+cast sig "transfer(address,uint256)"
+# 0xa9059cbb
+
+# Or in Python:
+python3 -c "from eth_utils import keccak; print('0x' + keccak(text='transfer(address,uint256)')[:4].hex())"</code></pre></div>
+</section>
+
+<footer>
+  <p><a href="09-governance-and-audit.html">← Governance &amp; Audit</a> · <a href="11-coding-problems.html">Next: Coding Problems →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

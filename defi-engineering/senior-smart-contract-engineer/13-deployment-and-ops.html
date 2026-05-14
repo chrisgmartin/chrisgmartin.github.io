@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Ops — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#scripts">Foundry scripts at scale</a>
+    <a href="#create2">CREATE2 with vanity addresses</a>
+    <a href="#multichain">Multi-chain deploys</a>
+    <a href="#reproducible">Reproducible builds</a>
+    <a href="#diff">Diff against deployed</a>
+    <a href="#bytecode">Bytecode auditing</a>
+    <a href="#deploy-day">Deploy-day playbook</a>
+    <a href="#rollback">Rollback (you mostly can't)</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="12-data-pipelines.html">← Previous</a>
+    <a href="14-domain-context.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Deployment &amp; Ops</h1>
+  <p class="subtitle">Shipping immutable code to mainnet is a specialized discipline. Reproducibility, deterministic addresses, deploy-day playbooks, and the cold reality that there is mostly no rollback.</p>
+</header>
+
+<section id="scripts">
+  <h2>Foundry scripts at scale</h2>
+  <p>Anything serious uses <code>forge script</code>. Patterns that hold up:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// script/Deploy.s.sol
+contract Deploy is Script {
+    function run() external {
+        // 1. Load deployer with env-only credentials — never commit
+        uint256 pk = vm.envUint("DEPLOYER_PK");
+        vm.startBroadcast(pk);
+
+        // 2. Pre-flight checks before any state-changing call
+        require(block.chainid == 1, "wrong chain");
+        require(_ethRpcSanity(), "rpc smells wrong");
+
+        // 3. Deploy with deterministic salt
+        bytes32 salt = bytes32(uint256(0xdeadbeef));
+        PoolManager pm = new PoolManager{salt: salt}(governance);
+        require(address(pm) == _predicted(), "address mismatch — refusing to continue");
+
+        // 4. Initial config
+        pm.setProtocolFee(1000);
+        pm.setOwner(governance);
+
+        // 5. Smoke tests inside the script
+        require(pm.owner() == governance, "owner not set");
+
+        vm.stopBroadcast();
+
+        // 6. Log everything
+        console.log("PoolManager:", address(pm));
+        _writeDeploymentJson(address(pm));
+    }
+}</code></pre></div>
+  <p>Run shape:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Dry-run on local fork
+forge script script/Deploy.s.sol --rpc-url $RPC --fork-url $RPC
+
+# Simulate on mainnet — no broadcast yet
+forge script script/Deploy.s.sol --rpc-url $RPC
+
+# Broadcast
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --verify \
+    --etherscan-api-key $ETHERSCAN_KEY --slow --legacy</code></pre></div>
+  <p><code>--slow</code> waits for each transaction to be mined before sending the next — critical for deploys that depend on prior addresses.</p>
+</section>
+
+<section id="create2">
+  <h2>CREATE2 with vanity addresses</h2>
+  <p>The address of a CREATE2-deployed contract is:</p>
+  <pre><code class="language-text">address = keccak256(0xff || deployer || salt || keccak256(initcode))[12:]</code></pre>
+  <p>By searching over salts (and sometimes initcode constructor args), you can mine addresses that:</p>
+  <ul>
+    <li><strong>Start with zero bytes</strong> — saves calldata gas when the contract is referenced (zero bytes cost 4 gas; nonzero 16).</li>
+    <li><strong>Encode v4 hook permissions</strong> — required, not optional, in v4.</li>
+    <li><strong>Are recognizable / branded</strong> — vanity for hash visibility.</li>
+  </ul>
+  <p>For 8 leading zero nibbles: ~4B keccak operations expected. A modern GPU does it in &lt;1 minute. Tools: <code>create2crunch</code>, <code>profanity</code>-style miners.</p>
+  <p>For the same contract bytecode deployed across multiple chains, the same CREATE2 inputs give the same address — assuming the deployer contract is also at the same address. Use a chain-agnostic <code>SingletonFactory</code> or <code>CreateX</code> to guarantee this.</p>
+</section>
+
+<section id="multichain">
+  <h2>Multi-chain deploys</h2>
+  <p>Today's DEXes deploy across 10-25 EVM chains. The challenges:</p>
+  <ul>
+    <li><strong>Same address on every chain</strong> — accomplished via CREATE2 + same deployer + same salt + same initcode.</li>
+    <li><strong>Chain-id-dependent immutables</strong> — DOMAIN_SEPARATOR for EIP-712 must vary; everything else must not.</li>
+    <li><strong>Different gas prices, different opcodes available</strong> — some L2s lag Cancun. Compile per-chain or pick a lowest-common-denominator.</li>
+    <li><strong>Per-chain governance addresses.</strong> Same code, but the owner differs.</li>
+    <li><strong>Verification on every block explorer.</strong> Etherscan, Arbiscan, OptimisticEtherscan, Basescan, Lineascan, Polygonscan, Snowtrace, etc. Use Foundry's <code>--verify</code> with the right API key per chain.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Multi-chain deploy with config file
+forge script script/Deploy.s.sol \
+    --chain-id 1 \
+    --rpc-url $ETH_RPC --etherscan-api-key $ETHERSCAN \
+    --broadcast --verify --slow
+
+forge script script/Deploy.s.sol \
+    --chain-id 8453 \
+    --rpc-url $BASE_RPC --etherscan-api-key $BASESCAN \
+    --broadcast --verify --slow
+
+# ...repeat per chain or driven by a deployer shell script
+</code></pre></div>
+</section>
+
+<section id="reproducible">
+  <h2>Reproducible builds</h2>
+  <p>The bytecode you deploy must be reproducible from the source. If a verifier (Etherscan, Sourcify, or an auditor) can't reproduce your bytecode from your repo, your verification is suspect.</p>
+  <p>Lockdown checklist:</p>
+  <ul>
+    <li><strong>Locked compiler version.</strong> <code>0.8.26</code>, not <code>^0.8.0</code>. In <code>foundry.toml</code>.</li>
+    <li><strong>Locked optimizer settings.</strong> Runs count and via-ir setting committed.</li>
+    <li><strong>Locked EVM version.</strong> <code>evm_version = "cancun"</code>.</li>
+    <li><strong>Locked dependencies.</strong> Git submodules pinned to commits, not branches. <code>forge install foo/bar@v1.2.3</code>.</li>
+    <li><strong>Deterministic metadata.</strong> Same source paths, same imports, same compiler flags → same bytecode hash.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text"># foundry.toml — reproducible-build settings
+[profile.default]
+solc_version  = "0.8.26"
+evm_version   = "cancun"
+via_ir        = true
+optimizer     = true
+optimizer_runs = 200_000
+bytecode_hash = "none"     # remove timestamp-like metadata
+cbor_metadata = false</code></pre></div>
+</section>
+
+<section id="diff">
+  <h2>Diff-against-deployed verification</h2>
+  <p>Before flipping the activation switch on a deploy, verify that the on-chain bytecode matches what you intended:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># Fetch deployed runtime bytecode
+cast code 0xPoolManagerAddress --rpc-url $RPC &gt; deployed.bytecode
+
+# Get expected from local build
+forge inspect PoolManager deployedBytecode &gt; expected.bytecode
+
+# Diff
+diff &lt;(xxd deployed.bytecode) &lt;(xxd expected.bytecode)</code></pre></div>
+  <p>Common false positives:</p>
+  <ul>
+    <li>Immutables get inlined into the deployed bytecode. Diff will show them.</li>
+    <li>Metadata hash at the end differs if compiler versions differ.</li>
+    <li>Library link references show up as placeholders.</li>
+  </ul>
+  <p>Tools that automate this: <code>contractwatcher</code>, custom <code>forge verify-check</code> wrappers.</p>
+</section>
+
+<section id="bytecode">
+  <h2>Bytecode auditing</h2>
+  <p>Sometimes you need to read deployed bytecode for which you don't have source. Tools:</p>
+  <ul>
+    <li><strong>Dedaub Decompile</strong> — best-in-class decompiler.</li>
+    <li><strong>Etherscan's auto-decompile</strong> — adequate.</li>
+    <li><strong><code>heimdall-rs</code></strong> — open-source decompiler / disassembler.</li>
+    <li><strong><code>cast disassemble</code></strong> — opcode-level walk.</li>
+    <li><strong><code>cast 4byte</code></strong> — selector → known signature lookup.</li>
+  </ul>
+  <p>You should be able to look at a 4-byte selector in a transaction, identify the function name, and reason about what the call did — without access to source.</p>
+</section>
+
+<section id="deploy-day">
+  <h2>Deploy-day playbook</h2>
+  <p>What a senior engineer actually executes the day of a mainnet deployment:</p>
+  <ol>
+    <li><strong>T-3 days:</strong> Final code freeze. Run full Foundry + Echidna + Halmos suite. Audit reports incorporated. Bytecode hash recorded.</li>
+    <li><strong>T-2 days:</strong> Dry-run the deploy script on a mainnet fork at current block. Verify all addresses, ownership, configs.</li>
+    <li><strong>T-1 day:</strong> Rehearsal — full deploy on testnet (Sepolia / Holesky). Smoke tests pass.</li>
+    <li><strong>Morning of:</strong> Sync with the team. Confirm gas prices are reasonable. Confirm deployer wallet has enough ETH.</li>
+    <li><strong>Execute:</strong> Run the deploy script. <code>--slow</code> for each step.</li>
+    <li><strong>Verify:</strong> Each contract source on Etherscan. Bytecode diff against expected.</li>
+    <li><strong>Smoke test:</strong> A first end-to-end transaction. Tiny size.</li>
+    <li><strong>Configure:</strong> Set initial caps. Transfer ownership to multisig / timelock.</li>
+    <li><strong>Publish:</strong> Update front-ends, subgraph, documentation. Announce.</li>
+    <li><strong>Watch:</strong> First 24h on-call. Monitor every alert.</li>
+  </ol>
+  <p>One missed step costs you a redeploy or worse.</p>
+</section>
+
+<section id="rollback">
+  <h2>Rollback — you mostly can't</h2>
+  <p>The hard truth: for immutable core contracts, there is no rollback. If you ship a bug:</p>
+  <ul>
+    <li>If the core is paused-capable: pause and forfeit operation.</li>
+    <li>If the core has a kill switch: trigger and let funds drain to a recovery contract.</li>
+    <li>If neither: hope the bug is non-economic, or coordinate a whitehat rescue.</li>
+    <li>If the bug is economic and being exploited: scream loud, coordinate with auditors and security partners, and accept the loss.</li>
+  </ul>
+  <p>The design implication: <strong>design for immutability from day one</strong>. No "we'll add an upgrade hatch just in case." That hatch IS the bug surface.</p>
+  <div class="callout warn">
+    <span class="callout-label">The senior reflex</span>
+    <p>When asked "how would you handle a deploy-day bug?" — the correct first answer is <em>"don't ship one."</em> The rollout playbook (caps, gradual release, multi-audit) exists precisely because rollback doesn't.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="12-data-pipelines.html">← Data &amp; pipelines</a> · <a href="14-domain-context.html">Next: Domain context →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

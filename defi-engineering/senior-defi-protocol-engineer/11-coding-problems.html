@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coding Problems — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#p1">P1: Constant-product AMM swap</a>
+    <a href="#p2">P2: Fixed-point pow()</a>
+    <a href="#p3">P3: ERC-4626 deposit/withdraw without loss</a>
+    <a href="#p4">P4: Spot the reentrancy</a>
+    <a href="#p5">P5: Spot the share-inflation</a>
+    <a href="#p6">P6: Dutch auction primitive</a>
+    <a href="#p7">P7: Uniswap v3 TWAP</a>
+    <a href="#p8">P8: Simple liquidation</a>
+    <a href="#p9">P9: Health-factor binary search</a>
+    <a href="#p10">P10: Flash-loan-based liquidator</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-coding-fundamentals.html">← Previous</a>
+    <a href="12-data-pipelines.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Coding</span>
+  <h1>Coding Problems Worked</h1>
+  <p class="subtitle">Ten Solidity problems at senior protocol-engineer difficulty. Drill them: read the problem, try it on paper, then expand the answer.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">How to use this page</span>
+  <p>Read each problem, attempt the solution mentally or on paper before expanding the answer. Each answer often includes a second, more idiomatic approach to compare.</p>
+</div>
+
+<section id="p1">
+  <h2>P1 — Constant-product AMM swap</h2>
+  <p>Implement <code>swap</code> for a Uniswap v2-style constant-product pool with reserves <code>(r0, r1)</code>. Inputs: <code>amountIn</code>, <code>zeroForOne</code>, fee in bps. Return the amount out. Maintain the invariant <code>(r0 + dx) × (r1 - dy) ≥ r0 × r1</code> after fee.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 feeBps)
+    public pure returns (uint256 amountOut)
+{
+    if (amountIn == 0) revert ZeroInput();
+    if (reserveIn == 0 || reserveOut == 0) revert NoLiquidity();
+    uint256 amountInWithFee = amountIn * (10_000 - feeBps);
+    uint256 numerator   = amountInWithFee * reserveOut;
+    uint256 denominator = reserveIn * 10_000 + amountInWithFee;
+    amountOut = numerator / denominator;
+}
+
+function swap(uint256 amountIn, bool zeroForOne, uint256 minOut, address to)
+    external returns (uint256 amountOut)
+{
+    (uint256 rIn, uint256 rOut) = zeroForOne ? (reserve0, reserve1) : (reserve1, reserve0);
+    amountOut = getAmountOut(amountIn, rIn, rOut, FEE_BPS);
+    if (amountOut &lt; minOut) revert SlippageExceeded();
+
+    (IERC20 tokenIn, IERC20 tokenOut) = zeroForOne ? (token0, token1) : (token1, token0);
+    tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
+    tokenOut.safeTransfer(to, amountOut);
+
+    // Effects last (or pre-compute and snapshot — many designs are CEI here)
+    if (zeroForOne) { reserve0 += uint128(amountIn); reserve1 -= uint128(amountOut); }
+    else            { reserve1 += uint128(amountIn); reserve0 -= uint128(amountOut); }
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> Fee is applied to <code>amountIn</code> before constant-product math. Slippage param protects users against MEV / price-impact. For a "real" UniV2, the swap is callback-based (flash swaps) and reserves are updated last with a K-check at the end.</p>
+  </details>
+</section>
+
+<section id="p2">
+  <h2>P2 — Fixed-point <code>pow(x, n)</code></h2>
+  <p>Implement <code>rpow(uint256 x, uint256 n, uint256 base)</code> that returns <code>x^n</code> in fixed-point with given base (e.g., 1e18). Must handle large <code>n</code> efficiently and overflow safely.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function rpow(uint256 x, uint256 n, uint256 base) internal pure returns (uint256 z) {
+    if (x == 0) return n == 0 ? base : 0;
+    z = n % 2 == 0 ? base : x;
+    uint256 half = base / 2;
+    for (n /= 2; n &gt; 0; n /= 2) {
+        uint256 xx = x * x;
+        require(x == 0 || xx / x == x, "OVERFLOW");
+        uint256 xxRound = xx + half;
+        require(xxRound &gt;= xx, "OVERFLOW");
+        x = xxRound / base;
+        if (n % 2 != 0) {
+            uint256 zx = z * x;
+            require(x == 0 || zx / x == z, "OVERFLOW");
+            uint256 zxRound = zx + half;
+            require(zxRound &gt;= zx, "OVERFLOW");
+            z = zxRound / base;
+        }
+    }
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> Exponentiation by squaring is O(log n). Without overflow checks the result is garbage at high <code>x</code> or <code>n</code>. <code>half = base / 2</code> is the round-half-up bias. MakerDAO's <code>rpow</code> is the canonical reference; this is the same shape in Solidity rather than Yul.</p>
+  </details>
+</section>
+
+<section id="p3">
+  <h2>P3 — ERC-4626 deposit/withdraw without dust loss</h2>
+  <p>Implement <code>deposit(assets) → shares</code> and <code>redeem(shares) → assets</code> for a vault where round-tripping is <em>monotonic</em>: depositing X then redeeming all shares never returns more than X.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function _convertToShares(uint256 assets, Math.Rounding r) internal view returns (uint256) {
+    uint256 ts = totalSupply();
+    return assets.mulDiv(ts + VIRTUAL_SHARES, totalAssets() + 1, r);
+}
+
+function _convertToAssets(uint256 shares, Math.Rounding r) internal view returns (uint256) {
+    return shares.mulDiv(totalAssets() + 1, totalSupply() + VIRTUAL_SHARES, r);
+}
+
+function deposit(uint256 assets, address receiver) public returns (uint256 shares) {
+    shares = _convertToShares(assets, Math.Rounding.Down);   // round shares down
+    if (shares == 0) revert ZeroShares();
+    asset.safeTransferFrom(msg.sender, address(this), assets);
+    _mint(receiver, shares);
+    emit Deposit(msg.sender, receiver, assets, shares);
+}
+
+function redeem(uint256 shares, address receiver, address owner) public returns (uint256 assets) {
+    if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
+    assets = _convertToAssets(shares, Math.Rounding.Down);   // round assets down
+    _burn(owner, shares);
+    asset.safeTransfer(receiver, assets);
+    emit Withdraw(msg.sender, receiver, owner, assets, shares);
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> Virtual shares (<code>VIRTUAL_SHARES = 1e6</code>, OpenZeppelin v5 pattern) defeat the donation attack. Rounding shares down on deposit and assets down on redeem guarantees the protocol never gives out more than was put in. If you want symmetric "mint shares for assets" semantics, the rounding direction flips.</p>
+  </details>
+</section>
+
+<section id="p4">
+  <h2>P4 — Spot the reentrancy in 30 lines</h2>
+  <p>Find the bug:</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract Bank {
+    mapping(address =&gt; uint256) public balance;
+
+    function deposit() external payable {
+        balance[msg.sender] += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        require(balance[msg.sender] &gt;= amount, "INSUF");
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "TX_FAILED");
+        balance[msg.sender] -= amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        require(balance[msg.sender] &gt;= amount, "INSUF");
+        balance[msg.sender] -= amount;
+        balance[to] += amount;
+    }
+}
+</code></pre></div>
+
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+    <p><strong>Bug:</strong> <code>withdraw</code> performs the external call <em>before</em> updating <code>balance</code>. A malicious contract's <code>receive</code> can re-enter <code>withdraw</code> and drain the bank — the balance check still passes because the deduction hasn't happened yet.</p>
+    <p><strong>Fix (CEI):</strong></p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw(uint256 amount) external {
+    require(balance[msg.sender] &gt;= amount, "INSUF");
+    balance[msg.sender] -= amount;                        // Effects first
+    (bool ok,) = msg.sender.call{value: amount}("");      // Interactions last
+    require(ok, "TX_FAILED");
+}
+</code></pre></div>
+
+    <p>Additional belt-and-braces: add a <code>nonReentrant</code> modifier (transient-storage version in 0.8.24+).</p>
+  </details>
+</section>
+
+<section id="p5">
+  <h2>P5 — Spot the share-inflation bug</h2>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract NaiveVault {
+    IERC20 public immutable asset;
+    uint256 public totalShares;
+    mapping(address =&gt; uint256) public shareOf;
+
+    function deposit(uint256 assets) external returns (uint256 shares) {
+        uint256 ta = asset.balanceOf(address(this));
+        shares = totalShares == 0 ? assets : assets * totalShares / ta;
+        asset.transferFrom(msg.sender, address(this), assets);
+        totalShares += shares;
+        shareOf[msg.sender] += shares;
+    }
+
+    function redeem(uint256 shares) external returns (uint256 assets) {
+        uint256 ta = asset.balanceOf(address(this));
+        assets = shares * ta / totalShares;
+        totalShares -= shares;
+        shareOf[msg.sender] -= shares;
+        asset.transfer(msg.sender, assets);
+    }
+}
+</code></pre></div>
+
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+    <p><strong>Bug:</strong> the donation attack on first deposit.</p>
+    <ol>
+      <li>Attacker deposits 1 wei. <code>totalShares = 0</code>, branch taken; mints 1 share.</li>
+      <li>Attacker sends 1e18 of the underlying directly to the contract (does not call deposit).</li>
+      <li>Victim deposits 2e18. <code>shares = 2e18 * 1 / (1 + 1e18) = 1</code> (rounds down).</li>
+      <li>Vault now holds ~3e18, distributed as 1 share to attacker, 1 share to victim.</li>
+      <li>Attacker redeems 1 share, receives ~1.5e18 — half the victim's deposit.</li>
+    </ol>
+    <p><strong>Fixes:</strong></p>
+    <ul>
+      <li>Use virtual shares: <code>shares = assets * (totalShares + 1e6) / (ta + 1)</code>.</li>
+      <li>Or mint and burn a chunk of "dead shares" on first deposit so the ratio cannot be inflated.</li>
+      <li>Or use a SHARES_OFFSET (e.g., 1e6) so the first deposit mints 1e6× shares.</li>
+    </ul>
+    <p>Bonus bug: <code>totalShares == 0</code> with <code>ta != 0</code> (donation before first deposit) would compute <code>shares = assets * 0 / ta = 0</code>, locking the first depositor out. The virtual-shares pattern fixes this too.</p>
+  </details>
+</section>
+
+<section id="p6">
+  <h2>P6 — Dutch auction primitive</h2>
+  <p>Implement a Dutch auction over a fixed quantity of <code>token</code>: start price <code>P0</code> at time <code>t0</code>, decays linearly to <code>P1 ≤ P0</code> by time <code>t1</code>. Anyone can claim by paying the current price.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract DutchAuction {
+    IERC20 public immutable token;
+    IERC20 public immutable paymentToken;
+    uint256 public immutable quantity;
+    uint256 public immutable p0;
+    uint256 public immutable p1;
+    uint64  public immutable t0;
+    uint64  public immutable t1;
+    bool    public sold;
+
+    constructor(IERC20 _t, IERC20 _p, uint256 q, uint256 _p0, uint256 _p1, uint64 _t0, uint64 _t1) {
+        require(_t0 &lt; _t1 &amp;&amp; _p1 &lt;= _p0, "BAD_PARAMS");
+        token = _t; paymentToken = _p; quantity = q;
+        p0 = _p0; p1 = _p1; t0 = _t0; t1 = _t1;
+    }
+
+    function currentPrice() public view returns (uint256) {
+        if (block.timestamp &lt;= t0) return p0;
+        if (block.timestamp &gt;= t1) return p1;
+        uint256 elapsed = block.timestamp - t0;
+        uint256 span    = t1 - t0;
+        // Linear decay from p0 to p1
+        return p0 - (p0 - p1) * elapsed / span;
+    }
+
+    function buy(uint256 maxPayment) external {
+        require(!sold, "SOLD");
+        uint256 price = currentPrice();
+        require(price &lt;= maxPayment, "PRICE_TOO_HIGH");
+        sold = true;
+        paymentToken.safeTransferFrom(msg.sender, address(this), price);
+        token.safeTransfer(msg.sender, quantity);
+        emit Sold(msg.sender, price);
+    }
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> Linear decay is the simplest; production auctions (e.g., Liquity v2 redemptions, Aave's MEV-resistant liquidations) often use exponential decay or piecewise curves. <code>maxPayment</code> protects against price spikes between block submission and inclusion. For liquidations, the auction is parameterized by the position's debt/collateral, not a fixed quantity.</p>
+  </details>
+</section>
+
+<section id="p7">
+  <h2>P7 — Compute a TWAP from a Uniswap v3 pool</h2>
+  <p>Given a Uniswap v3 pool address and a window in seconds, return the TWAP price of token1/token0 as a Q64.96 sqrt price.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function getTwapSqrtPrice(address pool, uint32 secondsAgo) public view returns (uint160 sqrtPriceX96) {
+    require(secondsAgo &gt; 0, "ZERO");
+    uint32[] memory secondsAgos = new uint32[](2);
+    secondsAgos[0] = secondsAgo;
+    secondsAgos[1] = 0;
+    (int56[] memory tickCumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
+
+    int56 delta = tickCumulatives[1] - tickCumulatives[0];
+    int24 avgTick = int24(delta / int56(uint56(secondsAgo)));
+    if (delta &lt; 0 &amp;&amp; (delta % int56(uint56(secondsAgo)) != 0)) avgTick--;   // round toward -inf
+
+    sqrtPriceX96 = TickMath.getSqrtRatioAtTick(avgTick);
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> <code>tickCumulative</code> values are running sums; their difference divided by the window is the TWAP <em>tick</em>. Tick is log-price; converting back via TickMath gives geometric mean price. Important: round toward negative infinity (Solidity's <code>/</code> rounds toward zero), or your TWAP biases up for negative ticks.</p>
+    <p>You must also ensure the pool's observation cardinality covers the window — otherwise <code>observe</code> reverts.</p>
+  </details>
+</section>
+
+<section id="p8">
+  <h2>P8 — Simple liquidation function</h2>
+  <p>Implement <code>liquidate(borrower, seizeCollateral)</code> for a single-collateral market. Liquidator repays <code>debt</code> = <code>seizeCollateral × price / (1 + LI)</code>. Reverts if position is healthy or if liquidator over-repays.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function liquidate(address borrower, uint256 seizeCollateral) external returns (uint256 repaid) {
+    _accrue();
+    Position storage p = position[borrower];
+    uint256 price = IOracle(ORACLE).price();
+    if (_isHealthy(p, price)) revert HealthyPosition();
+    if (seizeCollateral &gt; p.collateral) revert OverSeize();
+
+    // debt = seize * price / (1 + LI), scaled
+    uint256 collateralValue = seizeCollateral * price / ORACLE_SCALE;
+    repaid = collateralValue * WAD / (WAD + LIQUIDATION_INCENTIVE);
+
+    if (repaid &gt; p.borrowAssets) {
+        // Cannot repay more than outstanding debt; clamp.
+        repaid = p.borrowAssets;
+        // and recompute corresponding collateral
+        seizeCollateral = repaid * (WAD + LIQUIDATION_INCENTIVE) * ORACLE_SCALE / WAD / price;
+    }
+
+    p.collateral    -= uint128(seizeCollateral);
+    p.borrowAssets  -= uint128(repaid);
+    totalBorrowAssets -= uint128(repaid);
+
+    LOAN.safeTransferFrom(msg.sender, address(this), repaid);
+    COLLATERAL.safeTransfer(msg.sender, seizeCollateral);
+
+    // Socialize remaining debt if collateral was fully seized
+    if (p.collateral == 0 &amp;&amp; p.borrowAssets &gt; 0) {
+        totalSupplyAssets -= p.borrowAssets;
+        totalBorrowAssets -= p.borrowAssets;
+        emit BadDebtSocialized(borrower, p.borrowAssets);
+        p.borrowAssets = 0;
+    }
+
+    emit Liquidate(msg.sender, borrower, seizeCollateral, repaid);
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> Round repaid amount <em>up</em> (favor protocol) in production; the over-repay clamp can leave collateral on the table. Health check before; post-condition check after. Socialization keeps the bookkeeping invariant.</p>
+  </details>
+</section>
+
+<section id="p9">
+  <h2>P9 — Binary search for the price at which a position becomes unhealthy</h2>
+  <p>Given a position with collateral <code>C</code>, borrow <code>B</code>, LLTV <code>L</code>, find the largest oracle price <code>p</code> at which the position is still healthy. (Useful for off-chain liquidator simulation.)</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+    <p>Closed form: <code>C × p × L = B</code>, so <code>p* = B / (C × L)</code> (with WAD scaling). No binary search needed.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function liquidationPrice(uint256 C, uint256 B, uint256 lltv) pure returns (uint256) {
+    // health: C * p * lltv / WAD &gt;= B  ==&gt;  p &gt;= B * WAD / (C * lltv)
+    // For collateral PRICED in loan-token units; sign convention may differ.
+    return B * WAD / (C * lltv / WAD);
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong> The instinct to binary search is good; the instinct to step back and find a closed form is better. In an interview, demonstrate both: "I could binary search this, but actually the function is linear in price so I'll just solve for it." That earns the round.</p>
+    <p>Where binary search <em>does</em> help: complex non-linear health functions (e.g., concentrated-liquidity positions, structured collateral) where there's no closed form.</p>
+  </details>
+</section>
+
+<section id="p10">
+  <h2>P10 — Flash-loan-based liquidator</h2>
+  <p>Sketch a contract that liquidates an unhealthy position using a flash loan for the repay capital. The liquidator should require zero capital in: borrow the loan token, repay debt, receive collateral, swap collateral → loan token to repay the flash loan, keep the spread.</p>
+  <details class="reveal">
+    <summary>Reveal answer</summary>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">contract FlashLiquidator is IFlashLoanReceiver {
+    IFlashLoanProvider public immutable lender;
+    ILendingCore       public immutable core;
+    ISwapRouter        public immutable router;
+
+    function liquidate(address borrower, uint256 seize, bytes calldata swapData) external {
+        // 1. Flash-borrow the loan token from a provider (Balancer, Aave, Uni v3 flash)
+        bytes memory data = abi.encode(borrower, seize, swapData);
+        lender.flashLoan(address(this), LOAN, MAX_BORROW, data);
+        // 4. After this returns, residual LOAN balance is profit -&gt; sweep
+        uint256 profit = LOAN.balanceOf(address(this));
+        LOAN.safeTransfer(msg.sender, profit);
+    }
+
+    // 2. Called back by the lender with the funds
+    function onFlashLoan(address /*initiator*/, address /*token*/, uint256 amount, uint256 fee, bytes calldata data)
+        external override returns (bytes32)
+    {
+        require(msg.sender == address(lender), "AUTH");
+        (address borrower, uint256 seize, bytes memory swapData) = abi.decode(data, (address, uint256, bytes));
+
+        // Approve core to pull loan token
+        LOAN.forceApprove(address(core), amount);
+        uint256 repaid = core.liquidate(borrower, seize);
+        require(repaid &lt;= amount, "MORE_THAN_BORROWED");
+
+        // 3. Swap seized collateral -&gt; loan token to repay flash loan + fee
+        uint256 needed = amount + fee;
+        router.exactOutput(swapData, needed);
+
+        LOAN.forceApprove(address(lender), needed);
+        return keccak256("ERC3156FlashBorrower.onFlashLoan");
+    }
+}
+</code></pre></div>
+
+    <p><strong>Discussion points:</strong></p>
+    <ul>
+      <li>The flow is callback-driven: <code>lender → onFlashLoan → core.liquidate → router.swap → lender</code>.</li>
+      <li>Real searchers will pre-compute the optimal <code>seize</code> off-chain (binary search over the slippage curve) and pass it in.</li>
+      <li>Use <code>forceApprove</code> (OZ v5) for USDT compatibility.</li>
+      <li>If the swap fails (illiquid collateral), the entire tx reverts — searcher loses gas but no principal.</li>
+      <li>Production liquidator bots use MEV-Boost / private mempools to avoid frontrunning.</li>
+    </ul>
+  </details>
+</section>
+
+<footer>
+  <p><a href="10-coding-fundamentals.html">← Coding Fundamentals</a> · <a href="12-data-pipelines.html">Next: Data &amp; Pipelines →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

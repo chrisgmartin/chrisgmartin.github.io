@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Practice Interview Questions — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body data-practice-key="defi-protocol-eng-practice">
+
+<div class="layout layout-wide">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#solidity-evm">1. Solidity &amp; EVM</a>
+    <a href="#mechanism">2. Mechanism design</a>
+    <a href="#oracles">3. Oracles</a>
+    <a href="#liquidations">4. Liquidations</a>
+    <a href="#gas">5. Gas &amp; efficiency</a>
+    <a href="#attacks">6. Attack vectors</a>
+    <a href="#design">7. Design / take-home</a>
+    <a href="#behavioral">8. Behavioral</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="14-domain-context.html">← Previous</a>
+    <a href="16-day-of.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · Reference</span>
+  <h1>Practice Interview Questions</h1>
+  <p class="subtitle">28 questions across 8 sections. Drill out loud. Tick the practice tracker as you go. Toggle drill mode to hide answers.</p>
+</header>
+
+<label class="drill-toggle"><input type="checkbox" id="drillToggle"> <span>Drill mode (hide answers)</span></label>
+
+<section id="solidity-evm">
+  <h2>1. Solidity &amp; EVM</h2>
+
+  <details class="reveal">
+    <summary><strong>Q1.</strong> Walk through what happens, step by step, when a user calls <code>transfer(address,uint256)</code> on an ERC-20.</summary>
+    <p>A: (1) Wallet sends a tx to the token's address; (2) EVM dispatches via the 4-byte selector to the function; (3) the function checks <code>balance[msg.sender] &gt;= amount</code>; (4) updates <code>balance[msg.sender] -= amount</code> and <code>balance[to] += amount</code>; (5) emits a <code>Transfer</code> event; (6) returns true (or doesn't, for USDT). The two SSTOREs dominate gas cost (~30k zero-to-nonzero or ~5k both nonzero). The wallet sees the receipt and the new balance via JSON-RPC.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q2.</strong> What is transient storage and when would you use it?</summary>
+    <p>A: Transient storage (EIP-1153, Cancun) gives you TLOAD/TSTORE — a per-transaction key-value store that resets when the tx ends. ~100 gas per op. Use cases: reentrancy guards (much cheaper than the SSTORE-based ReentrancyGuard), per-tx caches, callback state passing. In Solidity 0.8.24+, declare with the <code>transient</code> data location.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q3.</strong> Explain custom errors vs require strings. What's in the revert data?</summary>
+    <p>A: <code>require("msg")</code> reverts with <code>Error(string)</code> — a 4-byte selector + ABI-encoded string. <code>revert CustomError(x, y)</code> reverts with the error's 4-byte selector + ABI-encoded args. Custom errors are cheaper at deploy and call time, self-document, and provide structured failure data. The selector is <code>bytes4(keccak256("CustomError(uint256,uint256)"))</code>. Off-chain consumers can decode via <code>cast 4byte-decode</code> or via the contract ABI.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q4.</strong> What's the difference between calldata, memory, and storage?</summary>
+    <p>A: Calldata is the read-only transaction payload (cheap, ~3 gas/word read). Memory is the function-scoped scratch space (cheap reads/writes, quadratic expansion past ~700 bytes). Storage is the contract's persistent state (SLOAD 2100 cold / 100 warm; SSTORE 20k zero→non-zero, 5k otherwise). Heuristic: prefer calldata for read-only inputs; cache storage to local stack variables inside loops; never use memory when calldata works.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q5.</strong> Where does <code>mapping(address =&gt; uint256) bal</code> declared at storage slot 3 actually live?</summary>
+    <p>A: The mapping itself doesn't store anything at slot 3 — slot 3 is reserved but empty. <code>bal[user]</code> lives at <code>keccak256(abi.encode(user, uint256(3)))</code>. There is no length, no enumeration; you can only read values whose keys you already know. To enumerate, you must index events off-chain.</p>
+  </details>
+</section>
+
+<section id="mechanism">
+  <h2>2. Mechanism design</h2>
+
+  <details class="reveal">
+    <summary><strong>Q6.</strong> Whiteboard a minimal lending market. What's the state and what are the invariants?</summary>
+    <p>A: Mapping <code>id =&gt; Market</code>; mapping <code>id =&gt; user =&gt; Position</code>. Market holds <code>totalSupplyAssets/Shares</code>, <code>totalBorrowAssets/Shares</code>, <code>lastUpdate</code>. Position holds <code>supplyShares</code>, <code>borrowShares</code>, <code>collateral</code>. Invariants: (1) <code>totalSupplyAssets &gt;= totalBorrowAssets</code>, (2) every position is healthy after every tx, (3) sum of position shares equals total shares, (4) interest accumulators are monotonic, (5) one user cannot modify another's position except via liquidation. Transitions: supply, withdraw, supplyCollateral, withdrawCollateral, borrow, repay, liquidate, accrueInterest.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q7.</strong> Defend isolated markets vs cross-collateral. When is each right?</summary>
+    <p>A: Isolated markets give strong risk isolation — bad debt in one cannot touch another. They allow permissionless market creation because the protocol does not have to curate every pair. Cost: lower capital efficiency (same collateral cannot back two borrows). Cross-collateral aggregates a user's position into one account; better UX and capital efficiency but a single toxic listing can damage the whole pool. Pick isolated for permissionless / minimal cores (Morpho Blue, Euler v2). Pick cross-collateral for curated, brand-driven UX where governance is comfortable picking listings (Aave v3, Compound).</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q8.</strong> Walk through a kinked IRM curve. Why a kink at 80% rather than linear?</summary>
+    <p>A: Two slopes: gentle from 0 to <code>U*</code> (e.g., 90%), steep from <code>U*</code> to 100%. Below the kink the rate climbs slowly to encourage utilization. Above, the rate climbs sharply to: (1) compensate suppliers for the risk of being illiquid; (2) discourage borrowers from pushing utilization to 100% where withdrawals fail; (3) pull in fresh supply to lower utilization. A purely linear curve does not produce the urgency near 100% — suppliers earn the same marginal rate at 91% as at 30%, so they don't show up just when they're needed.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q9.</strong> How would you add fixed-rate loans on top of an existing variable-rate lending core?</summary>
+    <p>A: Two main approaches. (1) Maturity-bucketed overlay: suppliers commit to a tenor (e.g., 30 days); a separate market matches borrowers at a fixed rate; on maturity, principal+interest settles. Used by Notional, Pendle PTs. (2) Perpetual fixed-rate via IRS: leave the variable-rate core, add an interest-rate-swap contract where borrowers pay fixed + receive floating; net result: synthetic fixed rate. Cleaner integration but introduces oracle/funding mechanism. Both are <em>periphery</em> changes — the variable-rate core remains untouched.</p>
+  </details>
+</section>
+
+<section id="oracles">
+  <h2>3. Oracles</h2>
+
+  <details class="reveal">
+    <summary><strong>Q10.</strong> Compare push (Chainlink) and pull (Pyth) oracles. Which would you pick for a new isolated lending market on a brand-new L2 and why?</summary>
+    <p>A: Push: simple read at use time; freshness limited by heartbeat / deviation. Pull: consumer posts a signed update from a relay; can get sub-second freshness but adds UX cost (caller pays the update fee). For a new L2 where Chainlink may not yet have a feed for the asset, Pyth often has coverage earlier. For mature pairs (ETH/USD on Base), Chainlink is operationally simpler. Hybrid pattern: Pyth primary, Chainlink cross-check; or vice versa. The "right" answer depends on the asset's volatility and which feed exists with credible publishers — but in interviews always frame the answer as a function of (asset, chain, availability) rather than picking blindly.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q11.</strong> What can go wrong with a Uniswap v3 TWAP?</summary>
+    <p>A: (1) Observation cardinality too low — TWAP reverts on long lookbacks. (2) Pool too shallow — manipulator can move price for a window cheaper than the win. (3) Wrong window — too short lets attackers manipulate cheaply; too long lags real price in fast markets. (4) Sign rounding: Solidity's truncating division biases TWAP up for negative ticks. (5) Wrong pool — if multiple fee-tier pools exist for the pair, pick the deepest. (6) Inverted pair — token0/token1 ordering matters. (7) On L2s during a sequencer outage, the TWAP can be stuck at the pre-outage price.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q12.</strong> Describe a hardened oracle adapter for a high-TVL lending market.</summary>
+    <p>A: Primary feed (e.g., Chainlink push). Staleness check (max age based on asset volatility). Positivity check. L2 sequencer feed + grace period if on an L2. Cross-check against a second source (TWAP or secondary push). On disagreement &gt; threshold, fall back to secondary or freeze. Hard min/max sanity bounds to catch catastrophic feed corruption. All readable via a single <code>price()</code> view that reverts on any failure mode. The market is bound to this adapter immutably; if it goes bad, the market gracefully freezes — no rug.</p>
+  </details>
+</section>
+
+<section id="liquidations">
+  <h2>4. Liquidations</h2>
+
+  <details class="reveal">
+    <summary><strong>Q13.</strong> Walk through what happens when a position becomes liquidatable on a typical isolated market.</summary>
+    <p>A: Oracle updates; off-chain liquidator bots detect new price; recompute every position's health factor; identify newly-unhealthy positions; submit liquidation tx (usually via private mempool / Flashbots). Tx flow: accrueInterest first, then check unhealthy, then transfer repaid loan tokens from liquidator to market, deduct from position debt, transfer seized collateral to liquidator (typically debtRepaid × (1 + LI) worth at oracle price). If collateral is exhausted with residual debt, socialize the loss: write down totalSupplyAssets by the bad-debt amount.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q14.</strong> Why might you use a Dutch auction instead of a fixed-LI partial liquidation?</summary>
+    <p>A: A fixed LI is a one-size-fits-all incentive. In high-vol moments, it can be too small (no one liquidates); in stable moments, too large (over-payment to liquidators). Dutch auctions price-discover: the discount starts at zero (or small) and increases until someone bids. The winning searcher pays exactly the LI the market clears at. Resists priority-gas auction dynamics. Cost: complexity; auctions take time to settle, which is bad in fast cascades. Used by Liquity v2 redemptions, some Aave-derivatives, and recent isolated-market designs.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q15.</strong> What is a pre-liquidation and what problem does it solve?</summary>
+    <p>A: A pre-liquidation triggers above the LLTV threshold — e.g., at 95% of LLTV — and seizes a small fraction of collateral at a discounted LI. It opt-in: borrower elects to allow it. Solves the "borrower gets fully liquidated by a price gap that just barely crosses LLTV" problem: smaller, gentler, earlier intervention. Some designs route pre-liquidations to a curated keeper rather than the public mempool. Reduces MEV competition for the borrower; can be a credit-improvement signal.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q16.</strong> How do you design liquidation incentives so they work in extreme markets?</summary>
+    <p>A: First, recognize that constant-LI fixed liquidations are robust in calm markets and fragile in volatile ones. Mitigations: (a) make LI a function of how unhealthy the position is (worse health → higher incentive); (b) Dutch auction the incentive; (c) pre-liquidations to handle small over-shoots; (d) bad-debt insurance fund as a backstop; (e) accept that in extreme tails, some bad debt is inevitable and design clear socialization rules. The senior takeaway: a single-knob "LI = 8%" is a sign of immature design; modern designs adapt.</p>
+  </details>
+</section>
+
+<section id="gas">
+  <h2>5. Gas &amp; efficiency</h2>
+
+  <details class="reveal">
+    <summary><strong>Q17.</strong> A supply() function does 5 cold SLOADs and 3 SSTOREs. Estimate the gas.</summary>
+    <p>A: ~5 × 2,100 = 10,500 for cold SLOADs; SSTOREs depend: if all three are zero→nonzero, 3 × 20,000 = 60,000; if all nonzero→nonzero, 3 × 5,000 = 15,000. Plus 21,000 base + calldata + external calls. Typical first-time supply: ~120-150k gas; subsequent supply (warm slots, no zero→nonzero): 60-80k. SSTORE is overwhelmingly the dominant term.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q18.</strong> When does it pay to pack two uint128s into one slot?</summary>
+    <p>A: When you write to both in the same function call. Both fields in one SSTORE = 5,000 gas; two separate SSTOREs = 10,000. If you only ever touch one, packing saves nothing on writes (an SSTORE on a packed slot still costs 5,000) and complicates the code. For reads, packing helps if you load both at once. Net: pack when fields are co-written in hot paths; don't pack purely "to look tight."</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q19.</strong> When should you reach for inline assembly?</summary>
+    <p>A: When the high-level Solidity expression has a measurable, repeatable gas overhead and the assembly version is well-understood. Canonical cases: storage slot reads/writes for upgradeable patterns; 512-bit mulDiv (Uniswap/Solady); precompile dispatch. Don't reach for it for general "I think this loop is slow" — benchmark first, and prefer the Solidity refactor (e.g., calldata vs memory, caching SLOADs). Inline assembly is a maintenance tax and a bug surface.</p>
+  </details>
+</section>
+
+<section id="attacks">
+  <h2>6. Attack vectors</h2>
+
+  <details class="reveal">
+    <summary><strong>Q20.</strong> Explain the donation / share-inflation attack and three mitigations.</summary>
+    <p>A: Attacker mints 1 share, donates a large balance directly to the vault, victim's deposit rounds down to 0 shares, attacker withdraws and walks away with a chunk of victim's deposit. Mitigations: (1) virtual shares (OpenZeppelin v5) — add a constant to numerator and denominator so the ratio cannot be inflated meaningfully; (2) dead shares — mint a chunk to address(0) on first deposit; (3) shares offset — make 1 wei of assets correspond to 1e6 shares so donating 1 wei doesn't shift the price ratio.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q21.</strong> What is read-only reentrancy and how do you defend?</summary>
+    <p>A: A function is mid-execution; it calls out to user-controlled code; that code calls a view function on this contract which returns stale (uncommitted) state. The view is read by another protocol as oracle — and that protocol gets fooled. Classic case: Curve / Balancer-style LP-pricing oracles that read pool state mid-callback. Defenses: (1) transient lock that blocks view reads during the callback window; (2) ensure all views remain consistent across the callback boundary (commit state before any external call); (3) clearly document which views are safe to use as oracles.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q22.</strong> Walk through an oracle staleness exploit and how you'd design against it.</summary>
+    <p>A: Price feed hasn't updated; real price has moved 10% down on the collateral. Attacker opens a max-LTV position at the stale (high) price, then waits for the oracle to update — the position is now underwater, but the attacker has already pocketed the loan-token value of the over-borrow. Defenses: (1) staleness check rejecting prices &gt; <code>MAX_AGE</code>; (2) protocol pauses borrowing if oracle is stale; (3) cross-check with a TWAP — disagreement &gt; threshold triggers fallback; (4) for L2s, sequencer-uptime grace period to catch outage-induced staleness.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q23.</strong> Name three flavors of governance attack and how to defend each.</summary>
+    <p>A: (1) Flash governance — borrow gov tokens, vote, repay in same tx. Defense: vote weight from a past block snapshot. (2) Bribery markets — buy votes externally. Defense: vote-escrowed locks; minimize governance surface. (3) Timelock bypass — privileged function not behind the timelock. Defense: every privileged function gated by the same timelock; no special fast-paths. Bonus: parameter-griefing → allow-list of valid params + immutable per-market params. Multisig compromise → hardware-backed signers, geographic separation, threshold &gt; 50%.</p>
+  </details>
+</section>
+
+<section id="design">
+  <h2>7. Design / take-home</h2>
+
+  <details class="reveal">
+    <summary><strong>Q24.</strong> Design pre-liquidations for an isolated lending core. State, invariants, transitions.</summary>
+    <p>A: New struct <code>PreLiqParams</code> per position: enabled/disabled flag, pre-LLTV (between LLTV and a max), discount LI applied to pre-liq seizures, seize fraction. Transition: borrower opts in by signing a SignedAuthorization; liquidator passing a position's pre-LLTV but not full LLTV can call <code>preLiquidate</code> seizing up to seize-fraction × collateral at discount LI. Invariants: pre-LLTV &lt; LLTV; pre-LI &lt; full LI; seize fraction &lt; close factor; borrower can always disable. Edge cases: post-pre-liquidation, position must still be healthy at full LLTV (or eligible for full liquidation). Audit-focused: ensure pre-liquidation cannot be used to grief a healthy position.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q25.</strong> Design an oracle for an LST (e.g., wstETH) as collateral. What are you pricing?</summary>
+    <p>A: Two-step. (1) Get the per-share value of stETH in ETH from a Lido-side rate accessor (or a hardened on-chain reading of the canonical exchange rate). (2) Convert ETH to the quote currency (typically USD) via Chainlink ETH/USD push feed. Compose: <code>wstETHPrice_USD = wstETH_to_stETH_rate × stETH_to_ETH_rate × ETH_USD_price</code>. The wstETH:stETH and stETH:ETH rates are not pure market prices — they're redemption-rate-like accumulators; price them off the staking protocol, not off a DEX (DEX prices can de-peg in stress, but for liquidation purposes the redemption rate is the conservative number). Add staleness checks on each component; if any is stale, revert.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q26.</strong> Take-home: design a permissionless ERC-4626 vault that allocates across multiple isolated lending markets according to a curator's caps. Sketch the interface.</summary>
+    <p>A: Vault tracks underlying (e.g., USDC) and shares. Constructor sets curator (address with allocation power), guardian (pause), owner (governance). State: supply caps per market (curator-set, increase-able instantly, decrease-able with timelock), allocation array. Functions: <code>setSupplyCap(marketId, cap)</code>; <code>reallocate(allocations[])</code> (curator only); <code>deposit/withdraw/mint/redeem</code> (standard 4626 with idle &amp; rebalancing logic). On deposit, allocate to the market with most headroom (or per-curator policy). On withdraw, withdraw from markets in liquidation-priority order. Performance fee + management fee periodically mints shares to fee recipient. Pause flag for guardian.</p>
+  </details>
+</section>
+
+<section id="behavioral">
+  <h2>8. Behavioral</h2>
+
+  <details class="reveal">
+    <summary><strong>Q27.</strong> Tell me about a time you found a bug in production code.</summary>
+    <p>A: Use the SAR shape: Situation (what was the code, who used it), Action (how you found the bug — invariant test? code review? mainnet anomaly?), Result (what was the fix, what changed in process to prevent recurrence). The strongest version emphasizes the <em>process change</em>: "After we fixed it, we added an invariant test for that specific class of bug, and now our CI catches it pre-PR." Senior interviewers care about the systemic improvement, not the heroics.</p>
+  </details>
+
+  <details class="reveal">
+    <summary><strong>Q28.</strong> You disagree with a senior teammate's design. They have more on-chain shipping experience than you. How do you handle it?</summary>
+    <p>A: Honest answer: state your model crisply, ask theirs, look for the disagreement (often it's a hidden assumption about a constraint, not a real disagreement on logic). If after exploring it, you still disagree, push the disagreement to a decision: write up the trade-off, share with the team, take the L gracefully if the team goes their way. The cardinal sin is silent disagreement — you're a senior, your job is to surface the trade-off, not to acquiesce or to grumble. The interviewer is looking for: can you hold a position respectfully and update visibly.</p>
+  </details>
+</section>
+
+<section id="closer">
+  <h2>Closing thought</h2>
+  <div class="callout insight">
+    <span class="callout-label">Drill plan</span>
+    <p>First pass: read each question, attempt out loud, expand the answer. Mark the practice tracker. Second pass: drill mode on, go through with answers hidden. Aim to answer each in &lt; 60 seconds, in your own words, with at least one concrete example. The questions are not exhaustive — the goal is to internalize the <em>shape</em> of the answer.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="14-domain-context.html">← Domain Context</a> · <a href="16-day-of.html">Next: Day-Of Tactics →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

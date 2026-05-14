@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Core Fundamentals — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#calldata-heavy">Calldata-heavy contracts</a>
+    <a href="#storage-slot">Single-slot designs</a>
+    <a href="#transient">Transient storage (EIP-1153)</a>
+    <a href="#dispatch">Function-pointer dispatch tricks</a>
+    <a href="#yul">Yul / inline-assembly for hot paths</a>
+    <a href="#erc20-quirks">ERC-20 quirks that bite DEX code</a>
+    <a href="#nft-positions">ERC-721 / ERC-1155 position NFTs</a>
+    <a href="#one-byte">One wrong byte costs millions</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-positioning-from-scratch.html">← Previous</a>
+    <a href="04-deep-dive-primary.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Core Fundamentals</h1>
+  <p class="subtitle">The Solidity foundations specific to a DEX surface — what every senior contract engineer is expected to know cold before they walk into a design or code round at an AMM team.</p>
+</header>
+
+<section id="calldata-heavy">
+  <h2>Calldata-heavy contracts</h2>
+  <p>DEX peripheries are dominated by calldata cost, not storage cost. A router takes a path, deadline, recipient, amount specs, and signature blobs — every one of those bytes is paid for by the user.</p>
+  <p>Three rules:</p>
+  <ol>
+    <li><strong>Prefer <code>calldata</code> over <code>memory</code></strong> for function parameters that aren't mutated. Memory copies cost gas; calldata reads don't.</li>
+    <li><strong>Pack inputs tightly.</strong> If your router takes <code>address tokenIn, address tokenOut, uint24 fee, uint160 sqrtPriceLimit</code>, that's two 32-byte slots if packed correctly versus four if naively encoded.</li>
+    <li><strong>Multicall the boring stuff.</strong> Permit, swap, refund — combine into one calldata payload via <code>Multicall</code>.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Bad — every external call pays calldata + ABI decoding cost separately
+function swapAndRefund(address t, uint a) external {
+    swap(t, a);
+    refund();
+}
+
+// Better — single calldata payload, one external call
+function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+    results = new bytes[](data.length);
+    for (uint256 i; i &lt; data.length; ++i) {
+        (bool ok, bytes memory ret) = address(this).delegatecall(data[i]);
+        require(ok, "multicall");
+        results[i] = ret;
+    }
+}</code></pre></div>
+  <p>Production DEX peripheries (Uniswap's <code>Multicall</code>, Uniswap v3 <code>SwapRouter</code>) lean on this pattern heavily. Be ready to write it from memory.</p>
+</section>
+
+<section id="storage-slot">
+  <h2>Single-storage-slot designs</h2>
+  <p>The most-read state in a DEX pool is often packed into a single 32-byte slot. Uniswap v3's <code>slot0</code> is the canonical example:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Uniswap v3 slot0 — single SLOAD reads everything the swap needs to start
+struct Slot0 {
+    uint160 sqrtPriceX96;       // current price
+    int24   tick;               // current tick
+    uint16  observationIndex;
+    uint16  observationCardinality;
+    uint16  observationCardinalityNext;
+    uint8   feeProtocol;
+    bool    unlocked;
+}
+// 160 + 24 + 16 + 16 + 16 + 8 + 8 = 248 bits → fits in 256 bits</code></pre></div>
+  <p>Why this matters at the bar: when you propose a design, a senior interviewer will mentally lay out the storage. If your design needs three separate <code>SLOAD</code>s on the hot path, they will push back. Plan your slots before you write the contract.</p>
+  <p>Auxiliary techniques:</p>
+  <ul>
+    <li><strong><code>immutable</code></strong> — set in constructor, embedded in bytecode. Zero SLOAD cost.</li>
+    <li><strong><code>constant</code></strong> — compile-time. Same property.</li>
+    <li><strong>Bit-packing</strong> — pack two <code>uint128</code>s into one slot, or a <code>uint160</code> address with a <code>uint96</code> counter.</li>
+    <li><strong>SSTORE2 / SSTORE3</strong> — store large blobs as runtime bytecode in a dummy contract. Useful for static configs.</li>
+  </ul>
+</section>
+
+<section id="transient">
+  <h2>Transient storage (EIP-1153) — Cancun</h2>
+  <p>Post-Cancun, <code>TSTORE</code> and <code>TLOAD</code> give you storage that exists only for the lifetime of the transaction. Two killer use cases for DEX code:</p>
+  <ol>
+    <li><strong>Reentrancy locks.</strong> Previously: write 1 / write 2 to a storage slot, costing ~20k + ~5k gas. With transient storage: ~100 + ~100. Massive savings on every swap.</li>
+    <li><strong>Intermediate state in a multi-hook lifecycle.</strong> v4's hooks need to pass data between <code>beforeSwap</code> and <code>afterSwap</code> without persisting it. Transient storage is purpose-built for this.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Pre-Cancun reentrancy guard — expensive
+uint256 private _locked = 1;
+modifier nonReentrant() {
+    require(_locked == 1, "reentrant");
+    _locked = 2;        // ~20k gas (cold) or ~5k (warm SSTORE)
+    _;
+    _locked = 1;        // ~5k or refund
+}
+
+// Cancun-era transient lock — ~200 gas total
+modifier tnonReentrant() {
+    assembly {
+        if tload(0) { revert(0,0) }
+        tstore(0, 1)
+    }
+    _;
+    assembly { tstore(0, 0) }
+}</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Interview signal</span>
+    <p>If you can name the opcodes (<code>TSTORE = 0x5D</code>, <code>TLOAD = 0x5C</code>) and explain that values reset at end-of-transaction <em>not</em> end-of-call, you've shown post-Cancun fluency.</p>
+  </div>
+</section>
+
+<section id="dispatch">
+  <h2>Function-pointer dispatch tricks</h2>
+  <p>Solidity's default function dispatch is a linear search through selectors. Solady popularized a sorted-selector dispatch trick — pre-sort by 4-byte selector and binary-search-style branch — that shaves measurable gas on hot routers.</p>
+  <p>You aren't usually expected to write this in an interview, but you should know:</p>
+  <ul>
+    <li>Solidity emits a series of <code>EQ + JUMPI</code> per selector. Cost grows linearly with selector count.</li>
+    <li>Frequently-called selectors should be ordered first (Solidity 0.8.x supports this via the <code>via-ir</code> pipeline and function ordering heuristics — and you can hint it).</li>
+    <li>Solady / advanced repos drop into Yul and write their own dispatcher. The gain is real on routers.</li>
+  </ul>
+</section>
+
+<section id="yul">
+  <h2>Yul / inline-assembly for hot paths</h2>
+  <p>You will not write a whole pool in Yul. You <em>will</em> see and write small inline-assembly blocks for:</p>
+  <ul>
+    <li><strong>Packed loads and stores</strong> when Solidity's struct semantics force extra SLOADs.</li>
+    <li><strong>Bit manipulation</strong> for tick bitmap operations (Uniswap v3 stores 256 ticks per uint256).</li>
+    <li><strong><code>mulDiv</code> and 512-bit math</strong> via Yul to avoid intermediate overflow.</li>
+    <li><strong>Memory-safe scratch space</strong> when computing hashes (<code>0x00..0x40</code> is fair game).</li>
+    <li><strong>Custom errors with payloads</strong> via <code>mstore + revert</code>.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Solady-style sqrt — Newton's method in inline assembly
+function sqrt(uint256 x) internal pure returns (uint256 z) {
+    assembly {
+        z := 181 // initial guess
+        // ... bit shifts to bring `x` into a normalized range
+        // Newton iterations:
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        z := shr(1, add(z, div(x, z)))
+        if lt(div(x, z), z) { z := div(x, z) }
+    }
+}</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">The Yul caveat</span>
+    <p>Every assembly block is a place the compiler can no longer help you. Memory safety annotations (<code>"memory-safe"</code>) help. Comments matter more here than anywhere else in Solidity. And it must be tested with the same fuzz rigor as the rest.</p>
+  </div>
+</section>
+
+<section id="erc20-quirks">
+  <h2>ERC-20 quirks that bite DEX code</h2>
+  <p>The single richest source of DEX bugs. Real tokens violate the spec in surprising ways. Periphery code has to defend against all of them.</p>
+  <table>
+    <thead><tr><th>Quirk</th><th>Example</th><th>What breaks</th></tr></thead>
+    <tbody>
+      <tr><td>Non-standard return</td><td>USDT, BNB, OMG — don't return bool from <code>transfer</code></td><td>Naive <code>require(token.transfer(...))</code> reverts on these</td></tr>
+      <tr><td>Fee-on-transfer</td><td>STA, PAXG (sometimes), various memecoins</td><td>Balance after transfer &lt; expected; AMM math breaks if you trust the input amount</td></tr>
+      <tr><td>Rebasing</td><td>AMPL, OHM, stETH (semi)</td><td>Balances change without transfers; LP accounting drifts</td></tr>
+      <tr><td>Double entrypoint</td><td>TUSD (historic), SNX (proxy)</td><td>Two addresses control one balance; allowlists with one address miss the other</td></tr>
+      <tr><td>Blacklist / pausable</td><td>USDC, USDT</td><td>Transfers can revert at runtime; idempotency-sensitive flows break</td></tr>
+      <tr><td>Decimals != 18</td><td>USDC (6), WBTC (8)</td><td>Naive 18-decimal math drops or gains precision</td></tr>
+      <tr><td>Approval-frontrun</td><td>"USDT approve-zero-first" pattern</td><td>Need increaseAllowance/decreaseAllowance or permit2 instead</td></tr>
+      <tr><td>Hooks / callbacks (ERC-777, ERC-1363)</td><td>imBTC, some wrappers</td><td>Reentrancy via transfer; classic attack surface</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// SafeERC20 — the canonical defense against non-standard returns
+function safeTransfer(IERC20 token, address to, uint256 value) internal {
+    (bool ok, bytes memory ret) = address(token).call(
+        abi.encodeWithSelector(IERC20.transfer.selector, to, value)
+    );
+    require(ok &amp;&amp; (ret.length == 0 || abi.decode(ret, (bool))), "ST");
+}
+
+// Fee-on-transfer-aware deposit pattern
+function _depositMeasured(IERC20 token, address from, uint256 amount) internal returns (uint256 received) {
+    uint256 before = token.balanceOf(address(this));
+    token.safeTransferFrom(from, address(this), amount);
+    received = token.balanceOf(address(this)) - before;   // trust the diff, not the input
+}</code></pre></div>
+</section>
+
+<section id="nft-positions">
+  <h2>ERC-721 / ERC-1155 position NFTs</h2>
+  <p>Modern AMMs ship liquidity positions as NFTs. Uniswap v3's <code>NonfungiblePositionManager</code> is ERC-721. Other systems use ERC-1155 for fungible tranches.</p>
+  <p>What you must know:</p>
+  <ul>
+    <li>The NFT is a <em>periphery</em> contract holding a pointer to the <em>core</em> position. The pool tracks <code>(owner, tickLower, tickUpper)</code> internally; the NFT translates that to <code>tokenId</code>.</li>
+    <li>Transferring the NFT transfers control of the underlying liquidity. The pool itself never sees the transfer.</li>
+    <li>This separation enables composability — money market protocols can use position NFTs as collateral.</li>
+    <li>It also enables <strong>read-only reentrancy</strong> attacks if a price-reading function fires during an NFT callback. Watch for that.</li>
+  </ul>
+</section>
+
+<section id="one-byte">
+  <h2>One wrong byte costs millions</h2>
+  <p>The thing that makes DEX engineering different from most software engineering: the cost function is non-continuous. Most software ships a bug and you patch it. AMM core code ships a bug and one of the following happens:</p>
+  <ul>
+    <li>It's exploited within hours and TVL is gone.</li>
+    <li>It can never be fixed because the contract is immutable.</li>
+    <li>You ship a new version (v3 → v4) and migrate, which takes months and isn't free.</li>
+  </ul>
+  <p>This shapes everything: code review depth, the audit budget, the test count, the use of formal methods, the deliberate choice to make core contracts immutable so that the worst-case outcome is bounded.</p>
+  <div class="callout insight">
+    <span class="callout-label">The senior posture</span>
+    <p>Treat every line of core code as if it will be deployed forever and run with $1B+ at stake. Because it will be.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="02-positioning-from-scratch.html">← Positioning</a> · <a href="04-deep-dive-primary.html">Next: AMM math →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

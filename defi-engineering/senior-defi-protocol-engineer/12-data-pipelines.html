@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data &amp; Pipelines — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#flows">On-chain data flows</a>
+    <a href="#subgraph">Subgraph design</a>
+    <a href="#indexers">Indexers — the modern landscape</a>
+    <a href="#monitoring">Off-chain monitoring</a>
+    <a href="#health">Position-health monitoring</a>
+    <a href="#oracle-monitoring">Oracle &amp; liquidation monitoring</a>
+    <a href="#meets">Where off-chain meets on-chain</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-coding-problems.html">← Previous</a>
+    <a href="13-deployment-and-ops.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production</span>
+  <h1>Data &amp; Pipelines</h1>
+  <p class="subtitle">On-chain data flows, indexers, off-chain monitoring, and where the protocol stops and the platform around it begins.</p>
+</header>
+
+<section id="flows">
+  <h2>On-chain data flows</h2>
+  <p>Protocol operators consume on-chain data through three primary channels:</p>
+  <ol>
+    <li><strong>Events.</strong> Emitted by contracts; cheap to read; queryable via JSON-RPC <code>eth_getLogs</code> or via a subgraph / indexer.</li>
+    <li><strong>State reads.</strong> <code>eth_call</code> against the latest (or pinned) block; expensive at scale.</li>
+    <li><strong>Trace reconstruction.</strong> Re-execute past blocks for fine-grained call-level data; very expensive, requires a full archive node.</li>
+  </ol>
+
+  <p>Senior reflex: every state change in your protocol must emit an event with all relevant fields. The cost is ~375 gas per topic + 8 gas per byte of data. Skip events and your indexer needs to read storage at every block, which is orders of magnitude worse.</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">event Supply(
+    Id indexed id,
+    address indexed caller,
+    address indexed onBehalf,
+    uint256 assets,
+    uint256 shares
+);
+
+// Indexed parameters become topics — searchable by EQ but limited to 3 indexed fields
+// Non-indexed parameters are ABI-encoded into the data field.
+emit Supply(id, msg.sender, onBehalf, assets, shares);
+</code></pre></div>
+</section>
+
+<section id="subgraph">
+  <h2>Subgraph design</h2>
+  <p>A subgraph (The Graph) is a hosted, schema-driven indexer. You write three things: schema, manifest (which contracts and events to track), and mappings (AssemblyScript handlers that translate events to entities).</p>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># schema.graphql
+type Market @entity {
+  id: Bytes!                  # market id
+  loanToken: Bytes!
+  collateralToken: Bytes!
+  oracle: Bytes!
+  irm: Bytes!
+  lltv: BigInt!
+  totalSupplyAssets: BigInt!
+  totalBorrowAssets: BigInt!
+  positions: [Position!]! @derivedFrom(field: "market")
+}
+
+type Position @entity {
+  id: ID!                     # market.id + "-" + user
+  market: Market!
+  user: Bytes!
+  supplyShares: BigInt!
+  borrowShares: BigInt!
+  collateral: BigInt!
+}
+
+type Liquidation @entity(immutable: true) {
+  id: Bytes!
+  market: Market!
+  borrower: Bytes!
+  liquidator: Bytes!
+  seizedCollateral: BigInt!
+  repaidAssets: BigInt!
+  timestamp: BigInt!
+}
+</code></pre></div>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash"># mapping (AssemblyScript)
+export function handleSupply(event: SupplyEvent): void {
+  let market = Market.load(event.params.id);
+  if (market == null) return;
+  market.totalSupplyAssets = market.totalSupplyAssets.plus(event.params.assets);
+  market.save();
+
+  let posId = event.params.id.toHexString() + "-" + event.params.onBehalf.toHexString();
+  let pos = Position.load(posId);
+  if (pos == null) {
+    pos = new Position(posId);
+    pos.market = event.params.id;
+    pos.user = event.params.onBehalf;
+    pos.supplyShares = BigInt.zero();
+    pos.borrowShares = BigInt.zero();
+    pos.collateral = BigInt.zero();
+  }
+  pos.supplyShares = pos.supplyShares.plus(event.params.shares);
+  pos.save();
+}
+</code></pre></div>
+
+  <p>Things senior engineers think about:</p>
+  <ul>
+    <li><strong>Derived fields</strong> (<code>@derivedFrom</code>) save storage but cost query time. Use for one-to-many relationships.</li>
+    <li><strong>Immutable entities</strong> (<code>@entity(immutable: true)</code>) are cheaper to write — use for append-only data like Liquidations, Trades.</li>
+    <li><strong>BigInt / BigDecimal</strong> are unavoidable; never use number for token values.</li>
+    <li><strong>Reorg handling</strong> is built in for subgraphs, but write idempotent handlers (don't add to derived fields that the subgraph already maintains).</li>
+    <li><strong>Indexing performance.</strong> Avoid contract <code>view</code> calls inside mappings if possible — they slow indexing dramatically. Prefer emitting all needed data in events.</li>
+  </ul>
+</section>
+
+<section id="indexers">
+  <h2>Indexers — the modern landscape</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Shape</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>The Graph (subgraph)</td><td>Hosted, AssemblyScript mappings</td><td>Battle-tested; large ecosystem</td><td>Slower indexing; cost on hosted plan</td></tr>
+      <tr><td>Goldsky</td><td>Hosted; subgraph + custom pipelines</td><td>Fast indexing; mirror to Postgres/S3</td><td>Vendor lock-in for advanced features</td></tr>
+      <tr><td>Envio</td><td>TypeScript/ReScript handlers; fast</td><td>Sub-second indexing; multi-chain native</td><td>Newer; smaller community</td></tr>
+      <tr><td>Ponder</td><td>TypeScript-first, dev-friendly</td><td>Modern DX; type-safe schema</td><td>Self-host or hosted</td></tr>
+      <tr><td>Custom indexer</td><td>Roll your own from eth_getLogs</td><td>Full control</td><td>Reorg handling, scaling, retries are your problem</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Choice in practice</span>
+    <p>Default to a hosted subgraph (The Graph or Goldsky) for protocol-wide analytics. Reach for Envio / Ponder when you need sub-second freshness (liquidation alerting). Build custom only when your data needs are exotic (re-traces, specific call-level data).</p>
+  </div>
+</section>
+
+<section id="monitoring">
+  <h2>Off-chain monitoring</h2>
+  <p>The on-call rotation needs eyes on the protocol at all times. Real-time monitoring tools:</p>
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Tenderly</td><td>Tx simulation, alerts on events / function calls, mempool monitoring, debug traces</td></tr>
+      <tr><td>OpenZeppelin Defender</td><td>Sentinels (alerts), Autotasks (scheduled scripts), Relayers (signed-tx submission)</td></tr>
+      <tr><td>Phalcon (BlockSec)</td><td>Tx replay, security monitoring, exploit detection</td></tr>
+      <tr><td>Forta</td><td>Distributed detection bots; community + custom</td></tr>
+      <tr><td>Dune / Flipside</td><td>SQL on on-chain data; ad-hoc analytics dashboards</td></tr>
+      <tr><td>Custom (Subgraph + Slack)</td><td>Webhook on subgraph events; cheap and reliable</td></tr>
+    </tbody>
+  </table>
+
+  <p>Typical alerts for a lending protocol:</p>
+  <ul>
+    <li>Any liquidation event &gt; $X notional → page on-call.</li>
+    <li>Any market crossing 95% utilization → page risk.</li>
+    <li>Oracle staleness &gt; threshold → page protocol.</li>
+    <li>Any pause-modifier triggered → page everyone.</li>
+    <li>Any guardian-key signing event → notify security.</li>
+    <li>Any deviation between subgraph state and on-chain state &gt; epsilon → page indexer ops.</li>
+  </ul>
+</section>
+
+<section id="health">
+  <h2>Position-health monitoring</h2>
+  <p>For liquidations, the protocol team typically runs (or relies on) services that:</p>
+  <ol>
+    <li>Index every position and its current health factor.</li>
+    <li>Subscribe to oracle price updates.</li>
+    <li>For each price update, recompute the set of "now liquidatable" positions.</li>
+    <li>Submit liquidation transactions, optionally via a flash loan.</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-typescript">// Pseudocode for a liquidation bot loop
+async function loop() {
+  const positions = await subgraph.getOpenPositions();
+  oracleClient.on("PriceUpdate", async (market, newPrice) =&gt; {
+    const candidates = positions
+      .filter(p =&gt; p.market === market)
+      .filter(p =&gt; healthFactor(p, newPrice) &lt; 1.0)
+      .sort((a, b) =&gt; expectedProfit(b, newPrice) - expectedProfit(a, newPrice));
+
+    for (const p of candidates) {
+      const seize = optimalSeize(p, newPrice);
+      const tx = await liquidator.populateTransaction.liquidate(p.borrower, seize, p.market);
+      await flashbots.sendBundle([tx]);    // private mempool
+    }
+  });
+}
+</code></pre></div>
+
+  <p>Most protocol teams do not run the liquidator bots themselves — third-party MEV searchers do that. But the protocol team should monitor whether liquidations are happening promptly. If positions remain underwater for blocks without being liquidated, the liquidation incentive may be too low or the collateral too illiquid.</p>
+</section>
+
+<section id="oracle-monitoring">
+  <h2>Oracle &amp; liquidation monitoring</h2>
+  <p>Specific dashboards the protocol team checks daily:</p>
+  <ul>
+    <li><strong>Oracle freshness.</strong> Heartbeat time since last update per feed. Heat-mapped.</li>
+    <li><strong>Oracle deviation.</strong> Price delta between primary feed and a cross-check (e.g., TWAP, secondary).</li>
+    <li><strong>L2 sequencer status.</strong> On Arbitrum, Optimism, Base — uptime via the chainlink sequencer-uptime feed.</li>
+    <li><strong>Liquidation latency.</strong> Time between a position becoming unhealthy (oracle update) and the first liquidation tx landing.</li>
+    <li><strong>Bad-debt watermark.</strong> Cumulative bad debt socialized across markets. Should be near-zero.</li>
+    <li><strong>Utilization heat-map.</strong> Each market's utilization, color-coded.</li>
+    <li><strong>Per-market PnL.</strong> Treasury fee accrual minus losses.</li>
+  </ul>
+</section>
+
+<section id="meets">
+  <h2>Where the off-chain stack meets on-chain reality</h2>
+  <p>A few subtleties the senior engineer carries in their head:</p>
+  <ul>
+    <li><strong>Subgraph lag.</strong> Subgraphs are typically 1-3 blocks behind tip. For UI display this is fine; for liquidator decisions it is not. Use direct RPC reads for time-sensitive decisions.</li>
+    <li><strong>Reorgs.</strong> An event you saw 2 blocks ago might be re-orged out. Subgraphs handle this transparently but custom indexers must wait for finality (often 12+ blocks on L1) before acting irreversibly.</li>
+    <li><strong>Cross-chain consistency.</strong> A multi-chain protocol's state is N blockchains' states, asynchronous by design. Aggregate dashboards must clearly attribute per-chain.</li>
+    <li><strong>RPC node trust.</strong> A compromised RPC provider can serve stale or fake data. For critical systems, query multiple providers and require quorum.</li>
+    <li><strong>Tx submission.</strong> Public mempool is a goldfish bowl — every searcher sees your bundle. Private relays (Flashbots, MEV-Share, Beaverbuild) cost nothing extra and protect against frontrunning.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Interview moment</span>
+    <p>If asked "how would you monitor your protocol?" the senior answer has three layers: (1) <em>events flow into an indexer</em>, (2) <em>dashboards/alerts on top of that indexer</em>, (3) <em>parallel direct RPC reads for time-critical checks</em>. Acknowledge that the indexer can lag, and have a fallback. That answer is right for ~90% of protocols.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="11-coding-problems.html">← Coding Problems</a> · <a href="13-deployment-and-ops.html">Next: Deployment &amp; Ops →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

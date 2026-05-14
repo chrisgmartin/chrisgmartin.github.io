@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation &amp; Quality — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#testing-math">Testing math-heavy contracts</a>
+    <a href="#fuzz">Foundry fuzz + invariant</a>
+    <a href="#diff">Differential testing</a>
+    <a href="#fixedpoint-asserts">Fixed-point assertion patterns</a>
+    <a href="#halmos">Symbolic testing — Halmos</a>
+    <a href="#echidna">Echidna</a>
+    <a href="#rounding">"Always round in protocol favor"</a>
+    <a href="#invariants">Property-based math invariants</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-applied-patterns.html">← Previous</a>
+    <a href="08-error-handling.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Evaluation &amp; Quality</h1>
+  <p class="subtitle">How senior engineers prove that math-heavy contracts are correct. Fuzz, invariants, differential checks against Python references, fixed-point tolerances, and the lemma that runs through everything: always round in the protocol's favor.</p>
+</header>
+
+<section id="testing-math">
+  <h2>Testing math-heavy contracts</h2>
+  <p>You can't unit-test a CFMM into correctness. There are too many states. The discipline is layered:</p>
+  <ol>
+    <li><strong>Unit tests</strong> for individual helpers (TickMath, FullMath, SqrtPriceMath).</li>
+    <li><strong>Property-based fuzz</strong> for individual math operations — "for any (a, b, c), mulDiv(a, b, c) equals floor(a·b/c)."</li>
+    <li><strong>Stateful invariant tests</strong> at the pool level — "after any sequence of swaps and LP actions, K never decreases except via fee mint."</li>
+    <li><strong>Differential tests</strong> against a Python or Vyper reference.</li>
+    <li><strong>Symbolic checks</strong> for short, gnarly functions (Halmos / hevm).</li>
+    <li><strong>Echidna</strong> on the assembled system.</li>
+    <li><strong>Mainnet fork tests</strong> against real tokens to catch real-world quirks.</li>
+  </ol>
+</section>
+
+<section id="fuzz">
+  <h2>Foundry fuzz + invariant testing</h2>
+  <p>Foundry's invariant runner is the gold standard. Two concepts:</p>
+  <ul>
+    <li><strong>Target selectors</strong> — restrict the runner to specific functions on specific contracts. Without this, it tries to call <code>setOwner</code> and trivially breaks invariants.</li>
+    <li><strong>Ghost variables</strong> — counters / accumulators maintained <em>by the test handler</em> alongside the system. Lets you assert "the sum of user deposits equals the pool's TVL."</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Handler — restricts what the fuzzer can call and tracks ghost state
+contract PoolHandler is Test {
+    Pool public pool;
+    uint256 public ghostInTotal;
+    uint256 public ghostOutTotal;
+
+    constructor(Pool _p) { pool = _p; }
+
+    function swap0For1(uint256 amountInSeed) external {
+        uint256 amountIn = bound(amountInSeed, 1, 1e24);
+        deal(address(token0), msg.sender, amountIn);
+        token0.approve(address(pool), amountIn);
+        uint256 out = pool.swap(amountIn, 0, msg.sender);
+        ghostInTotal  += amountIn;
+        ghostOutTotal += out;
+    }
+}
+
+// Invariant test
+contract PoolInvariants is Test {
+    Pool pool;
+    PoolHandler handler;
+    function setUp() public { /* deploy, fund, wire handler */ }
+    function invariant_K_only_increases() public {
+        uint256 k = pool.reserve0() * pool.reserve1();
+        assertGe(k, lastSeenK);  // tracked across runs
+    }
+}</code></pre></div>
+  <p>Foundry config knobs to know:</p>
+  <pre><code class="language-text">[invariant]
+runs = 1000
+depth = 50
+fail_on_revert = false
+call_override = false</code></pre>
+  <p><code>depth</code> is the number of calls per run. Bigger = more thorough = slower. Real DEX codebases run nightly with <code>runs = 100_000, depth = 200</code>.</p>
+</section>
+
+<section id="diff">
+  <h2>Differential testing</h2>
+  <p>The single most powerful technique for math contracts: implement the algorithm twice (once in Python, once in Solidity) and assert agreement under fuzz.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function testFuzz_getAmountOut_matchesPython(uint256 in_, uint256 rIn, uint256 rOut) public {
+    in_  = bound(in_,  1, 1e24);
+    rIn  = bound(rIn,  1e6, 1e30);
+    rOut = bound(rOut, 1e6, 1e30);
+
+    uint256 solOut = library_.getAmountOut(in_, rIn, rOut);
+
+    string[] memory cmds = new string[](5);
+    cmds[0] = "python3";
+    cmds[1] = "test/refs/get_amount_out.py";
+    cmds[2] = vm.toString(in_);
+    cmds[3] = vm.toString(rIn);
+    cmds[4] = vm.toString(rOut);
+    bytes memory raw = vm.ffi(cmds);
+    uint256 pyOut = abi.decode(raw, (uint256));
+
+    assertEq(solOut, pyOut);  // exact, no eps — CPMM is integer math
+}</code></pre></div>
+  <p>For Newton-based math (StableSwap), you'll need a tolerance — typically 1 wei, or 1 ULP, depending on the operation. Document the tolerance and justify it.</p>
+</section>
+
+<section id="fixedpoint-asserts">
+  <h2>Fixed-point assertion patterns</h2>
+  <p>Assertions in fixed-point math need eps tolerances. Common patterns:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Absolute tolerance — assert within `eps` wei
+function assertApproxAbs(uint256 a, uint256 b, uint256 eps) internal {
+    uint256 diff = a &gt; b ? a - b : b - a;
+    assertLe(diff, eps, "approxAbs failed");
+}
+
+// Relative tolerance — assert within `bps` basis points
+function assertApproxRel(uint256 a, uint256 b, uint256 bps) internal {
+    if (b == 0) { assertEq(a, 0); return; }
+    uint256 diff = a &gt; b ? a - b : b - a;
+    assertLe(diff * 10_000 / b, bps, "approxRel failed");
+}
+
+// PRBMath helper — for SD59x18 / UD60x18 values
+function assertApproxFixed(UD60x18 a, UD60x18 b, UD60x18 eps) internal {
+    UD60x18 diff = a.gt(b) ? a.sub(b) : b.sub(a);
+    assertTrue(diff.lte(eps));
+}</code></pre></div>
+  <p>Foundry's <code>std-assertions</code> ships <code>assertApproxEqAbs</code> and <code>assertApproxEqRel</code> — use those by default; write your own only when the operation needs special tolerance accounting.</p>
+</section>
+
+<section id="halmos">
+  <h2>Symbolic testing with Halmos</h2>
+  <p>Halmos (a16z/crytic) is a symbolic execution engine that runs your Foundry tests with symbolic inputs instead of concrete fuzz seeds. It either proves your assertion holds for <em>all</em> inputs or produces a counterexample.</p>
+  <p>When to use:</p>
+  <ul>
+    <li>Small, gnarly pure functions (sqrt, tick conversions, fee splits).</li>
+    <li>Properties you suspect are subtly false at the edges.</li>
+    <li>Not for full pool state — too many paths.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-bash">halmos --function "check_" --solver-timeout-assertion 60000</code></pre></div>
+  <p>By convention, Halmos picks up functions prefixed <code>check_</code>. The same code Foundry runs as a fuzz test, Halmos can run as a proof attempt.</p>
+</section>
+
+<section id="echidna">
+  <h2>Echidna</h2>
+  <p>Trail of Bits' coverage-guided property fuzzer. Two big advantages over Foundry's:</p>
+  <ul>
+    <li><strong>Coverage-guided</strong> — explores new branches more aggressively.</li>
+    <li><strong>Multi-actor</strong> — first-class support for multiple <code>msg.sender</code>s, which matters for AMM scenarios.</li>
+  </ul>
+  <p>Mature DEX projects often run <strong>both</strong> — Foundry for development feedback loop, Echidna for overnight property sweeps.</p>
+</section>
+
+<section id="rounding">
+  <h2>The "always round in protocol favor" lemma</h2>
+  <p>The single most important rule in DEX math. Every division could round up or down by one ULP. The protocol must round the way that <em>can't be exploited</em>.</p>
+  <table>
+    <thead><tr><th>Operation</th><th>Round which way</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Compute amount out (given amount in)</td><td>Down</td><td>User gets at most the formula result; never more</td></tr>
+      <tr><td>Compute amount in (given amount out)</td><td>Up</td><td>User pays at least the formula result; never less</td></tr>
+      <tr><td>Mint LP shares (deposit)</td><td>Down</td><td>Depositor gets at most the formula's worth of shares</td></tr>
+      <tr><td>Burn LP shares (withdraw)</td><td>Down</td><td>Withdrawer gets at most the formula's worth of assets</td></tr>
+      <tr><td>Fee accrual to position</td><td>Down</td><td>Position owner can claim no more than earned</td></tr>
+      <tr><td>Liquidation collateral seize</td><td>Up (in favor of the protocol seizing more)</td><td>Borrower can't escape with extra collateral</td></tr>
+    </tbody>
+  </table>
+  <p>Test this explicitly:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function invariant_outputRoundedDown() public {
+    uint256 idealOut = (amountIn * 997 * reserveOut) / ((reserveIn * 1000) + (amountIn * 997));
+    assertLe(actualOut, idealOut);  // actual must NEVER exceed ideal
+}</code></pre></div>
+</section>
+
+<section id="invariants">
+  <h2>Property-based math invariants</h2>
+  <p>The invariants every CFMM should pass:</p>
+  <ol>
+    <li><strong>K never decreases</strong> (or its analogue — D for StableSwap, the v3 invariant within range).</li>
+    <li><strong>Swap monotonicity</strong> — larger input ⇒ larger or equal output (no negative slippage).</li>
+    <li><strong>No-arbitrage</strong> — round-tripping (swap A→B then B→A) loses value equal to fees + rounding, never gains.</li>
+    <li><strong>Conservation</strong> — sum of all LP claims + protocol fee accruals ≤ pool's actual token balances.</li>
+    <li><strong>Position fees converge</strong> — for a position that hasn't been touched, claimable fees only grow (or stay flat on out-of-range periods).</li>
+    <li><strong>Solvency</strong> — total LP-redeemable value ≤ pool TVL at all times.</li>
+    <li><strong>Tick crossing correctness</strong> — fees-owed and feesGrowthInside accounting net to zero across the full price range.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">A test you can write today</span>
+    <p>Write an invariant test that does N random swaps in both directions and asserts that the second leg of an A→B→A round-trip produces strictly less than the original input. That single invariant catches most fee-on-transfer integration bugs.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="06-applied-patterns.html">← Patterns</a> · <a href="08-error-handling.html">Next: Error handling →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

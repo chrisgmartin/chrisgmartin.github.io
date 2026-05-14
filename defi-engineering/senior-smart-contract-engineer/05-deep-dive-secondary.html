@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dive — Gas &amp; EVM — Senior Smart Contract Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#mental-model">The gas mental model</a>
+    <a href="#opcodes">Opcodes that matter</a>
+    <a href="#storage">Storage layout &amp; packing</a>
+    <a href="#calldata-memory">Calldata vs memory</a>
+    <a href="#selectors">Function selector ordering</a>
+    <a href="#errors">Custom errors</a>
+    <a href="#yul-paths">Yul hot paths</a>
+    <a href="#branchless">Branchless math</a>
+    <a href="#shave-20">"Shave 20% off this function"</a>
+    <a href="#forks">EVM forks — Cancun, Prague</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-deep-dive-primary.html">← Previous</a>
+    <a href="06-applied-patterns.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core · Secondary</span>
+  <h1>Gas &amp; EVM Mastery</h1>
+  <p class="subtitle">The second pillar interviewers probe. AMM math gets the headline; gas mastery is the daily reality. Every swap, every LP action, every quoter call is paid by a user — your job is to make the cost reasonable.</p>
+</header>
+
+<section id="mental-model">
+  <h2>The gas mental model</h2>
+  <p>Carry two numbers in your head:</p>
+  <ul>
+    <li><strong>Cold SLOAD = 2,100 gas. Warm SLOAD = 100 gas.</strong> The single most important fact about EVM gas. Everything else is corollary.</li>
+    <li><strong>Cold SSTORE (zero → nonzero) = 22,100 gas. Warm SSTORE = 5,000 gas (or 100 if no change).</strong> Writes are catastrophic on the cold path.</li>
+  </ul>
+  <p>Implications for DEX design:</p>
+  <ul>
+    <li>Pack hot state into <strong>one slot</strong> (v3 <code>slot0</code> pattern).</li>
+    <li>Read it once at the top of the function.</li>
+    <li>Make as many fields <code>immutable</code> as possible — zero SLOAD cost.</li>
+    <li>Use <strong>transient storage</strong> for per-tx state (reentrancy locks, intermediate values).</li>
+    <li>Cache repeated reads in local variables — <code>uint256 r0 = reserve0;</code>.</li>
+  </ul>
+</section>
+
+<section id="opcodes">
+  <h2>Opcodes that matter</h2>
+  <table>
+    <thead><tr><th>Opcode</th><th>Gas</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>SLOAD</code></td><td>2100 / 100</td><td>Cold first read; warm afterwards in same tx</td></tr>
+      <tr><td><code>SSTORE</code></td><td>22100 / 5000 / 100 / refund</td><td>Depends on zero/nonzero before and after</td></tr>
+      <tr><td><code>TLOAD</code> (Cancun)</td><td>100</td><td>Transient. Always warm.</td></tr>
+      <tr><td><code>TSTORE</code> (Cancun)</td><td>100</td><td>Transient. Always cheap.</td></tr>
+      <tr><td><code>MCOPY</code> (Cancun)</td><td>3 + 3·words</td><td>Memory-to-memory copy. Replaces <code>identity</code> precompile dance.</td></tr>
+      <tr><td><code>CALL</code></td><td>2600 / 100 + value transfer</td><td>Cold/warm address access</td></tr>
+      <tr><td><code>EXTCODESIZE</code></td><td>2600 / 100</td><td>Same. Don't use as "isContract" — use <code>tx.origin</code>-aware patterns.</td></tr>
+      <tr><td><code>EXTCODEHASH</code></td><td>2600 / 100</td><td>Used for CREATE2 address prediction</td></tr>
+      <tr><td><code>KECCAK256</code></td><td>30 + 6·words</td><td>Cheap, but every storage mapping access is one</td></tr>
+      <tr><td><code>BLOBHASH</code> (Cancun)</td><td>3</td><td>Read versioned hash of blob in current tx</td></tr>
+    </tbody>
+  </table>
+  <p>For DEX hot paths, the dominant costs are typically: 1-2 SLOADs (slot0), 1-2 SSTOREs (updated slot0 + fee growth), token transfers (each = CALL + receiving contract logic). Optimizing past that requires Yul or architecture change.</p>
+</section>
+
+<section id="storage">
+  <h2>Storage layout &amp; packing</h2>
+  <p>Solidity's auto-layout rules:</p>
+  <ul>
+    <li>Variables occupy slots in declaration order.</li>
+    <li>Smaller-than-32-byte variables pack into the same slot <em>if</em> they fit.</li>
+    <li>Structs follow the same rule, slot-internally.</li>
+    <li>Mappings and dynamic arrays consume one slot for their root; the actual data lives at <code>keccak(key, slot)</code>.</li>
+  </ul>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// BAD — three slots
+contract Bad {
+    uint128 a;   // slot 0
+    uint256 b;   // slot 1  (uint128 a can't pack with uint256 b)
+    uint128 c;   // slot 2
+}
+
+// GOOD — two slots
+contract Good {
+    uint128 a;   // slot 0 — lower 16 bytes
+    uint128 c;   // slot 0 — upper 16 bytes (packs!)
+    uint256 b;   // slot 1
+}
+
+// BEST for hot reads — one slot
+struct Slot0 {
+    uint160 sqrtPriceX96;
+    int24   tick;
+    uint16  obsIndex;
+    uint16  obsCardinality;
+    uint16  obsCardinalityNext;
+    uint8   feeProtocol;
+    bool    unlocked;
+} // 248 bits → 1 slot</code></pre></div>
+  <p>The <code>forge inspect &lt;Contract&gt; storage-layout</code> command shows the layout. Read it for every contract you touch.</p>
+</section>
+
+<section id="calldata-memory">
+  <h2>Calldata vs memory</h2>
+  <p>Calldata is read-only, externally provided, and <strong>free to read</strong> (other than the 4-or-16 gas/byte transmission cost the user already paid). Memory must be allocated, written, and grows quadratically in expansion cost.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Memory copy — wastes gas
+function quote(uint256[] memory amounts) external view returns (uint256) {
+    return amounts[0] * 2;
+}
+
+// Calldata read — cheap
+function quote(uint256[] calldata amounts) external view returns (uint256) {
+    return amounts[0] * 2;
+}</code></pre></div>
+  <p>Rule of thumb: every external function with a complex parameter (struct, array, bytes) should default to <code>calldata</code> unless you need to mutate it.</p>
+  <p>Memory cost is roughly:</p>
+  <pre><code class="language-text">cost(words) = 3·words + words²/512</code></pre>
+  <p>The quadratic term bites at large allocations. A 10KB memory region costs ~330 gas; a 100KB region costs ~2,300 gas <em>per access</em>.</p>
+</section>
+
+<section id="selectors">
+  <h2>Function selector ordering</h2>
+  <p>Solidity's dispatcher does a linear search of selectors. Each comparison costs ~22 gas. So the 10th-listed function on your contract pays ~200 gas more on every call than the 1st.</p>
+  <p>For a router with 20 selectors where <code>swapExactTokensForTokens</code> is hit 90% of the time, that's free gas if you reorder.</p>
+  <p>The Solady-popularized trick: name your hot functions so their 4-byte selectors sort first. Or use <code>via-ir</code> with explicit function ordering hints. Or write a custom Yul dispatcher.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">// Yul dispatcher sketch — binary-search selector match
+object "Router" {
+  code {
+    let s := shr(224, calldataload(0))
+    switch s
+    case 0x12345678 { /* swap path */ }
+    case 0x9abcdef0 { /* mint path */ }
+    default { revert(0, 0) }
+  }
+}</code></pre></div>
+</section>
+
+<section id="errors">
+  <h2>Custom errors</h2>
+  <p>Pre-0.8.4: <code>require(cond, "TOO_LONG_STRING")</code> costs 50-100 gas per character of the string, embedded in bytecode and emitted on revert.</p>
+  <p>Post-0.8.4: <code>if (!cond) revert MyError(arg);</code> compresses to a 4-byte selector plus encoded args. Smaller bytecode, smaller revert payload, named in clients.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Old
+require(amount &gt; 0, "INSUFFICIENT_INPUT_AMOUNT");
+
+// New — saves bytecode and gas on revert path
+error InsufficientInput(uint256 amount);
+if (amount == 0) revert InsufficientInput(amount);</code></pre></div>
+  <p>For DEX peripheries with dozens of revert conditions, this saves real deployment cost. Use it everywhere new.</p>
+</section>
+
+<section id="yul-paths">
+  <h2>Yul hot paths</h2>
+  <p>Where assembly actually helps:</p>
+  <ol>
+    <li><strong>Custom hashing.</strong> Computing position keys via Solidity is fine; via <code>mstore + keccak256</code> from assembly is ~30% cheaper.</li>
+    <li><strong>512-bit math.</strong> <code>FullMath.mulDiv</code> is mostly Yul. Reading it teaches you the canonical pattern.</li>
+    <li><strong>Tick bitmap operations.</strong> Find-next-set-bit-in-uint256 is a beautiful Yul snippet.</li>
+    <li><strong>Selector dispatch and ABI-encoding shortcuts</strong> when you control the call shape.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// FullMath.mulDiv — Remco Bloemen's algorithm, in Yul
+function mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
+    uint256 prod0; uint256 prod1;
+    assembly {
+        let mm := mulmod(a, b, not(0))
+        prod0 := mul(a, b)
+        prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+    }
+    if (prod1 == 0) { unchecked { return prod0 / denominator; } }
+    require(denominator &gt; prod1, "FullMath: overflow");
+    // ... long-division step omitted for brevity
+}</code></pre></div>
+  <p>Don't write mulDiv from scratch in an interview — cite it, explain why it's needed (you can compute <code>a·b/c</code> even when <code>a·b</code> overflows 256 bits), and use it.</p>
+</section>
+
+<section id="branchless">
+  <h2>Branchless math</h2>
+  <p>Branches cost ~10 gas each on JUMPI. They also defeat some compiler optimizations. For tight inner loops (e.g. Newton iterations), branchless variants win.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Branched min
+function min(uint256 a, uint256 b) internal pure returns (uint256) {
+    return a &lt; b ? a : b;
+}
+
+// Branchless min — compiles tighter
+function minBL(uint256 a, uint256 b) internal pure returns (uint256 r) {
+    assembly { r := xor(a, mul(xor(a, b), lt(b, a))) }
+}</code></pre></div>
+  <p>Don't reach for these reflexively. Profile first; readability second.</p>
+</section>
+
+<section id="shave-20">
+  <h2>The "shave 20% off this function" exercise</h2>
+  <p>A common live-coding round. They show you a 40-line function and ask for measurable gas wins. The reliable plays:</p>
+  <ol>
+    <li><strong>Cache storage reads.</strong> Repeated <code>reserve0</code> → <code>uint256 r0 = reserve0;</code>.</li>
+    <li><strong>Mark unchanging vars <code>immutable</code> / <code>constant</code>.</strong></li>
+    <li><strong><code>unchecked</code> arithmetic</strong> where you can prove no overflow.</li>
+    <li><strong>Combine SSTOREs</strong> — pack multiple writes into one slot, write once.</li>
+    <li><strong>Switch require strings to custom errors.</strong></li>
+    <li><strong>Calldata-ify struct params.</strong></li>
+    <li><strong>Short-circuit checks early.</strong></li>
+    <li><strong>Replace external calls</strong> with <code>staticcall</code> where applicable.</li>
+    <li><strong>Use <code>++i</code></strong> instead of <code>i++</code> in loops (tiny but free).</li>
+    <li><strong>Inline a one-call helper</strong> to skip the JUMP.</li>
+  </ol>
+  <p>If you walk through the list in this order in an interview, you'll find 15-25% in most contracts.</p>
+</section>
+
+<section id="forks">
+  <h2>EVM forks — what's relevant</h2>
+  <table>
+    <thead><tr><th>Fork</th><th>Year</th><th>What DEX engineers care about</th></tr></thead>
+    <tbody>
+      <tr><td>Byzantium</td><td>2017</td><td>Cheap modular exponentiation precompile; static call</td></tr>
+      <tr><td>Constantinople</td><td>2019</td><td>CREATE2 (deterministic addresses) — vanity, factory patterns</td></tr>
+      <tr><td>Istanbul</td><td>2019</td><td>CHAINID, repriced SLOAD</td></tr>
+      <tr><td>Berlin</td><td>2021</td><td>Access lists (EIP-2929 warm/cold gas model)</td></tr>
+      <tr><td>London</td><td>2021</td><td>EIP-1559 base fee; affects gas auctions and MEV</td></tr>
+      <tr><td>Shanghai</td><td>2023</td><td>PUSH0 (1-byte zero push); withdrawals</td></tr>
+      <tr><td><strong>Cancun</strong></td><td>2024</td><td>EIP-1153 transient storage; EIP-4844 blobs; MCOPY; SELFDESTRUCT semantics change</td></tr>
+      <tr><td><strong>Prague / Pectra</strong></td><td>2025</td><td>EIP-7702 (EOA delegation); EIP-3074-equivalent; expanded precompiles</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">DEX implications of Pectra (EIP-7702)</span>
+    <p>EOAs can temporarily act as smart accounts within a transaction. This collapses Permit2 + flash flows into a single signature flow — expect router redesigns to lean on 7702 over the next year.</p>
+  </div>
+</section>
+
+<footer>
+  <p><a href="04-deep-dive-primary.html">← AMM math</a> · <a href="06-applied-patterns.html">Next: Applied patterns →</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

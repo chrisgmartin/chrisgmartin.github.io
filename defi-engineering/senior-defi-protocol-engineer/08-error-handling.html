@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Handling &amp; Failure Modes — Senior DeFi Protocol Engineer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#taxonomy">A taxonomy of lending bugs</a>
+    <a href="#bad-debt">Bad-debt accrual</a>
+    <a href="#donation">Share-inflation / donation</a>
+    <a href="#rounding">Rounding direction</a>
+    <a href="#oracle">Oracle staleness</a>
+    <a href="#reentrancy">Reentrancy in callbacks</a>
+    <a href="#mev">MEV &amp; frontrunning liquidations</a>
+    <a href="#irm-math">IRM math at extremes</a>
+    <a href="#governance">Governance attacks</a>
+    <a href="#token-quirks">ERC-20 quirks</a>
+    <a href="#checklist">A pre-merge checklist</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-evaluation-quality.html">← Previous</a>
+    <a href="09-governance-and-audit.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Technical Core</span>
+  <h1>Error Handling &amp; Failure Modes</h1>
+  <p class="subtitle">A taxonomy of the bugs that kill lending protocols. For each: how it looks, how to detect, how to design it out.</p>
+</header>
+
+<section id="taxonomy">
+  <h2>A taxonomy of lending bugs</h2>
+  <p>The post-mortems for lending protocols across the last few cycles cluster into a recognizable shape. A senior engineer treats this list as a reflex — every PR is read through it.</p>
+  <table>
+    <thead><tr><th>Class</th><th>Symptom</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr><td>Bad-debt accrual</td><td>Protocol becomes insolvent silently</td><td>Critical</td></tr>
+      <tr><td>Share inflation (donation)</td><td>First depositor steals from later depositors</td><td>High</td></tr>
+      <tr><td>Rounding in user favor</td><td>Small per-tx drain, eventually catastrophic</td><td>High</td></tr>
+      <tr><td>Oracle staleness</td><td>Stale price enables free borrow / wrong liquidation</td><td>Critical</td></tr>
+      <tr><td>Reentrancy in callbacks</td><td>State invariant violated during external call</td><td>Critical</td></tr>
+      <tr><td>MEV / frontrun on liquidation</td><td>Liquidators race to extract; protocol still ok but bad UX</td><td>Medium</td></tr>
+      <tr><td>IRM extremes</td><td>Rate overflow / underflow at U near 0 or 100%</td><td>High</td></tr>
+      <tr><td>Governance attack</td><td>Voter manipulation; timelock-bypass; flash governance</td><td>Critical</td></tr>
+      <tr><td>ERC-20 quirks</td><td>USDT (no return value), fee-on-transfer, rebasing</td><td>High</td></tr>
+      <tr><td>Read-only reentrancy</td><td>Stale view fools an external integrator</td><td>High</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="bad-debt">
+  <h2>Bad-debt accrual</h2>
+  <p><strong>What it looks like:</strong> a position falls underwater faster than liquidators can act; debt is greater than collateral × LLTV. The protocol now has more borrowed than backed.</p>
+  <p><strong>Causes:</strong></p>
+  <ul>
+    <li>Oracle price gap (a discrete jump exceeds the safety margin between max borrow LTV and LLTV).</li>
+    <li>Collateral becomes illiquid (no one will repay debt to receive seizable collateral).</li>
+    <li>Liquidator MEV / gas spike makes liquidation unprofitable.</li>
+    <li>Oracle outage prevents liquidation.</li>
+  </ul>
+  <p><strong>Detection:</strong> off-chain monitoring of every position's health; an invariant test asserting sum-of-debts ≤ sum-of-collateral-values.</p>
+  <p><strong>Design-out:</strong></p>
+  <ul>
+    <li>Choose a max borrow LTV strictly less than LLTV — the gap is the safety margin for price moves between updates.</li>
+    <li>Add pre-liquidations to start closing positions before LLTV.</li>
+    <li>Socialize bad debt immediately when collateral hits 0 (don't let it accumulate silently).</li>
+    <li>For high-vol collaterals, prefer Dutch-auction liquidations that adapt the incentive.</li>
+  </ul>
+</section>
+
+<section id="donation">
+  <h2>Share-inflation / the "donation" attack</h2>
+  <p>A famous ERC-4626 / Compound v2 class of bug.</p>
+  <p><strong>What it looks like:</strong></p>
+  <ol>
+    <li>Vault is empty (totalAssets = 0, totalShares = 0).</li>
+    <li>Attacker deposits 1 wei. Mints 1 share.</li>
+    <li>Attacker transfers (donates) 1e18 of the underlying directly to the vault. totalAssets is now 1e18 + 1, totalShares is still 1.</li>
+    <li>Victim deposits 1.5e18. With <code>shares = assets × totalShares / totalAssets</code>, victim gets <code>1.5e18 × 1 / (1e18 + 1) = 1</code> share (rounded down).</li>
+    <li>Victim's deposit is split between attacker (now holds 50% of shares) and the donation pool. Attacker withdraws their 1 share and walks away with ~0.5x the victim's deposit.</li>
+  </ol>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Mitigation 1: virtual shares (OpenZeppelin v5)
+function _convertToShares(uint256 assets, Math.Rounding rounding) internal view returns (uint256) {
+    return assets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), totalAssets() + 1, rounding);
+}
+
+// Mitigation 2: dead shares — mint a chunk of shares to address(0) on first deposit
+function _deposit(uint256 assets, address receiver) internal {
+    uint256 shares = previewDeposit(assets);
+    if (totalSupply() == 0) {
+        // Send DEAD_SHARES to address(0), the rest to receiver
+        _mint(address(0), DEAD_SHARES);
+        shares -= DEAD_SHARES;
+    }
+    _mint(receiver, shares);
+}
+
+// Mitigation 3 (Morpho Blue): SHARES_OFFSET — shares are 1e6× the assets at parity
+uint256 public constant SHARES_OFFSET = 1e6;
+// First supply: 1 wei assets =&gt; 1e6 shares. Donating 1 wei doesn't move the ratio meaningfully.
+</code></pre></div>
+
+  <div class="callout warn">
+    <span class="callout-label">Senior reflex</span>
+    <p>Any time you see <code>shares = assets × totalShares / totalAssets</code>, you should automatically check: what happens on first deposit? What if totalAssets is donated? If your mental model doesn't immediately give you the answer, you have a bug.</p>
+  </div>
+</section>
+
+<section id="rounding">
+  <h2>Rounding direction</h2>
+  <p>Every share / asset conversion rounds <em>some way</em>. The rule is: <strong>always in the protocol's favor</strong>.</p>
+  <table>
+    <thead><tr><th>Operation</th><th>Round shares</th><th>Round assets</th></tr></thead>
+    <tbody>
+      <tr><td>Deposit (assets→shares)</td><td>Down</td><td>—</td></tr>
+      <tr><td>Withdraw (shares→assets)</td><td>—</td><td>Down</td></tr>
+      <tr><td>Mint (shares→assets)</td><td>—</td><td>Up</td></tr>
+      <tr><td>Redeem (assets→shares)</td><td>Up</td><td>—</td></tr>
+      <tr><td>Borrow (assets→shares)</td><td>Up</td><td>—</td></tr>
+      <tr><td>Repay (shares→assets)</td><td>—</td><td>Up</td></tr>
+    </tbody>
+  </table>
+  <p>Mnemonic: "users always pay one wei more than they should; protocol always receives one wei more than it should." The result is monotonic and impossible to game.</p>
+</section>
+
+<section id="oracle">
+  <h2>Oracle staleness</h2>
+  <p>Covered in depth in <a href="05-deep-dive-secondary.html">chapter 05</a>; key bug class summary:</p>
+  <ul>
+    <li><strong>No staleness check:</strong> oracle returns a value but it's hours old. Borrower opens an undercollateralized position. Liquidatable when oracle updates, but protocol already lost.</li>
+    <li><strong>Only check <code>updatedAt</code>, not <code>answer</code>:</strong> some feeds return 0 on error. Always check <code>answer &gt; 0</code> and <code>updatedAt &gt; block.timestamp - MAX_STALENESS</code>.</li>
+    <li><strong>Ignoring L2 sequencer:</strong> on L2, sequencer outages stall the price feed. Use Chainlink's L2 Sequencer Uptime feed and apply a grace period.</li>
+    <li><strong>Trusting confidence intervals blindly:</strong> on Pyth, a wide <code>conf</code> means the publisher network is uncertain. Reject prices with <code>conf / price &gt; threshold</code>.</li>
+  </ul>
+</section>
+
+<section id="reentrancy">
+  <h2>Reentrancy in callbacks</h2>
+  <p>Most modern lending bugs in this class are not classic reentrancy — those are caught by even basic review. The subtler ones:</p>
+  <ul>
+    <li><strong>Read-only reentrancy.</strong> Function A is mid-execution; it calls out to user X; user X calls a view function on another protocol that reads this contract's state via a getter. The getter returns stale state.</li>
+    <li><strong>Cross-function reentrancy.</strong> Function A makes an external call. The recipient calls function B, which observes A's not-yet-committed state.</li>
+    <li><strong>Callback-with-invariant-after.</strong> The pattern is sound when invariants are checked <em>after</em> the callback. The bug is when one branch (e.g., a fallback path) skips the post-callback invariant check.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// VULNERABLE — view returns mid-update state during a callback
+contract Vault {
+    uint256 public totalAssets;
+
+    function withdraw(uint256 amount, bytes calldata data) external nonReentrant {
+        totalAssets -= amount;             // updated
+        asset.safeTransfer(msg.sender, amount);
+        if (data.length != 0) ICallback(msg.sender).onWithdraw(data);
+        // What if msg.sender is itself called by another protocol that reads totalAssets here?
+        // Actually fine in this case — totalAssets is committed before the call.
+    }
+
+    function pricePerShare() external view returns (uint256) {
+        return totalAssets * 1e18 / totalShares;   // could be read mid-callback
+    }
+}
+</code></pre></div>
+
+  <p>The senior fix: any view function that other protocols might read as an oracle should either (a) revert during the callback window via a transient lock, or (b) be guaranteed-consistent.</p>
+</section>
+
+<section id="mev">
+  <h2>MEV &amp; frontrunning of liquidations</h2>
+  <p>Not strictly a bug — but a systemic design concern. When a position becomes liquidatable, every searcher in the mempool races. The most common effects:</p>
+  <ul>
+    <li>The liquidation incentive is competed away in priority fees; borrowers get punished, but searchers and validators capture the rents.</li>
+    <li>Sandwich attacks on the price update that makes a position liquidatable.</li>
+    <li>"Just-in-time" liquidity around oracles to maximize an arbitrage on a stale price.</li>
+  </ul>
+  <p><strong>Mitigations:</strong></p>
+  <ul>
+    <li>Dutch auctions price-discover the LI; the winning searcher pays exactly what they need to.</li>
+    <li>Pre-liquidations move part of the close to a curated keeper, off the public mempool.</li>
+    <li>Use commit-reveal or batch-auction primitives for price-sensitive transitions.</li>
+    <li>For borrowers, design pre-liquidations that opt-in to a smaller, predictable haircut.</li>
+  </ul>
+</section>
+
+<section id="irm-math">
+  <h2>IRM math at extreme utilization</h2>
+  <p>Common failure modes:</p>
+  <ul>
+    <li><strong>U = 100%</strong>: a divide-by-zero if your formula divides by <code>1 - U</code>. Cap U or guard the divide.</li>
+    <li><strong>U &gt; 100%</strong> (briefly during accrual): some accumulator updates can temporarily push U over 1 if borrow grows faster than supply. The IRM must not revert or produce nonsense in that window.</li>
+    <li><strong>Rate overflow.</strong> An adaptive IRM that ratchets up unboundedly will eventually overflow. Cap MAX_BORROW_RATE and clamp.</li>
+    <li><strong>Rate underflow / zero rate.</strong> Some PID controllers can drive rate to zero or negative if utilization is very low for very long. Floor at MIN_BORROW_RATE.</li>
+    <li><strong>Compounding precision.</strong> Discrete compounding over short intervals with very high rates can produce noticeable rounding drift. Use Taylor expansions or rpow-style integer compounding with care.</li>
+  </ul>
+
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// rpow — exponentiate a per-second rate over dt seconds using exponentiation-by-squaring
+// MakerDAO-style. Be very careful with overflow on intermediates.
+function rpow(uint256 x, uint256 n, uint256 base) internal pure returns (uint256 z) {
+    assembly {
+        switch x case 0 { switch n case 0 { z := base } default { z := 0 } }
+        default {
+            switch mod(n, 2) case 0 { z := base } default { z := x }
+            let half := div(base, 2)
+            for { n := div(n, 2) } n { n := div(n, 2) } {
+                let xx := mul(x, x)
+                if iszero(eq(div(xx, x), x)) { revert(0, 0) }
+                let xxRound := add(xx, half)
+                if lt(xxRound, xx) { revert(0, 0) }
+                x := div(xxRound, base)
+                if mod(n, 2) {
+                    let zx := mul(z, x)
+                    if and(iszero(iszero(x)), iszero(eq(div(zx, x), z))) { revert(0, 0) }
+                    let zxRound := add(zx, half)
+                    if lt(zxRound, zx) { revert(0, 0) }
+                    z := div(zxRound, base)
+                }
+            }
+        }
+    }
+}
+</code></pre></div>
+</section>
+
+<section id="governance">
+  <h2>Governance attacks</h2>
+  <p>Five flavors:</p>
+  <ul>
+    <li><strong>Flash governance.</strong> Attacker borrows governance tokens, votes, executes a malicious proposal in one tx. Mitigation: snapshot at a past block, not at execution time.</li>
+    <li><strong>Timelock bypass.</strong> A proposal that calls a privileged function which is not behind the timelock. Mitigation: every privileged function is behind the same timelock.</li>
+    <li><strong>Voter bribery.</strong> Bribe pools (e.g., Hidden Hand-style markets) let attackers rent voting power. Mitigation: long lock-ups, vote-escrowed tokens, or move risk decisions out of governance.</li>
+    <li><strong>Multisig compromise.</strong> The "guardian" or "owner" multisig is the highest-value target. Mitigation: hardware-backed signers, geographic separation, social-recovery.</li>
+    <li><strong>Parameter-griefing.</strong> A proposal sets LLTV / IRM to malicious values. Mitigation: parameter allow-lists; immutable per-market parameters.</li>
+  </ul>
+</section>
+
+<section id="token-quirks">
+  <h2>ERC-20 quirks</h2>
+  <table>
+    <thead><tr><th>Quirk</th><th>Token</th><th>Failure mode</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>No return value</td><td>USDT</td><td><code>transfer().returns(bool)</code> reverts on USDT</td><td>Use <code>SafeERC20</code> / <code>safeTransfer</code></td></tr>
+      <tr><td>Fee-on-transfer</td><td>Some meme tokens, PAXG</td><td>Received amount &lt; sent amount</td><td>Measure balance before/after; reject or handle</td></tr>
+      <tr><td>Rebasing</td><td>stETH, AMPL</td><td>Balance changes without transfer</td><td>Use wrapped variant (wstETH); record shares</td></tr>
+      <tr><td>Blocklist / pausable</td><td>USDC, USDT</td><td>Transfer reverts if sender/receiver is blocked</td><td>Have a withdrawal recovery path</td></tr>
+      <tr><td>Approve race</td><td>Old ERC-20</td><td>front-run an approve</td><td>Use increaseAllowance / Permit2</td></tr>
+      <tr><td>Permit</td><td>EIP-2612 tokens</td><td>Frontrun-able permit signatures grief approvals</td><td>Use try/catch around <code>permit</code></td></tr>
+      <tr><td>Decimals weirdness</td><td>USDC (6), WBTC (8)</td><td>Hardcoded 18 decimals → 1e12 errors</td><td>Read <code>decimals()</code> or use ORACLE_SCALE</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="checklist">
+  <h2>A pre-merge checklist</h2>
+  <details class="collapse-card" open>
+    <summary><strong>Read every PR through this filter</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li>Does every external entry call <code>accrueInterest</code> first?</li>
+        <li>Does every share/asset conversion round in protocol favor?</li>
+        <li>Does the health check happen <em>after</em> any callback?</li>
+        <li>Are oracle reads guarded by staleness + positivity?</li>
+        <li>Are all external transfers wrapped in SafeERC20?</li>
+        <li>Are state mutations done <em>before</em> external calls (CEI)?</li>
+        <li>Are events emitted for every state change (for indexers / audit trail)?</li>
+        <li>Do custom errors include the offending values (for debugging)?</li>
+        <li>Do new functions live behind the same authorization gates as siblings?</li>
+        <li>Are there fuzz / invariant tests covering the new state transitions?</li>
+        <li>Was <code>forge inspect storage</code> diffed against main?</li>
+        <li>Was <code>forge snapshot</code> diffed against main?</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <p><a href="07-evaluation-quality.html">← Evaluation &amp; Quality</a> · <a href="09-governance-and-audit.html">Next: Governance &amp; Audit →</a> · <a href="index.html">All guides</a></p>
+</footer>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

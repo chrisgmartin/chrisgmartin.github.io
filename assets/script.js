@@ -47,6 +47,15 @@
         { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
         { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
+    },
+    {
+      name: 'DeFi Engineering',
+      folder: 'defi-engineering',
+      guides: [
+        { name: 'Senior DeFi Protocol Engineer', folder: 'senior-defi-protocol-engineer' },
+        { name: 'Smart Contract Security Engineer', folder: 'smart-contract-security-engineer' },
+        { name: 'Senior Smart Contract Engineer', folder: 'senior-smart-contract-engineer' }
+      ]
     }
   ];
 
