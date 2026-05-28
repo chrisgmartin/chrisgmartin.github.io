@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Layout-Aware Models</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why spatial features matter</a>
+    <a href="#family">The model family</a>
+    <a href="#layoutlm">LayoutLM family</a>
+    <a href="#docformer">DocFormer</a>
+    <a href="#lilt">LiLT</a>
+    <a href="#docllm">DocLLM &amp; newer alternatives</a>
+    <a href="#when">When to use which</a>
+    <a href="#limits">What they're bad at</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-ocr-layer.html">← Previous</a>
+    <a href="04-field-extraction-patterns.html">Next: Field extraction →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · The stack</span>
+  <h1>Layout-Aware Models</h1>
+  <p class="subtitle">LayoutLM, LayoutLMv3, DocFormer, LiLT, DocLLM — the model family that consumes text + spatial position jointly. Why it matters, when to use which, and what they're collectively bad at.</p>
+</header>
+
+<section id="why">
+  <h2>Why spatial features matter</h2>
+  <p>Pure text models (BERT, RoBERTa, T5) can read a contract — but they only see the linear sequence of tokens after the page has been flattened to text. A "30 days" appearing in the payment-terms section reads the same as a "30 days" appearing in the termination-notice section. The model has to infer which is which from surrounding text.</p>
+  <p>Layout-aware models consume the text <em>and</em> the (x, y) position of each token, plus often font size and visual features. This lets them learn relationships like "the 30 days that appears in the bottom-right of page 2 is part of the signature page, not a financial term" or "the dollar amount in a cell next to 'Total' is the contract value."</p>
+  <p>For document classes with consistent layouts (invoices, forms, receipts), layout-aware models are dramatically better than text-only. For unstructured prose (clauses in a contract body), the advantage shrinks but still helps for region classification.</p>
+</section>
+
+<section id="family">
+  <h2>The model family</h2>
+  <p>The major published layout-aware models, in rough order of release:</p>
+  <ul>
+    <li><strong>LayoutLM</strong> (2020, Microsoft) — first widely-used. Text + 2D position embeddings.</li>
+    <li><strong>LayoutLMv2</strong> (2021) — adds visual features (CNN over the page image).</li>
+    <li><strong>LayoutLMv3</strong> (2022) — replaces CNN with patch-based vision transformer; cleaner pretraining objective.</li>
+    <li><strong>DocFormer</strong> (2021, Amazon) — different fusion architecture; competitive with LayoutLMv2 on form understanding.</li>
+    <li><strong>LiLT</strong> (2022) — Language-independent Layout Transformer. Separates text encoder (any language) from layout encoder; useful for multi-language deployments.</li>
+    <li><strong>DocLLM</strong> (2024, JPMorgan AI) — adapts LLM architecture to layout. Marketed for legal/financial documents.</li>
+    <li><strong>Donut, Nougat, Pix2Struct</strong> — end-to-end pixel-to-structured-output models; skip the OCR step entirely. More research than production-default today.</li>
+  </ul>
+
+  <p>You don't need to know all of these for FDE work. The two worth understanding deeply are LayoutLMv3 (current default for the LayoutLM family) and LiLT (when multi-language matters). The rest are useful as alternatives if vendor relationships or compute constraints favor them.</p>
+</section>
+
+<section id="layoutlm">
+  <h2>LayoutLM family</h2>
+  <p>Microsoft's progression of layout-aware encoders. LayoutLMv3 is the current state-of-the-art in this family.</p>
+
+  <h3>Architecture, abbreviated</h3>
+  <ul>
+    <li>Text tokens (from OCR) embedded as in BERT.</li>
+    <li>2D position embeddings added per token — encoding (x_min, y_min, x_max, y_max) of the token's bounding box on the page.</li>
+    <li>Visual features (LayoutLMv3) via patch-based ViT over the page image, fused with text via cross-attention.</li>
+    <li>Pretraining objectives include masked text + masked image + word-patch alignment.</li>
+  </ul>
+
+  <h3>What you do with it</h3>
+  <p>Two common patterns:</p>
+  <ul>
+    <li><strong>Token classification</strong>: BIO tagging for fields (B-PARTY, I-PARTY, O for outside) — fine-tune the model head, get per-token labels.</li>
+    <li><strong>Region classification</strong>: classify each layout region as a type (paragraph, table, signature). Often a pre-step before LLM-based extraction.</li>
+  </ul>
+
+  <h3>Code shape</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>layoutlmv3_inference (transformers)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from transformers import LayoutLMv3ForTokenClassification, LayoutLMv3Processor
+from PIL import Image
+
+processor = LayoutLMv3Processor.from_pretrained("microsoft/layoutlmv3-base")
+model = LayoutLMv3ForTokenClassification.from_pretrained("path/to/finetuned")
+
+image = Image.open("page.png").convert("RGB")
+# words and boxes come from your OCR output
+words = ["This", "Master", "Service", "Agreement", ...]
+boxes = [[121, 240, 480, 280], ...]  # (x0, y0, x1, y1) per word
+
+encoding = processor(image, words, boxes=boxes, return_tensors="pt")
+outputs = model(**encoding)
+predictions = outputs.logits.argmax(-1).squeeze().tolist()</code></pre>
+  </div>
+
+  <p>The handle in practice: LayoutLMv3 is the default reach when you want a layout-aware encoder you'll fine-tune yourself on a labeled corpus. Microsoft's pretrained checkpoint is on Hugging Face; fine-tuning on 500–5000 labeled documents is the standard recipe.</p>
+</section>
+
+<section id="docformer">
+  <h2>DocFormer</h2>
+  <p>Amazon's contribution. Different fusion architecture — text, layout, and image features are merged earlier in the transformer stack rather than late-fused. Empirically competitive with LayoutLMv2 on form-understanding benchmarks (FUNSD, CORD, SROIE) and sometimes wins on documents with dense visual structure.</p>
+  <p>Less momentum than LayoutLMv3 in the open-source community; uses include Amazon's own Textract Analyze Document under the hood and some commercial document AI platforms. Worth knowing exists; not where most production work starts.</p>
+</section>
+
+<section id="lilt">
+  <h2>LiLT</h2>
+  <p>Language-independent Layout Transformer. The clever architectural move: <strong>decouple the text encoder from the layout encoder</strong>. The text encoder can be swapped (XLM-RoBERTa for multilingual, BERT for English-only) while the layout encoder stays the same.</p>
+  <p>When this matters:</p>
+  <ul>
+    <li>Customer corpus spans multiple languages (English MSAs + German amendments + French SOWs).</li>
+    <li>You want to fine-tune once on multilingual data and serve all languages.</li>
+    <li>Compute is constrained — LiLT is smaller than LayoutLMv3.</li>
+  </ul>
+  <p>The cost: empirically slightly behind LayoutLMv3 on monolingual English benchmarks. For an English-only contract platform, LayoutLMv3 is usually the right call.</p>
+</section>
+
+<section id="docllm">
+  <h2>DocLLM &amp; newer alternatives</h2>
+  <p>The newer trend (2024–2026) is adapting LLM architectures to document layout — either by training an LLM with layout inputs (DocLLM) or by using vision-capable foundation models directly (Claude with vision, GPT-4o, Gemini).</p>
+
+  <h3>DocLLM</h3>
+  <p>JPMorgan's release. Decoder-only LLM that takes text + spatial position as input. Promising for tasks that need free-form generation rather than classification (e.g., "summarize the indemnification clause").</p>
+
+  <h3>Vision-LLMs as extractors</h3>
+  <p>Claude / GPT-4o / Gemini can ingest a page image directly and produce structured output. Cleanest UX; you skip OCR + layout-aware-model + extractor as separate steps and let the LLM do all three. Tradeoffs:</p>
+  <ul>
+    <li>Cost: per-page vision-LLM cost is significantly higher than dedicated OCR + small extractor.</li>
+    <li>Latency: vision-LLMs are slower per page than dedicated stacks.</li>
+    <li>Accuracy: comparable on simple layouts; sometimes weaker on dense, multi-column documents.</li>
+    <li>Throughput: dedicated OCR scales horizontally cheaper.</li>
+  </ul>
+  <p>For prototypes and low-volume use cases, the vision-LLM approach is excellent. For production at corpus scale, dedicated OCR + LayoutLM-family + LLM-as-extractor is usually more economical.</p>
+</section>
+
+<section id="when">
+  <h2>When to use which</h2>
+
+  <table>
+    <thead><tr><th>Situation</th><th>Reach for</th></tr></thead>
+    <tbody>
+      <tr><td>Form-heavy documents (invoices, receipts, applications)</td><td>LayoutLMv3 fine-tuned</td></tr>
+      <tr><td>Contract prose with diverse layouts</td><td>Cloud OCR + layout regions + LLM extractor (skip dedicated layout-aware encoder)</td></tr>
+      <tr><td>Multi-language corpora</td><td>LiLT with multilingual text encoder</td></tr>
+      <tr><td>Low-volume prototype or POC</td><td>Vision-LLM (Claude / GPT-4o)</td></tr>
+      <tr><td>Tables with structured data</td><td>Cloud OCR with table extraction (Textract Tables, Document AI Layout)</td></tr>
+      <tr><td>Compute-constrained edge deployment</td><td>LiLT or smaller LayoutLM variants</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">The decision that usually wins for contract intelligence</span>
+    <p>Cloud OCR with layout-aware extraction (Textract Analyze Document or Document AI Layout) does the OCR + layout-region classification in one step. Then an LLM (Claude, GPT-4) extracts the structured fields from the regions. The dedicated LayoutLM-family fine-tuning step is often unnecessary if the cloud service's layout output is sufficient. Skip the model-training cost when you can.</p>
+  </div>
+</section>
+
+<section id="limits">
+  <h2>What layout-aware models are collectively bad at</h2>
+  <ul>
+    <li><strong>Hand-drawn annotations and corrections.</strong> Models trained on typeset documents struggle when humans write on the page.</li>
+    <li><strong>Multi-page reasoning.</strong> Most layout-aware models process one page at a time. A contract where an obligation is defined on page 2 and modified on page 8 requires multi-page logic on top of the model.</li>
+    <li><strong>Tables with merged cells, footnotes, complex nesting.</strong> Layout models infer row/column relationships heuristically; complex tables break them.</li>
+    <li><strong>Heavily customized documents.</strong> A bespoke legal document that doesn't look like the training distribution gets lower-quality predictions. Fine-tuning helps if you have labels.</li>
+    <li><strong>Documents where reading order is ambiguous.</strong> Sidebar content, footnotes, multi-column with embedded boxes. Often the wrong text ends up next to the wrong text in the linearized sequence.</li>
+  </ul>
+
+  <p>The collective fix isn't a better layout-aware model — it's the validation and HITL layer (chapters 06–07) catching the cases the model gets wrong and routing them to human review.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

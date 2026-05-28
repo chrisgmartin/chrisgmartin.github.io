@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spend &amp; Invoices</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#table">The spend table</a>
+    <a href="#sources">Where spend data comes from</a>
+    <a href="#linking">Linking spend to agreements</a>
+    <a href="#fuzzy">The fuzzy-link problem</a>
+    <a href="#currency">Currency normalization</a>
+    <a href="#off-contract">On-contract vs off-contract</a>
+    <a href="#operations">Common operations</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-obligations.html">← Previous</a>
+    <a href="07-sql-pattern-library.html">Next: SQL patterns →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Temporal &amp; transactional</span>
+  <h1>Spend &amp; Invoices</h1>
+  <p class="subtitle">The spend fact table — invoice and PO actuals joined to suppliers and agreements. The fuzzy-link problem, currency normalization, and the on-contract / off-contract distinction that drives platform ROI.</p>
+</header>
+
+<section id="table">
+  <h2>The spend table</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>spend.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE spend (
+  spend_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  supplier_id TEXT NOT NULL REFERENCES suppliers,
+  agreement_id TEXT REFERENCES agreements,   -- nullable: off-contract spend
+  invoice_id TEXT,
+  amount NUMERIC(15, 2) NOT NULL,
+  currency TEXT NOT NULL,
+  accrued_at DATE NOT NULL,
+  spend_category TEXT
+);</code></pre>
+  </div>
+
+  <h3>Field rationale</h3>
+  <ul>
+    <li><code>supplier_id</code>: the canonical supplier from chapter 02. Resolved via entity resolution if extracted from a document; pulled from ERP master if sourced from a procurement system.</li>
+    <li><code>agreement_id</code>: nullable. When the spend can be tied to a specific agreement, populated. Off-contract spend has it null.</li>
+    <li><code>invoice_id</code>: source-system identifier. Helps trace back to the customer's ERP.</li>
+    <li><code>amount</code>: numeric, fixed precision. Avoid floats for money.</li>
+    <li><code>currency</code>: ISO 4217 code (USD, EUR, GBP). Always populated; default conversion lives in marts.</li>
+    <li><code>accrued_at</code>: when the spend was accrued in accounting. Usually invoice date or service date depending on customer policy.</li>
+    <li><code>spend_category</code>: customer's category taxonomy. Often pulled from their ERP.</li>
+  </ul>
+</section>
+
+<section id="sources">
+  <h2>Where spend data comes from</h2>
+
+  <h3>Customer's ERP</h3>
+  <p>The most common source — SAP, Oracle, NetSuite, Workday, etc. The platform pulls invoice and PO data via API or warehouse extract. Most reliable; this is the customer's system-of-record for spend.</p>
+
+  <h3>Customer's procurement suite</h3>
+  <p>Coupa, Ariba, etc. Often has more category-level detail than ERP; sometimes cleaner supplier mapping. Use alongside ERP rather than instead of.</p>
+
+  <h3>Extracted from invoices and POs</h3>
+  <p>The platform's own extraction pipeline can pull spend from invoice and PO documents directly. Useful when ERP integration is gated or incomplete; produces spend rows from the same pipeline that produces obligations.</p>
+
+  <h3>Customer's data warehouse</h3>
+  <p>Mature customers maintain spend data in their own warehouse, often combined across sources. If you're delivering output into their warehouse anyway, joining to their pre-existing spend table is cleanest.</p>
+</section>
+
+<section id="linking">
+  <h2>Linking spend to agreements</h2>
+  <p>The hard problem in spend modeling. An invoice from "Acme Cloud Services" needs to be tied to the right active agreement with that supplier — but:</p>
+  <ul>
+    <li>The customer might have three active agreements with the same supplier.</li>
+    <li>The invoice might reference a specific PO; the PO might reference a specific SOW; the SOW might be under a specific MSA.</li>
+    <li>Or the invoice might just say "Services per agreement" without specifying.</li>
+  </ul>
+
+  <h3>Strong links</h3>
+  <p>When the ERP or invoice explicitly references a contract ID that matches an agreement_id in your platform: trivial. Set <code>agreement_id</code> directly.</p>
+
+  <h3>Inferred links</h3>
+  <ul>
+    <li>If the supplier has exactly one active agreement at the invoice date, link to it.</li>
+    <li>If multiple, look for keyword matches (project name, SOW reference) in the invoice description.</li>
+    <li>If still ambiguous, use the highest-spend agreement for that supplier in the past 90 days.</li>
+    <li>If still ambiguous, leave agreement_id null and flag for the customer's data team.</li>
+  </ul>
+
+  <h3>The fuzzy-link confidence</h3>
+  <p>Like supplier resolution, spend-to-agreement linkage can have confidence. Some platforms add a <code>link_confidence</code> column and a separate audit table tracking how each link was made.</p>
+</section>
+
+<section id="fuzzy">
+  <h2>The fuzzy-link problem</h2>
+  <p>Even with the best customer data, ~10–30% of spend can't be cleanly tied to a specific agreement. Reasons:</p>
+  <ul>
+    <li>The supplier has no agreement in the platform yet (off-contract).</li>
+    <li>Multiple plausible agreements; insufficient evidence to pick one.</li>
+    <li>The invoice covers work spanning multiple agreements (e.g., a master invoice for a quarter of services).</li>
+    <li>Data quality issues — supplier name doesn't match canonically, invoice date is wrong, etc.</li>
+  </ul>
+
+  <p>Production approach:</p>
+  <ol>
+    <li>Set agreement_id where the link is confident.</li>
+    <li>Leave it null where it isn't.</li>
+    <li>Surface unlinkable spend to the customer's data team as a queue.</li>
+    <li>Periodically re-link as new agreements come in or as resolution improves.</li>
+  </ol>
+</section>
+
+<section id="currency">
+  <h2>Currency normalization</h2>
+  <p>Multi-currency customers — most enterprises — accrue spend in many currencies. Some normalization patterns:</p>
+
+  <h3>Store the original; convert at query time</h3>
+  <p>The cleanest approach. <code>amount</code> and <code>currency</code> are the original. A separate <code>fx_rates</code> table converts to USD (or the customer's reporting currency) at query time.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">CREATE TABLE fx_rates (
+  from_currency TEXT NOT NULL,
+  to_currency TEXT NOT NULL,
+  rate_date DATE NOT NULL,
+  rate NUMERIC(20, 10) NOT NULL,
+  PRIMARY KEY (from_currency, to_currency, rate_date)
+);
+
+-- Spend in USD at the accrual date
+SELECT s.spend_id, s.amount * fx.rate AS amount_usd, s.accrued_at
+FROM spend s
+JOIN fx_rates fx
+  ON fx.from_currency = s.currency
+ AND fx.to_currency = 'USD'
+ AND fx.rate_date = s.accrued_at;</code></pre>
+  </div>
+
+  <h3>Pre-converted columns</h3>
+  <p>Some platforms denormalize a <code>amount_usd</code> column for query convenience. Acceptable but locks in a specific conversion-date convention.</p>
+
+  <h3>Which date to convert on</h3>
+  <ul>
+    <li><strong>Accrual date</strong>: most accurate for matching to financial period.</li>
+    <li><strong>Invoice date</strong>: easier to look up; aligns with payable accounting.</li>
+    <li><strong>Month-average rate</strong>: simpler; less precise for high-volatility periods.</li>
+  </ul>
+  <p>Pick one with the customer's finance team; document it; don't change silently.</p>
+</section>
+
+<section id="off-contract">
+  <h2>On-contract vs off-contract</h2>
+  <p>The single most valuable analytical question this schema supports:</p>
+
+  <h3>Definition</h3>
+  <ul>
+    <li><strong>On-contract spend</strong>: spend with a supplier where an active agreement covers the time period.</li>
+    <li><strong>Off-contract spend</strong>: spend where no active agreement covers it. Either with an unknown supplier, or with a supplier whose agreement has expired.</li>
+  </ul>
+
+  <h3>Why customers care</h3>
+  <p>Off-contract spend means:</p>
+  <ul>
+    <li>The customer didn't capture negotiated pricing they could have.</li>
+    <li>Policy controls (preferred supplier lists, payment terms) weren't enforced.</li>
+    <li>Risk exposure: no contractual protections (liability caps, indemnification, DPAs).</li>
+  </ul>
+  <p>Customers typically discover 15–30% of their spend is off-contract. That's often the headline ROI number the platform is sold on.</p>
+
+  <h3>Subcategories</h3>
+  <ul>
+    <li><strong>Unknown-supplier off-contract</strong>: the supplier isn't in any agreement. Often opportunistic purchases or new vendors that bypassed procurement.</li>
+    <li><strong>Expired-agreement off-contract</strong>: the supplier had an agreement that expired and was never renewed. Often preventable.</li>
+    <li><strong>Out-of-scope-of-agreement</strong>: the supplier has an agreement but the spend is for a category outside what the agreement covers. Harder to detect; needs category matching.</li>
+  </ul>
+  <p>SQL pattern for computing each is in chapter 07.</p>
+</section>
+
+<section id="operations">
+  <h2>Common operations</h2>
+
+  <h3>Ingest spend from an ERP extract</h3>
+  <div class="code-wrap">
+<pre><code class="language-python">def ingest_spend_batch(rows: list[dict], customer_id: str):
+    for row in rows:
+        supplier_id = resolve_supplier(row["vendor_name"], customer_id, row.get("vendor_tax_id"))
+        agreement_id = infer_agreement(supplier_id, row["invoice_date"], row.get("po_reference"))
+        db.execute("""
+            INSERT INTO spend (spend_id, customer_id, supplier_id, agreement_id,
+                               invoice_id, amount, currency, accrued_at, spend_category)
+            VALUES (%(id)s, %(cust)s, %(sup)s, %(agr)s, %(inv)s, %(amt)s,
+                    %(cur)s, %(acc)s, %(cat)s)
+            ON CONFLICT (spend_id) DO NOTHING
+        """, {...})</code></pre>
+  </div>
+
+  <h3>Compute supplier spend per FY (with parent rollup)</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">WITH supplier_hierarchy AS (
+  SELECT supplier_id, supplier_id AS root_id FROM suppliers WHERE parent_supplier_id IS NULL
+  UNION ALL
+  SELECT s.supplier_id, h.root_id
+  FROM suppliers s JOIN supplier_hierarchy h ON s.parent_supplier_id = h.supplier_id
+)
+SELECT
+  parent.canonical_name AS parent_supplier,
+  SUM(s.amount * fx.rate) AS total_spend_usd
+FROM spend s
+JOIN supplier_hierarchy h ON h.supplier_id = s.supplier_id
+JOIN suppliers parent ON parent.supplier_id = h.root_id
+JOIN fx_rates fx
+  ON fx.from_currency = s.currency
+ AND fx.to_currency = 'USD'
+ AND fx.rate_date = s.accrued_at
+WHERE s.customer_id = 'cust_acme'
+  AND s.accrued_at &gt;= '2025-07-01'  -- customer FY start
+  AND s.accrued_at &lt;  '2026-07-01'
+GROUP BY parent.canonical_name
+ORDER BY total_spend_usd DESC;</code></pre>
+  </div>
+
+  <h3>Find off-contract spend</h3>
+  <p>See chapter 07 for the full SQL pattern. Briefly:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s.supplier_id, SUM(s.amount) AS off_contract_total
+FROM spend s
+LEFT JOIN agreements a
+  ON a.supplier_id = s.supplier_id
+ AND a.status = 'active'
+ AND s.accrued_at BETWEEN a.effective_date AND COALESCE(a.current_term_end, '9999-12-31')
+WHERE a.agreement_id IS NULL
+  AND s.customer_id = 'cust_acme'
+GROUP BY s.supplier_id;</code></pre>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

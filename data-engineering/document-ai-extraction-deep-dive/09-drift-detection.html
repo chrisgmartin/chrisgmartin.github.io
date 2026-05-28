@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drift Detection &amp; Monitoring</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#three-layers">Three layers of drift</a>
+    <a href="#input">Input drift</a>
+    <a href="#output">Output drift</a>
+    <a href="#outcome">Outcome drift</a>
+    <a href="#metrics">Drift metrics</a>
+    <a href="#alerts">Alerting thresholds</a>
+    <a href="#customer-surfacing">What to surface to customers</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-eval-methodology.html">← Previous</a>
+    <a href="10-failure-modes.html">Next: Failure modes →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Drift Detection &amp; Monitoring</h1>
+  <p class="subtitle">Three layers of drift — input, output, outcome — and the monitoring discipline that catches quality problems before they become customer-visible. The customer-facing alert rule of thumb.</p>
+</header>
+
+<section id="three-layers">
+  <h2>Three layers of drift</h2>
+  <p>"Drift" is a generic term for "things changed in production in a way that affects extraction quality." Three distinct kinds, each with its own detection mechanism:</p>
+  <ul>
+    <li><strong>Input drift</strong> — the documents flowing in have shifted in some way. Customer's data is different from what the system was tuned on.</li>
+    <li><strong>Output drift</strong> — the extractions are systematically different from before, even if inputs haven't changed visibly. Often signals a model or pipeline change.</li>
+    <li><strong>Outcome drift</strong> — the accuracy itself has slipped, measured against ground truth.</li>
+  </ul>
+  <p>Output and outcome drift often have the same root cause but surface differently. Input drift is upstream of both.</p>
+</section>
+
+<section id="input">
+  <h2>Input drift</h2>
+  <p>What the customer is sending changed. Examples:</p>
+  <ul>
+    <li>A new procurement system is producing documents in a layout the model wasn't trained on.</li>
+    <li>The customer started accepting French-language supplier contracts in addition to English.</li>
+    <li>An acquisition brought in 10,000 legacy documents from a different template family.</li>
+    <li>Scan quality degraded (new copier; remote work; rushed uploads).</li>
+  </ul>
+
+  <h3>What to monitor</h3>
+  <ul>
+    <li><strong>OCR confidence distribution</strong> over time. Sudden drops signal scan-quality regression.</li>
+    <li><strong>Layout-region distribution</strong>: are we seeing more / fewer tables, signature blocks, multi-column pages?</li>
+    <li><strong>Document length distribution</strong>: shorter or longer than typical?</li>
+    <li><strong>Language distribution</strong>: any non-English text appearing where none did before?</li>
+    <li><strong>Source distribution</strong>: changes in which customer-side system is producing documents.</li>
+  </ul>
+
+  <h3>Detection method</h3>
+  <p>Compute distribution statistics weekly; compare to the prior 90-day baseline. Surface anything that shifts by more than 2 standard deviations.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>input_drift_check.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import numpy as np
+
+def detect_distribution_shift(
+    current: np.ndarray,
+    baseline: np.ndarray,
+    threshold: float = 2.0,
+) -&gt; dict:
+    """Z-score-style shift detection for a univariate distribution."""
+    baseline_mean = baseline.mean()
+    baseline_std = baseline.std()
+    current_mean = current.mean()
+    z = (current_mean - baseline_mean) / max(baseline_std, 1e-6)
+    return {
+        "current_mean": current_mean,
+        "baseline_mean": baseline_mean,
+        "z_score": z,
+        "shifted": abs(z) &gt; threshold,
+    }</code></pre>
+  </div>
+</section>
+
+<section id="output">
+  <h2>Output drift</h2>
+  <p>The extractions are systematically different even when input statistics look stable. Often signals:</p>
+  <ul>
+    <li>A model version change.</li>
+    <li>A prompt change.</li>
+    <li>An upstream OCR vendor change (e.g., Textract pushed a quality update).</li>
+    <li>A customer-config change (someone adjusted thresholds).</li>
+  </ul>
+
+  <h3>What to monitor</h3>
+  <ul>
+    <li><strong>Confidence distribution</strong>: deciles of confidence per document class over time. A sudden shift toward lower confidence often precedes accuracy drops.</li>
+    <li><strong>Field-population rates</strong>: what fraction of documents have a non-null value for each field? Sudden changes here are sometimes the first signal of layout drift.</li>
+    <li><strong>HITL routing rate</strong>: what fraction of extractions hit HITL? Spikes mean the model is less confident; drops mean the threshold may be too lax.</li>
+    <li><strong>Pipeline timing</strong>: average inference latency per document. Slowdowns can indicate model swaps or queue issues.</li>
+  </ul>
+</section>
+
+<section id="outcome">
+  <h2>Outcome drift</h2>
+  <p>The ground-truth signal. Accuracy on labeled samples is below where it was. This is the metric customers contractually care about; it's also the slowest to detect because it requires labeled outcomes.</p>
+
+  <h3>Sources</h3>
+  <ul>
+    <li><strong>Rolling audit sample</strong>: the online-eval sample from chapter 08.</li>
+    <li><strong>HITL corrections</strong>: when reviewers correct a previously-auto-approved value (unusual but it happens), or when the rate of "model was right" in HITL drops.</li>
+    <li><strong>Customer-reported corrections</strong>: customers occasionally flag specific extractions as wrong. Their feedback is high-signal.</li>
+  </ul>
+
+  <h3>The lag problem</h3>
+  <p>Outcome drift is slow to detect because labeling takes time. By the time accuracy on a 30-day rolling window shows a drop, the underlying cause may have been live for 4–6 weeks. This is why output and input drift monitoring matter — they're leading indicators of outcome drift.</p>
+</section>
+
+<section id="metrics">
+  <h2>Drift metrics</h2>
+
+  <h3>Population Stability Index (PSI)</h3>
+  <p>Compares the distribution of a feature between two time periods. PSI &lt; 0.1: no shift. 0.1–0.25: moderate. &gt; 0.25: significant. Easy to compute, easy to interpret.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>psi.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import numpy as np
+
+def psi(baseline: np.ndarray, current: np.ndarray, n_bins: int = 10) -&gt; float:
+    edges = np.quantile(baseline, np.linspace(0, 1, n_bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    b_counts, _ = np.histogram(baseline, bins=edges)
+    c_counts, _ = np.histogram(current, bins=edges)
+    # Laplace-smooth so no zero division
+    b_pct = (b_counts + 1) / (b_counts.sum() + n_bins)
+    c_pct = (c_counts + 1) / (c_counts.sum() + n_bins)
+    return float(np.sum((c_pct - b_pct) * np.log(c_pct / b_pct)))</code></pre>
+  </div>
+
+  <h3>Kolmogorov–Smirnov test</h3>
+  <p>Tests whether two samples come from the same distribution. Returns a p-value; threshold on it for alerts. More statistically principled than PSI; less interpretable for non-statisticians.</p>
+
+  <h3>Per-bucket relative change</h3>
+  <p>Sometimes the simplest is best. For each confidence decile, what fraction of documents fall in it this week vs last week? Surface deciles with &gt; 30% relative change.</p>
+</section>
+
+<section id="alerts">
+  <h2>Alerting thresholds</h2>
+  <p>The art is alerting often enough to catch real drift but not so often that alerts get ignored. Rough thresholds:</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Severity</th><th>Trigger</th></tr></thead>
+    <tbody>
+      <tr><td>SLA accuracy</td><td>P1</td><td>Below contracted threshold</td></tr>
+      <tr><td>SLA accuracy trending toward threshold</td><td>P2</td><td>Within 2pp, declining trend over 7 days</td></tr>
+      <tr><td>HITL routing rate</td><td>P2</td><td>&gt; 30% change vs 30-day baseline</td></tr>
+      <tr><td>Output drift (PSI on confidence)</td><td>P3</td><td>PSI &gt; 0.25 on any field</td></tr>
+      <tr><td>Input drift (PSI on doc length, OCR confidence)</td><td>P3</td><td>PSI &gt; 0.25</td></tr>
+      <tr><td>OCR confidence distribution shift</td><td>P2</td><td>p95 OCR confidence drops by &gt; 5pp</td></tr>
+      <tr><td>Pipeline failure</td><td>P1 / P2</td><td>Depending on whether SLA window is affected — see runbook in the playbook</td></tr>
+    </tbody>
+  </table>
+
+  <p>Each P1 alert pages someone. P2 goes to a Slack channel where it's reviewed daily. P3 lands in a weekly digest.</p>
+</section>
+
+<section id="customer-surfacing">
+  <h2>What to surface to customers</h2>
+  <p>Not every alert needs customer visibility. The rule of thumb:</p>
+  <ul>
+    <li><strong>Customer-facing dashboard</strong>: the SLA accuracy and rolling 30-day trend. Always visible.</li>
+    <li><strong>Proactive notification</strong>: when accuracy is trending toward the threshold (within 2pp, declining), tell the customer before they ask.</li>
+    <li><strong>Active incident</strong>: SLA is below threshold — formal communication via email + dashboard banner, plus a remediation plan with timeline.</li>
+    <li><strong>Internal-only</strong>: most input and output drift signals — debug-grade information, not customer-facing.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The proactive-disclosure rule</span>
+    <p>The single best trust signal in an SLA-backed deployment: the customer learns about a quality issue from you before they learn about it from their own users. The cost of one Friday email saying "we noticed accuracy trending lower on supplier agreements; here's what we're doing" is zero. The cost of the customer discovering it themselves is sometimes the entire renewal.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Eval Methodology</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why eval is the differentiator</a>
+    <a href="#ground-truth">Ground-truth sources</a>
+    <a href="#sampling">Sample sizing</a>
+    <a href="#metrics">Metrics</a>
+    <a href="#per-class">Per-class measurement</a>
+    <a href="#offline">Offline eval before deploys</a>
+    <a href="#online">Online eval in production</a>
+    <a href="#reporting">Customer-facing reporting</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-hitl-economics.html">← Previous</a>
+    <a href="09-drift-detection.html">Next: Drift detection →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Quality &amp; eval</span>
+  <h1>Eval Methodology</h1>
+  <p class="subtitle">An SLA-backed platform measures accuracy continuously. Ground-truth sourcing, sample sizing, the metrics that matter, the cadence of offline vs online eval, and how to report it to the customer.</p>
+</header>
+
+<section id="why">
+  <h2>Why eval is the differentiator</h2>
+  <p>Two organizations can have identical extraction stacks but very different operational outcomes — because one of them measures accuracy rigorously and the other doesn't. Without measurement:</p>
+  <ul>
+    <li>You can't tell when quality slips until the customer complains.</li>
+    <li>You can't ship a model change confidently — you have no scoreboard.</li>
+    <li>You can't price the SLA — you don't know what you can stand behind.</li>
+    <li>You can't tune the HITL threshold — you don't know the auto-approved accuracy.</li>
+  </ul>
+  <p>Eval isn't optional. The discipline of measurement is what makes SLA-backed accuracy a real product rather than a marketing claim.</p>
+</section>
+
+<section id="ground-truth">
+  <h2>Ground-truth sources</h2>
+  <p>Eval requires knowing the right answer for each test example. Four sources, in order of preference:</p>
+
+  <h3>1. Customer-supplied gold set</h3>
+  <p>The customer's team confirms the right values for a sample of their documents. Best quality (it's their domain), best customer credibility (they can't argue with their own labels later). Most expensive to obtain — customer time is hard to get.</p>
+
+  <h3>2. Internal analyst audit</h3>
+  <p>Platform-employed analysts re-read sampled documents and produce ground truth. Most common in practice. Cheaper than customer time; quality is high if analysts are well-trained.</p>
+
+  <h3>3. Customer-confirmed extractions</h3>
+  <p>Extractions that the customer's reviewers confirmed in the HITL workflow. Free in volume; biased toward documents that hit HITL (i.e., low-confidence ones). Useful for calibration; less useful for top-line accuracy measurement.</p>
+
+  <h3>4. Synthetic ground truth</h3>
+  <p>Generate fake contracts with known ground truth. Useful for development testing only — never for SLA measurement against real customers.</p>
+
+  <h3>Inter-rater agreement on ground truth</h3>
+  <p>Even ground truth has noise. Two analysts labeling the same document independently should agree ≥ 90% on simple fields. Below that, the field definition is too ambiguous to measure cleanly — fix the spec before fixing the model.</p>
+</section>
+
+<section id="sampling">
+  <h2>Sample sizing</h2>
+  <p>To estimate a population accuracy with confidence, you need enough labeled samples. The math:</p>
+
+  <p>For estimating a proportion p with margin of error E at confidence level (1−α), sample size n ≈ <code>z² × p × (1−p) / E²</code>, where z is the z-score for the confidence level.</p>
+
+  <p>For 95% accuracy with ±2 percentage points at 95% confidence: n ≈ 456. Round up to 500 for safety. For ±1pp: n ≈ 1800. For ±5pp: n ≈ 73.</p>
+
+  <p>This is <em>per-document-class</em>. If your SLA covers 5 classes, you need ~500 labeled samples per class to measure each independently.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>sample_size.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from math import ceil
+from scipy.stats import norm
+
+def required_sample_size(target_accuracy: float, margin: float, confidence: float = 0.95) -&gt; int:
+    """For a binary outcome (correct / not), how many samples for the margin?"""
+    p = target_accuracy
+    z = norm.ppf(1 - (1 - confidence) / 2)
+    n = (z ** 2) * p * (1 - p) / (margin ** 2)
+    return ceil(n)
+
+print(required_sample_size(0.95, 0.02))   # → 456
+print(required_sample_size(0.95, 0.01))   # → 1825
+print(required_sample_size(0.95, 0.05))   # → 73</code></pre>
+  </div>
+
+  <h3>Rolling windows</h3>
+  <p>SLA measurement is typically a rolling 30-day window. The sample is recomputed daily; oldest examples drop off. Keeps the metric responsive to recent drift without single-day noise.</p>
+</section>
+
+<section id="metrics">
+  <h2>Metrics</h2>
+
+  <h3>Field-level accuracy</h3>
+  <p>Of all extracted field values, what fraction match ground truth (within tolerance)? The headline number on the SLA dashboard.</p>
+  <ul>
+    <li>String fields: exact match, or fuzzy (Levenshtein, normalized casing/whitespace) within a tolerance — defined in the contract.</li>
+    <li>Date fields: exact, or within ±N days.</li>
+    <li>Numeric fields: exact, or within ±X% of the true value.</li>
+    <li>Categorical fields: exact match against canonical taxonomy.</li>
+  </ul>
+
+  <h3>Precision and recall</h3>
+  <p>For field presence (did the extractor find a value when there should be one, abstain when there shouldn't):</p>
+  <ul>
+    <li><strong>Precision</strong> = of fields the extractor returned, what fraction matched ground truth.</li>
+    <li><strong>Recall</strong> = of fields where ground truth said a value exists, what fraction did the extractor find.</li>
+  </ul>
+
+  <h3>Document-level accuracy</h3>
+  <p>Stricter — a document is correct only if all of its required fields are correct. Often what customers care about ("if I trust this row, is everything in it right?").</p>
+
+  <h3>Lift over baseline</h3>
+  <p>What's the accuracy of a trivial baseline (e.g., regex-only, or "always return null")? Your model's accuracy minus the baseline shows the model's actual contribution.</p>
+
+  <h3>Calibration metrics</h3>
+  <p>ECE and reliability diagrams (chapter 06). Track alongside accuracy; if calibration drifts, the HITL threshold needs recompute even before accuracy slips.</p>
+</section>
+
+<section id="per-class">
+  <h2>Per-class measurement</h2>
+  <p>Aggregating accuracy across document classes is misleading. A 95% overall accuracy might hide:</p>
+  <ul>
+    <li>MSAs at 98%.</li>
+    <li>SOWs at 96%.</li>
+    <li>Supplier agreements at 91% (below SLA, hidden by aggregation).</li>
+  </ul>
+
+  <p>Always report per-class. If your SLA contract has per-class thresholds, the per-class number is what's reportable.</p>
+
+  <h3>Per-field within class</h3>
+  <p>Drill one level deeper: per-field within each class. The dashboard's heatmap is doc-class × field × accuracy, with the SLA threshold drawn as a line. Failures are immediately visible.</p>
+</section>
+
+<section id="offline">
+  <h2>Offline eval before deploys</h2>
+  <p>Before any model or prompt change ships, run it against a frozen eval set.</p>
+
+  <h3>The frozen eval set</h3>
+  <ul>
+    <li>500–1000 documents per class with labeled ground truth.</li>
+    <li>Sampled to be representative of production distribution.</li>
+    <li>Frozen — doesn't change month-to-month. Lets you compare results across model versions over time.</li>
+    <li>Versioned. When the eval set is updated, it's a new version (eval-v2.1) so you can interpret historical reports correctly.</li>
+  </ul>
+
+  <h3>The eval run</h3>
+  <ol>
+    <li>Run the new model/prompt against the eval set.</li>
+    <li>Score per-field accuracy, precision, recall, calibration.</li>
+    <li>Generate a comparison report vs the current production model.</li>
+    <li>Approve / reject the change based on the report.</li>
+  </ol>
+
+  <p>Build this into CI. Every PR that touches extraction code runs the eval and fails CI if accuracy regresses on any class above the noise floor.</p>
+</section>
+
+<section id="online">
+  <h2>Online eval in production</h2>
+  <p>Offline eval doesn't catch drift in production. Online eval continuously samples production output for audit.</p>
+
+  <h3>The online sample</h3>
+  <ul>
+    <li>Randomly sample N documents per day across each class.</li>
+    <li>Route them to internal analysts for ground-truth labeling (or use customer-confirmed extractions if available).</li>
+    <li>Score and aggregate into the rolling 30-day metric.</li>
+    <li>Surface anomalies (sudden drops, class-specific issues) via alerts.</li>
+  </ul>
+
+  <h3>The sample-vs-audit overhead</h3>
+  <p>Online eval is itself a labeling cost. Budget 1–5% of HITL capacity for it. The cost is paid in accuracy assurance — without it, the platform doesn't know what its own quality looks like.</p>
+</section>
+
+<section id="reporting">
+  <h2>Customer-facing reporting</h2>
+  <p>The SLA dashboard the customer sees should include:</p>
+
+  <h3>Headline numbers</h3>
+  <p>Rolling 30-day accuracy per class, plotted against the SLA threshold as a line. Color-code by status (green / yellow / red).</p>
+
+  <h3>Sample composition</h3>
+  <p>How many documents are in the rolling sample? When was it last refreshed? Source of ground truth?</p>
+
+  <h3>Methodology disclosure</h3>
+  <p>How is accuracy measured? Tolerance rules? Inter-rater agreement? This is the transparency layer; sophisticated customers want it.</p>
+
+  <h3>Historical trend</h3>
+  <p>Accuracy over time (last 6 months). Shows trajectory; surfaces drift.</p>
+
+  <h3>Failure-mode breakdown</h3>
+  <p>For accuracy below SLA, which fields are dragging it down? Lets the customer see what's being remediated.</p>
+
+  <h3>Calibration disclosure</h3>
+  <p>Especially for sophisticated customers: "Of the fields auto-approved at confidence ≥ 0.85, observed accuracy is 0.94." Demonstrates that the calibration math is honest.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The customer-facing dashboard discipline</span>
+    <p>The instinct is to hide the dashboard until accuracy is green. The opposite is right. Show the customer the dashboard early and often. Building familiarity when things are healthy means they trust the dashboard when things slip. Hiding it until renewal builds suspicion.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

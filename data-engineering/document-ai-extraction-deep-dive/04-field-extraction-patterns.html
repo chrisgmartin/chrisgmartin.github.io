@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Field Extraction Patterns</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#decision">The architectural decision</a>
+    <a href="#rules">Rule-based extraction</a>
+    <a href="#encoders">Task-specific encoders</a>
+    <a href="#llm">LLM-based extraction</a>
+    <a href="#structured-output">Structured-output techniques</a>
+    <a href="#hybrid">The hybrid default</a>
+    <a href="#prompting">Prompt engineering for extraction</a>
+    <a href="#cost">Cost &amp; latency</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-layout-aware-models.html">← Previous</a>
+    <a href="05-output-schema-provenance.html">Next: Output schema →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Field extraction</span>
+  <h1>Field Extraction Patterns</h1>
+  <p class="subtitle">The biggest single architectural decision in the stack — how you turn document regions into structured field values. Rule-based vs task-specific encoders vs LLMs vs hybrid. With production guidance per choice.</p>
+</header>
+
+<section id="decision">
+  <h2>The architectural decision</h2>
+  <p>You're going from "this region of this page contains text about renewal terms" to "renewal_term: 'auto-renew, 12 months, 60 days notice'." Four architectural choices, each with tradeoffs:</p>
+  <table>
+    <thead><tr><th>Approach</th><th>Best for</th><th>Cost</th><th>Latency</th><th>Debuggability</th></tr></thead>
+    <tbody>
+      <tr><td>Rule-based</td><td>Templated documents, simple fields</td><td>Negligible</td><td>ms</td><td>Excellent</td></tr>
+      <tr><td>Task-specific encoder</td><td>Mid-complexity fields, large corpora</td><td>Low at scale</td><td>~10ms</td><td>Good (with attention viz)</td></tr>
+      <tr><td>LLM</td><td>Complex / variable / open-ended fields</td><td>$0.001–$0.05 per doc</td><td>1–5s</td><td>Hard (chain-of-reasoning helps)</td></tr>
+      <tr><td>Hybrid</td><td>Most production systems</td><td>Mixed</td><td>Mixed</td><td>Per-pipeline</td></tr>
+    </tbody>
+  </table>
+  <p>Most production contract-intelligence systems run hybrid. Rules for the easy 60% of fields (effective_date when consistently formatted, parties from a signature-block pattern), models for the hard 40%.</p>
+</section>
+
+<section id="rules">
+  <h2>Rule-based extraction</h2>
+  <p>Regex, pattern templates, anchor-relative position lookups. Brittle on non-templated documents; fast and debuggable on consistent ones.</p>
+
+  <h3>When it works</h3>
+  <ul>
+    <li>Customer's documents follow a consistent template (e.g., supplier agreements all generated from one MSA template).</li>
+    <li>Fields appear in predictable positions (date below the title, signature block at end of last page).</li>
+    <li>Field values follow regex-able patterns (USD amounts, ISO dates).</li>
+  </ul>
+
+  <h3>Example: extracting effective date from a templated MSA</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>rule_extract_effective_date.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import re
+from datetime import datetime
+
+EFFECTIVE_DATE_PATTERNS = [
+    r"effective\s+(?:as\s+of\s+|date[:\s]+)([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})",
+    r"effective\s+(?:as\s+of\s+|date[:\s]+)(\d{1,2}/\d{1,2}/\d{4})",
+    r"entered\s+into\s+(?:as\s+of\s+|on\s+)([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})",
+    r"dated\s+([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})",
+]
+
+def extract_effective_date(text: str) -&gt; str | None:
+    for pattern in EFFECTIVE_DATE_PATTERNS:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return normalize_date(m.group(1))
+    return None
+
+def normalize_date(s: str) -&gt; str | None:
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None</code></pre>
+  </div>
+
+  <h3>Where rules break</h3>
+  <ul>
+    <li>"This agreement, effective as of the later of the dates set forth on the signature page below" — the date isn't here.</li>
+    <li>Documents that don't use the templated phrase ("Initial Term: 12 months from execution"). The regex misses.</li>
+    <li>Multi-language documents.</li>
+    <li>Hand-drafted bespoke agreements.</li>
+  </ul>
+
+  <p>Rules are excellent as the first layer of a hybrid pipeline — they handle the cleanly-templated documents fast and free, and you save the LLM budget for the documents rules miss.</p>
+</section>
+
+<section id="encoders">
+  <h2>Task-specific encoders</h2>
+  <p>Fine-tuned BERT-class (or LayoutLM-class) models for token classification. Per-field or per-task models.</p>
+
+  <h3>The shape</h3>
+  <ul>
+    <li>Label 1000–10000 documents with span-level annotations (B-EFFECTIVE_DATE, I-EFFECTIVE_DATE, O for outside).</li>
+    <li>Fine-tune a pretrained encoder (BERT for text-only, LayoutLMv3 for layout-aware).</li>
+    <li>At inference, classify each token; merge contiguous spans of the same label.</li>
+  </ul>
+
+  <h3>When it's the right call</h3>
+  <ul>
+    <li>You have or can produce labeled data (1000+ examples per field).</li>
+    <li>The corpus is large enough that LLM cost per document matters.</li>
+    <li>Fields are structured-extractable (named entities, fixed-format values) rather than requiring reasoning ("what's the effective term length considering all amendments").</li>
+    <li>You need predictable latency and cost.</li>
+  </ul>
+
+  <h3>Where it falls short</h3>
+  <ul>
+    <li>Bespoke / one-off fields that don't justify a label set.</li>
+    <li>Fields that require reasoning across multiple sections of the document.</li>
+    <li>Free-form summarization (the renewal term might be "auto-renew unless terminated with 60 days notice prior to anniversary, except in Year 1 where notice is 90 days" — a token classifier can't summarize that).</li>
+  </ul>
+</section>
+
+<section id="llm">
+  <h2>LLM-based extraction</h2>
+  <p>Send the document (or extracted region) to an LLM with a structured-output prompt. Most flexible; most expensive per call; non-trivial to fully control.</p>
+
+  <h3>The shape</h3>
+  <ul>
+    <li>Send the document text (and possibly image) to Claude / GPT-4 / Gemini.</li>
+    <li>Include a JSON schema or Pydantic model defining the expected output structure.</li>
+    <li>Parse the model's response into the structured schema.</li>
+    <li>Validate against the schema; surface failures.</li>
+  </ul>
+
+  <h3>When it wins</h3>
+  <ul>
+    <li>Diverse, non-templated documents.</li>
+    <li>Fields that require reasoning or summarization.</li>
+    <li>Many distinct fields where labeling 1000 examples per field is prohibitive.</li>
+    <li>Multi-language documents (LLMs handle this near-natively).</li>
+    <li>Edge cases that rules and small models miss.</li>
+  </ul>
+
+  <h3>Where to be careful</h3>
+  <ul>
+    <li><strong>Hallucination.</strong> LLMs will produce fluent-but-wrong values. Especially for fields the model "wants" to find but isn't actually present.</li>
+    <li><strong>Inconsistency across runs.</strong> Same input can produce slightly different outputs. Use temperature=0; even then, prompt sensitivity is real.</li>
+    <li><strong>Cost at scale.</strong> $0.01–$0.05 per document × 50,000 documents = $500–$2500 per backfill.</li>
+    <li><strong>Confidence calibration.</strong> LLMs don't naturally produce well-calibrated confidence; you need to engineer it (see calibration chapter).</li>
+  </ul>
+</section>
+
+<section id="structured-output">
+  <h2>Structured-output techniques</h2>
+  <p>Getting LLMs to produce reliable, parseable structured output is its own engineering discipline. Three approaches:</p>
+
+  <h3>1. JSON-mode / response_format=json</h3>
+  <p>Most modern LLM APIs support a "respond in JSON" mode. Pair with a schema in the prompt. The model usually produces parseable JSON.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>claude_json_extraction.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from anthropic import Anthropic
+import json
+
+client = Anthropic()
+
+EXTRACTION_PROMPT = """You are extracting structured fields from a Master Service Agreement.
+
+Document text:
+&lt;document&gt;
+{text}
+&lt;/document&gt;
+
+Extract the following fields and return as JSON. If a field cannot be found, return null for that field.
+
+Schema:
+{{
+  "parties": list of party names (the contracting entities),
+  "effective_date": ISO date string (YYYY-MM-DD),
+  "term_length_months": integer or null,
+  "renewal_terms": {{
+    "auto_renew": boolean,
+    "term_length_months": integer,
+    "notice_period_days": integer
+  }} or null,
+  "governing_law": string or null
+}}
+
+Return only valid JSON. No explanation."""
+
+def extract_msa(text: str) -&gt; dict:
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        temperature=0,
+        messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(text=text)}],
+    )
+    return json.loads(response.content[0].text)</code></pre>
+  </div>
+
+  <h3>2. Function/tool calling with structured arguments</h3>
+  <p>Define the extraction as a "tool" the model calls with structured arguments. The provider enforces schema validity.</p>
+
+  <h3>3. Constrained decoding (open-source)</h3>
+  <p>Libraries like Outlines, Guidance, or LMQL constrain the LLM's token sampling to match a grammar or schema. Useful for open-source models or stricter output control. More setup than provider-native modes.</p>
+
+  <h3>Pydantic + provider tool-calling</h3>
+  <p>The modern default: define a Pydantic model, use the LLM provider's tool-calling, get back a validated object.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>pydantic_extraction.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from typing import Optional
+
+class RenewalTerms(BaseModel):
+    auto_renew: bool
+    term_length_months: int
+    notice_period_days: int
+
+class MSAExtraction(BaseModel):
+    parties: list[str]
+    effective_date: str = Field(description="ISO date, YYYY-MM-DD")
+    term_length_months: Optional[int] = None
+    renewal_terms: Optional[RenewalTerms] = None
+    governing_law: Optional[str] = None
+
+# Pass MSAExtraction's JSON schema to the LLM as the function definition;
+# parse the result with MSAExtraction.model_validate(response_dict).</code></pre>
+  </div>
+</section>
+
+<section id="hybrid">
+  <h2>The hybrid default</h2>
+  <p>What most production contract-intelligence systems actually run:</p>
+  <ol>
+    <li><strong>Cloud OCR + layout regions</strong> → text + region boundaries.</li>
+    <li><strong>Rule-based pre-pass</strong> attempts to extract high-confidence "easy" fields (effective_date, parties from signature block) using regex against the OCR text. Wins ~50–70% of fields cheap.</li>
+    <li><strong>LLM-based extraction</strong> for fields the rule pass missed, or for fields that require summarization (renewal_terms, indemnification clauses).</li>
+    <li><strong>Confidence calibration</strong> combines per-field confidence from each layer.</li>
+    <li><strong>HITL routing</strong> for any field below the threshold.</li>
+  </ol>
+  <p>The hybrid wins on cost (the easy fields don't hit the LLM), latency (rules are fast), and quality (LLM has more attention budget per remaining field).</p>
+</section>
+
+<section id="prompting">
+  <h2>Prompt engineering for extraction</h2>
+  <p>Production extraction prompts are not "extract everything you can" — they're engineered for accuracy and reliability. Patterns:</p>
+
+  <h3>Explicit schema in the prompt</h3>
+  <p>Even with JSON mode, include the schema textually. The model performs better when the schema is in its context, not just as a separate parameter.</p>
+
+  <h3>Instructions about uncertainty</h3>
+  <p><em>"If a field is not present or cannot be confidently extracted, return null. Do not guess. Do not fabricate values that aren't supported by the text."</em> This single instruction reduces hallucination materially.</p>
+
+  <h3>Per-field guidance</h3>
+  <p>For ambiguous fields, give the model definitional guidance. <em>"renewal_terms refers to the contractual auto-renewal clause if present; do not extract termination clauses here."</em></p>
+
+  <h3>Few-shot examples</h3>
+  <p>Two or three worked examples in the prompt dramatically improve accuracy on idiosyncratic field formats. Token cost is usually worth it.</p>
+
+  <h3>Chain-of-thought for reasoning fields</h3>
+  <p>For fields that require reasoning ("what's the effective term length considering this amendment"), have the model reason first, then produce the structured output. Increases token usage; improves accuracy.</p>
+
+  <h3>Citation requirements</h3>
+  <p>Require the model to cite the page or quote the supporting text. Trivially expensive; massively improves debuggability and trustworthiness.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>citation-required schema</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">class FieldWithCitation(BaseModel):
+    value: str
+    quote: str = Field(description="The exact text from the document supporting this value")
+    page: int
+
+class MSAExtraction(BaseModel):
+    effective_date: Optional[FieldWithCitation] = None
+    # ... other fields with same pattern</code></pre>
+  </div>
+</section>
+
+<section id="cost">
+  <h2>Cost &amp; latency at scale</h2>
+  <p>For a typical contract-intelligence platform extracting ~10 fields per document over a 50,000-document corpus:</p>
+  <ul>
+    <li><strong>Pure LLM extraction</strong>: $500–$5000 backfill cost depending on model and document length. 1–5 seconds latency per document.</li>
+    <li><strong>Hybrid (rules + LLM)</strong>: $50–$1000 for the same corpus. Median latency near-zero; tail latency 1–5s.</li>
+    <li><strong>Token-classification encoder</strong>: $5–$50 of inference cost. ~10ms latency per document. Plus the upfront label-and-train cost.</li>
+  </ul>
+  <p>For long-lived deployments, token-classification encoders win on cost. For shorter or one-off deployments, LLM-based or hybrid wins because the upfront training cost doesn't amortize.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

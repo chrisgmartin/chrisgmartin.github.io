@@ -27,7 +27,13 @@
       folder: 'data-engineering',
       guides: [
         { name: 'Data Analytics Engineering', folder: 'data-analytics-interview-prep' },
-        { name: 'Senior Data Analytics Engineer', folder: 'senior-data-analytics-engineer' }
+        { name: 'Senior Data Analytics Engineer', folder: 'senior-data-analytics-engineer' },
+        { name: 'Forward Deployed Engineer — Data Engineering', folder: 'fde-data-engineering' },
+        { name: 'Document AI Extraction — Deep Dive', folder: 'document-ai-extraction-deep-dive' },
+        { name: 'Build a Contract-Intelligence Pipeline', folder: 'build-contract-intelligence-pipeline' },
+        { name: 'The FDE-DE Playbook', folder: 'fde-de-playbook' },
+        { name: 'Contract Data Model — Reference', folder: 'contract-data-model-reference' },
+        { name: 'Enterprise Integration Atlas', folder: 'enterprise-integration-atlas' }
       ]
     },
     {
@@ -55,6 +61,24 @@
         { name: 'Senior DeFi Protocol Engineer', folder: 'senior-defi-protocol-engineer' },
         { name: 'Smart Contract Security Engineer', folder: 'smart-contract-security-engineer' },
         { name: 'Senior Smart Contract Engineer', folder: 'senior-smart-contract-engineer' }
+      ]
+    },
+    {
+      name: 'Neocloud',
+      folder: 'neocloud',
+      guides: [
+        { name: 'Vast.AI — Comprehensive', folder: 'vast-ai' },
+        { name: 'RunPod', folder: 'runpod' },
+        { name: 'CoreWeave', folder: 'coreweave' },
+        { name: 'Crusoe', folder: 'crusoe' },
+        { name: 'Together.AI', folder: 'together-ai' },
+        { name: 'Lambda', folder: 'lambda' },
+        { name: 'Hyperbolic', folder: 'hyperbolic' },
+        { name: 'Nebius', folder: 'nebius' },
+        { name: 'TensorDock', folder: 'tensordock' },
+        { name: 'Neocloud — History & Future', folder: 'neocloud-history-future' },
+        { name: 'Physical Futures Marketplaces', folder: 'compute-futures-marketplaces' },
+        { name: 'The Neocloud Landscape — Comparison', folder: 'neocloud-comparison' }
       ]
     }
   ];

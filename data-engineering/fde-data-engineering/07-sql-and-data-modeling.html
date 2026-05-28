@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL &amp; Contract Data Modeling</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#model">The contract data model</a>
+    <a href="#entities">Entity resolution</a>
+    <a href="#obligations">Obligations &amp; renewals</a>
+    <a href="#spend">Spend rollups</a>
+    <a href="#queries">SQL patterns</a>
+    <a href="#fuzzy">Fuzzy joins</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-pipelines-under-deployment.html">← Previous</a>
+    <a href="08-warehouse-and-integration.html">Next: Warehouse →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Data craft</span>
+  <h1>SQL &amp; Contract Data Modeling</h1>
+  <p class="subtitle">The data model for contracts, suppliers, obligations, renewals, and spend rollups. SQL patterns you'll write a hundred times in a deployment, and the joins that make them tricky.</p>
+</header>
+
+<section id="model">
+  <h2>The contract data model</h2>
+  <p>A working contract-intelligence data model has roughly six core entities. Different platforms name them differently; the shapes are the same.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>core schema sketch</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Suppliers — canonical entities (after dedup / normalization)
+suppliers (
+  supplier_id, canonical_name, parent_supplier_id,
+  country, tax_id, industry, first_seen_at
+)
+
+-- Documents — every ingested file
+documents (
+  document_id, customer_id, source_uri, file_hash,
+  doc_class, ingested_at, page_count
+)
+
+-- Agreements — logical contracts. One agreement = many documents
+-- (MSA + amendments + SOWs all roll up to one agreement)
+agreements (
+  agreement_id, customer_id, supplier_id,
+  agreement_type, effective_date, current_term_end,
+  parent_agreement_id, status
+)
+
+-- Document → agreement linkage (M:N)
+document_agreement_links (
+  document_id, agreement_id, role  -- master | amendment | sow | exhibit
+)
+
+-- Obligations — extracted commitments. One agreement → many obligations
+obligations (
+  obligation_id, agreement_id, obligation_type,
+  party_obligated, value, currency, due_at, status,
+  confidence, extracted_from_document_id, extracted_at
+)
+
+-- Spend — actuals from invoices / POs joined to agreements (sometimes)
+spend (
+  spend_id, customer_id, supplier_id, agreement_id,
+  invoice_id, amount, currency, accrued_at,
+  spend_category
+)</code></pre>
+  </div>
+
+  <p>Key modeling decisions:</p>
+  <ul>
+    <li><strong>Document vs agreement.</strong> A document is the physical PDF; an agreement is the logical commitment that may be made of many documents. Most analytical questions are about agreements; debugging is at document level.</li>
+    <li><strong>Supplier canonicalization.</strong> "Acme Corp," "ACME Corporation," "Acme Corp Inc.," "Acme" might all be the same supplier. The canonical_name in the suppliers table is the resolved version; raw extractions point to the canonical via supplier_id.</li>
+    <li><strong>Parent-supplier hierarchy.</strong> Acme Cloud and Acme Datacenter are subsidiaries of Acme Holdings. Roll-up queries need the parent.</li>
+    <li><strong>Obligation status.</strong> "Pending," "fulfilled," "overdue," "waived." Status changes over time — sometimes need temporal modeling.</li>
+  </ul>
+</section>
+
+<section id="entities">
+  <h2>Entity resolution</h2>
+  <p>The hardest data-modeling problem in contract intelligence. Two of your customer's contracts both reference "Acme Corp" — are those the same supplier? Probably. But maybe one is "Acme Corp (UK)" and the other is "Acme Corp (US)," which for tax purposes are distinct entities.</p>
+
+  <h3>Techniques</h3>
+  <ul>
+    <li><strong>Exact match</strong> on tax_id (best when present), otherwise canonical_name. Resolves the easy 60%.</li>
+    <li><strong>Fuzzy match</strong> on name (Levenshtein, Jaro-Winkler, embedding similarity). Resolves another 25% with confidence.</li>
+    <li><strong>Customer-supplied mapping.</strong> The customer's procurement team often has an internal supplier master. Use it.</li>
+    <li><strong>Manual review.</strong> The hard residual goes to HITL or to the customer's data team.</li>
+  </ul>
+
+  <h3>The model</h3>
+  <p>Don't merge silently. Store raw extracted names + resolved canonical IDs, with confidence. If a merge turns out to be wrong, you can re-resolve without re-extracting.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>raw and resolved supplier names</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">supplier_name_resolutions (
+  raw_supplier_name,        -- what was in the document
+  resolved_supplier_id,     -- canonical
+  resolution_method,        -- exact_tax_id | fuzzy_name | customer_map | manual
+  confidence,
+  resolved_at,
+  resolved_by               -- model_version or analyst_id
+)</code></pre>
+  </div>
+</section>
+
+<section id="obligations">
+  <h2>Obligations &amp; renewals</h2>
+
+  <h3>The renewal query</h3>
+  <p>"What's renewing in the next 90 days?" — the single most-asked question in contract intelligence.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>renewals_in_window</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  a.agreement_id,
+  a.supplier_id,
+  s.canonical_name,
+  a.current_term_end,
+  a.current_term_end - CURRENT_DATE AS days_until_renewal,
+  -- Find the renewal-clause obligation
+  o.value AS renewal_notice_days,
+  a.current_term_end - INTERVAL '1 day' * COALESCE(o.value::INT, 60) AS notice_deadline
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+LEFT JOIN obligations o
+  ON o.agreement_id = a.agreement_id
+ AND o.obligation_type = 'renewal_notice'
+WHERE a.status = 'active'
+  AND a.current_term_end BETWEEN CURRENT_DATE
+                              AND CURRENT_DATE + INTERVAL '90 days'
+ORDER BY days_until_renewal;</code></pre>
+  </div>
+
+  <p>The senior touch: <code>notice_deadline</code> (when the customer has to give renewal notice) is often more actionable than the renewal date itself. Customers who miss the notice window are locked in for another term.</p>
+
+  <h3>The auto-renew trap</h3>
+  <p>Many agreements auto-renew unless cancelled. Your data model needs to capture:</p>
+  <ul>
+    <li>Auto-renew yes/no</li>
+    <li>Renewal term length (often differs from initial term)</li>
+    <li>Notice period required to cancel</li>
+    <li>Whether notice has been given (often manually tracked elsewhere)</li>
+  </ul>
+</section>
+
+<section id="spend">
+  <h2>Spend rollups</h2>
+  <p>"How much are we spending with Supplier X?" sounds simple. It is not.</p>
+
+  <h3>The traps</h3>
+  <ul>
+    <li><strong>Supplier hierarchy.</strong> Roll up subsidiaries to the parent or not? Depends on the customer's procurement org.</li>
+    <li><strong>Currency.</strong> Multi-currency totals require FX rates at a specific date. Which date? Invoice date? Accrual date?</li>
+    <li><strong>Time alignment.</strong> Fiscal year vs calendar year. Customer's fiscal year might end in July.</li>
+    <li><strong>Off-contract spend.</strong> Spend on a supplier without a corresponding agreement — often the most interesting line item.</li>
+    <li><strong>Pass-through vs primary.</strong> A staffing agency invoices for contractors; is that "spend with the staffing agency" or "spend on contractor labor"?</li>
+  </ul>
+
+  <h3>The spend-by-supplier query</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>spend_with_parent_rollup</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH supplier_hierarchy AS (
+  -- Recursive: find the root parent for each supplier
+  SELECT supplier_id, supplier_id AS root_id FROM suppliers WHERE parent_supplier_id IS NULL
+  UNION ALL
+  SELECT s.supplier_id, h.root_id
+  FROM suppliers s JOIN supplier_hierarchy h ON s.parent_supplier_id = h.supplier_id
+),
+spend_in_fy AS (
+  SELECT
+    sp.supplier_id,
+    sp.amount * fx.rate_to_usd AS amount_usd
+  FROM spend sp
+  JOIN fx_rates fx
+    ON fx.from_currency = sp.currency
+   AND fx.rate_date = DATE_TRUNC('month', sp.accrued_at)
+  WHERE sp.accrued_at &gt;= '2025-07-01'  -- customer FY start
+    AND sp.accrued_at &lt;  '2026-07-01'
+)
+SELECT
+  parent.canonical_name AS parent_supplier,
+  SUM(sf.amount_usd) AS spend_usd_fy
+FROM spend_in_fy sf
+JOIN supplier_hierarchy h ON h.supplier_id = sf.supplier_id
+JOIN suppliers parent ON parent.supplier_id = h.root_id
+GROUP BY parent.canonical_name
+ORDER BY spend_usd_fy DESC;</code></pre>
+  </div>
+</section>
+
+<section id="queries">
+  <h2>SQL patterns you'll write a hundred times</h2>
+  <ul>
+    <li><strong>"Latest extraction per document"</strong> — partition by document_id, order by extracted_at desc, take rank=1.</li>
+    <li><strong>"Documents that should belong to an agreement but don't"</strong> — anti-join, useful for finding orphaned amendments.</li>
+    <li><strong>"Agreements without a parent MSA"</strong> — SOWs floating without a master.</li>
+    <li><strong>"Obligations missing required fields"</strong> — quality check.</li>
+    <li><strong>"Spend with no matching agreement"</strong> — off-contract spend, often the customer's biggest discovery.</li>
+    <li><strong>"Agreements expiring in next N days, segmented by notice-window status"</strong> — the renewal pipeline.</li>
+  </ul>
+
+  <p>Each of these is the kind of question a customer's procurement analyst will want to ask. Write them as dbt models with named columns; their analysts will reuse and extend them.</p>
+</section>
+
+<section id="fuzzy">
+  <h2>Fuzzy joins</h2>
+  <p>Joining contracts (with extracted supplier names) to the customer's existing supplier master (cleaner names) is fuzzy by nature.</p>
+
+  <h3>Approach</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>fuzzy_supplier_join (Postgres trigram)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Requires pg_trgm extension
+SELECT
+  e.raw_supplier_name,
+  s.canonical_name,
+  similarity(e.raw_supplier_name, s.canonical_name) AS sim
+FROM extracted_supplier_names e
+CROSS JOIN LATERAL (
+  SELECT canonical_name
+  FROM suppliers
+  ORDER BY canonical_name % e.raw_supplier_name
+  LIMIT 5
+) s
+WHERE similarity(e.raw_supplier_name, s.canonical_name) &gt; 0.65;</code></pre>
+  </div>
+
+  <p>At BigQuery / Snowflake scale, prefer pre-computed embeddings + vector similarity, or LLM-as-judge on a candidate set generated by trigram or n-gram.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal"><summary>Show probe 1: "Walk me through how you'd model contracts."</summary><div class="reveal-body">
+    <p>Six core entities: suppliers (with parent-supplier hierarchy), documents (physical files), agreements (logical contracts — multiple documents can roll up to one agreement), document-to-agreement links (M:N), obligations (extracted commitments per agreement, versioned by extraction), and spend (invoice/PO actuals, sometimes linked to agreements). Key decisions: keep document and agreement separate; canonicalize suppliers (don't merge silently); store raw and resolved supplier names so you can re-resolve without re-extracting.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 2: "Customer wants 'spend by supplier' rolled up to parent companies. Walk me through it."</summary><div class="reveal-body">
+    <p>Recursive CTE to find each supplier's root parent (handles multi-level subsidiary hierarchies). Convert all spend to a common currency at invoice/accrual date using an FX rate table. Aggregate spend by root parent within the customer's fiscal year (not calendar year). Watch the pass-through trap — staffing agency invoices need a separate categorization. Verify against customer's existing supplier master if they have one.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 3: "How do you handle 'same supplier with different names' across documents?"</summary><div class="reveal-body">
+    <p>Entity resolution layered. (1) Exact match on tax_id when present. (2) Fuzzy match on name — Levenshtein/Jaro-Winkler for short names, embedding similarity for longer ones. (3) Use customer's internal supplier master if available — they often have an authoritative one. (4) Manual review for the hard residual. Don't merge silently; store raw and resolved names with confidence, so you can re-resolve when you find a mistake.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 4: "What's the difference between renewal date and notice deadline?"</summary><div class="reveal-body">
+    <p>Renewal date is when the agreement renews. Notice deadline is when the customer has to formally cancel to prevent renewal — often 30–90 days before renewal. Customers who miss the notice window are locked in for another term. The notice deadline is the actionable date; the renewal date alone is too late to act on. Surface both, with notice deadline as the primary alert.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 5: "Off-contract spend — how would you compute it?"</summary><div class="reveal-body">
+    <p>Spend records that don't link to any active agreement at the time of the spend. (1) Get all spend in the period. (2) Left-join to agreements on supplier_id where the agreement was active at the spend date. (3) Anti-join — keep only spend with no matching agreement. (4) Sub-categorize: was it a supplier with no agreement at all, or a supplier with an expired agreement? The second is usually preventable; the first is more concerning. Customers often discover 15–30% of their spend is off-contract — that's the platform's headline ROI number.</p>
+  </div></details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

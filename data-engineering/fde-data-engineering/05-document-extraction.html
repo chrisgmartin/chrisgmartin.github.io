@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Document Extraction</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#stack">The extraction stack</a>
+    <a href="#ocr">OCR layer</a>
+    <a href="#layout">Layout-aware models</a>
+    <a href="#extraction">Field extraction</a>
+    <a href="#hitl">Human-in-the-loop</a>
+    <a href="#failure">Failure modes</a>
+    <a href="#fde-fit">Where the FDE fits</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-customer-embedding.html">← Previous</a>
+    <a href="06-pipelines-under-deployment.html">Next: Pipelines →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Data craft</span>
+  <h1>Document Extraction</h1>
+  <p class="subtitle">The technical stack that turns unstructured contracts, invoices, and POs into structured, queryable data. OCR, layout-aware models, field extraction, human-in-the-loop. What an FDE consumes vs what platform engineering owns.</p>
+</header>
+
+<section id="stack">
+  <h2>The extraction stack</h2>
+  <p>Document-AI platforms typically run a layered pipeline:</p>
+  <ol>
+    <li><strong>Pre-processing</strong> — file ingestion, format detection (PDF, DOCX, image), de-skewing, page splitting.</li>
+    <li><strong>OCR</strong> — for image-based PDFs and scans. Modern stacks use Tesseract, AWS Textract, Google Document AI, Azure Form Recognizer, or a homegrown model.</li>
+    <li><strong>Layout analysis</strong> — segment the document into regions (tables, paragraphs, headers, signature blocks). Layout-aware models (LayoutLM family, DocFormer, LiLT, or custom) consume both text and spatial features.</li>
+    <li><strong>Field extraction</strong> — pull specific values: party names, effective date, renewal terms, payment terms, jurisdiction, signatures. Either rule-based (for templated docs) or model-based (LLM + structured-output, or task-specific encoders).</li>
+    <li><strong>Normalization</strong> — map extracted strings to canonical entities (supplier dedup, currency normalization, date parsing).</li>
+    <li><strong>Validation + HITL</strong> — confidence scoring, threshold-based human review, feedback into next training round.</li>
+    <li><strong>Persistence</strong> — write the structured output to a database (Postgres, Snowflake, etc.) tied to the source document.</li>
+  </ol>
+  <p>As FDE-DE, you don't typically train these models. You consume their output, surface failure modes back to platform, and wire results into the customer's stack. But you need to be able to reason about each layer.</p>
+</section>
+
+<section id="ocr">
+  <h2>OCR layer</h2>
+  <p>The vocabulary worth knowing:</p>
+  <ul>
+    <li><strong>Native PDF</strong>: text is stored as actual characters. Parse with pdfminer / pdfplumber — no OCR needed.</li>
+    <li><strong>Image-based PDF / scan</strong>: text is rendered as pixels. Needs OCR. Quality varies wildly with scan resolution and skew.</li>
+    <li><strong>Mixed PDF</strong>: native text + scanned attachments. Process page-by-page.</li>
+    <li><strong>Word docs / RTF</strong>: easy to parse but layout fidelity isn't perfect.</li>
+  </ul>
+
+  <h3>OCR failure modes</h3>
+  <ul>
+    <li>Multi-column layouts read in the wrong order — text comes out as gibberish.</li>
+    <li>Tables flatten — column structure lost.</li>
+    <li>Handwritten signatures or annotations confuse the model.</li>
+    <li>Rotated pages produce garbage.</li>
+    <li>Watermarks bleed into text.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The OCR-quality preflight</span>
+    <p>Before promising extraction quality to a customer, run an OCR-quality sample on 50–100 of their documents. Spot-check the output by eye. If 30% of their corpus is poorly scanned, your downstream extraction will inherit that error and you need to know on day one, not month two.</p>
+  </div>
+</section>
+
+<section id="layout">
+  <h2>Layout-aware models</h2>
+  <p>Modern document extraction uses models that jointly process text and spatial position — where words appear on the page, not just what they say. LayoutLM (Microsoft), LayoutLMv3, DocFormer, LiLT are the well-known family.</p>
+  <p>Why it matters: in a contract, the word "30 days" means different things if it's in the "payment terms" section vs the "termination notice" section. Pure text models can't distinguish; layout-aware models can.</p>
+  <p>For an FDE, the practical implication is: <strong>document classes that are visually consistent (same layout across many docs) extract well; visually idiosyncratic docs do not</strong>. The first thing to know about a new customer is how visually varied their corpus is.</p>
+</section>
+
+<section id="extraction">
+  <h2>Field extraction</h2>
+  <p>Two patterns:</p>
+
+  <h3>Rule-based extraction</h3>
+  <p>Regex + pattern templates. Fast, deterministic, easy to debug. Works on templated documents. Brittle when layouts shift.</p>
+
+  <h3>Model-based extraction</h3>
+  <p>Either a task-specific encoder (fine-tuned for "extract effective date") or a general LLM with structured-output prompting. More robust to variance, slower, harder to debug. The norm for non-templated corpora.</p>
+
+  <h3>The hybrid play</h3>
+  <p>Most production stacks use both: rules for high-confidence, easy-pattern fields (signed date often appears in a predictable location); models for harder fields (renewal terms, indemnification clauses); HITL when neither is confident enough.</p>
+
+  <h3>Output schema</h3>
+  <p>The extraction output should be:</p>
+  <ul>
+    <li><strong>Structured</strong> — JSON or row-level records with explicit field names.</li>
+    <li><strong>Provenance-stamped</strong> — every extracted value carries which document, which page, which coordinates it came from. Auditability matters.</li>
+    <li><strong>Confidence-scored</strong> — every field has a model-confidence score that downstream pipelines can threshold on.</li>
+    <li><strong>Versioned</strong> — which model version produced this output, in case you need to reprocess.</li>
+  </ul>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>example extraction output</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-json">{
+  "document_id": "msa-acme-2024-038.pdf",
+  "doc_class": "master_service_agreement",
+  "extracted_at": "2026-05-26T14:32:01Z",
+  "model_version": "extract-v4.2.1",
+  "fields": {
+    "parties": {
+      "value": ["Acme Corp", "Customer Inc"],
+      "confidence": 0.97,
+      "provenance": {"page": 1, "bbox": [120, 240, 480, 280]}
+    },
+    "effective_date": {
+      "value": "2024-03-15",
+      "confidence": 0.94,
+      "provenance": {"page": 1, "bbox": [120, 310, 290, 330]}
+    },
+    "renewal_term": {
+      "value": "auto-renew, 12 months, 60 days notice",
+      "confidence": 0.62,
+      "provenance": {"page": 8, "bbox": [80, 540, 520, 615]},
+      "review_status": "pending_human"
+    }
+  }
+}</code></pre>
+  </div>
+</section>
+
+<section id="hitl">
+  <h2>Human-in-the-loop</h2>
+  <p>The differentiator for SLA-backed platforms. Confidence-thresholded extractions go to human reviewers (often labeled "analysts") who either confirm, correct, or flag.</p>
+
+  <h3>What HITL solves</h3>
+  <ul>
+    <li>Low-confidence model outputs become high-confidence labeled data.</li>
+    <li>Customer-visible accuracy stays above SLA even when the model is wrong.</li>
+    <li>Reviewer corrections become training signal for the next model.</li>
+  </ul>
+
+  <h3>What FDE-DE needs to know</h3>
+  <ul>
+    <li>The HITL queue is a real piece of infrastructure with capacity constraints. Pushing too many docs to review breaks the queue.</li>
+    <li>Inter-rater agreement on borderline fields can be 70–85%. Calibrate the customer's expectations.</li>
+    <li>Some customers can't tolerate HITL — they have data sensitivity that prohibits external review. The platform either has on-prem reviewers, customer-side reviewers, or doesn't sell to them.</li>
+  </ul>
+</section>
+
+<section id="failure">
+  <h2>Failure modes you'll diagnose</h2>
+  <ul>
+    <li><strong>OCR quality below threshold</strong> — customer's scans are poor; extraction is downstream-noisy. Diagnose with a quality sample; talk to customer about re-scanning or relax SLA.</li>
+    <li><strong>Layout class regression</strong> — extraction quality drops on a specific document class because the platform model was updated. File platform bug; deploy temporary HITL workaround.</li>
+    <li><strong>Schema variance</strong> — customer's documents from 2008 use different terminology than 2024 documents. Talk to customer's procurement team; expand the prompt/model coverage.</li>
+    <li><strong>Confidence-score drift</strong> — model is more confident than it should be on a certain field type. Recalibrate threshold; surface to platform.</li>
+    <li><strong>Provenance mismatch</strong> — extracted value's bounding box doesn't match the source text on the page. Usually an OCR-segmentation issue. File bug; check if rotated pages or multi-column layout.</li>
+  </ul>
+</section>
+
+<section id="fde-fit">
+  <h2>Where the FDE fits in the extraction stack</h2>
+  <p>You don't train models. You're not building the OCR. You don't ship LayoutLM v2.</p>
+  <p>What you do own:</p>
+  <ul>
+    <li>Decide which customer document classes get extraction and in what order.</li>
+    <li>Configure extraction templates / prompts / rules for the customer's specific patterns.</li>
+    <li>Wire extraction output into the customer's data layer.</li>
+    <li>Operate the HITL queue against the customer's deadline.</li>
+    <li>Surface failure modes to platform with customer-evidence write-ups.</li>
+    <li>Set expectations with the customer about what's achievable when.</li>
+  </ul>
+  <p>The interview implication: you should be able to <strong>narrate the stack credibly</strong> without claiming you'd train the model yourself. The bar is "I understand how this works, I know what's hard, I can debug a failure, I know what to escalate vs fix locally."</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal"><summary>Show probe 1: "Walk me through what happens when a contract enters the platform."</summary><div class="reveal-body">
+    <p>Seven stages: pre-processing (format detection, de-skew, page split), OCR (if image-based), layout analysis (segment into regions), field extraction (rules + models, hybrid), normalization (entity resolution, date parsing), validation + HITL (confidence-threshold review queue), persistence (structured output with provenance). Each layer produces input for the next; failures at any layer cascade.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 2: "Extraction quality on a customer's supplier contracts is below SLA. What do you do?"</summary><div class="reveal-body">
+    <p>Diagnose first. (1) Sample 20 failures and look by eye — is it OCR (text garbled), layout (regions wrong), or field-level (text is fine but the model picked the wrong span)? (2) If OCR, check scan quality; might need rescanning or reduced SLA on this class. (3) If layout, check whether their docs look visually different from the model's training distribution. (4) If field-level, check whether confidence scores are misleading — recalibrate threshold or expand HITL. (5) Once diagnosed, file platform bug with evidence and ship a temporary HITL workaround to stay above SLA while platform iterates.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 3: "Why provenance on extraction output?"</summary><div class="reveal-body">
+    <p>Three reasons. (1) Auditability — when a customer disputes an extracted value, you need to point at the source page/coordinates. (2) Debugging — when extraction is wrong, knowing which region the model looked at tells you whether it's a layout problem or a field problem. (3) Re-extraction — when you ship a model update, you can re-process only documents where confidence was low or where the previous extraction's bounding box looks suspicious, instead of reprocessing everything.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 4: "When would you NOT use HITL?"</summary><div class="reveal-body">
+    <p>Three cases. (1) Customer data sensitivity prohibits external review (some regulated industries). (2) The document class has high enough model confidence that HITL would only review false alarms — wasteful. (3) The SLA doesn't require it — internal/research use cases sometimes tolerate higher error rates. In sensitive cases, alternatives are on-prem reviewers, customer-side reviewers, or auto-only with lower SLA.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 5: "How would you check if a customer's corpus is going to extract well?"</summary><div class="reveal-body">
+    <p>Pre-deployment quality sample. (1) Pull 50–100 representative documents covering the customer's claimed format mix. (2) Run them through OCR alone and spot-check by eye — does the text come out readable? (3) Run extraction and compare output against your manual reading of the same documents on a 20-doc subset. (4) Quantify: what percent of fields extract cleanly, what percent need HITL, what percent fail entirely? (5) Calibrate the customer's expectations before signing the SLA, not after.</p>
+  </div></details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

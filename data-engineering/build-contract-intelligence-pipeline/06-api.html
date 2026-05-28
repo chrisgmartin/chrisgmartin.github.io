@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Exposure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What we're building</a>
+    <a href="#app">FastAPI app</a>
+    <a href="#schemas">Response schemas</a>
+    <a href="#endpoints">Endpoints</a>
+    <a href="#run">Run it</a>
+    <a href="#verify">Verify</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-eval-harness.html">← Previous</a>
+    <a href="07-next-steps.html">Next: Extensions →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Hands-on · ~25 min</span>
+  <h1>API Exposure</h1>
+  <p class="subtitle">FastAPI endpoints over the extracted data: list agreements, fetch one with obligations, search by supplier. The shape a customer's BI / app would call.</p>
+</header>
+
+<section id="goal">
+  <h2>What we're building</h2>
+  <p>A small REST API:</p>
+  <ul>
+    <li><code>GET /agreements</code> — list, with filter by supplier or term_end.</li>
+    <li><code>GET /agreements/{id}</code> — full record, including linked documents.</li>
+    <li><code>GET /suppliers</code> — list.</li>
+    <li><code>GET /renewals/upcoming</code> — agreements with upcoming renewals.</li>
+  </ul>
+  <p>No auth, no pagination beyond limit. Production would add both; for the build-along we keep it minimal.</p>
+</section>
+
+<section id="app">
+  <h2>FastAPI app</h2>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/api.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from datetime import date, timedelta
+from typing import Annotated
+from fastapi import FastAPI, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ci.db import SessionLocal
+from ci.models import Agreement, Supplier, Document, DocumentAgreementLink, Extraction
+from ci.api_schemas import AgreementOut, AgreementDetail, SupplierOut, RenewalOut
+
+
+app = FastAPI(title="Contract Intelligence API")
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}</code></pre>
+  </div>
+</section>
+
+<section id="schemas">
+  <h2>Response schemas</h2>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/api_schemas.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from datetime import date
+from pydantic import BaseModel
+
+
+class SupplierOut(BaseModel):
+    supplier_id: str
+    canonical_name: str
+    country: str | None = None
+
+
+class AgreementOut(BaseModel):
+    agreement_id: str
+    supplier: SupplierOut
+    agreement_type: str
+    effective_date: date | None
+    current_term_end: date | None
+    status: str
+
+
+class DocumentOut(BaseModel):
+    document_id: str
+    doc_class: str
+    page_count: int
+    role: str  # master | amendment | sow | exhibit
+
+
+class AgreementDetail(AgreementOut):
+    documents: list[DocumentOut] = []
+    extracted_fields: dict | None = None
+
+
+class RenewalOut(AgreementOut):
+    days_until_renewal: int</code></pre>
+  </div>
+</section>
+
+<section id="endpoints">
+  <h2>Endpoints</h2>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/api.py — endpoints</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from fastapi import Depends
+
+
+@app.get("/suppliers", response_model=list[SupplierOut])
+def list_suppliers(db: Session = Depends(get_db),
+                   limit: int = Query(100, le=1000)):
+    rows = db.execute(select(Supplier).limit(limit)).scalars().all()
+    return [SupplierOut(supplier_id=r.supplier_id,
+                        canonical_name=r.canonical_name,
+                        country=r.country) for r in rows]
+
+
+@app.get("/agreements", response_model=list[AgreementOut])
+def list_agreements(
+    db: Session = Depends(get_db),
+    supplier_id: str | None = Query(None),
+    status: str | None = Query(None),
+    limit: int = Query(100, le=1000),
+):
+    q = select(Agreement, Supplier).join(Supplier, Supplier.supplier_id == Agreement.supplier_id)
+    if supplier_id:
+        q = q.where(Agreement.supplier_id == supplier_id)
+    if status:
+        q = q.where(Agreement.status == status)
+    q = q.limit(limit)
+    rows = db.execute(q).all()
+    return [
+        AgreementOut(
+            agreement_id=a.agreement_id,
+            supplier=SupplierOut(supplier_id=s.supplier_id, canonical_name=s.canonical_name, country=s.country),
+            agreement_type=a.agreement_type,
+            effective_date=a.effective_date,
+            current_term_end=a.current_term_end,
+            status=a.status,
+        )
+        for a, s in rows
+    ]
+
+
+@app.get("/agreements/{agreement_id}", response_model=AgreementDetail)
+def get_agreement(agreement_id: str, db: Session = Depends(get_db)):
+    row = db.execute(
+        select(Agreement, Supplier)
+        .join(Supplier, Supplier.supplier_id == Agreement.supplier_id)
+        .where(Agreement.agreement_id == agreement_id)
+    ).first()
+    if not row:
+        raise HTTPException(404, "Agreement not found")
+    a, s = row
+
+    docs = db.execute(
+        select(Document, DocumentAgreementLink.role)
+        .join(DocumentAgreementLink, DocumentAgreementLink.document_id == Document.document_id)
+        .where(DocumentAgreementLink.agreement_id == agreement_id)
+    ).all()
+    doc_outs = [DocumentOut(document_id=d.document_id, doc_class=d.doc_class,
+                            page_count=d.page_count, role=role)
+                for d, role in docs]
+
+    # Pull the master document's extraction
+    master_doc = next((d for d, r in docs if r == "master"), None)
+    extracted_fields = None
+    if master_doc:
+        ext = db.execute(
+            select(Extraction).where(Extraction.document_id == master_doc.document_id)
+            .order_by(Extraction.extracted_at.desc())
+        ).scalar_one_or_none()
+        if ext:
+            extracted_fields = ext.fields
+
+    return AgreementDetail(
+        agreement_id=a.agreement_id,
+        supplier=SupplierOut(supplier_id=s.supplier_id, canonical_name=s.canonical_name, country=s.country),
+        agreement_type=a.agreement_type,
+        effective_date=a.effective_date,
+        current_term_end=a.current_term_end,
+        status=a.status,
+        documents=doc_outs,
+        extracted_fields=extracted_fields,
+    )
+
+
+@app.get("/renewals/upcoming", response_model=list[RenewalOut])
+def upcoming_renewals(
+    db: Session = Depends(get_db),
+    days: int = Query(90, le=365),
+):
+    cutoff = date.today() + timedelta(days=days)
+    rows = db.execute(
+        select(Agreement, Supplier)
+        .join(Supplier, Supplier.supplier_id == Agreement.supplier_id)
+        .where(Agreement.status == "active")
+        .where(Agreement.current_term_end &lt;= cutoff)
+        .where(Agreement.current_term_end &gt;= date.today())
+        .order_by(Agreement.current_term_end)
+    ).all()
+    return [
+        RenewalOut(
+            agreement_id=a.agreement_id,
+            supplier=SupplierOut(supplier_id=s.supplier_id, canonical_name=s.canonical_name, country=s.country),
+            agreement_type=a.agreement_type,
+            effective_date=a.effective_date,
+            current_term_end=a.current_term_end,
+            status=a.status,
+            days_until_renewal=(a.current_term_end - date.today()).days,
+        )
+        for a, s in rows
+    ]</code></pre>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Run it</h2>
+  <div class="code-wrap">
+<pre><code class="language-bash">uvicorn ci.api:app --reload --port 8000</code></pre>
+  </div>
+
+  <p>Open <code>http://localhost:8000/docs</code> — FastAPI's auto-generated Swagger UI. You can hit every endpoint from the browser.</p>
+</section>
+
+<section id="verify">
+  <h2>Verify</h2>
+  <div class="code-wrap">
+<pre><code class="language-bash">curl http://localhost:8000/suppliers | jq
+curl http://localhost:8000/agreements | jq
+curl http://localhost:8000/renewals/upcoming?days=180 | jq
+
+# Pick an agreement_id from the list:
+curl http://localhost:8000/agreements/agr_demo_abc123 | jq</code></pre>
+  </div>
+
+  <p>You should see:</p>
+  <ul>
+    <li>Suppliers populated with the canonical names extracted in chapter 04.</li>
+    <li>Agreements with their effective_date and current_term_end.</li>
+    <li>Per-agreement detail including linked documents and extracted fields with confidence + provenance.</li>
+    <li>Renewals filtered to the window you specify.</li>
+  </ul>
+
+  <h3>Test</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>tests/test_api.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from fastapi.testclient import TestClient
+from ci.api import app
+
+
+def test_healthz():
+    client = TestClient(app)
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+def test_list_agreements_empty():
+    client = TestClient(app)
+    resp = client.get("/agreements?limit=10")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)</code></pre>
+  </div>
+
+  <p>Run <code>pytest tests/test_api.py -v</code>. With a populated database, you can extend tests to verify specific records.</p>
+
+  <p>The pipeline is now complete end-to-end: PDFs → documents → extractions → agreements → API.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

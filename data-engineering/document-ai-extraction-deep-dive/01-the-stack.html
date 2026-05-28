@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Extraction Stack</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#layers">The seven layers</a>
+    <a href="#preprocessing">1 · Preprocessing</a>
+    <a href="#ocr">2 · OCR</a>
+    <a href="#layout">3 · Layout analysis</a>
+    <a href="#extraction">4 · Field extraction</a>
+    <a href="#normalization">5 · Normalization</a>
+    <a href="#validation">6 · Validation &amp; HITL</a>
+    <a href="#persistence">7 · Persistence</a>
+    <a href="#compounding">How errors compound</a>
+    <a href="#ownership">Who owns each layer</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-ocr-layer.html">Next: OCR →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · The stack</span>
+  <h1>The Extraction Stack</h1>
+  <p class="subtitle">Seven layers from raw file to structured row. What each does, how errors compound across layers, and who owns each piece in practice.</p>
+</header>
+
+<section id="layers">
+  <h2>The seven layers</h2>
+  <p>Production document-extraction systems separate concerns into discrete layers because each one has different failure modes, different scale characteristics, and different teams who own it. Knowing the boundaries lets you diagnose efficiently — when extraction is wrong, you can usually narrow the root cause to one layer.</p>
+  <table>
+    <thead><tr><th>#</th><th>Layer</th><th>Input</th><th>Output</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Preprocessing</td><td>Raw file (PDF, DOCX, image)</td><td>Cleaned pages + metadata</td></tr>
+      <tr><td>2</td><td>OCR</td><td>Cleaned pages</td><td>Text + spatial positions</td></tr>
+      <tr><td>3</td><td>Layout analysis</td><td>Text + positions</td><td>Page regions (table, paragraph, header, signature)</td></tr>
+      <tr><td>4</td><td>Field extraction</td><td>Regions + text</td><td>Structured field values + confidence</td></tr>
+      <tr><td>5</td><td>Normalization</td><td>Raw extracted values</td><td>Canonical values (entity-resolved, typed, units-converted)</td></tr>
+      <tr><td>6</td><td>Validation &amp; HITL</td><td>Normalized values + confidence</td><td>Reviewer-confirmed or auto-approved values</td></tr>
+      <tr><td>7</td><td>Persistence</td><td>Confirmed values</td><td>Rows in operational store + provenance</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="preprocessing">
+  <h2>1. Preprocessing</h2>
+  <p>The unglamorous first layer. What it does:</p>
+  <ul>
+    <li><strong>Format detection.</strong> PDF (native text vs image-based), DOCX, RTF, image (PNG/JPEG/TIFF). Picks the route through the next layer.</li>
+    <li><strong>Page splitting.</strong> Multi-page documents → per-page processing. Lets layers downstream parallelize.</li>
+    <li><strong>De-skewing &amp; rotation correction.</strong> Scanned documents often arrive slightly rotated; OCR engines struggle past ~3° skew.</li>
+    <li><strong>Denoising.</strong> Remove speckle, watermark bleed-through, scan artifacts.</li>
+    <li><strong>Resolution normalization.</strong> Upsample low-DPI scans before OCR.</li>
+  </ul>
+  <p>For native PDFs, preprocessing often collapses to "extract embedded text directly with pdfplumber/pdfminer; skip OCR." Knowing which route a document takes is the most important preprocessing decision.</p>
+</section>
+
+<section id="ocr">
+  <h2>2. OCR</h2>
+  <p>Optical Character Recognition: pixels → text. The major options today:</p>
+  <ul>
+    <li><strong>Cloud OCR services</strong>: AWS Textract, Google Document AI, Azure Document Intelligence (formerly Form Recognizer). Generally excellent. The Form-Recognizer flavor of Document Intelligence and Textract have layout-aware variants that produce structured output, not just flat text.</li>
+    <li><strong>Open-source</strong>: Tesseract (battle-tested, sometimes inferior on complex layouts), PaddleOCR (better on Asian languages, layout-aware variant).</li>
+    <li><strong>Specialty</strong>: ABBYY (legacy, still strong on print quality), Mathpix (math/equations), Nougat (academic papers).</li>
+  </ul>
+  <p>Output is typically per-word with bounding boxes — every recognized word carries its (x, y, width, height) coordinates on the page. Downstream layers depend on those coordinates.</p>
+  <p>Covered in depth in <a href="02-ocr-layer.html">chapter 02</a>.</p>
+</section>
+
+<section id="layout">
+  <h2>3. Layout analysis</h2>
+  <p>Given text with spatial positions, classify the page into regions: text paragraphs, tables, headers, footers, signature blocks, page numbers. This step is what makes "this number is in the 'Payment Terms' section" distinguishable from "this number is in the 'Termination Notice' section."</p>
+  <p>Two flavors:</p>
+  <ul>
+    <li><strong>Heuristic</strong>: rule-based on coordinates, font sizes, indentation. Works for simple, consistent layouts. Brittle.</li>
+    <li><strong>Model-based</strong>: LayoutLM family, LiLT, DocFormer. Train jointly on text + spatial features. Robust to layout variance.</li>
+  </ul>
+  <p>Cloud services (Textract, Document AI) ship strong layout analysis bundled with OCR. If you're building from scratch, this is the most valuable layer to use a managed service for.</p>
+  <p>Covered in <a href="03-layout-aware-models.html">chapter 03</a>.</p>
+</section>
+
+<section id="extraction">
+  <h2>4. Field extraction</h2>
+  <p>Given regions and text, extract specific field values: party names, effective date, renewal terms, indemnification clauses, payment amounts. The architectural choice here is the biggest single decision in the stack:</p>
+  <ul>
+    <li><strong>Rule-based</strong>: regex + pattern matching. Brittle, fast, debuggable.</li>
+    <li><strong>Task-specific encoders</strong>: fine-tuned BERT-class models per field. Mid-range complexity.</li>
+    <li><strong>LLM-based</strong>: Claude / GPT-4 / etc. with structured output prompts. Most flexible, most expensive, hardest to fully debug.</li>
+    <li><strong>Hybrid</strong>: rules for high-confidence fields, models for the rest. Production-default.</li>
+  </ul>
+  <p>Covered in <a href="04-field-extraction-patterns.html">chapter 04</a>.</p>
+</section>
+
+<section id="normalization">
+  <h2>5. Normalization</h2>
+  <p>Extracted values are messy. Normalization brings them to canonical form:</p>
+  <ul>
+    <li><strong>Dates</strong>: "March 15, 2024" / "03/15/2024" / "15-Mar-2024" → <code>2024-03-15</code>.</li>
+    <li><strong>Currency</strong>: "$1,234.50" / "USD 1234.50" / "$1.2K" → <code>{amount: 1234.50, currency: "USD"}</code>.</li>
+    <li><strong>Entity resolution</strong>: "Acme Corp" / "Acme Corporation" / "Acme Inc." → canonical supplier_id.</li>
+    <li><strong>Unit conversion</strong>: "30 days" / "1 month" / "thirty days" → <code>30 days</code> (or a canonical unit per field).</li>
+  </ul>
+  <p>Normalization failures are often invisible — they don't fail loudly, they produce subtly wrong canonical values. Good systems log raw + normalized so you can audit.</p>
+</section>
+
+<section id="validation">
+  <h2>6. Validation &amp; HITL</h2>
+  <p>Below a confidence threshold, route to a human reviewer queue. Reviewer either confirms, corrects, or escalates. The pieces:</p>
+  <ul>
+    <li><strong>Confidence calibration</strong> determines which extractions hit HITL.</li>
+    <li><strong>Queue infrastructure</strong> manages reviewer assignment, deadline tracking, capacity.</li>
+    <li><strong>Reviewer UI</strong> shows the source document, the extracted value, the proposed correction.</li>
+    <li><strong>Feedback loop</strong>: reviewer corrections become training signal for the next model version.</li>
+  </ul>
+  <p>HITL economics (chapter 07) determines where the threshold sits. Too low: queue overflows, customer-visible delays. Too high: low-confidence extractions land in customer output, accuracy slips.</p>
+</section>
+
+<section id="persistence">
+  <h2>7. Persistence</h2>
+  <p>Confirmed values are written to a structured store with full provenance — which document, which page, which bounding box, which model version, which reviewer. The persistence layer is also the one that interfaces with the warehouse / API / downstream consumers.</p>
+  <p>Two structural patterns:</p>
+  <ul>
+    <li><strong>Wide-narrow</strong>: one row per (document, field, extraction_id). Easy to extend.</li>
+    <li><strong>Wide-wide</strong>: one row per document with typed columns per field. Faster to query; harder to evolve.</li>
+  </ul>
+  <p>Production-default: wide-narrow for ground truth + extraction records; wide marts on top via dbt for query convenience.</p>
+</section>
+
+<section id="compounding">
+  <h2>How errors compound</h2>
+  <p>The reason the layered model matters: <strong>errors at any layer cascade downward</strong>. An OCR mistake at layer 2 becomes a wrong extraction at layer 4 becomes a wrong normalization at layer 5 becomes a wrong row at layer 7.</p>
+  <p>Concrete examples:</p>
+  <ul>
+    <li>OCR misreads "12-month" as "1-month" → field-extraction returns the wrong term → renewal-alert pipeline fires 11 months early.</li>
+    <li>Layout analysis treats a signature block as a paragraph → field-extraction extracts "John Smith" as a party name → supplier resolution creates a phantom supplier.</li>
+    <li>Field extraction misses the contingency clause → normalization has nothing to normalize → contract risk surfacing fails silently.</li>
+  </ul>
+  <p>The diagnostic implication: <strong>when extraction looks wrong, walk down through the layers</strong>. Start at layer 2 (is OCR clean?). Then layer 3 (is the right region identified?). Then layer 4 (is the model picking the right span?). And so on.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The cascade rule of thumb</span>
+    <p>An n% error rate at each of seven layers compounds to roughly (1 − 0.99⁷) ≈ 7% error rate end-to-end even when each layer is 99% accurate. Real systems have layers with 90–95% per-layer accuracy. Compounding is why SLA-backed accuracy at 95% is engineering-hard.</p>
+  </div>
+</section>
+
+<section id="ownership">
+  <h2>Who owns each layer in practice</h2>
+  <p>At a document-AI platform, the ownership map typically looks like:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Owner</th></tr></thead>
+    <tbody>
+      <tr><td>1. Preprocessing</td><td>Platform engineering</td></tr>
+      <tr><td>2. OCR</td><td>Platform ML / vendor</td></tr>
+      <tr><td>3. Layout analysis</td><td>Platform ML</td></tr>
+      <tr><td>4. Field extraction</td><td>Platform ML (the model), FDE (the prompt config per customer)</td></tr>
+      <tr><td>5. Normalization</td><td>Platform engineering + FDE (customer-specific rules)</td></tr>
+      <tr><td>6. Validation &amp; HITL</td><td>Reviewer ops + FDE (threshold tuning)</td></tr>
+      <tr><td>7. Persistence</td><td>Platform engineering + FDE (schema choices)</td></tr>
+    </tbody>
+  </table>
+  <p>For an FDE: layers 4, 5, 6, 7 are your daily territory. Layers 1, 2, 3 are usually managed services or platform team work; you consume their output and file bugs against them.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

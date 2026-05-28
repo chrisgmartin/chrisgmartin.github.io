@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Persistence: The Contract Data Model</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What we're building</a>
+    <a href="#models">SQLAlchemy models</a>
+    <a href="#migration">Migration</a>
+    <a href="#persist">Persist extractions</a>
+    <a href="#agreements">Create agreements</a>
+    <a href="#cli">CLI</a>
+    <a href="#verify">Verify</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-extraction.html">← Previous</a>
+    <a href="05-eval-harness.html">Next: Eval harness →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Hands-on · ~30 min</span>
+  <h1>Persistence: The Contract Data Model</h1>
+  <p class="subtitle">Extend the schema with suppliers, agreements, extractions tables. Upsert extraction results idempotently per (document_id, model_version). Create agreements from MSA extractions.</p>
+</header>
+
+<section id="goal">
+  <h2>What we're building</h2>
+  <ul>
+    <li>Suppliers, agreements, extractions tables in Postgres.</li>
+    <li>A function that takes an MSA extraction and writes it to the DB.</li>
+    <li>Supplier creation / lookup based on extracted party names.</li>
+    <li>Idempotency: re-extracting with the same model_version updates rather than duplicates.</li>
+  </ul>
+</section>
+
+<section id="models">
+  <h2>SQLAlchemy models</h2>
+  <p>Extend <code>src/ci/models.py</code>.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/models.py — additions</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import uuid
+from datetime import date, datetime
+from sqlalchemy import String, Integer, DateTime, Date, Float, ForeignKey, UniqueConstraint, JSON
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+
+class Supplier(Base):
+    __tablename__ = "suppliers"
+    __table_args__ = (UniqueConstraint("customer_id", "canonical_name"),)
+
+    supplier_id: Mapped[str] = mapped_column(String, primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    canonical_name: Mapped[str] = mapped_column(String, nullable=False)
+    parent_supplier_id: Mapped[str | None] = mapped_column(ForeignKey("suppliers.supplier_id"), nullable=True)
+    country: Mapped[str | None] = mapped_column(String, nullable=True)
+    tax_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    industry: Mapped[str | None] = mapped_column(String, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Agreement(Base):
+    __tablename__ = "agreements"
+
+    agreement_id: Mapped[str] = mapped_column(String, primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.supplier_id"), nullable=False)
+    agreement_type: Mapped[str] = mapped_column(String, nullable=False)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    current_term_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    parent_agreement_id: Mapped[str | None] = mapped_column(ForeignKey("agreements.agreement_id"), nullable=True)
+    status: Mapped[str] = mapped_column(String, default="active", nullable=False)
+    status_changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Extraction(Base):
+    __tablename__ = "extractions"
+    __table_args__ = (UniqueConstraint("document_id", "model_version"),)
+
+    extraction_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.document_id"), nullable=False, index=True)
+    customer_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    model_version: Mapped[str] = mapped_column(String, nullable=False)
+    pipeline_version: Mapped[str] = mapped_column(String, nullable=False)
+    fields: Mapped[dict] = mapped_column(JSON, nullable=False)
+    qa: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    extracted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class DocumentAgreementLink(Base):
+    __tablename__ = "document_agreement_links"
+
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.document_id"), primary_key=True)
+    agreement_id: Mapped[str] = mapped_column(ForeignKey("agreements.agreement_id"), primary_key=True)
+    role: Mapped[str] = mapped_column(String, nullable=False)</code></pre>
+  </div>
+</section>
+
+<section id="migration">
+  <h2>Migration</h2>
+  <div class="code-wrap">
+<pre><code class="language-bash">alembic revision --autogenerate -m "suppliers, agreements, extractions"
+alembic upgrade head
+
+docker compose exec postgres psql -U ci -d contract_intel \
+  -c "\dt"</code></pre>
+  </div>
+  <p>Verify all five tables exist: documents, suppliers, agreements, extractions, document_agreement_links.</p>
+</section>
+
+<section id="persist">
+  <h2>Persist extractions</h2>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/persistence.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import uuid
+from datetime import datetime
+
+from ci.config import settings
+from ci.db import db_session
+from ci.models import Extraction
+from ci.extraction.schemas import MSAExtraction
+
+
+def persist_extraction(
+    document_id: str,
+    extraction: MSAExtraction,
+    text_source: str,  # 'native' or 'ocr'
+) -&gt; str:
+    """Upsert the extraction record. Idempotent per (document_id, model_version)."""
+    extraction_id = f"ext_{document_id}_{settings.extraction_model}"
+
+    with db_session() as s:
+        existing = s.get(Extraction, extraction_id)
+        fields_json = extraction.model_dump(mode="json")
+        qa = {"text_source": text_source}
+        if existing:
+            existing.fields = fields_json
+            existing.qa = qa
+            existing.extracted_at = datetime.utcnow()
+        else:
+            s.add(Extraction(
+                extraction_id=extraction_id,
+                document_id=document_id,
+                customer_id=settings.customer_id,
+                model_version=settings.extraction_model,
+                pipeline_version=settings.pipeline_version,
+                fields=fields_json,
+                qa=qa,
+            ))
+    return extraction_id</code></pre>
+  </div>
+</section>
+
+<section id="agreements">
+  <h2>Create agreements</h2>
+  <p>From an MSA extraction, create or update the corresponding agreement and link the document.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/persistence.py — additions</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from datetime import date, timedelta
+from sqlalchemy import select
+
+from ci.models import Supplier, Agreement, DocumentAgreementLink
+
+
+def normalize_supplier_name(name: str) -&gt; str:
+    s = " ".join(name.split())
+    for suffix in (", Inc.", " Inc.", ", LLC", " LLC", ", Ltd", " Ltd", " Corp.", ", Corp."):
+        if s.lower().endswith(suffix.lower()):
+            s = s[:-len(suffix)].strip()
+            break
+    return s
+
+
+def get_or_create_supplier(session, customer_id: str, raw_name: str) -&gt; str:
+    canonical = normalize_supplier_name(raw_name)
+    existing = session.scalar(
+        select(Supplier)
+        .where(Supplier.customer_id == customer_id, Supplier.canonical_name == canonical)
+    )
+    if existing:
+        return existing.supplier_id
+    supplier_id = f"sup_{customer_id[:8]}_{uuid.uuid4().hex[:12]}"
+    session.add(Supplier(
+        supplier_id=supplier_id,
+        customer_id=customer_id,
+        canonical_name=canonical,
+    ))
+    return supplier_id
+
+
+def create_agreement_from_extraction(
+    document_id: str,
+    extraction: MSAExtraction,
+    customer_party_index: int = 1,  # which entry in parties is the customer
+) -&gt; str:
+    """Create an agreement row from an MSA extraction. Idempotent by document_id."""
+    with db_session() as s:
+        # Skip if already linked
+        existing_link = s.execute(
+            select(DocumentAgreementLink)
+            .where(DocumentAgreementLink.document_id == document_id,
+                   DocumentAgreementLink.role == "master")
+        ).first()
+        if existing_link:
+            return existing_link[0].agreement_id
+
+        # Pick the supplier (the non-customer party)
+        if not extraction.parties or len(extraction.parties) &lt; 2:
+            raise ValueError(f"MSA {document_id} doesn't have ≥2 parties")
+        supplier_raw = extraction.parties[1 - customer_party_index]
+        supplier_id = get_or_create_supplier(s, settings.customer_id, supplier_raw)
+
+        # Compute current_term_end
+        eff = extraction.effective_date.value
+        term_months = extraction.term_length_months.value
+        current_term_end = None
+        if eff and term_months:
+            try:
+                eff_date = date.fromisoformat(eff)
+                # Approximate: 30 days per month
+                current_term_end = eff_date + timedelta(days=int(term_months) * 30)
+            except (ValueError, TypeError):
+                pass
+
+        agreement_id = f"agr_{settings.customer_id[:8]}_{uuid.uuid4().hex[:12]}"
+        s.add(Agreement(
+            agreement_id=agreement_id,
+            customer_id=settings.customer_id,
+            supplier_id=supplier_id,
+            agreement_type="master_service_agreement",
+            effective_date=date.fromisoformat(eff) if eff else None,
+            current_term_end=current_term_end,
+            status="active",
+        ))
+        s.add(DocumentAgreementLink(
+            document_id=document_id,
+            agreement_id=agreement_id,
+            role="master",
+        ))
+    return agreement_id</code></pre>
+  </div>
+</section>
+
+<section id="cli">
+  <h2>CLI</h2>
+  <p>Add an end-to-end command: extract + persist + create agreement.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/cli.py — process command</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from ci.extraction import extract_document
+from ci.persistence import persist_extraction, create_agreement_from_extraction
+
+
+@app.command()
+def process(document_id: str | None = None) -&gt; None:
+    """Extract + persist + create agreement for one or all MSAs."""
+    with db_session() as s:
+        if document_id:
+            doc_ids = [document_id]
+        else:
+            doc_ids = list(s.scalars(
+                select(Document.document_id).where(Document.doc_class == "master_service_agreement")
+            ))
+
+    for doc_id in doc_ids:
+        try:
+            extraction = extract_document(doc_id)
+            ext_id = persist_extraction(doc_id, extraction, text_source="native")  # simplified
+            agreement_id = create_agreement_from_extraction(doc_id, extraction)
+            console.print(f"[green]✓[/green] {doc_id} → ext={ext_id}, agreement={agreement_id}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] {doc_id}: {e}")</code></pre>
+  </div>
+</section>
+
+<section id="verify">
+  <h2>Verify</h2>
+  <div class="code-wrap">
+<pre><code class="language-bash">ci process
+# Each MSA: extract, persist extraction, create supplier + agreement</code></pre>
+  </div>
+
+  <p>Check the database:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Suppliers
+SELECT supplier_id, canonical_name FROM suppliers;
+
+-- Agreements with their suppliers
+SELECT a.agreement_id, s.canonical_name AS supplier, a.effective_date, a.current_term_end
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id;
+
+-- Extraction confidence per field
+SELECT
+  document_id,
+  fields-&gt;'effective_date'-&gt;&gt;'value' AS effective_date,
+  fields-&gt;'effective_date'-&gt;&gt;'confidence' AS conf
+FROM extractions;</code></pre>
+  </div>
+
+  <p>You should see a complete view: documents → extractions → agreements → suppliers, all linked via foreign keys. Re-run <code>ci process</code> — no duplicates; extractions update in place.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

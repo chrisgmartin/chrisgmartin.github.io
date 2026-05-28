@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Failure Modes &amp; Debugging</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#protocol">The debugging protocol</a>
+    <a href="#ocr-failures">OCR-layer failures</a>
+    <a href="#layout-failures">Layout-layer failures</a>
+    <a href="#extraction-failures">Extraction-layer failures</a>
+    <a href="#normalization-failures">Normalization failures</a>
+    <a href="#hitl-failures">HITL-related failures</a>
+    <a href="#cross-layer">Cross-layer failures</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-drift-detection.html">← Previous</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Failure Modes &amp; Debugging</h1>
+  <p class="subtitle">The catalog of how extraction goes wrong in production, organized by layer. For each failure mode: symptom, root cause, diagnostic, fix. The debugging protocol when something feels off.</p>
+</header>
+
+<section id="protocol">
+  <h2>The debugging protocol</h2>
+  <p>When an extraction looks wrong, walk down through the layers in this order:</p>
+  <ol>
+    <li><strong>Is the OCR text correct?</strong> Look at the OCR output for the field's region. If garbled, the problem is OCR.</li>
+    <li><strong>Is the right region identified?</strong> If OCR is clean but the extractor pulled from the wrong section, the problem is layout.</li>
+    <li><strong>Is the model picking the right span?</strong> If layout is right but the model picked a wrong substring, the problem is extraction.</li>
+    <li><strong>Is normalization clobbering a correct value?</strong> If extraction is right but the canonical value is wrong, the problem is normalization.</li>
+    <li><strong>Did HITL miss this?</strong> If a low-confidence prediction was incorrectly auto-approved, the problem is calibration or threshold tuning.</li>
+  </ol>
+  <p>Walking the layers takes 10–15 minutes per failure. It's tempting to skip to "must be a model issue." Usually it's an earlier layer.</p>
+</section>
+
+<section id="ocr-failures">
+  <h2>OCR-layer failures</h2>
+
+  <h3>Multi-column reading order garbled</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted text is nonsensical even though the PDF looks fine in Acrobat.</li>
+    <li><strong>Root cause</strong>: OCR engine read columns row-by-row across columns instead of top-to-bottom within each.</li>
+    <li><strong>Diagnostic</strong>: compare OCR text to source PDF; look for "shuffled" sentences.</li>
+    <li><strong>Fix</strong>: switch OCR engine, change page-segmentation mode (Tesseract <code>--psm 1</code>), or use a layout-aware OCR service (Textract, Document AI Layout).</li>
+  </ul>
+
+  <h3>Table flattening</h3>
+  <ul>
+    <li><strong>Symptom</strong>: tabular data extracts as flat text; row/column structure is lost.</li>
+    <li><strong>Root cause</strong>: OCR engine doesn't detect tables, or table-detection is disabled.</li>
+    <li><strong>Diagnostic</strong>: look at the OCR output for any table on a page. Are cells structured?</li>
+    <li><strong>Fix</strong>: enable table extraction in the OCR service (Textract Analyze Document with Tables, Document AI Form). For complex tables, post-process with a layout-aware model.</li>
+  </ul>
+
+  <h3>Rotated pages</h3>
+  <ul>
+    <li><strong>Symptom</strong>: a specific page returns garbage; OCR confidence on that page is near zero.</li>
+    <li><strong>Root cause</strong>: page is rotated 90°/180°/270° and rotation detection failed.</li>
+    <li><strong>Diagnostic</strong>: open the PDF; visually check for rotation.</li>
+    <li><strong>Fix</strong>: add rotation-detection pre-processing (most OCR services have this; ensure it's enabled). For mass corpus issues, use deskew preprocessing libraries.</li>
+  </ul>
+
+  <h3>Watermark contamination</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extractions include "DRAFT" or "CONFIDENTIAL" tokens mixed with content.</li>
+    <li><strong>Root cause</strong>: OCR is reading semi-transparent watermarks as content.</li>
+    <li><strong>Diagnostic</strong>: check OCR text for known watermark strings.</li>
+    <li><strong>Fix</strong>: post-process OCR text to strip known watermarks. For severe cases, image-preprocess with HSV filtering before OCR.</li>
+  </ul>
+</section>
+
+<section id="layout-failures">
+  <h2>Layout-layer failures</h2>
+
+  <h3>Signature block read as paragraph</h3>
+  <ul>
+    <li><strong>Symptom</strong>: "John Smith" or "/s/ John Smith" appears as an extracted party name.</li>
+    <li><strong>Root cause</strong>: layout analysis didn't classify the signature block as such; the extractor treated the text as content.</li>
+    <li><strong>Diagnostic</strong>: check region classifications for the affected document.</li>
+    <li><strong>Fix</strong>: improve layout-aware model coverage (fine-tune on signature-block examples); add post-extraction validation that signature-page text isn't treated as content.</li>
+  </ul>
+
+  <h3>Header/footer pollution</h3>
+  <ul>
+    <li><strong>Symptom</strong>: page-number tokens or company-letterhead text appear in extracted fields.</li>
+    <li><strong>Root cause</strong>: layout analysis didn't identify recurring header/footer regions; they were treated as content.</li>
+    <li><strong>Diagnostic</strong>: look at the field's provenance — does the bbox fall in the header/footer region of the page?</li>
+    <li><strong>Fix</strong>: configure layout analysis to detect and exclude recurring headers/footers; add a heuristic filter on bbox position.</li>
+  </ul>
+
+  <h3>Wrong region selected</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extraction is from the wrong section — e.g., termination-notice value extracted as renewal-notice.</li>
+    <li><strong>Root cause</strong>: layout identified the regions correctly but the extractor picked the wrong one (often because it lacked semantic context).</li>
+    <li><strong>Diagnostic</strong>: check provenance bbox; is it in the right section of the document?</li>
+    <li><strong>Fix</strong>: add region-classification step before extraction; tighten the extraction prompt to specify which region to look at.</li>
+  </ul>
+</section>
+
+<section id="extraction-failures">
+  <h2>Extraction-layer failures</h2>
+
+  <h3>Hallucination</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted value isn't in the source document at all.</li>
+    <li><strong>Root cause</strong>: LLM filled in a plausible-sounding value rather than abstaining.</li>
+    <li><strong>Diagnostic</strong>: search the OCR text for the extracted value. If not found, hallucination.</li>
+    <li><strong>Fix</strong>: require citations in the extraction prompt; validate citations by string-match; fail extraction if citation isn't in the text.</li>
+  </ul>
+
+  <h3>Wrong span selected</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted value is in the document, but it's the wrong instance — e.g., the address of one party when you wanted the other.</li>
+    <li><strong>Root cause</strong>: model couldn't disambiguate; both candidate values are plausible.</li>
+    <li><strong>Diagnostic</strong>: check provenance; trace what the model attended to.</li>
+    <li><strong>Fix</strong>: tighten prompt with disambiguation instructions; add few-shot examples of the ambiguous case; route similar cases to HITL.</li>
+  </ul>
+
+  <h3>Format / type mismatch</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted "value" is a string when an integer was expected, or fails schema validation.</li>
+    <li><strong>Root cause</strong>: LLM generated a value that doesn't match the schema constraint.</li>
+    <li><strong>Diagnostic</strong>: schema-validation logs.</li>
+    <li><strong>Fix</strong>: use provider tool-calling with strict schema enforcement (most providers reject invalid schemas); add a parse-or-retry wrapper.</li>
+  </ul>
+
+  <h3>Over-extraction on absent fields</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted values for fields that don't appear in the document.</li>
+    <li><strong>Root cause</strong>: model is biased toward producing non-null outputs when uncertain.</li>
+    <li><strong>Diagnostic</strong>: compare extraction outputs to ground truth on a sample.</li>
+    <li><strong>Fix</strong>: include explicit "return null if not present" instructions in the prompt; few-shot examples with null values; calibrate the threshold so low-confidence non-null predictions go to HITL.</li>
+  </ul>
+</section>
+
+<section id="normalization-failures">
+  <h2>Normalization failures</h2>
+
+  <h3>Date parsing failure</h3>
+  <ul>
+    <li><strong>Symptom</strong>: extracted_date is null even though the model returned a value.</li>
+    <li><strong>Root cause</strong>: date format wasn't in the normalizer's recognized list (e.g., "the fifteenth day of March, two thousand twenty-four").</li>
+    <li><strong>Diagnostic</strong>: check raw_value vs normalized value.</li>
+    <li><strong>Fix</strong>: expand the date-parser; for unusual formats, route to HITL rather than silently dropping.</li>
+  </ul>
+
+  <h3>Currency normalization off</h3>
+  <ul>
+    <li><strong>Symptom</strong>: amounts in a non-USD currency are stored without the currency code.</li>
+    <li><strong>Root cause</strong>: normalizer assumed USD; lost the currency signal.</li>
+    <li><strong>Diagnostic</strong>: spot-check international customers' contracts.</li>
+    <li><strong>Fix</strong>: always extract currency code alongside amount; normalize to a (amount, currency) tuple.</li>
+  </ul>
+
+  <h3>Silent entity-resolution merges</h3>
+  <ul>
+    <li><strong>Symptom</strong>: two distinct supplier entities are silently mapped to the same canonical ID.</li>
+    <li><strong>Root cause</strong>: fuzzy-match threshold too aggressive.</li>
+    <li><strong>Diagnostic</strong>: audit the supplier-resolution log; look for false merges.</li>
+    <li><strong>Fix</strong>: tighten the threshold; route ambiguous matches to HITL; never merge silently without a confidence record.</li>
+  </ul>
+</section>
+
+<section id="hitl-failures">
+  <h2>HITL-related failures</h2>
+
+  <h3>Confidence miscalibration causing wrong routing</h3>
+  <ul>
+    <li><strong>Symptom</strong>: many auto-approved predictions are wrong; HITL queue is too small to catch them.</li>
+    <li><strong>Root cause</strong>: confidence is over-stated; calibration is off.</li>
+    <li><strong>Diagnostic</strong>: reliability diagram; ECE.</li>
+    <li><strong>Fix</strong>: recompute calibrator on recent ground truth; raise threshold until calibration catches up.</li>
+  </ul>
+
+  <h3>Reviewer drift</h3>
+  <ul>
+    <li><strong>Symptom</strong>: customer-confirmed extractions disagree with later customer feedback.</li>
+    <li><strong>Root cause</strong>: reviewer calibration has shifted; field interpretation has drifted.</li>
+    <li><strong>Diagnostic</strong>: inter-rater agreement on calibration set; Cohen's kappa over time.</li>
+    <li><strong>Fix</strong>: re-train reviewers on calibration set; tighten field-definition spec.</li>
+  </ul>
+
+  <h3>Queue overflow masking quality</h3>
+  <ul>
+    <li><strong>Symptom</strong>: HITL queue is so deep that reviewers are rushing; quality slips.</li>
+    <li><strong>Root cause</strong>: capacity isn't matched to volume; or threshold is too generous.</li>
+    <li><strong>Diagnostic</strong>: queue depth, throughput, per-task review time trends.</li>
+    <li><strong>Fix</strong>: add capacity, throttle ingest, or tighten the threshold so fewer items route to HITL (paid in accuracy).</li>
+  </ul>
+</section>
+
+<section id="cross-layer">
+  <h2>Cross-layer failures</h2>
+  <p>Some failures look like one layer's problem but originate elsewhere. Two common patterns worth recognizing:</p>
+
+  <h3>"The model is wrong" → it was OCR</h3>
+  <p>The extraction looks wrong; first instinct is that the model failed. Actually the OCR text the model was working from was already garbled. The model produced a plausible answer from corrupted input.</p>
+  <p><strong>Diagnostic</strong>: always check OCR output first. If OCR is wrong, the model is correct conditional on bad input.</p>
+
+  <h3>"The customer's data drifted" → it was a vendor change</h3>
+  <p>Output suddenly looks different. First instinct: the customer's documents changed. Actually the OCR vendor (Textract, Document AI) pushed a model update that changed the text output.</p>
+  <p><strong>Diagnostic</strong>: check vendor release notes; look for model-version changes on the OCR side, not just your platform side.</p>
+
+  <h3>The "everything's fine" failure</h3>
+  <p>All monitoring is green. SLA dashboard shows accuracy above threshold. Customer reports specific extractions are wrong.</p>
+  <p>Usually: the rolling audit sample didn't include the affected document class or field. Aggregated metrics hide concentrated failures.</p>
+  <p><strong>Diagnostic</strong>: drill into per-class, per-field accuracy. Look for cells where the SLA dashboard hides the problem.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The senior diagnostic instinct</span>
+    <p>Walk the layers in order. Don't skip to the layer you think it must be. Most "this is obviously the model" tickets turn out to be OCR, layout, or calibration. The 10 minutes of walking the layers saves the 2 hours of "investigating" an issue in the wrong place.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

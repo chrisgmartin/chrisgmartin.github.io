@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Output Schema &amp; Provenance</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why output design is load-bearing</a>
+    <a href="#anatomy">Anatomy of a good extraction record</a>
+    <a href="#provenance">Provenance</a>
+    <a href="#confidence">Per-field confidence</a>
+    <a href="#versioning">Model versioning</a>
+    <a href="#schema-design">Schema design choices</a>
+    <a href="#audit">Audit story</a>
+    <a href="#anti">Anti-patterns</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-field-extraction-patterns.html">← Previous</a>
+    <a href="06-confidence-calibration.html">Next: Calibration →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Field extraction</span>
+  <h1>Output Schema &amp; Provenance</h1>
+  <p class="subtitle">The shape of extraction output determines whether you can audit, debug, reprocess, and trust the system months later. Provenance, confidence, versioning, and the schema-design choices that make the rest of the platform possible.</p>
+</header>
+
+<section id="why">
+  <h2>Why output design is load-bearing</h2>
+  <p>Extraction output is the artifact every downstream system depends on. Marts, dashboards, alerts, customer outputs — all read from it. If the output shape is wrong, every downstream consumer pays for it. Inversely, if the output shape is right, you get auditability, debuggability, and re-extraction for free.</p>
+  <p>Three properties to engineer in:</p>
+  <ul>
+    <li><strong>Provenance</strong> — for every extracted value, where it came from in the source document.</li>
+    <li><strong>Confidence</strong> — per-field, calibrated.</li>
+    <li><strong>Versioning</strong> — which model / pipeline / config produced this value.</li>
+  </ul>
+</section>
+
+<section id="anatomy">
+  <h2>Anatomy of a good extraction record</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>extraction_record.json</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-json">{
+  "extraction_id": "ext_8f3a2b1c",
+  "document_id": "doc_a4e2c9d1",
+  "customer_id": "cust_acme",
+  "doc_class": "master_service_agreement",
+  "extracted_at": "2026-05-27T14:32:01Z",
+
+  "model_version": "extract-v4.2.1",
+  "pipeline_version": "pipeline-v2.7",
+  "customer_config_version": "acme-config-v1.4",
+
+  "fields": {
+    "parties": {
+      "value": ["Acme Corp", "Customer Inc"],
+      "raw_value": ["ACME Corp.", "Customer, Inc."],
+      "confidence": 0.97,
+      "provenance": [
+        {"page": 1, "bbox": [120, 240, 480, 280], "quote": "ACME Corp."},
+        {"page": 1, "bbox": [120, 295, 510, 335], "quote": "Customer, Inc."}
+      ]
+    },
+    "effective_date": {
+      "value": "2024-03-15",
+      "raw_value": "March 15, 2024",
+      "confidence": 0.94,
+      "provenance": {"page": 1, "bbox": [120, 310, 290, 330], "quote": "effective as of March 15, 2024"}
+    },
+    "renewal_terms": {
+      "value": {
+        "auto_renew": true,
+        "term_length_months": 12,
+        "notice_period_days": 60
+      },
+      "confidence": 0.78,
+      "provenance": {"page": 8, "bbox": [80, 540, 520, 615],
+                     "quote": "This Agreement shall automatically renew for successive 12-month terms unless either party provides written notice of non-renewal at least 60 days prior to the end of the then-current term."},
+      "review_status": "pending_human"
+    }
+  },
+
+  "qa": {
+    "schema_valid": true,
+    "completeness": 1.0,
+    "ocr_avg_confidence": 0.96
+  }
+}</code></pre>
+  </div>
+
+  <p>Walking through what each piece earns its place:</p>
+  <ul>
+    <li><strong>extraction_id</strong>: stable identifier for this specific extraction event. Often <code>document_id + model_version</code>.</li>
+    <li><strong>document_id, customer_id, doc_class</strong>: routing keys for downstream marts.</li>
+    <li><strong>extracted_at</strong>: when this record was produced. Useful for monitoring drift over time.</li>
+    <li><strong>model_version, pipeline_version, customer_config_version</strong>: forensic stack. When something looks wrong, you can reconstruct exactly which combination of components produced it.</li>
+    <li><strong>fields</strong>: the actual extracted values, each with value, raw_value, confidence, provenance.</li>
+    <li><strong>qa</strong>: meta about the extraction itself — schema validation result, completeness (what fraction of required fields were extracted), OCR quality signal.</li>
+  </ul>
+</section>
+
+<section id="provenance">
+  <h2>Provenance</h2>
+  <p>For every extracted value, store where it came from. The minimal shape:</p>
+  <ul>
+    <li><strong>page</strong> — page number (1-indexed).</li>
+    <li><strong>bbox</strong> — bounding box (x0, y0, x1, y1) in normalized or pixel coordinates.</li>
+    <li><strong>quote</strong> — the exact source text the model used as evidence.</li>
+  </ul>
+
+  <h3>Why all three</h3>
+  <ul>
+    <li><strong>Auditability</strong>: when a customer disputes a value, you can point at the exact page and quote.</li>
+    <li><strong>Debugging</strong>: when extraction is wrong, knowing which region the model looked at tells you whether the failure is layout (wrong region) or extraction (right region, wrong span).</li>
+    <li><strong>UI</strong>: customer-facing reviewers want to click a field and see the source highlighted. Provenance enables that.</li>
+    <li><strong>Selective re-extraction</strong>: when you ship a model update, you can re-process only documents where provenance looks suspicious (no bbox, low overlap with the field region) instead of reprocessing everything.</li>
+  </ul>
+
+  <h3>Multi-source provenance</h3>
+  <p>Some fields have multiple sources — the "parties" field in an MSA might cite the title block on page 1 and the signature block on page N. Use a list of provenance entries, not a single one.</p>
+
+  <h3>When you can't get provenance</h3>
+  <p>Pure-LLM extraction with no anchoring sometimes produces values without traceable provenance ("the model summarized something from page 3-4"). Two mitigations:</p>
+  <ul>
+    <li>Ask the model to cite — the citation goes in the provenance.quote field.</li>
+    <li>Validate after extraction by string-matching the quote against the OCR text; flag if not found.</li>
+  </ul>
+</section>
+
+<section id="confidence">
+  <h2>Per-field confidence</h2>
+  <p>One number per field, between 0.0 and 1.0, calibrated such that fields with confidence 0.9 are correct ~90% of the time. (Calibration is its own chapter — 06.)</p>
+
+  <h3>Where confidence comes from</h3>
+  <ul>
+    <li><strong>OCR confidence</strong>: per-word confidence aggregated over the field's tokens.</li>
+    <li><strong>Model confidence</strong>: token-classifier softmax, or LLM logprobs, or self-reported confidence from the LLM.</li>
+    <li><strong>Validation rules</strong>: schema match, format match, plausibility checks.</li>
+  </ul>
+  <p>The composite confidence is typically a weighted combination, calibrated against held-out gold data.</p>
+
+  <h3>Confidence at the wrong granularity</h3>
+  <p>Per-document confidence is mostly useless — the same document can have very-confident parties and not-confident renewal-terms. Always store confidence at field granularity, not document granularity.</p>
+</section>
+
+<section id="versioning">
+  <h2>Model versioning</h2>
+  <p>Three versioned components, all stored on every extraction:</p>
+
+  <h3>model_version</h3>
+  <p>The extraction model that produced this. For LLM-based, includes the model name + the prompt version (Claude 3.6 with extract-prompt-v4.2). For task-specific encoders, the trained-model checkpoint identifier.</p>
+
+  <h3>pipeline_version</h3>
+  <p>The overall extraction pipeline (preprocessing, OCR engine, layout analysis, extraction). A git SHA or semver string.</p>
+
+  <h3>customer_config_version</h3>
+  <p>Customer-specific configuration — doc-class taxonomy, field mappings, prompt customizations. Versioned per customer because each customer's config evolves independently.</p>
+
+  <h3>Why all three</h3>
+  <p>When something looks wrong, you want to reconstruct exactly what combination produced this row. "The supplier-agreement extractions started looking wrong around 2026-05-15" → you query for the model/pipeline/config versions in use that day; one of them is likely the culprit.</p>
+</section>
+
+<section id="schema-design">
+  <h2>Schema design choices</h2>
+
+  <h3>Wide-narrow extraction table</h3>
+  <p>One row per (document_id, model_version, field_name). The flexible default — adding a new field doesn't require schema migration.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>wide_narrow.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE extractions (
+  extraction_id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  pipeline_version TEXT NOT NULL,
+  field_name TEXT NOT NULL,
+  value JSONB NOT NULL,
+  raw_value JSONB,
+  confidence FLOAT NOT NULL,
+  provenance JSONB NOT NULL,
+  review_status TEXT,
+  extracted_at TIMESTAMP NOT NULL,
+  UNIQUE (document_id, model_version, field_name)
+);
+CREATE INDEX idx_extractions_doc ON extractions (document_id, model_version);
+CREATE INDEX idx_extractions_field ON extractions (field_name);</code></pre>
+  </div>
+
+  <h3>Wide-wide extraction table</h3>
+  <p>One row per (document_id, model_version) with typed columns per field. Faster to query for known fields; rigid schema.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>wide_wide.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE extracted_msas (
+  extraction_id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  pipeline_version TEXT NOT NULL,
+  extracted_at TIMESTAMP NOT NULL,
+
+  parties TEXT[],
+  parties_confidence FLOAT,
+  parties_provenance JSONB,
+
+  effective_date DATE,
+  effective_date_confidence FLOAT,
+  effective_date_provenance JSONB,
+
+  -- ... per field
+  UNIQUE (document_id, model_version)
+);</code></pre>
+  </div>
+
+  <h3>Combined: wide-narrow ground truth + wide marts</h3>
+  <p>The production-default: wide-narrow for the source-of-truth table (rare to evolve once schema settles); dbt models on top that produce per-doc-class wide marts for query convenience.</p>
+
+  <h3>Where confidence/provenance lives</h3>
+  <ul>
+    <li>Inline with the field (wide-wide) — convenient when querying a single field.</li>
+    <li>JSONB sidecar (wide-narrow) — flexible, slightly slower to query.</li>
+    <li>Separate provenance table — overkill for most platforms; only worth it if provenance is queried independently of values.</li>
+  </ul>
+</section>
+
+<section id="audit">
+  <h2>The audit story</h2>
+  <p>The shape lets you answer key questions at any time:</p>
+  <ul>
+    <li><strong>"Why does the system say the renewal term is 12 months?"</strong> → query the extraction record for renewal_terms; show the page, bbox, and quote.</li>
+    <li><strong>"What did the system say about this document 6 months ago?"</strong> → query by document_id; sort by extracted_at; pick the historical extraction.</li>
+    <li><strong>"All documents extracted with model version X had this issue — which are they?"</strong> → query by model_version.</li>
+    <li><strong>"What changed when we deployed v4.2.1 vs v4.1.0?"</strong> → join extractions where document_id is in both versions; diff the values.</li>
+  </ul>
+
+  <p>None of these queries require special infrastructure — they're SQL. But they only work if the data shape supports them. Most "we can't audit our extractions" stories trace back to a schema decision made early that didn't include provenance or versioning.</p>
+</section>
+
+<section id="anti">
+  <h2>Anti-patterns</h2>
+
+  <h3>Single-row updates that overwrite history</h3>
+  <p>"Latest extraction wins; we update the row in place." Convenient; destroys auditability. Always insert new extraction rows; let marts present the "current" view by partitioning on model_version + extracted_at.</p>
+
+  <h3>No provenance because "the LLM already saw the document"</h3>
+  <p>Saving 5% disk and losing 95% of debuggability. Always store provenance — at minimum a quote.</p>
+
+  <h3>Document-level confidence only</h3>
+  <p>Easy to compute, hard to use. Store confidence per field; aggregate up if you need a document-level number.</p>
+
+  <h3>Mixing extracted and normalized values</h3>
+  <p>Store both. <code>raw_value</code> is what the model said; <code>value</code> is the normalized canonical version. Normalization is a step that can be redone; the raw extraction is the unrepeatable artifact.</p>
+
+  <h3>Pipeline version not tied to a git SHA</h3>
+  <p>"v2.7" of the pipeline could mean any of several states. Tie pipeline_version to either a semver release or a git SHA — something the team can resolve to specific code months later.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
