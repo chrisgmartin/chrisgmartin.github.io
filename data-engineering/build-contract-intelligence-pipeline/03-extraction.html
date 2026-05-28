@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Extraction: OCR + LLM</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What we're building</a>
+    <a href="#text">Text extraction</a>
+    <a href="#schema">Pydantic schema</a>
+    <a href="#prompt">The extraction prompt</a>
+    <a href="#llm">LLM call</a>
+    <a href="#pipeline">Putting it together</a>
+    <a href="#verify">Verify</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-ingestion.html">← Previous</a>
+    <a href="04-persistence.html">Next: Persistence →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Hands-on · ~45 min</span>
+  <h1>Extraction: OCR + LLM</h1>
+  <p class="subtitle">Get text from PDFs (native + OCR fallback), then call Claude with a structured-output prompt to extract parties, effective date, term, renewal terms. Pydantic-validated output.</p>
+</header>
+
+<section id="goal">
+  <h2>What we're building</h2>
+  <ul>
+    <li>A text-extraction function that handles native and image PDFs.</li>
+    <li>A Pydantic schema defining what we extract.</li>
+    <li>A prompt that asks Claude for structured output.</li>
+    <li>An end-to-end <code>extract_msa(document_id)</code> that ties them together.</li>
+  </ul>
+</section>
+
+<section id="text">
+  <h2>Text extraction</h2>
+  <p>Native first; OCR fallback if pdfplumber returns little text.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/extraction/ocr.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import io
+import pdfplumber
+import pytesseract
+from pdf2image import convert_from_bytes
+
+
+def text_from_native(file_bytes: bytes) -&gt; str:
+    parts = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            parts.append(t)
+    return "\n\n".join(parts)
+
+
+def text_from_ocr(file_bytes: bytes) -&gt; str:
+    images = convert_from_bytes(file_bytes, dpi=200)
+    parts = []
+    for img in images:
+        parts.append(pytesseract.image_to_string(img))
+    return "\n\n".join(parts)
+
+
+def extract_text(file_bytes: bytes) -&gt; tuple[str, str]:
+    """Return (text, source) where source is 'native' or 'ocr'."""
+    native = text_from_native(file_bytes)
+    if len(native.strip()) &gt; 200:
+        return native, "native"
+    # Fall back to OCR for image-heavy docs
+    return text_from_ocr(file_bytes), "ocr"</code></pre>
+  </div>
+
+  <p>The 200-character threshold avoids OCR'ing native PDFs that just have very short content.</p>
+</section>
+
+<section id="schema">
+  <h2>Pydantic schema</h2>
+  <p>What we're extracting. The schema becomes the contract with Claude — we pass it via tool-calling.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/extraction/schemas.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from pydantic import BaseModel, Field
+
+
+class Citation(BaseModel):
+    quote: str = Field(description="The exact text from the document supporting this value")
+    page: int | None = Field(default=None, description="Page number (1-indexed) if known")
+
+
+class FieldWithCitation(BaseModel):
+    value: str | None
+    confidence: float = Field(ge=0.0, le=1.0)
+    citation: Citation | None = None
+
+
+class RenewalTerms(BaseModel):
+    auto_renew: bool
+    term_length_months: int
+    notice_period_days: int
+
+
+class RenewalTermsWithCitation(BaseModel):
+    value: RenewalTerms | None
+    confidence: float = Field(ge=0.0, le=1.0)
+    citation: Citation | None = None
+
+
+class MSAExtraction(BaseModel):
+    """Fields extracted from a Master Service Agreement."""
+    parties: list[str] = Field(description="The contracting entities (e.g., ['Acme Corp', 'Customer Inc'])")
+    parties_confidence: float = Field(ge=0.0, le=1.0)
+    effective_date: FieldWithCitation
+    term_length_months: FieldWithCitation
+    renewal_terms: RenewalTermsWithCitation
+    governing_law: FieldWithCitation</code></pre>
+  </div>
+</section>
+
+<section id="prompt">
+  <h2>The extraction prompt</h2>
+  <p>System prompt + user message with the document. We ask for citations explicitly — they enable provenance later.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/extraction/llm.py — prompt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">SYSTEM_PROMPT = """You are an expert at extracting structured information from Master Service Agreements (MSAs).
+
+You will be given the text of an MSA. Extract the fields requested.
+
+Rules:
+1. If a field cannot be found in the document, return null for that field's value.
+2. Do not guess. Do not fabricate. If you are uncertain, return null and set confidence below 0.7.
+3. For every extracted value, return a citation: the exact quote from the document supporting it, and the page if known.
+4. Confidence is your honest estimate of correctness: 1.0 means certain, 0.7 is the default for HITL routing, &lt; 0.5 means very uncertain.
+5. Normalize dates to ISO format (YYYY-MM-DD). If only a month/year is present, leave value as null.
+"""
+
+USER_TEMPLATE = """Extract structured fields from the following Master Service Agreement.
+
+&lt;document&gt;
+{text}
+&lt;/document&gt;
+
+Return your answer as a single JSON object matching the schema."""</code></pre>
+  </div>
+</section>
+
+<section id="llm">
+  <h2>LLM call</h2>
+  <p>Anthropic's structured output via tool definitions. Pass the Pydantic schema; get back a validated dict.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/extraction/llm.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import json
+from anthropic import Anthropic
+from pydantic import ValidationError
+
+from ci.config import settings
+from ci.extraction.schemas import MSAExtraction
+
+
+SYSTEM_PROMPT = "..."  # as above
+USER_TEMPLATE = "..."  # as above
+
+_client = Anthropic(api_key=settings.anthropic_api_key)
+
+
+def extract_msa(text: str) -&gt; MSAExtraction:
+    """Extract MSA fields from document text."""
+    tool = {
+        "name": "extract_msa_fields",
+        "description": "Extract structured MSA fields",
+        "input_schema": MSAExtraction.model_json_schema(),
+    }
+
+    response = _client.messages.create(
+        model=settings.extraction_model,
+        max_tokens=settings.extraction_max_tokens,
+        temperature=settings.extraction_temperature,
+        system=SYSTEM_PROMPT,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "extract_msa_fields"},
+        messages=[
+            {"role": "user", "content": USER_TEMPLATE.format(text=text[:30000])}
+            # 30k char truncation; LLMs handle longer but cost / latency adds up.
+        ],
+    )
+
+    # Anthropic returns the tool_use block with structured input
+    tool_block = next(b for b in response.content if b.type == "tool_use")
+    try:
+        return MSAExtraction.model_validate(tool_block.input)
+    except ValidationError as e:
+        # In production, raise a parse-or-retry; here we surface the error
+        raise RuntimeError(f"Extraction schema validation failed: {e}") from e</code></pre>
+  </div>
+
+  <p>Notes:</p>
+  <ul>
+    <li><code>tool_choice</code> forces Claude to call the tool — no free-form text.</li>
+    <li>Truncation at 30k chars: for very long documents (50-page MSAs), you'd want chunking or page-targeted extraction. Out of scope for this build.</li>
+    <li><code>temperature=0.0</code> for reproducibility.</li>
+  </ul>
+</section>
+
+<section id="pipeline">
+  <h2>Putting it together</h2>
+  <p>Glue function: takes a document_id, fetches the file, extracts text, calls the LLM, returns the result.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/extraction/__init__.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from pathlib import Path
+
+from ci.db import db_session
+from ci.models import Document
+from ci.extraction.ocr import extract_text
+from ci.extraction.llm import extract_msa
+from ci.extraction.schemas import MSAExtraction
+
+
+def extract_document(document_id: str) -&gt; MSAExtraction:
+    """End-to-end: fetch document, OCR, LLM extract."""
+    with db_session() as s:
+        doc = s.get(Document, document_id)
+        if not doc:
+            raise ValueError(f"Document {document_id} not found")
+        path = Path(doc.source_uri)
+        if not path.exists():
+            raise FileNotFoundError(f"Source file missing: {path}")
+        doc_class = doc.doc_class
+
+    file_bytes = path.read_bytes()
+    text, source = extract_text(file_bytes)
+
+    if doc_class == "master_service_agreement":
+        return extract_msa(text)
+    # Add per-class extractors as you grow the build.
+    raise NotImplementedError(f"No extractor for doc_class={doc_class}")</code></pre>
+  </div>
+</section>
+
+<section id="verify">
+  <h2>Verify</h2>
+  <p>Add a CLI subcommand and run against the ingested documents from chapter 02.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>add to src/ci/cli.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from ci.extraction import extract_document
+from sqlalchemy import select
+
+
+@app.command()
+def extract(document_id: str | None = None) -&gt; None:
+    """Run extraction on a document (or all MSAs if none specified)."""
+    with db_session() as s:
+        if document_id:
+            doc_ids = [document_id]
+        else:
+            doc_ids = list(
+                s.scalars(select(Document.document_id)
+                          .where(Document.doc_class == "master_service_agreement"))
+            )
+
+    for doc_id in doc_ids:
+        console.print(f"[blue]Extracting {doc_id}...[/blue]")
+        try:
+            result = extract_document(doc_id)
+            console.print(result.model_dump_json(indent=2))
+        except Exception as e:
+            console.print(f"[red]Failed: {e}[/red]")</code></pre>
+  </div>
+
+  <p>Run:</p>
+  <div class="code-wrap">
+<pre><code class="language-bash">ci extract
+# Should print extracted fields per document.</code></pre>
+  </div>
+
+  <p>Check the output by eye against the source PDFs. The values should match. Confidence scores should be high for fields the model is sure about, lower for ambiguous ones.</p>
+
+  <p>Next chapter: persist these extractions to Postgres alongside the documents.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

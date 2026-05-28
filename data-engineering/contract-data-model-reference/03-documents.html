@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Documents</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#table">The documents table</a>
+    <a href="#document-id">document_id derivation</a>
+    <a href="#doc-class">Document class taxonomy</a>
+    <a href="#timeline">The ingest + process timeline</a>
+    <a href="#operations">Common operations</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-suppliers.html">← Previous</a>
+    <a href="04-agreements.html">Next: Agreements →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Core entities</span>
+  <h1>Documents</h1>
+  <p class="subtitle">The physical-file table — what it represents, why document_id derives from content hash, the doc-class taxonomy, and the ingest-to-process timeline that operates on this table.</p>
+</header>
+
+<section id="table">
+  <h2>The documents table</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>documents.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE documents (
+  document_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  source_uri TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  doc_class TEXT NOT NULL,
+  page_count INT NOT NULL,
+  ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (customer_id, file_hash)
+);</code></pre>
+  </div>
+
+  <p>One row per physical file. A signed MSA, an amendment, a SOW are three separate rows. The agreements table (chapter 04) links them into logical contracts.</p>
+
+  <h3>Field-by-field rationale</h3>
+  <ul>
+    <li><code>document_id</code>: stable identifier derived from file_hash (see next section).</li>
+    <li><code>source_uri</code>: where the file came from. S3 path, SharePoint URL, CLM document ID. Needed for audit and to fetch the file if needed.</li>
+    <li><code>file_hash</code>: SHA-256 of the file contents. The basis for idempotency.</li>
+    <li><code>doc_class</code>: the document class taxonomy entry (see below).</li>
+    <li><code>page_count</code>: stored at ingestion time; useful for routing (single-page invoices vs 100-page MSAs need different handling).</li>
+    <li><code>ingested_at</code>: when this document first entered the platform. Different from when it was created in the source.</li>
+  </ul>
+
+  <h3>What's NOT here</h3>
+  <ul>
+    <li>The file contents. Files are stored in object storage (S3, GCS, Azure Blob) at <code>source_uri</code>. The documents table holds metadata only.</li>
+    <li>The OCR'd text. Lives in a separate <code>document_text</code> or <code>ocr_results</code> table, joined by document_id. Keeping it out of the documents table keeps row sizes small for the analytics use case.</li>
+    <li>The extracted fields. Those live in <code>extractions</code> (chapter 01 schema).</li>
+  </ul>
+</section>
+
+<section id="document-id">
+  <h2>document_id derivation</h2>
+  <p>The convention: <code>document_id</code> is deterministic based on file contents, not random.</p>
+
+  <h3>The recipe</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>derive_document_id.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import hashlib
+
+def derive_document_id(file_bytes: bytes, customer_id: str) -&gt; tuple[str, str]:
+    """Return (document_id, file_hash). Stable across re-ingestion."""
+    h = hashlib.sha256(file_bytes).hexdigest()
+    # 16-char prefix is enough to avoid collisions in practice;
+    # full hash stored separately for cross-checking.
+    document_id = f"doc_{customer_id[:8]}_{h[:16]}"
+    return document_id, h</code></pre>
+  </div>
+
+  <h3>Why this matters</h3>
+  <ul>
+    <li><strong>Idempotent ingestion.</strong> Same file re-uploaded gets the same document_id. The INSERT is an upsert; nothing changes. No duplicate rows.</li>
+    <li><strong>Cross-system tracing.</strong> If the customer asks "what's document doc_acme_a3b4c5d6?", they can find it across logs, dashboards, extractions, audit trails.</li>
+    <li><strong>Deduplication across sources.</strong> If the same file lands in both their SharePoint and their CLM, both ingests produce the same document_id. The platform sees one document, not two.</li>
+  </ul>
+
+  <h3>Edge cases</h3>
+  <ul>
+    <li><strong>Re-scanned versions.</strong> A document scanned twice produces two different file_hashes (the binary data differs even if the content is the same). They'd be separate document_ids. That's correct — the platform shouldn't deduplicate across scan-quality variations.</li>
+    <li><strong>Format conversions.</strong> The same contract as DOCX and as PDF are different files. Different document_ids. Some platforms add a "content fingerprint" (canonicalized text) as a separate column for cross-format dedupe; that's a layer above this schema.</li>
+  </ul>
+</section>
+
+<section id="doc-class">
+  <h2>Document class taxonomy</h2>
+  <p>The doc_class string identifies what kind of document this is — drives routing through the extraction pipeline.</p>
+
+  <h3>A working taxonomy</h3>
+  <table>
+    <thead><tr><th>Class</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>master_service_agreement</code></td><td>MSA establishing relationship terms</td></tr>
+      <tr><td><code>statement_of_work</code></td><td>SOW under an MSA</td></tr>
+      <tr><td><code>amendment</code></td><td>Modifies an existing agreement</td></tr>
+      <tr><td><code>nda</code></td><td>Non-disclosure agreement</td></tr>
+      <tr><td><code>dpa</code></td><td>Data Processing Agreement</td></tr>
+      <tr><td><code>baa</code></td><td>Business Associate Agreement (HIPAA)</td></tr>
+      <tr><td><code>supplier_agreement</code></td><td>Generic supplier contract not matching above</td></tr>
+      <tr><td><code>invoice</code></td><td>Invoice document</td></tr>
+      <tr><td><code>purchase_order</code></td><td>PO document</td></tr>
+      <tr><td><code>supplier_catalog</code></td><td>Supplier-provided product/service catalog</td></tr>
+      <tr><td><code>unclassified</code></td><td>Couldn't be classified at ingest; needs review</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How classification happens</h3>
+  <ul>
+    <li><strong>Source-system metadata</strong>: if the document comes from a CLM tagged "MSA," trust the tag.</li>
+    <li><strong>Filename pattern</strong>: "MSA_Acme_2024.pdf" → master_service_agreement.</li>
+    <li><strong>Header-content classification</strong>: read the first page; classify by title.</li>
+    <li><strong>Model-based classification</strong>: a small classifier model on the first page or full document. Used when other signals fail.</li>
+  </ul>
+
+  <h3>Customer-specific extensions</h3>
+  <p>Some customers have proprietary document types. Extend the taxonomy with customer-scoped entries:</p>
+  <div class="code-wrap">
+<pre><code class="language-text">acme_corp:vendor_onboarding_packet
+acme_corp:annual_review</code></pre>
+  </div>
+  <p>Namespace by customer to avoid global-taxonomy bloat.</p>
+</section>
+
+<section id="timeline">
+  <h2>The ingest + process timeline</h2>
+  <p>The documents table is the join point of multiple timelines:</p>
+
+  <table>
+    <thead><tr><th>Timestamp</th><th>Meaning</th><th>Stored on</th></tr></thead>
+    <tbody>
+      <tr><td>signed_at</td><td>When the document was executed by the parties</td><td>Extracted field on extractions</td></tr>
+      <tr><td>created_in_source</td><td>When it first appeared in the source system (CLM, SharePoint)</td><td>Optional column on documents</td></tr>
+      <tr><td>ingested_at</td><td>When the platform first saw the document</td><td>documents.ingested_at</td></tr>
+      <tr><td>extracted_at</td><td>When extraction ran (per model version)</td><td>extractions.extracted_at</td></tr>
+      <tr><td>confirmed_at</td><td>When a reviewer confirmed the extraction</td><td>Field on extractions or HITL queue</td></tr>
+    </tbody>
+  </table>
+
+  <p>signed_at is the business-meaningful date. ingested_at is the platform-operational date. For renewal logic, signed_at matters. For SLA reporting, ingested_at + extracted_at matter.</p>
+</section>
+
+<section id="operations">
+  <h2>Common operations</h2>
+
+  <h3>Idempotent ingest</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>ingest_document.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def ingest_document(file_bytes: bytes, source_uri: str, customer_id: str) -&gt; dict:
+    document_id, file_hash = derive_document_id(file_bytes, customer_id)
+    doc_class = classify(file_bytes)  # heuristic or model
+    page_count = count_pages(file_bytes)
+
+    db.execute("""
+        INSERT INTO documents (document_id, customer_id, source_uri, file_hash,
+                               doc_class, page_count, ingested_at)
+        VALUES (%(doc_id)s, %(customer)s, %(uri)s, %(hash)s,
+                %(class)s, %(pages)s, NOW())
+        ON CONFLICT (customer_id, file_hash) DO NOTHING
+        RETURNING document_id, (xmax = 0) AS inserted
+    """, {"doc_id": document_id, "customer": customer_id, "uri": source_uri,
+          "hash": file_hash, "class": doc_class, "pages": page_count})
+    # If returning row's inserted=true, this is a new doc; if false, already existed.</code></pre>
+  </div>
+
+  <h3>Fetch documents that need extraction</h3>
+  <p>Pattern: find documents that haven't been extracted with the current model version.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT d.document_id, d.source_uri, d.doc_class
+FROM documents d
+LEFT JOIN extractions e
+  ON e.document_id = d.document_id
+ AND e.model_version = 'extract-v4.2.1'
+WHERE d.customer_id = 'cust_acme'
+  AND e.extraction_id IS NULL
+ORDER BY d.ingested_at;</code></pre>
+  </div>
+
+  <h3>Reclassify a document</h3>
+  <p>If classification was wrong, update doc_class:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">UPDATE documents SET doc_class = 'amendment'
+WHERE document_id = 'doc_acme_a3b4c5d6';</code></pre>
+  </div>
+  <p>Then trigger re-extraction with the new class's extraction config. Old extraction rows stay for audit.</p>
+
+  <h3>Soft-delete a document</h3>
+  <p>Customers occasionally upload documents in error. Don't hard-delete (breaks foreign-key references in agreements / extractions). Add a <code>status</code> column with values <code>active</code> / <code>archived</code>; filter on it in mart views.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

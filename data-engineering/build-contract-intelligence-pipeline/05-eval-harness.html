@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluation Harness</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What we're building</a>
+    <a href="#gold">Gold set</a>
+    <a href="#scoring">Scoring</a>
+    <a href="#runner">Eval runner</a>
+    <a href="#report">Report</a>
+    <a href="#verify">Verify</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-persistence.html">← Previous</a>
+    <a href="06-api.html">Next: API →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Hands-on · ~30 min</span>
+  <h1>Evaluation Harness</h1>
+  <p class="subtitle">A small gold set, a CLI that scores extraction against it, a Markdown report. Run before every prompt or model change.</p>
+</header>
+
+<section id="goal">
+  <h2>What we're building</h2>
+  <ul>
+    <li>A directory <code>data/gold/</code> with paired PDF + JSON ground-truth.</li>
+    <li>A scoring function that compares extraction output to gold values.</li>
+    <li>A CLI that runs the gold set through extraction and emits a Markdown report.</li>
+  </ul>
+  <p>This is a learning-grade harness; real production eval needs more rigor (chapter 08 of the Doc AI deep dive). But the shape is the same.</p>
+</section>
+
+<section id="gold">
+  <h2>Gold set</h2>
+  <p>For each PDF in the gold set, an adjacent <code>.gold.json</code> file with the right answers.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>data/gold/acme_msa_2024.gold.json</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-json">{
+  "document_id": "doc_demo_a3b4c5d6e7f8",
+  "doc_class": "master_service_agreement",
+  "fields": {
+    "parties": ["Acme Corp", "Customer Inc"],
+    "effective_date": "2024-03-15",
+    "term_length_months": 12,
+    "renewal_terms": {
+      "auto_renew": true,
+      "term_length_months": 12,
+      "notice_period_days": 60
+    },
+    "governing_law": "Delaware"
+  }
+}</code></pre>
+  </div>
+
+  <p>Place 5–10 PDFs in <code>data/gold/</code> with matching JSON. Construct the JSON by hand based on the source documents — that's the labeling step.</p>
+</section>
+
+<section id="scoring">
+  <h2>Scoring</h2>
+  <p>Field-level match with tolerances per type.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/eval/scoring.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from datetime import date
+from typing import Any
+
+
+def normalize_str(v: Any) -&gt; str:
+    return str(v).strip().lower() if v else ""
+
+
+def match_string(extracted: Any, gold: Any) -&gt; bool:
+    return normalize_str(extracted) == normalize_str(gold)
+
+
+def match_date(extracted: Any, gold: Any, tolerance_days: int = 1) -&gt; bool:
+    try:
+        if not extracted or not gold: return False
+        e = date.fromisoformat(extracted)
+        g = date.fromisoformat(gold)
+        return abs((e - g).days) &lt;= tolerance_days
+    except (ValueError, TypeError):
+        return False
+
+
+def match_int(extracted: Any, gold: Any, tolerance: int = 0) -&gt; bool:
+    try:
+        return abs(int(extracted) - int(gold)) &lt;= tolerance
+    except (ValueError, TypeError):
+        return False
+
+
+def match_renewal_terms(extracted: dict | None, gold: dict | None) -&gt; bool:
+    if extracted is None and gold is None: return True
+    if extracted is None or gold is None: return False
+    return (extracted.get("auto_renew") == gold.get("auto_renew")
+            and match_int(extracted.get("term_length_months"), gold.get("term_length_months"))
+            and match_int(extracted.get("notice_period_days"), gold.get("notice_period_days"), tolerance=5))
+
+
+def match_parties(extracted: list, gold: list) -&gt; bool:
+    if not extracted or not gold: return False
+    e = sorted(normalize_str(x) for x in extracted)
+    g = sorted(normalize_str(x) for x in gold)
+    return e == g
+
+
+def score_extraction(extracted: dict, gold: dict) -&gt; dict:
+    """Return per-field correctness + overall accuracy."""
+    results = {
+        "parties": match_parties(extracted.get("parties", []), gold.get("parties", [])),
+        "effective_date": match_date(
+            extracted.get("effective_date", {}).get("value"),
+            gold.get("effective_date"),
+        ),
+        "term_length_months": match_int(
+            extracted.get("term_length_months", {}).get("value"),
+            gold.get("term_length_months"),
+        ),
+        "renewal_terms": match_renewal_terms(
+            extracted.get("renewal_terms", {}).get("value"),
+            gold.get("renewal_terms"),
+        ),
+        "governing_law": match_string(
+            extracted.get("governing_law", {}).get("value"),
+            gold.get("governing_law"),
+        ),
+    }
+    total = len(results)
+    correct = sum(results.values())
+    return {
+        "per_field": results,
+        "correct": correct,
+        "total": total,
+        "accuracy": correct / total,
+    }</code></pre>
+  </div>
+</section>
+
+<section id="runner">
+  <h2>Eval runner</h2>
+  <p>Walk the gold directory, run extraction on each PDF, score, accumulate.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/eval/runner.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import json
+from pathlib import Path
+from collections import defaultdict
+
+from ci.config import settings
+from ci.extraction.ocr import extract_text
+from ci.extraction.llm import extract_msa
+from ci.eval.scoring import score_extraction
+
+
+def run_eval(gold_dir: Path) -&gt; dict:
+    """Run extraction over the gold set; return aggregate report."""
+    pdfs = sorted(gold_dir.glob("*.pdf"))
+    if not pdfs:
+        raise RuntimeError(f"No PDFs in {gold_dir}")
+
+    per_file = []
+    field_correct: dict[str, int] = defaultdict(int)
+    field_total: dict[str, int] = defaultdict(int)
+
+    for pdf in pdfs:
+        gold_path = pdf.with_suffix(".gold.json")
+        if not gold_path.exists():
+            print(f"Skip {pdf.name}: no gold file")
+            continue
+        gold = json.loads(gold_path.read_text())
+
+        file_bytes = pdf.read_bytes()
+        text, _ = extract_text(file_bytes)
+        extraction = extract_msa(text)
+        scored = score_extraction(extraction.model_dump(mode="json"), gold["fields"])
+
+        per_file.append({"file": pdf.name, **scored})
+        for field, was_correct in scored["per_field"].items():
+            field_total[field] += 1
+            if was_correct: field_correct[field] += 1
+
+    overall_correct = sum(f["correct"] for f in per_file)
+    overall_total = sum(f["total"] for f in per_file)
+    return {
+        "model": settings.extraction_model,
+        "n_documents": len(per_file),
+        "overall_accuracy": overall_correct / overall_total if overall_total else 0.0,
+        "per_field_accuracy": {
+            f: field_correct[f] / field_total[f] for f in field_total
+        },
+        "per_file": per_file,
+    }</code></pre>
+  </div>
+</section>
+
+<section id="report">
+  <h2>Markdown report</h2>
+  <p>Render the eval results as a copy-pasteable Markdown report.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/eval/report.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def render_report(eval_result: dict) -&gt; str:
+    lines = []
+    lines.append(f"# Extraction Eval Report")
+    lines.append(f"")
+    lines.append(f"- **Model**: {eval_result['model']}")
+    lines.append(f"- **Documents**: {eval_result['n_documents']}")
+    lines.append(f"- **Overall accuracy**: {eval_result['overall_accuracy']:.1%}")
+    lines.append(f"")
+    lines.append(f"## Per-field accuracy")
+    for f, acc in sorted(eval_result['per_field_accuracy'].items()):
+        marker = "✅" if acc &gt;= 0.9 else "⚠️" if acc &gt;= 0.7 else "❌"
+        lines.append(f"- {marker} **{f}**: {acc:.1%}")
+    lines.append(f"")
+    lines.append(f"## Per-document results")
+    lines.append(f"| File | Correct/Total | Accuracy |")
+    lines.append(f"|------|--------------|----------|")
+    for f in eval_result['per_file']:
+        lines.append(f"| {f['file']} | {f['correct']}/{f['total']} | {f['accuracy']:.0%} |")
+    return "\n".join(lines)</code></pre>
+  </div>
+
+  <p>Wire to the CLI:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/cli.py — eval command</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from pathlib import Path
+from ci.eval.runner import run_eval
+from ci.eval.report import render_report
+
+
+@app.command()
+def eval_(gold_dir: Path = Path(settings.gold_dir)) -&gt; None:
+    """Run eval against the gold set."""
+    console.print(f"Running eval against {gold_dir}...")
+    result = run_eval(gold_dir)
+    report = render_report(result)
+    console.print(report)
+    Path("eval_report.md").write_text(report)
+    console.print(f"\nReport saved to eval_report.md")</code></pre>
+  </div>
+
+  <p>(Function name is <code>eval_</code> because <code>eval</code> is a Python builtin; Typer will expose it as <code>eval</code>.)</p>
+</section>
+
+<section id="verify">
+  <h2>Verify</h2>
+  <div class="code-wrap">
+<pre><code class="language-bash">ci eval</code></pre>
+  </div>
+
+  <p>You should see something like:</p>
+  <div class="code-wrap">
+<pre><code class="language-text"># Extraction Eval Report
+
+- **Model**: claude-sonnet-4-6
+- **Documents**: 7
+- **Overall accuracy**: 86.0%
+
+## Per-field accuracy
+- ✅ **parties**: 100.0%
+- ✅ **effective_date**: 100.0%
+- ⚠️ **renewal_terms**: 71.4%
+- ⚠️ **term_length_months**: 85.7%
+- ✅ **governing_law**: 85.7%
+
+## Per-document results
+| File | Correct/Total | Accuracy |
+| --- | --- | --- |
+| acme_msa_2024.pdf | 5/5 | 100% |
+| ...</code></pre>
+  </div>
+
+  <p>The pattern: run eval, see where accuracy dips, adjust the prompt or schema, re-run. The harness is the scoreboard.</p>
+
+  <h3>Use the harness</h3>
+  <ul>
+    <li>Before changing the prompt — record baseline accuracy.</li>
+    <li>After every prompt change — compare to baseline.</li>
+    <li>When upgrading model — run with old and new, compare.</li>
+    <li>In CI — fail the build if accuracy regresses below a threshold.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

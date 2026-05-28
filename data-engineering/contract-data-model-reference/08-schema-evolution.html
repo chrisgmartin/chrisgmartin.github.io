@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Schema Evolution Recipes</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#principles">Principles</a>
+    <a href="#add-column">Adding a column</a>
+    <a href="#rename">Two-phase rename</a>
+    <a href="#json-sidecar">JSON sidecar pattern</a>
+    <a href="#new-doc-class">Adding a new document class</a>
+    <a href="#new-obligation">Adding a new obligation type</a>
+    <a href="#customer-extension">Customer-specific extensions</a>
+    <a href="#migration-cadence">Migration cadence</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-sql-pattern-library.html">← Previous</a>
+    <a href="09-quality-tests-dbt.html">Next: Quality tests →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Schema evolution &amp; quality</span>
+  <h1>Schema Evolution Recipes</h1>
+  <p class="subtitle">The schema will change. The recipes that keep migrations backward-compatible, forward-deployable, and reversible — so you can evolve without breaking customer-facing consumers.</p>
+</header>
+
+<section id="principles">
+  <h2>Principles</h2>
+  <ul>
+    <li><strong>Backward-compatible.</strong> Existing queries should keep working through the migration window.</li>
+    <li><strong>Forward-deployable.</strong> You can deploy the migration before any code that uses the new shape.</li>
+    <li><strong>Reversible.</strong> If the migration is wrong, you can roll back without losing data.</li>
+    <li><strong>Two-phase for structural change.</strong> Rename, type change, column drop — always two phases minimum (add new, populate, switch readers, drop old).</li>
+    <li><strong>JSONB for flexibility.</strong> When you don't know yet whether a field belongs as a typed column, the JSONB sidecar pattern buys you time.</li>
+  </ul>
+</section>
+
+<section id="add-column">
+  <h2>Adding a column</h2>
+  <p>The easy case. Add nullable; existing queries ignore it.</p>
+
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Migration: add jurisdiction column to agreements
+ALTER TABLE agreements ADD COLUMN jurisdiction TEXT;
+
+-- Backfill is optional and can be done lazily.
+-- Existing queries continue to work; new queries can use the column.</code></pre>
+  </div>
+
+  <h3>If the column needs a default</h3>
+  <p>For very large tables, adding a column with a non-null default rewrites the whole table on some database engines. Modern Postgres (11+) handles this efficiently for static defaults. For older versions or other engines, add nullable, then backfill in batches, then add the constraint.</p>
+</section>
+
+<section id="rename">
+  <h2>Two-phase rename</h2>
+  <p>The most-error-prone pattern. Renaming a column in production breaks every consumer that hasn't been updated yet.</p>
+
+  <h3>Two-phase recipe</h3>
+  <ol>
+    <li><strong>Phase 1</strong>: add the new column. Populate via trigger or batch backfill from the old column.</li>
+    <li>Deploy code that writes to both columns.</li>
+    <li>Migrate readers one by one to use the new column.</li>
+    <li>Once all readers are migrated, stop writing to the old column.</li>
+    <li><strong>Phase 2</strong> (later release): drop the old column.</li>
+  </ol>
+
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Phase 1
+ALTER TABLE agreements ADD COLUMN current_end_date DATE;
+UPDATE agreements SET current_end_date = current_term_end;
+-- (Then deploy code that writes to both; migrate readers.)
+
+-- Phase 2 (after all readers migrated)
+ALTER TABLE agreements DROP COLUMN current_term_end;</code></pre>
+  </div>
+
+  <p>The cost is days or weeks of overhead and dual-writing. The benefit is zero downtime, no broken consumers.</p>
+</section>
+
+<section id="json-sidecar">
+  <h2>JSON sidecar pattern</h2>
+  <p>When you're not sure whether a new field should be a typed column yet — because it's customer-specific, experimental, or you haven't seen the full data variance — put it in a JSONB sidecar.</p>
+
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Add a flexible sidecar to agreements
+ALTER TABLE agreements ADD COLUMN extra JSONB;
+
+-- Use it for fields you'll later promote
+UPDATE agreements
+SET extra = jsonb_set(COALESCE(extra, '{}'),
+                      '{billing_frequency}', '"monthly"'::jsonb)
+WHERE agreement_id = 'agr_x';
+
+-- Query
+SELECT agreement_id, extra-&gt;&gt;'billing_frequency' AS billing_frequency
+FROM agreements;</code></pre>
+  </div>
+
+  <p>Once a field stabilizes (used by many queries, mature definition), promote it to a typed column via the two-phase rename pattern.</p>
+
+  <h3>When NOT to use the sidecar</h3>
+  <ul>
+    <li>Fields that drive joins or indexes — typed columns first.</li>
+    <li>Fields with strict type or constraint requirements — typed columns enforce that better.</li>
+    <li>Fields that are core to the product. The sidecar is for experimental; the model is for stable.</li>
+  </ul>
+</section>
+
+<section id="new-doc-class">
+  <h2>Adding a new document class</h2>
+  <p>The pattern that runs most frequently in customer deployments. Schema doesn't change — only the doc_class taxonomy expands.</p>
+
+  <ol>
+    <li>Add the new class to the taxonomy config (often a JSON or YAML file).</li>
+    <li>Configure extraction prompts / templates for the new class.</li>
+    <li>Set initial confidence threshold (default 0.85; recalibrate).</li>
+    <li>Run on a pilot sample (100 documents); customer-side analysts validate.</li>
+    <li>Add to the SLA dashboard.</li>
+    <li>Update the working agreement to reflect the new class.</li>
+  </ol>
+
+  <p>No SQL migration required — the doc_class column already accepts any string. Just consistent usage.</p>
+</section>
+
+<section id="new-obligation">
+  <h2>Adding a new obligation type</h2>
+  <p>Similar. The obligation_type column is a string; new types are added to the taxonomy.</p>
+
+  <ol>
+    <li>Define the JSONB value shape for the new obligation type.</li>
+    <li>Add to the taxonomy config.</li>
+    <li>Update extraction prompts to extract the new type when present.</li>
+    <li>Backfill on historical documents if the type was always there (e.g., you just started extracting it).</li>
+    <li>Update dbt models to surface the new type in the mart layer.</li>
+  </ol>
+</section>
+
+<section id="customer-extension">
+  <h2>Customer-specific extensions</h2>
+  <p>Some customers have unique fields that don't apply to others. Three patterns:</p>
+
+  <h3>Pattern 1: Customer-namespaced JSONB</h3>
+  <p>Put it in a sidecar JSONB column, namespace by customer:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">-- One sidecar column per entity, key by customer
+ALTER TABLE agreements ADD COLUMN customer_extensions JSONB;
+
+UPDATE agreements
+SET customer_extensions = jsonb_set(COALESCE(customer_extensions, '{}'),
+                                    '{acme_corp,vendor_program_tier}', '"gold"'::jsonb)
+WHERE agreement_id = 'agr_acme_x';</code></pre>
+  </div>
+
+  <h3>Pattern 2: Per-customer extension table</h3>
+  <p>For customers with many unique fields, a separate table:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">CREATE TABLE acme_agreement_extensions (
+  agreement_id TEXT PRIMARY KEY REFERENCES agreements,
+  vendor_program_tier TEXT,
+  internal_owner TEXT,
+  contract_review_status TEXT
+);</code></pre>
+  </div>
+  <p>Heavier-weight but cleaner queries. Useful when the customer's data team will be writing dashboards on top.</p>
+
+  <h3>Pattern 3: Generic key-value table</h3>
+  <p>Most flexible; weakest performance:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">CREATE TABLE entity_attributes (
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  attr_key TEXT NOT NULL,
+  attr_value JSONB,
+  PRIMARY KEY (entity_type, entity_id, customer_id, attr_key)
+);</code></pre>
+  </div>
+  <p>Rarely the right call. Use pattern 1 or 2 first.</p>
+</section>
+
+<section id="migration-cadence">
+  <h2>Migration cadence</h2>
+  <p>Operating recommendations:</p>
+  <ul>
+    <li><strong>Migrations ship in their own deploy</strong>, separate from code changes that use them. Reduces blast radius if a migration fails.</li>
+    <li><strong>Reversible migrations</strong> — every migration has an "down" path. Some teams enforce this in CI.</li>
+    <li><strong>Per-customer migrations</strong> for multi-tenant. If a migration is non-trivial, roll it customer-by-customer. Big customers' freezes will force this anyway.</li>
+    <li><strong>dbt model rebuilds</strong> happen automatically when source schema changes; tests catch regressions before they hit customer-facing dashboards.</li>
+    <li><strong>Drop columns slowly</strong>. The typical lifecycle is: add → backfill → migrate readers → wait at least one release cycle → drop. Resist the urge to drop in the same release as the rename.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">The migration-rollback hygiene</span>
+    <p>Before every migration deploy, write the rollback. Run the rollback against a copy of production data. Verify it works. The hour spent doing this saves the painful afternoon when the migration is in production and the rollback turns out to be broken.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

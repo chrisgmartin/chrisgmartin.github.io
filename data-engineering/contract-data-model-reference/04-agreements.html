@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agreements</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#table">The agreements table</a>
+    <a href="#logical">Documents vs agreements</a>
+    <a href="#linking">Document-agreement links</a>
+    <a href="#parent">Parent-child agreements</a>
+    <a href="#status">Status modeling</a>
+    <a href="#operations">Common operations</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-documents.html">← Previous</a>
+    <a href="05-obligations.html">Next: Obligations →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Core entities</span>
+  <h1>Agreements</h1>
+  <p class="subtitle">The logical-contract table. How many documents roll up to one agreement, the MSA-amendment-SOW pattern, status modeling, and the document-to-agreement linkage that makes the rest of the schema work.</p>
+</header>
+
+<section id="table">
+  <h2>The agreements table</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>agreements.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE agreements (
+  agreement_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  supplier_id TEXT NOT NULL REFERENCES suppliers,
+  agreement_type TEXT NOT NULL,
+  effective_date DATE,
+  current_term_end DATE,
+  parent_agreement_id TEXT REFERENCES agreements,
+  status TEXT NOT NULL DEFAULT 'active',
+  status_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE document_agreement_links (
+  document_id TEXT NOT NULL REFERENCES documents,
+  agreement_id TEXT NOT NULL REFERENCES agreements,
+  role TEXT NOT NULL,  -- master | amendment | sow | exhibit
+  PRIMARY KEY (document_id, agreement_id)
+);</code></pre>
+  </div>
+
+  <h3>Field rationale</h3>
+  <ul>
+    <li><code>agreement_id</code>: platform-assigned. Unlike document_id, this isn't content-derived because the agreement is a logical entity assembled from multiple documents.</li>
+    <li><code>supplier_id</code>: the counterparty. Most queries on agreements join through this.</li>
+    <li><code>agreement_type</code>: msa, sow, supplier_agreement, dpa, baa, etc. Often matches a single document's doc_class, but not always.</li>
+    <li><code>effective_date</code>: when the agreement took effect. Could be earlier than the latest amendment's signed_at.</li>
+    <li><code>current_term_end</code>: when the current term ends. Updated when amendments extend or change the term.</li>
+    <li><code>parent_agreement_id</code>: when this agreement modifies or hangs under another (rare; usually used for partner / reseller chains rather than amendment relationships, which are captured via document_agreement_links).</li>
+    <li><code>status</code>: active / expired / terminated / superseded / draft.</li>
+  </ul>
+</section>
+
+<section id="logical">
+  <h2>Documents vs agreements</h2>
+  <p>The clearest example: a customer-supplier MSA from 2020, amended twice (2021 and 2023), with five SOWs underneath. That's:</p>
+  <ul>
+    <li><strong>1 agreement</strong> — the customer-supplier relationship under that MSA.</li>
+    <li><strong>8 documents</strong> — original MSA + 2 amendments + 5 SOWs.</li>
+  </ul>
+
+  <p>Most analytical questions ("what's the customer's current obligation under their MSA with Acme?") want the agreement-level view, with the current term and renewal terms computed from the most recent amendments.</p>
+
+  <p>Most debugging questions ("why does the extracted renewal date look wrong?") need document-level granularity.</p>
+</section>
+
+<section id="linking">
+  <h2>Document-agreement links</h2>
+  <p>The M:N table <code>document_agreement_links</code> ties documents to agreements with a role.</p>
+
+  <h3>Roles</h3>
+  <table>
+    <thead><tr><th>Role</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>master</code></td><td>The MSA itself (one per agreement)</td></tr>
+      <tr><td><code>amendment</code></td><td>An amendment modifying the master</td></tr>
+      <tr><td><code>sow</code></td><td>A statement of work under the master</td></tr>
+      <tr><td><code>exhibit</code></td><td>Schedule, addendum, exhibit attached to the master or an amendment</td></tr>
+      <tr><td><code>dpa</code></td><td>Data Processing Agreement attached to the master</td></tr>
+      <tr><td><code>baa</code></td><td>Business Associate Agreement</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How linkages are determined</h3>
+  <ul>
+    <li><strong>Source-system parentage</strong>: if the CLM tracks "this amendment is attached to MSA X," use that directly.</li>
+    <li><strong>Title and reference matching</strong>: amendments often say "amends the MSA between Customer and Supplier dated March 15, 2024" — match on supplier + date.</li>
+    <li><strong>Manual linkage</strong>: customer's data team or reviewer assigns the link when automation can't.</li>
+  </ul>
+
+  <h3>Orphaned amendments</h3>
+  <p>Sometimes you have an amendment whose master MSA isn't in the corpus. Don't drop it; insert into <code>documents</code> with <code>doc_class = amendment</code> but no link to an agreement until the master surfaces (or until the customer confirms the master is missing). See <a href="07-sql-pattern-library.html">chapter 07</a> for the "orphaned amendments" query pattern.</p>
+</section>
+
+<section id="parent">
+  <h2>Parent-child agreements</h2>
+  <p>The <code>parent_agreement_id</code> column handles cases where one agreement legally hangs under another. Less common than document-to-agreement linkage, but real:</p>
+  <ul>
+    <li>A reseller agreement under a master partner agreement.</li>
+    <li>A region-specific localization of a global MSA.</li>
+    <li>A subsidiary's agreement under a parent-company master contract.</li>
+  </ul>
+
+  <h3>When to use what</h3>
+  <ul>
+    <li><strong>Amendment to an MSA</strong>: linked via document_agreement_links (the amendment document is linked to the MSA agreement; same agreement_id).</li>
+    <li><strong>Separate agreement modifying terms of another</strong>: parent_agreement_id (two distinct agreement rows; one references the other).</li>
+  </ul>
+
+  <p>Amendments don't get their own agreement_id — they modify an existing agreement. Sub-agreements (e.g., regional contracts) do get their own agreement_id with parent reference.</p>
+</section>
+
+<section id="status">
+  <h2>Status modeling</h2>
+  <p>Agreement status changes over time. The minimal status set:</p>
+  <ul>
+    <li><code>draft</code> — not yet signed (rare in this schema, since we usually treat signed documents as input).</li>
+    <li><code>active</code> — currently in effect.</li>
+    <li><code>expired</code> — passed its current_term_end without renewal.</li>
+    <li><code>terminated</code> — ended early by one party.</li>
+    <li><code>superseded</code> — replaced by a newer agreement (common when companies renegotiate the entire MSA rather than amending).</li>
+  </ul>
+
+  <h3>Temporal status modeling</h3>
+  <p>For audit, you sometimes need to know an agreement's status at a historical point. Two patterns:</p>
+
+  <h4>Pattern 1: Current-only with audit log</h4>
+  <p>The <code>agreements.status</code> column shows current status. A separate <code>agreement_status_changes</code> table logs every change.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">CREATE TABLE agreement_status_changes (
+  change_id TEXT PRIMARY KEY,
+  agreement_id TEXT NOT NULL REFERENCES agreements,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  changed_by TEXT,  -- model_version | analyst_id | system
+  reason TEXT
+);</code></pre>
+  </div>
+
+  <h4>Pattern 2: SCD-2 directly on agreements</h4>
+  <p>Add row-effective-from and row-effective-to columns; new status creates a new row. More query overhead; cleaner for some audit workflows. Pattern 1 is more common.</p>
+
+  <h3>Computing status</h3>
+  <p>Status can be computed in some cases:</p>
+  <ul>
+    <li><code>active</code> if current_term_end is in the future and status is not terminated/superseded.</li>
+    <li><code>expired</code> if current_term_end has passed and no renewal has been processed.</li>
+  </ul>
+  <p>Many platforms run a daily job that promotes <code>active → expired</code> when term ends pass. Avoid relying on the stored status if your data isn't auto-updated; compute in queries against current_term_end and last_amendment_date.</p>
+</section>
+
+<section id="operations">
+  <h2>Common operations</h2>
+
+  <h3>Create an agreement from extracted documents</h3>
+  <p>When a new MSA is ingested:</p>
+  <ol>
+    <li>Extract supplier identity (parties extraction); resolve to supplier_id.</li>
+    <li>Extract effective_date and term details.</li>
+    <li>Create the agreement row.</li>
+    <li>Link the document via document_agreement_links with role='master'.</li>
+  </ol>
+  <div class="code-wrap">
+<pre><code class="language-python">def create_agreement(extraction: dict, document_id: str, customer_id: str) -&gt; str:
+    supplier_id = resolve_supplier(extraction["parties"][1], customer_id)  # other party
+    agreement_id = f"agr_{uuid4()}"
+    db.execute("""
+        INSERT INTO agreements (agreement_id, customer_id, supplier_id,
+                                agreement_type, effective_date, current_term_end,
+                                status)
+        VALUES (%(id)s, %(cust)s, %(sup)s, %(type)s, %(eff)s, %(end)s, 'active')
+    """, {
+        "id": agreement_id, "cust": customer_id, "sup": supplier_id,
+        "type": "master_service_agreement",
+        "eff": extraction["effective_date"],
+        "end": compute_term_end(extraction["effective_date"], extraction["term_months"])
+    })
+    db.execute("""
+        INSERT INTO document_agreement_links (document_id, agreement_id, role)
+        VALUES (%s, %s, 'master')
+    """, document_id, agreement_id)
+    return agreement_id</code></pre>
+  </div>
+
+  <h3>Apply an amendment</h3>
+  <p>When an amendment is ingested and linked to an existing agreement:</p>
+  <ol>
+    <li>Link the document via document_agreement_links with role='amendment'.</li>
+    <li>Extract what the amendment changes (term extension, price change, scope expansion, etc.).</li>
+    <li>Update the agreement row if material terms change. Log the change in <code>agreement_status_changes</code>.</li>
+    <li>Insert new obligations or supersede old ones (chapter 05).</li>
+  </ol>
+
+  <h3>Find an agreement's full document trail</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT
+  dal.role,
+  d.document_id,
+  d.doc_class,
+  d.ingested_at
+FROM document_agreement_links dal
+JOIN documents d ON d.document_id = dal.document_id
+WHERE dal.agreement_id = 'agr_acme_msa_2020'
+ORDER BY d.ingested_at;</code></pre>
+  </div>
+
+  <h3>Mark an agreement superseded</h3>
+  <p>When the customer renegotiates the entire MSA rather than amending:</p>
+  <ol>
+    <li>Create the new agreement (with its own agreement_id, linked to the new MSA document).</li>
+    <li>Mark the old agreement: <code>UPDATE agreements SET status = 'superseded', status_changed_at = NOW() WHERE agreement_id = 'old_id'</code>.</li>
+    <li>Log the change in agreement_status_changes.</li>
+    <li>Don't delete the old agreement — its obligations remain in history.</li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

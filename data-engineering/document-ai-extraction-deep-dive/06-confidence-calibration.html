@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Confidence &amp; Calibration</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why calibration matters</a>
+    <a href="#reliability">Reliability diagrams</a>
+    <a href="#sources">Sources of confidence</a>
+    <a href="#calibration-methods">Calibration methods</a>
+    <a href="#llm-confidence">LLM confidence specifically</a>
+    <a href="#composite">Composite confidence</a>
+    <a href="#cost">The cost of miscalibration</a>
+    <a href="#operating">Operating calibration in production</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-output-schema-provenance.html">← Previous</a>
+    <a href="07-hitl-economics.html">Next: HITL →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Quality &amp; eval</span>
+  <h1>Confidence &amp; Calibration</h1>
+  <p class="subtitle">A confidence score is only useful if 0.9 actually means 90% correct. Reliability diagrams, calibration techniques, and why miscalibrated confidence breaks the HITL queue economics.</p>
+</header>
+
+<section id="why">
+  <h2>Why calibration matters</h2>
+  <p>Calibration is whether the model's stated confidence matches its observed accuracy. A perfectly-calibrated model: of all extractions scored at 0.9 confidence, 90% are actually correct.</p>
+  <p>Three operational decisions depend on calibration:</p>
+  <ul>
+    <li><strong>HITL routing thresholds.</strong> If you route everything below 0.85 to reviewers, you're assuming 0.85+ predictions are accurate enough to skip review. If actual accuracy at 0.85 is only 0.7, customer-visible accuracy slips.</li>
+    <li><strong>SLA reporting.</strong> If the model is over-confident, the SLA dashboard reads "we're hitting 95%" while reality is 87%. The customer finds out the hard way.</li>
+    <li><strong>Cost-quality tradeoffs.</strong> Tuning the threshold is the lever for HITL volume. The lever doesn't work if the input (confidence) is uncalibrated.</li>
+  </ul>
+</section>
+
+<section id="reliability">
+  <h2>Reliability diagrams</h2>
+  <p>The standard calibration diagnostic. Bin predictions by confidence (deciles or finer), then plot the bin's mean confidence vs the bin's actual accuracy. A perfectly calibrated model lies on the y=x diagonal.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>reliability_diagram.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from collections import defaultdict
+
+def reliability_curve(predictions: list[dict], n_bins: int = 10) -&gt; list[dict]:
+    """
+    Each prediction: {"confidence": float, "was_correct": bool}
+    Returns per-bin: mean_confidence, mean_accuracy, n, gap.
+    """
+    buckets = defaultdict(list)
+    for p in predictions:
+        b = min(int(p["confidence"] * n_bins), n_bins - 1)
+        buckets[b].append(p)
+    out = []
+    for b in range(n_bins):
+        items = buckets.get(b, [])
+        if not items:
+            continue
+        mc = sum(i["confidence"] for i in items) / len(items)
+        ma = sum(1 for i in items if i["was_correct"]) / len(items)
+        out.append({"bin": b, "n": len(items),
+                    "mean_confidence": mc, "mean_accuracy": ma,
+                    "gap": ma - mc})
+    return out
+
+def expected_calibration_error(predictions, n_bins=10) -&gt; float:
+    """ECE — the standard scalar summary of calibration."""
+    curve = reliability_curve(predictions, n_bins)
+    total = sum(b["n"] for b in curve)
+    return sum(b["n"] * abs(b["gap"]) for b in curve) / total</code></pre>
+  </div>
+
+  <p>ECE (Expected Calibration Error) is the weighted average of the calibration gap across bins. ECE under 0.02 is excellent; over 0.05 means meaningful miscalibration.</p>
+</section>
+
+<section id="sources">
+  <h2>Sources of confidence</h2>
+  <p>Each layer in the extraction stack produces a confidence signal; they're often combined.</p>
+
+  <h3>OCR confidence</h3>
+  <p>Per-word from the OCR engine. Aggregate across the tokens of an extracted field. Reliable signal for "did we read the text correctly."</p>
+
+  <h3>Layout/region confidence</h3>
+  <p>From layout-aware models — confidence that this region is what we classified it as (paragraph vs table vs signature).</p>
+
+  <h3>Token-classifier softmax</h3>
+  <p>For token-classification extractors (BIO tagging with BERT/LayoutLM), the softmax probability of the predicted label. Usually over-confident out of the box; needs calibration.</p>
+
+  <h3>LLM logprobs</h3>
+  <p>For LLM-based extraction, the logprobs of the generated tokens. Available from most provider APIs. Indirect signal — high logprobs mean the model is fluent, not necessarily correct.</p>
+
+  <h3>LLM self-reported confidence</h3>
+  <p>Asking the LLM "rate your confidence in this extraction from 0 to 1." Notoriously miscalibrated unless you train against ground truth and Platt-scale.</p>
+
+  <h3>Validation-rule confidence</h3>
+  <p>Did the extracted value pass format checks? Range checks? Cross-field consistency checks? Each can boost or reduce composite confidence.</p>
+</section>
+
+<section id="calibration-methods">
+  <h2>Calibration methods</h2>
+
+  <h3>Platt scaling</h3>
+  <p>Fit a logistic regression mapping raw confidence to calibrated probability. Two parameters; works well when miscalibration is roughly sigmoidal. Cheap to fit, cheap to apply.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>platt_calibration.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from sklearn.linear_model import LogisticRegression
+import numpy as np
+
+def fit_platt(raw_confidences: np.ndarray, was_correct: np.ndarray) -&gt; LogisticRegression:
+    """raw_confidences: floats in [0,1]; was_correct: 0/1."""
+    X = raw_confidences.reshape(-1, 1)
+    model = LogisticRegression()
+    model.fit(X, was_correct)
+    return model
+
+def apply_platt(model, raw_confidence: float) -&gt; float:
+    return float(model.predict_proba([[raw_confidence]])[0, 1])</code></pre>
+  </div>
+
+  <h3>Isotonic regression</h3>
+  <p>Fit a monotonic step function mapping raw confidence to calibrated probability. More flexible than Platt; handles non-sigmoidal miscalibration. Needs more held-out data (500+ examples per bin for stable fit).</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>isotonic_calibration.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from sklearn.isotonic import IsotonicRegression
+
+def fit_isotonic(raw_confidences: np.ndarray, was_correct: np.ndarray) -&gt; IsotonicRegression:
+    model = IsotonicRegression(out_of_bounds="clip")
+    model.fit(raw_confidences, was_correct)
+    return model
+
+def apply_isotonic(model, raw_confidence: float) -&gt; float:
+    return float(model.predict([raw_confidence])[0])</code></pre>
+  </div>
+
+  <h3>Temperature scaling</h3>
+  <p>For models that produce logits (token-classifiers), divide logits by a learned temperature T before softmax. Single-parameter; preserves rank ordering. Common for neural-network classifier calibration.</p>
+
+  <h3>Binning</h3>
+  <p>The simplest: replace raw confidence with the empirical accuracy of its bin. Coarse but defensible. Use when sample sizes are small.</p>
+</section>
+
+<section id="llm-confidence">
+  <h2>LLM confidence specifically</h2>
+  <p>LLM-based extraction has unusual confidence properties worth knowing.</p>
+
+  <h3>Logprobs are about fluency, not correctness</h3>
+  <p>An LLM generating "March 15, 2024" with high logprob means the model finds that string fluent given the context. The string might still be wrong (e.g., the date is actually on a different page). Logprobs over-estimate accuracy.</p>
+
+  <h3>Self-reported confidence is miscalibrated by default</h3>
+  <p>Asking the model "how confident are you?" returns plausible-sounding numbers (usually 0.85, 0.9, 0.95). They don't correspond to reality without calibration.</p>
+
+  <h3>Consistency-as-confidence</h3>
+  <p>A more reliable signal: <strong>sample the model N times</strong>, look at agreement. Fields where 5 of 5 runs agree are typically more accurate than fields where 3 of 5 agree. Costs N× the inference; worth it for high-stakes extractions or for offline confidence training.</p>
+
+  <h3>Citation-grounding</h3>
+  <p>If the model produces a citation (quote from source), validate by string-matching against the OCR text. Failed citations are a strong "low confidence" signal.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>consistency_confidence.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from collections import Counter
+
+def consistency_confidence(values: list, n_samples: int) -&gt; tuple[any, float]:
+    """Given N sampled extractions of the same field, return the
+    most-common value and its agreement rate."""
+    counts = Counter(values)
+    most_common_value, count = counts.most_common(1)[0]
+    return most_common_value, count / n_samples</code></pre>
+  </div>
+</section>
+
+<section id="composite">
+  <h2>Composite confidence</h2>
+  <p>In production, you usually combine multiple confidence signals into one number used by HITL routing and reporting. A common shape:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>composite_confidence.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def composite_confidence(
+    model_conf: float,
+    ocr_conf: float,
+    citation_validated: bool,
+    schema_valid: bool,
+    weights: dict[str, float] = None,
+) -&gt; float:
+    """Combine signals into a calibrated composite.
+    Then apply isotonic / Platt against ground truth to keep calibration."""
+    weights = weights or {"model": 0.6, "ocr": 0.2,
+                          "citation": 0.1, "schema": 0.1}
+    base = (
+        weights["model"] * model_conf
+        + weights["ocr"] * ocr_conf
+        + weights["citation"] * (1.0 if citation_validated else 0.0)
+        + weights["schema"] * (1.0 if schema_valid else 0.0)
+    )
+    return base  # then pass through isotonic calibrator</code></pre>
+  </div>
+
+  <p>The weights and calibrator are fit against ground truth per document class. They drift; recompute periodically.</p>
+</section>
+
+<section id="cost">
+  <h2>The cost of miscalibration</h2>
+  <p>Miscalibration has asymmetric costs depending on direction.</p>
+
+  <h3>Over-confidence</h3>
+  <p>Model says 0.9 but is actually right only 0.7. Threshold-based HITL auto-approves predictions that should have been reviewed. Customer-visible accuracy degrades; SLA breaches.</p>
+
+  <h3>Under-confidence</h3>
+  <p>Model says 0.7 but is actually right 0.9. HITL queue fills with predictions that would have been correct. Reviewer cost rises; throughput suffers; customer-visible latency increases.</p>
+
+  <p>Over-confidence is usually worse — it produces silent quality issues. Under-confidence is loud (queue overflow, latency complaints) and easier to detect and fix.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">The miscalibration arithmetic</span>
+    <p>If the model is over-confident by 10pp (says 0.9, actually 0.8) and you auto-approve at 0.85: roughly 5–10% of your auto-approved predictions are wrong. On a 100,000-document customer corpus extracting 10 fields, that's 50,000–100,000 wrong values landing in customer-visible output. Calibration is not an academic concern.</p>
+  </div>
+</section>
+
+<section id="operating">
+  <h2>Operating calibration in production</h2>
+
+  <h3>Recompute calibration regularly</h3>
+  <p>Model drift, customer data drift, OCR vendor changes — calibration shifts. Recompute monthly or after every significant model deploy.</p>
+
+  <h3>Per-document-class calibration</h3>
+  <p>Calibration that's correct for MSAs may be wrong for invoices. Fit calibrators per document class; store the calibrator version alongside the model version.</p>
+
+  <h3>Calibrate against representative ground truth</h3>
+  <p>Calibration data should reflect the production distribution of inputs. Calibrating on cherry-picked easy examples produces calibrators that fail on hard ones.</p>
+
+  <h3>Monitor calibration in production</h3>
+  <p>When labeled outcomes arrive (HITL corrections, customer feedback), update a rolling reliability diagram. If ECE creeps up, recalibrate before it affects SLA.</p>
+
+  <h3>Cold-start calibration</h3>
+  <p>New customer, new document class — you don't have ground truth yet. Start with the calibrator from a similar customer / class; collect HITL outcomes for the first 200–500 documents; refit. Until then, lean conservative on the threshold (route more to HITL than strictly necessary).</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

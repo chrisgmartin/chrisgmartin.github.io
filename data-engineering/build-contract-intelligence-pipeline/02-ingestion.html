@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ingestion: Folder Watcher to Postgres</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What we're building</a>
+    <a href="#models">SQLAlchemy models</a>
+    <a href="#migration">Initial migration</a>
+    <a href="#document-id">document_id</a>
+    <a href="#ingest">Ingest function</a>
+    <a href="#cli">CLI wrapper</a>
+    <a href="#verify">Verify</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-setup.html">← Previous</a>
+    <a href="03-extraction.html">Next: Extraction →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Hands-on · ~30 min</span>
+  <h1>Ingestion: Folder Watcher to Postgres</h1>
+  <p class="subtitle">Watch <code>data/inbox/</code> for PDFs; for each new file, compute a stable document_id (content hash) and persist file metadata to Postgres. Idempotent on re-ingest.</p>
+</header>
+
+<section id="goal">
+  <h2>What we're building</h2>
+  <ul>
+    <li>A documents table in Postgres.</li>
+    <li>An idempotent <code>ingest_file(path)</code> function.</li>
+    <li>A CLI that processes <code>data/inbox/*.pdf</code>.</li>
+    <li>Re-running the CLI doesn't duplicate rows.</li>
+  </ul>
+</section>
+
+<section id="models">
+  <h2>SQLAlchemy models</h2>
+  <p>Minimum to get ingestion working. We'll extend in chapter 04 when we add extractions, agreements, etc.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/models.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from datetime import datetime
+from sqlalchemy import String, Integer, DateTime, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (UniqueConstraint("customer_id", "file_hash"),)
+
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    source_uri: Mapped[str] = mapped_column(String, nullable=False)
+    file_hash: Mapped[str] = mapped_column(String, nullable=False)
+    doc_class: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/db.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from collections.abc import Iterator
+from contextlib import contextmanager
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from ci.config import settings
+
+engine = create_engine(settings.db_dsn, future=True)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+@contextmanager
+def db_session() -&gt; Iterator[Session]:
+    s = SessionLocal()
+    try:
+        yield s
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()</code></pre>
+  </div>
+</section>
+
+<section id="migration">
+  <h2>Initial migration</h2>
+  <p>Alembic for migrations.</p>
+  <div class="code-wrap">
+<pre><code class="language-bash">alembic init -t async alembic   # creates alembic/ directory
+# Edit alembic.ini: set sqlalchemy.url = (your db_dsn)
+# Edit alembic/env.py: import Base and set target_metadata = Base.metadata
+
+alembic revision --autogenerate -m "documents table"
+alembic upgrade head</code></pre>
+  </div>
+
+  <p>Verify in psql:</p>
+  <div class="code-wrap">
+<pre><code class="language-bash">docker compose exec postgres psql -U ci -d contract_intel -c "\d documents"</code></pre>
+  </div>
+</section>
+
+<section id="document-id">
+  <h2>document_id</h2>
+  <p>Content-hash derivation. From <a href="../contract-data-model-reference/03-documents.html#document-id">Contract Data Model §03</a>.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/ingestion.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+import hashlib
+from pathlib import Path
+import pdfplumber
+
+from ci.config import settings
+from ci.db import db_session
+from ci.models import Document
+
+
+def derive_document_id(file_bytes: bytes, customer_id: str) -&gt; tuple[str, str]:
+    h = hashlib.sha256(file_bytes).hexdigest()
+    document_id = f"doc_{customer_id[:8]}_{h[:16]}"
+    return document_id, h
+
+
+def classify_doc(file_bytes: bytes, filename: str) -&gt; str:
+    """Heuristic classification by filename. Replace with a real classifier later."""
+    name = filename.lower()
+    if "msa" in name or "master_service" in name:
+        return "master_service_agreement"
+    if "sow" in name or "statement_of_work" in name:
+        return "statement_of_work"
+    if "amendment" in name:
+        return "amendment"
+    if "nda" in name:
+        return "nda"
+    if "invoice" in name:
+        return "invoice"
+    return "unclassified"
+
+
+def page_count(file_bytes: bytes) -&gt; int:
+    import io
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        return len(pdf.pages)
+
+
+def ingest_file(path: Path, customer_id: str | None = None) -&gt; dict:
+    customer_id = customer_id or settings.customer_id
+    file_bytes = path.read_bytes()
+    document_id, file_hash = derive_document_id(file_bytes, customer_id)
+    doc_class = classify_doc(file_bytes, path.name)
+    pages = page_count(file_bytes)
+
+    with db_session() as s:
+        existing = s.get(Document, document_id)
+        if existing:
+            return {"document_id": document_id, "status": "exists", "doc_class": existing.doc_class}
+        doc = Document(
+            document_id=document_id,
+            customer_id=customer_id,
+            source_uri=str(path.resolve()),
+            file_hash=file_hash,
+            doc_class=doc_class,
+            page_count=pages,
+        )
+        s.add(doc)
+    return {"document_id": document_id, "status": "ingested", "doc_class": doc_class, "page_count": pages}</code></pre>
+  </div>
+</section>
+
+<section id="ingest">
+  <h2>Ingest function</h2>
+  <p>The core is above. A few notes:</p>
+  <ul>
+    <li><strong>Idempotent</strong>: re-running on the same file returns <code>status: exists</code>; no duplicate row.</li>
+    <li><strong>Content-derived ID</strong>: same file from a different path produces the same document_id.</li>
+    <li><strong>Per-customer namespace</strong>: prefix the hash with customer_id, so two customers' "Acme_MSA.pdf" don't collide.</li>
+  </ul>
+</section>
+
+<section id="cli">
+  <h2>CLI wrapper</h2>
+  <p>Use Typer for a nice CLI.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>src/ci/cli.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from __future__ import annotations
+from pathlib import Path
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from ci.config import settings
+from ci.ingestion import ingest_file
+
+app = typer.Typer()
+console = Console()
+
+
+@app.command()
+def ingest(directory: Path = Path(settings.inbox_dir)) -&gt; None:
+    """Ingest all PDFs in DIRECTORY."""
+    pdfs = sorted(directory.glob("*.pdf"))
+    if not pdfs:
+        console.print(f"[yellow]No PDFs in {directory}[/yellow]")
+        return
+
+    table = Table(title=f"Ingested from {directory}")
+    table.add_column("File")
+    table.add_column("Status")
+    table.add_column("doc_class")
+    table.add_column("pages", justify="right")
+
+    for path in pdfs:
+        result = ingest_file(path)
+        table.add_row(path.name, result["status"],
+                      result.get("doc_class", "-"),
+                      str(result.get("page_count", "-")))
+    console.print(table)
+
+
+if __name__ == "__main__":
+    app()</code></pre>
+  </div>
+
+  <p>Add a console-script entry to <code>pyproject.toml</code> for convenience:</p>
+  <div class="code-wrap">
+<pre><code class="language-toml">[project.scripts]
+ci = "ci.cli:app"</code></pre>
+  </div>
+  <p>Then <code>pip install -e .</code> again to pick it up.</p>
+</section>
+
+<section id="verify">
+  <h2>Verify</h2>
+  <p>Drop two PDFs into <code>data/inbox/</code> (sample MSAs are fine — public templates work). Run:</p>
+
+  <div class="code-wrap">
+<pre><code class="language-bash">ci ingest
+# Should show: 2 PDFs, status=ingested, doc_class=master_service_agreement
+
+ci ingest
+# Re-run: 2 PDFs, status=exists. No duplicates.
+
+docker compose exec postgres psql -U ci -d contract_intel -c "SELECT document_id, doc_class, page_count FROM documents;"</code></pre>
+  </div>
+
+  <p>You should see two rows. Re-running ingest doesn't add more. That's the idempotency working.</p>
+
+  <h3>Test</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>tests/test_ingestion.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from pathlib import Path
+from ci.ingestion import derive_document_id, ingest_file
+
+
+def test_derive_document_id_deterministic():
+    content = b"hello world"
+    id1, h1 = derive_document_id(content, "cust_test")
+    id2, h2 = derive_document_id(content, "cust_test")
+    assert id1 == id2
+    assert h1 == h2
+
+
+def test_derive_document_id_customer_specific():
+    content = b"hello world"
+    id1, _ = derive_document_id(content, "cust_a")
+    id2, _ = derive_document_id(content, "cust_b")
+    assert id1 != id2
+
+
+def test_ingest_is_idempotent(tmp_path: Path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")  # not a real PDF — pdfplumber will fail on page_count
+    # In practice, use a real sample PDF in test fixtures.</code></pre>
+  </div>
+
+  <p>Run: <code>pytest tests/test_ingestion.py -v</code>. The first two tests should pass; the third requires a real fixture PDF.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

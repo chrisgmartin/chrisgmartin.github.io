@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Obligations &amp; Temporal Modeling</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#table">The obligations table</a>
+    <a href="#types">Obligation types</a>
+    <a href="#versioning">Versioning across extractions</a>
+    <a href="#temporal">Temporal modeling</a>
+    <a href="#current-view">Querying the "current" view</a>
+    <a href="#operations">Common operations</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-agreements.html">← Previous</a>
+    <a href="06-spend.html">Next: Spend →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Temporal &amp; transactional</span>
+  <h1>Obligations &amp; Temporal Modeling</h1>
+  <p class="subtitle">Obligations as extracted commitments. The versioning pattern that keeps old extractions for audit, temporal modeling for status changes over time, and the canonical "current" view that downstream consumers see.</p>
+</header>
+
+<section id="table">
+  <h2>The obligations table</h2>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>obligations.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE obligations (
+  obligation_id TEXT PRIMARY KEY,
+  agreement_id TEXT NOT NULL REFERENCES agreements,
+  obligation_type TEXT NOT NULL,
+  party_obligated TEXT,
+  value JSONB,
+  currency TEXT,
+  due_at DATE,
+  status TEXT NOT NULL DEFAULT 'pending',
+  confidence FLOAT,
+  extracted_from_document_id TEXT REFERENCES documents,
+  model_version TEXT NOT NULL,
+  extracted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);</code></pre>
+  </div>
+
+  <h3>Field rationale</h3>
+  <ul>
+    <li><code>obligation_id</code>: stable identifier. Often <code>agreement_id + obligation_type + model_version</code> hashed.</li>
+    <li><code>agreement_id</code>: which agreement this obligation belongs to.</li>
+    <li><code>obligation_type</code>: see types list below. Drives which fields in <code>value</code> are populated.</li>
+    <li><code>party_obligated</code>: who has to do this — customer, supplier, both. Sometimes null for mutual obligations.</li>
+    <li><code>value</code>: JSONB. Shape varies by obligation_type.</li>
+    <li><code>currency</code>: when obligation involves money. Extracted alongside the amount in <code>value</code>.</li>
+    <li><code>due_at</code>: when this obligation comes due. Null for ongoing obligations (e.g., confidentiality).</li>
+    <li><code>status</code>: pending / fulfilled / overdue / waived / superseded.</li>
+    <li><code>confidence</code>: extraction confidence per obligation.</li>
+    <li><code>extracted_from_document_id</code>: which document produced this obligation. Provenance.</li>
+    <li><code>model_version</code>: which extraction model produced it. Versioning.</li>
+  </ul>
+</section>
+
+<section id="types">
+  <h2>Obligation types</h2>
+  <p>The taxonomy of obligation kinds determines the shape of <code>value</code>. A working starter set:</p>
+
+  <table>
+    <thead><tr><th>Type</th><th>Value shape (JSONB)</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>renewal_notice</code></td><td>{auto_renew, term_months, notice_period_days, notice_party}</td><td>auto_renew=true, term_months=12, notice_period_days=60</td></tr>
+      <tr><td><code>payment</code></td><td>{amount, currency, schedule, payment_terms_days}</td><td>amount=10000, currency=USD, schedule="monthly", payment_terms_days=30</td></tr>
+      <tr><td><code>liability_cap</code></td><td>{cap_amount, cap_type}</td><td>cap_amount=1000000, cap_type="aggregate"</td></tr>
+      <tr><td><code>indemnification</code></td><td>{indemnifying_party, scope}</td><td>indemnifying_party="supplier", scope="ip_infringement"</td></tr>
+      <tr><td><code>service_level</code></td><td>{metric, threshold, measurement_period}</td><td>metric="uptime", threshold=99.9, measurement_period="monthly"</td></tr>
+      <tr><td><code>data_protection</code></td><td>{addendum_present, sub_processors_listed, breach_notification_hours}</td><td>addendum_present=true, breach_notification_hours=72</td></tr>
+      <tr><td><code>termination_for_cause</code></td><td>{notice_days, cure_period_days}</td><td>notice_days=30, cure_period_days=30</td></tr>
+      <tr><td><code>termination_for_convenience</code></td><td>{allowed, notice_days, fee}</td><td>allowed=true, notice_days=90, fee=null</td></tr>
+      <tr><td><code>price_change</code></td><td>{frequency, cap, basis}</td><td>frequency="annual", cap=0.05, basis="cpi"</td></tr>
+      <tr><td><code>most_favored_nation</code></td><td>{scope, applies_to}</td><td>scope="pricing", applies_to="all_customers"</td></tr>
+    </tbody>
+  </table>
+
+  <p>The list isn't exhaustive. Production platforms add types as customers ask for them. The taxonomy lives in a config file or table; extending it doesn't require schema migration.</p>
+</section>
+
+<section id="versioning">
+  <h2>Versioning across extractions</h2>
+  <p>When a new extraction model version processes a document, the obligations it finds are <em>new rows</em>, not updates to existing rows.</p>
+
+  <h3>Why insert, not update</h3>
+  <ul>
+    <li><strong>Audit</strong>: customer can ask "what did the system say about this obligation 6 months ago?" — the historical row is still there.</li>
+    <li><strong>Diffing</strong>: "what changed when we upgraded the model?" — compare model_version X obligations to model_version Y obligations for the same agreement.</li>
+    <li><strong>Rollback</strong>: revert to a previous model version without losing the new extractions; mart picks up the older version.</li>
+    <li><strong>Calibration</strong>: HITL corrections on old rows produce labeled data without altering the original extraction record.</li>
+  </ul>
+
+  <h3>The shape</h3>
+  <p>For agreement A and obligation type renewal_notice, you might have:</p>
+  <ul>
+    <li>One row from model_version v3.1 (extracted on 2026-01-15).</li>
+    <li>One row from model_version v4.0 (extracted on 2026-04-10).</li>
+    <li>One row from model_version v4.2.1 (extracted on 2026-05-20).</li>
+  </ul>
+  <p>Three rows in obligations; one logical obligation. The "current" view (next section) picks the latest version.</p>
+</section>
+
+<section id="temporal">
+  <h2>Temporal modeling</h2>
+  <p>Some obligations have temporal aspects beyond just versioning: status changes over time, term changes via amendments.</p>
+
+  <h3>Status changes</h3>
+  <p>A payment obligation moves from <code>pending</code> → <code>fulfilled</code> when the customer's accounting confirms payment. An audit log captures the transition:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">CREATE TABLE obligation_status_changes (
+  change_id TEXT PRIMARY KEY,
+  obligation_id TEXT NOT NULL REFERENCES obligations,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  changed_by TEXT,
+  evidence TEXT  -- e.g., link to invoice or payment record
+);</code></pre>
+  </div>
+
+  <h3>Amendments that supersede obligations</h3>
+  <p>An amendment changes the renewal term. The old obligation (from the original MSA) gets status = <code>superseded</code>; a new obligation is inserted from the amendment.</p>
+  <p>Both rows reference the same agreement_id. The "current" view shows only non-superseded.</p>
+
+  <h3>SCD-2 alternative</h3>
+  <p>Some platforms use Slowly Changing Dimension Type 2 patterns directly on obligations — row-effective-from / row-effective-to columns; updates close the old row and insert a new one. More query overhead; cleaner for some temporal-audit workflows. Mart-layer SCD-2 (chapter 09) is more common.</p>
+</section>
+
+<section id="current-view">
+  <h2>Querying the "current" view</h2>
+  <p>The canonical view downstream consumers want: <strong>for each (agreement, obligation_type), the latest non-superseded obligation</strong>.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>current_obligations.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH ranked AS (
+  SELECT
+    o.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY o.agreement_id, o.obligation_type
+      ORDER BY o.extracted_at DESC, o.model_version DESC
+    ) AS rn
+  FROM obligations o
+  WHERE o.status != 'superseded'
+)
+SELECT
+  agreement_id, obligation_type, party_obligated,
+  value, currency, due_at, status, confidence,
+  extracted_from_document_id, model_version, extracted_at
+FROM ranked
+WHERE rn = 1;</code></pre>
+  </div>
+
+  <p>This view is what dbt mart models typically materialize. The marts table becomes the source for the customer's BI dashboards.</p>
+
+  <h3>Why this is not just MAX(extracted_at) per group</h3>
+  <p>You also want to consider model_version because:</p>
+  <ul>
+    <li>Two extractions could have the same extracted_at if a batch reprocessed many at once.</li>
+    <li>Ordering by model_version (lexicographically: v4.2.1 > v3.1 > v2) gives a deterministic tie-break.</li>
+  </ul>
+</section>
+
+<section id="operations">
+  <h2>Common operations</h2>
+
+  <h3>Insert obligations from an extraction</h3>
+  <div class="code-wrap">
+<pre><code class="language-python">def insert_obligations(agreement_id: str, extraction: dict, document_id: str, model_version: str):
+    """Each obligation extracted from a document becomes a new row, keyed by model_version."""
+    for ob_type, ob_data in extraction.get("obligations", {}).items():
+        obligation_id = f"ob_{agreement_id}_{ob_type}_{model_version}"
+        db.execute("""
+            INSERT INTO obligations (obligation_id, agreement_id, obligation_type,
+                                     party_obligated, value, currency, due_at,
+                                     status, confidence, extracted_from_document_id,
+                                     model_version)
+            VALUES (%(id)s, %(agr)s, %(type)s, %(party)s, %(val)s, %(cur)s,
+                    %(due)s, 'pending', %(conf)s, %(doc)s, %(ver)s)
+            ON CONFLICT (obligation_id) DO UPDATE SET
+                value = EXCLUDED.value,
+                confidence = EXCLUDED.confidence,
+                extracted_at = NOW()
+        """, {...})</code></pre>
+  </div>
+
+  <h3>Mark an obligation fulfilled</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">UPDATE obligations SET status = 'fulfilled'
+WHERE obligation_id = 'ob_acme_msa_payment_q1_v4.2.1';
+
+INSERT INTO obligation_status_changes (change_id, obligation_id, from_status, to_status, changed_by, evidence)
+VALUES ('chg_uuid', 'ob_acme_msa_payment_q1_v4.2.1', 'pending', 'fulfilled',
+        'customer_ar_system', 'invoice INV-2026-0142 paid 2026-04-30');</code></pre>
+  </div>
+
+  <h3>Supersede an obligation when an amendment changes it</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Mark old obligations from this agreement, of this type, as superseded
+UPDATE obligations
+SET status = 'superseded', status_changed_at = NOW()
+WHERE agreement_id = 'agr_acme_msa_2020'
+  AND obligation_type = 'renewal_notice'
+  AND status != 'superseded'
+  AND obligation_id != 'ob_new_from_amendment';
+-- Then the new obligation row from the amendment is the "current" one.</code></pre>
+  </div>
+
+  <h3>Compute upcoming due obligations</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name AS supplier,
+       o.obligation_type, o.value, o.due_at,
+       o.due_at - CURRENT_DATE AS days_until_due
+FROM current_obligations o  -- the view from earlier
+JOIN agreements a ON a.agreement_id = o.agreement_id
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE o.status = 'pending'
+  AND o.due_at BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+ORDER BY o.due_at;</code></pre>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Schema Overview</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#entities">The six core entities</a>
+    <a href="#full-schema">Full SQL schema</a>
+    <a href="#decisions">Design decisions, explained</a>
+    <a href="#what-not">What this schema is not</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-suppliers.html">Next: Suppliers →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Core entities</span>
+  <h1>Schema Overview</h1>
+  <p class="subtitle">The six core entities, the full SQL schema, and the rationale behind every load-bearing design decision.</p>
+</header>
+
+<section id="entities">
+  <h2>The six core entities</h2>
+  <table>
+    <thead><tr><th>Entity</th><th>What it represents</th><th>Grain</th></tr></thead>
+    <tbody>
+      <tr><td><strong>customers</strong></td><td>Tenant boundary; the platform's customer (the buyer of the platform)</td><td>One row per platform customer</td></tr>
+      <tr><td><strong>suppliers</strong></td><td>Vendors / counterparties in the customer's contracts</td><td>One row per canonical supplier (post-resolution)</td></tr>
+      <tr><td><strong>documents</strong></td><td>Physical files: PDFs, DOCXs, scans</td><td>One row per file</td></tr>
+      <tr><td><strong>agreements</strong></td><td>Logical contracts (an MSA + amendments + SOWs = one agreement)</td><td>One row per logical contract</td></tr>
+      <tr><td><strong>obligations</strong></td><td>Extracted commitments per agreement</td><td>One row per (agreement, obligation, extraction)</td></tr>
+      <tr><td><strong>spend</strong></td><td>Invoice / PO actuals</td><td>One row per spend line item</td></tr>
+    </tbody>
+  </table>
+  <p>Plus three supporting entities:</p>
+  <ul>
+    <li><strong>document_agreement_links</strong>: M:N table connecting documents to agreements with role (master / amendment / sow / exhibit).</li>
+    <li><strong>extractions</strong>: per-document extraction records with model_version, fields, confidence, provenance.</li>
+    <li><strong>supplier_name_resolutions</strong>: raw-supplier-name → canonical-supplier-id mappings with method and confidence.</li>
+  </ul>
+</section>
+
+<section id="full-schema">
+  <h2>Full SQL schema</h2>
+  <p>The complete schema in PostgreSQL dialect. Adapt to Snowflake / BigQuery as needed; the shapes don't change.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>schema.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Customers (tenant boundary)
+CREATE TABLE customers (
+  customer_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Suppliers (canonical entities; post-resolution)
+CREATE TABLE suppliers (
+  supplier_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  canonical_name TEXT NOT NULL,
+  parent_supplier_id TEXT REFERENCES suppliers,
+  country TEXT,
+  tax_id TEXT,
+  industry TEXT,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (customer_id, canonical_name)
+);
+CREATE INDEX idx_suppliers_customer ON suppliers (customer_id);
+CREATE INDEX idx_suppliers_parent ON suppliers (parent_supplier_id);
+
+-- Documents (physical files)
+CREATE TABLE documents (
+  document_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  source_uri TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  doc_class TEXT NOT NULL,
+  page_count INT NOT NULL,
+  ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (customer_id, file_hash)
+);
+CREATE INDEX idx_documents_customer_class ON documents (customer_id, doc_class);
+CREATE INDEX idx_documents_ingested ON documents (ingested_at);
+
+-- Agreements (logical contracts)
+CREATE TABLE agreements (
+  agreement_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  supplier_id TEXT NOT NULL REFERENCES suppliers,
+  agreement_type TEXT NOT NULL,
+  effective_date DATE,
+  current_term_end DATE,
+  parent_agreement_id TEXT REFERENCES agreements,
+  status TEXT NOT NULL DEFAULT 'active',
+  status_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_agreements_supplier ON agreements (supplier_id);
+CREATE INDEX idx_agreements_term_end ON agreements (current_term_end);
+CREATE INDEX idx_agreements_status ON agreements (customer_id, status);
+
+-- Document ↔ Agreement linkage (M:N)
+CREATE TABLE document_agreement_links (
+  document_id TEXT NOT NULL REFERENCES documents,
+  agreement_id TEXT NOT NULL REFERENCES agreements,
+  role TEXT NOT NULL,  -- master | amendment | sow | exhibit
+  PRIMARY KEY (document_id, agreement_id)
+);
+CREATE INDEX idx_dal_agreement ON document_agreement_links (agreement_id);
+
+-- Obligations (extracted commitments per agreement)
+CREATE TABLE obligations (
+  obligation_id TEXT PRIMARY KEY,
+  agreement_id TEXT NOT NULL REFERENCES agreements,
+  obligation_type TEXT NOT NULL,
+  party_obligated TEXT,
+  value JSONB,
+  currency TEXT,
+  due_at DATE,
+  status TEXT NOT NULL DEFAULT 'pending',
+  confidence FLOAT,
+  extracted_from_document_id TEXT REFERENCES documents,
+  model_version TEXT NOT NULL,
+  extracted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_obligations_agreement ON obligations (agreement_id);
+CREATE INDEX idx_obligations_due ON obligations (due_at);
+
+-- Spend (invoice / PO actuals; sometimes linked to agreements)
+CREATE TABLE spend (
+  spend_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  supplier_id TEXT NOT NULL REFERENCES suppliers,
+  agreement_id TEXT REFERENCES agreements,
+  invoice_id TEXT,
+  amount NUMERIC(15, 2) NOT NULL,
+  currency TEXT NOT NULL,
+  accrued_at DATE NOT NULL,
+  spend_category TEXT
+);
+CREATE INDEX idx_spend_supplier ON spend (supplier_id);
+CREATE INDEX idx_spend_agreement ON spend (agreement_id);
+CREATE INDEX idx_spend_accrued ON spend (accrued_at);
+
+-- Extractions (versioned per-document outputs)
+CREATE TABLE extractions (
+  extraction_id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  model_version TEXT NOT NULL,
+  pipeline_version TEXT NOT NULL,
+  fields JSONB NOT NULL,
+  qa JSONB,
+  extracted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (document_id, model_version)
+);
+CREATE INDEX idx_extractions_doc_version ON extractions (document_id, model_version);
+
+-- Supplier name resolutions (raw extracted names → canonical)
+CREATE TABLE supplier_name_resolutions (
+  resolution_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  raw_supplier_name TEXT NOT NULL,
+  resolved_supplier_id TEXT NOT NULL REFERENCES suppliers,
+  resolution_method TEXT NOT NULL,  -- exact_tax_id | fuzzy_name | customer_map | manual
+  confidence FLOAT NOT NULL,
+  resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  resolved_by TEXT NOT NULL  -- model_version or analyst_id
+);
+CREATE INDEX idx_snr_raw ON supplier_name_resolutions (customer_id, raw_supplier_name);</code></pre>
+  </div>
+</section>
+
+<section id="decisions">
+  <h2>Design decisions, explained</h2>
+
+  <h3>Why separate documents and agreements</h3>
+  <p>A signed MSA, two amendments, and three SOWs are four physical documents but one logical contract. Most analytical queries ("how much spend with this supplier under their current MSA") operate on agreements. Most debugging ("why is the renewal date wrong on this contract") operates on documents. Separating them lets both reads be efficient.</p>
+
+  <h3>Why <code>parent_supplier_id</code> on suppliers</h3>
+  <p>Acme Cloud is a subsidiary of Acme Holdings. Spend rollups want to consolidate at the parent. The recursive parent reference enables rollup queries (see chapter 07) without separate hierarchy tables.</p>
+
+  <h3>Why <code>file_hash</code> uniqueness on documents</h3>
+  <p>Re-ingest must be idempotent. <code>document_id</code> is derived from <code>file_hash</code>; the same file re-uploaded gets the same ID. Without this, every re-ingestion would create duplicate documents.</p>
+
+  <h3>Why <code>(document_id, model_version)</code> uniqueness on extractions</h3>
+  <p>Each model version produces its own extraction record for each document. Older extractions stay for audit. The composite unique constraint ensures a single extraction record per (document, model_version) — re-running the same model is idempotent.</p>
+
+  <h3>Why obligations are per-extraction, not per-agreement</h3>
+  <p>When a new model version re-extracts a document, the obligations it finds are new rows. Old obligations stay for audit. The "current" obligations for an agreement is the set extracted by the latest model version — surfaced via a mart, not by overwriting.</p>
+
+  <h3>Why <code>supplier_name_resolutions</code> as a separate table</h3>
+  <p>Resolution is a separable concern from extraction. If you change the resolution algorithm or fix a wrong merge, you can re-resolve without re-extracting. The audit trail of "this raw name resolved to this canonical supplier via this method at this time" lives in this table.</p>
+
+  <h3>Why <code>value JSONB</code> on obligations</h3>
+  <p>Obligations have heterogeneous shapes — a renewal-notice obligation has {auto_renew, term, notice_period}; a payment obligation has {amount, currency, due_date}. A JSONB column accommodates both without proliferating sparse columns. The cost: queries on specific obligation fields need JSON-path expressions. The benefit: schema flexibility.</p>
+
+  <h3>Why <code>fields JSONB</code> on extractions</h3>
+  <p>Similar reasoning. Each doc class extracts different fields. JSONB stores them all; marts (chapter 09) materialize per-class typed columns for query convenience.</p>
+</section>
+
+<section id="what-not">
+  <h2>What this schema is not</h2>
+
+  <h3>Not a CLM workflow database</h3>
+  <p>If you need to model drafting, approval routing, e-signature, redlining — that's CLM territory. This schema treats the signed document as input; it doesn't track contract creation workflow.</p>
+
+  <h3>Not a full procurement system</h3>
+  <p>Spend is captured as a fact table for cross-referencing with agreements. Procurement workflow (3-way match exceptions, PO approval, receiver matching) belongs in the customer's ERP / S2P system.</p>
+
+  <h3>Not vendor master / supplier risk in depth</h3>
+  <p>The suppliers table captures enough to do rollups and resolution. Deep supplier risk modeling (financial health, sanctions screening, ESG scores) typically lives in a dedicated supplier-risk product, joined to suppliers via supplier_id.</p>
+
+  <h3>Not legal review / clause library</h3>
+  <p>Clause-by-clause comparison ("this MSA's indemnification differs from our standard") is a related but separate problem. Could be modeled on top of this schema with an additional <code>clauses</code> table; included in production platforms but not in this reference.</p>
+
+  <h3>Not multi-tenant in itself</h3>
+  <p><code>customer_id</code> is on every row, making single-tenant-per-row possible. True multi-tenant deployment requires row-level security, separate schemas per tenant, or other isolation. This is application-layer concern.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

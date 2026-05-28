@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipelines Under Deployment</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#difference">What makes deployed pipelines different</a>
+    <a href="#ingestion">Ingestion patterns</a>
+    <a href="#idempotency">Idempotency &amp; reprocessing</a>
+    <a href="#versioning">Versioning</a>
+    <a href="#schema-evolution">Schema evolution</a>
+    <a href="#orchestration">Orchestration</a>
+    <a href="#observability">Observability</a>
+    <a href="#probes">Interview probes</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-document-extraction.html">← Previous</a>
+    <a href="07-sql-and-data-modeling.html">Next: SQL &amp; modeling →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Data craft</span>
+  <h1>Pipelines Under Deployment</h1>
+  <p class="subtitle">Ingestion / ETL patterns when the customer's data shape changes weekly, schemas are negotiable, and "production" lives in the customer's cloud. The discipline that separates one-off scripts from durable customer-facing infrastructure.</p>
+</header>
+
+<section id="difference">
+  <h2>What makes deployed pipelines different</h2>
+  <p>Pipelines you build in an FDE deployment have constraints that internal pipelines don't:</p>
+  <ul>
+    <li><strong>The data shape changes during deployment.</strong> You'll get new document classes in week 4 that nobody mentioned in week 1. Your pipeline must absorb new inputs without rewrites.</li>
+    <li><strong>Production lives at the customer.</strong> Sometimes your pipeline runs in your cloud feeding theirs; sometimes the opposite; sometimes both. Multi-region, multi-tenant considerations.</li>
+    <li><strong>You'll reprocess. A lot.</strong> A new extraction-model version drops, the customer wants the historical corpus reprocessed. Idempotency is mandatory.</li>
+    <li><strong>The customer's data team will read your code.</strong> Their analysts will run your queries, debug your DAGs, and eventually own them. Readability is a deliverable.</li>
+    <li><strong>SLAs apply.</strong> A pipeline failure isn't just an internal alert — it can be a contract breach.</li>
+  </ul>
+</section>
+
+<section id="ingestion">
+  <h2>Ingestion patterns</h2>
+  <p>Three patterns you'll meet often:</p>
+
+  <h3>1. Customer drop bucket</h3>
+  <p>Customer drops files into an S3 / GCS / Azure Blob bucket the platform watches. Cheapest, easiest to set up, awkward when there are millions of docs. Used for initial historical loads and one-shot batches.</p>
+
+  <h3>2. Connector / API pull</h3>
+  <p>Pipeline pulls from the customer's source system — DocuSign, Concur, SAP Ariba, custom CLM. More work to set up (auth, paging, rate limits, schemas) but durable. Used for ongoing flow.</p>
+
+  <h3>3. Event push</h3>
+  <p>Customer's system fires a webhook when a new document is signed/uploaded. Real-time. Requires the customer to do dev work on their side. Used for time-sensitive flows (renewal triggers).</p>
+
+  <h3>Pattern selection</h3>
+  <ul>
+    <li>Historical backfill → drop bucket.</li>
+    <li>Ongoing flow at moderate volume → connector pull on a schedule (daily, hourly).</li>
+    <li>Real-time decisioning → event push.</li>
+    <li>Most deployments end up with two of three.</li>
+  </ul>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency &amp; reprocessing</h2>
+  <p>Every stage of the pipeline should be idempotent — running it twice on the same input produces the same output. This sounds obvious; in practice most pipelines aren't built this way the first time, and fixing it later is painful.</p>
+
+  <h3>The discipline</h3>
+  <ul>
+    <li><strong>Stable IDs.</strong> Every document, every extraction, every output row has a deterministic ID derived from inputs. <code>document_id</code> = hash of file contents + customer_id. <code>extraction_id</code> = <code>document_id</code> + <code>model_version</code>.</li>
+    <li><strong>Upserts, not appends.</strong> Re-running the same input updates rather than duplicates.</li>
+    <li><strong>Versioned outputs.</strong> Output rows carry the model version that produced them. New model version produces new rows; old rows stay for audit.</li>
+    <li><strong>Partition by ingest date AND processing date.</strong> Lets you reprocess "all documents ingested before March 1 with the new model" without touching the original ingest record.</li>
+  </ul>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>idempotent reprocess SQL pattern</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Re-run extraction on all contracts where current extraction is below threshold
+-- and re-extract with the new model version. Old rows preserved for audit.
+INSERT INTO extractions (
+  document_id, model_version, extracted_at, fields, confidence
+)
+SELECT
+  d.document_id,
+  'extract-v5.0.0' AS model_version,
+  NOW() AS extracted_at,
+  -- ... extraction columns
+  -- (in practice, this would be a pipeline call, not pure SQL)
+FROM documents d
+LEFT JOIN extractions e
+  ON e.document_id = d.document_id
+ AND e.model_version = 'extract-v5.0.0'
+WHERE e.document_id IS NULL  -- not yet processed with v5
+  AND EXISTS (
+    SELECT 1 FROM extractions e2
+    WHERE e2.document_id = d.document_id
+      AND e2.confidence &lt; 0.85
+  );</code></pre>
+  </div>
+</section>
+
+<section id="versioning">
+  <h2>Versioning</h2>
+  <p>FDE pipelines version everything:</p>
+  <ul>
+    <li><strong>Pipeline version</strong> — Git SHA of the pipeline code that ran.</li>
+    <li><strong>Model version</strong> — extraction model identifier.</li>
+    <li><strong>Schema version</strong> — output table schema can evolve; row carries which schema applied at write time.</li>
+    <li><strong>Customer config version</strong> — per-customer extraction template / mapping rules. Treat as code, version, deploy.</li>
+  </ul>
+  <p>The forensic value: when something looks wrong, you can reconstruct exactly which combination of pipeline + model + schema + config produced the suspect row.</p>
+</section>
+
+<section id="schema-evolution">
+  <h2>Schema evolution</h2>
+  <p>The customer's data shape will change. Your schema needs to absorb it without rewrites.</p>
+
+  <h3>Patterns</h3>
+  <ul>
+    <li><strong>Strict typed columns + flexible JSON sidecar.</strong> Common pattern. Required fields are typed columns; everything else lives in a <code>raw</code> JSON column. New fields appear in the sidecar first, get promoted to typed columns once stable.</li>
+    <li><strong>Wide-table schema with nullable columns.</strong> Works for small variance. Breaks at scale.</li>
+    <li><strong>Per-document-class tables.</strong> Used when document classes have fundamentally different shapes (a master service agreement and an invoice don't have the same columns).</li>
+  </ul>
+
+  <h3>Migrations</h3>
+  <p>Schema migrations in deployed pipelines need to be:</p>
+  <ul>
+    <li>Backward-compatible — old queries still work.</li>
+    <li>Forward-deployable — you can deploy the migration before the code that uses it.</li>
+    <li>Reversible — if the migration is wrong, you can roll back.</li>
+  </ul>
+  <p>This means no <code>DROP COLUMN</code> in the same release as the code change. Migrate in two stages: add new column → backfill → deploy code → deprecate old column → drop in a later release.</p>
+</section>
+
+<section id="orchestration">
+  <h2>Orchestration</h2>
+  <p>The dominant tools you'll meet:</p>
+  <ul>
+    <li><strong>Airflow</strong> — the incumbent. Verbose but battle-tested. Customers know it.</li>
+    <li><strong>dbt</strong> — for the SQL-transformation layer specifically. Standard for the warehouse step.</li>
+    <li><strong>Dagster / Prefect</strong> — newer, more flexible, Python-native. Less common in enterprise customer stacks but more pleasant to build with.</li>
+    <li><strong>Internal platform DAGs</strong> — many document-AI platforms have their own internal orchestration. As FDE-DE you'll often write pipelines that consume from the platform-owned DAG and produce into the customer's chosen tool (often Airflow).</li>
+  </ul>
+
+  <h3>The FDE-DE move</h3>
+  <p>Don't impose your favorite orchestration tool on the customer. Use whatever they already have. If they have nothing, default to the simplest thing that works (often a scheduled Python script + dbt for the SQL piece) and only graduate to Airflow if scale demands it.</p>
+</section>
+
+<section id="observability">
+  <h2>Observability</h2>
+  <p>Three layers you must monitor:</p>
+
+  <h3>1. Pipeline-level</h3>
+  <p>Are DAGs running on schedule? Are runs succeeding? How long do they take? Standard data-platform metrics — push to whatever the customer's ops team uses (Datadog, PagerDuty, their internal Prometheus stack).</p>
+
+  <h3>2. Data-quality-level</h3>
+  <p>Are output row counts in expected bands? Are confidence scores stable? Are HITL queue depths within capacity? These are FDE-specific; standard pipeline observability won't surface them.</p>
+
+  <h3>3. SLA-level</h3>
+  <p>Are extraction-quality metrics above the contracted threshold per document class? A dashboard the customer sees, showing pass-rate by class, with anomalies flagged. The customer sees this dashboard regularly — that's a feature, not a problem.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The customer-facing SLA dashboard</span>
+    <p>Showing the customer the SLA dashboard regularly — including when it's close to the line — builds trust. Hiding it until renewal is when trust breaks. Senior FDE-DE habit: include a one-screen "this is how the data is doing" view in your Friday status. The dashboard URL goes in the working agreement.</p>
+  </div>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <details class="reveal"><summary>Show probe 1: "How would you design ingestion when the customer's data shape changes weekly?"</summary><div class="reveal-body">
+    <p>Strict typed columns for the fields you know are stable; a flexible JSON sidecar for everything else. New fields appear in sidecar first; get promoted to typed columns once stable. Per-document-class tables when shapes are fundamentally different. Migrations are two-stage (add column → backfill → use it → eventually drop) to stay backward-compatible. Don't try to nail the perfect schema upfront — it'll be wrong.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 2: "Why idempotency matters in extraction pipelines?"</summary><div class="reveal-body">
+    <p>You'll reprocess constantly — new model versions, customer adding new doc classes, fixing bugs in extraction logic. Without idempotency, every reprocess either duplicates rows or requires manual cleanup. With idempotency (stable IDs, upserts, versioned outputs), reprocess is safe and routine. Stable IDs typically derive from content hash + customer_id; extractions are keyed by document_id + model_version so re-runs with a new model don't clobber old extractions.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 3: "Customer wants their pipeline in Airflow but you'd choose Dagster. Who wins?"</summary><div class="reveal-body">
+    <p>Customer. Use whatever their data team already runs. Imposing your preference adds operational burden they'll have to absorb after handoff, and earns no trust. Only push back if the customer's tool is genuinely incompatible with the workload — and then bring evidence, not preference.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 4: "What goes on a customer-facing SLA dashboard?"</summary><div class="reveal-body">
+    <p>Per-document-class extraction accuracy (rolling 30 days) with the SLA threshold drawn as a line. HITL queue depth and throughput. Pipeline success rate. Document volume processed. The customer should see this regularly — show it in weekly status, link in the working agreement. The trust signal is showing them the dashboard when it's close to the line, not just when it's green.</p>
+  </div></details>
+
+  <details class="reveal"><summary>Show probe 5: "Your pipeline produced wrong output for a month before anyone noticed. How would that happen?"</summary><div class="reveal-body">
+    <p>Four common causes. (1) Upstream schema drift you didn't catch — customer's source system added a field, your parser silently dropped it. (2) Confidence-score drift — the model became more confident in wrong answers, so HITL stopped catching them. (3) Customer-config rot — a customer-specific rule was tuned for last quarter's data and doesn't fit current data. (4) Missing monitoring on a downstream metric — row counts looked fine but the business outcome was wrong. The fix is layered monitoring: pipeline-level, data-quality-level, and SLA-level, plus customer reconciliation on a sample.</p>
+  </div></details>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

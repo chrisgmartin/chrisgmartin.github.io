@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quality Tests &amp; dbt Patterns</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why dbt tests matter here</a>
+    <a href="#schema-tests">Schema tests</a>
+    <a href="#business-logic">Business-logic tests</a>
+    <a href="#freshness">Freshness</a>
+    <a href="#row-counts">Row-count thresholds</a>
+    <a href="#materialization">Materialization patterns</a>
+    <a href="#layout">Project layout</a>
+    <a href="#running">Running &amp; alerting</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-schema-evolution.html">← Previous</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Schema evolution &amp; quality</span>
+  <h1>Quality Tests &amp; dbt Patterns</h1>
+  <p class="subtitle">dbt tests for the contract data model — uniqueness, referential integrity, business-logic assertions, freshness. Materialization patterns for the marts layer that the customer's analysts query.</p>
+</header>
+
+<section id="why">
+  <h2>Why dbt tests matter here</h2>
+  <p>The contract data model is where the customer's BI dashboards, ERP integrations, and renewal alerts read from. If a row in <code>agreements</code> has a wrong current_term_end, every downstream consumer is wrong. Tests catch the wrongness before it ships.</p>
+  <p>The discipline:</p>
+  <ul>
+    <li>Tests run on every model materialization.</li>
+    <li>CI fails when tests fail.</li>
+    <li>Production failures alert; data isn't promoted to marts until tests pass.</li>
+  </ul>
+</section>
+
+<section id="schema-tests">
+  <h2>Schema tests</h2>
+  <p>The basics — uniqueness, not-null, accepted-values. Defined in YAML alongside the model.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/marts/_models.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: dim_agreements
+    description: Current view of agreements (latest extraction per agreement_id)
+    columns:
+      - name: agreement_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: supplier_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_suppliers')
+              field: supplier_id
+      - name: agreement_type
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['master_service_agreement', 'statement_of_work',
+                       'amendment', 'nda', 'dpa', 'baa',
+                       'supplier_agreement', 'invoice', 'purchase_order']
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['active', 'expired', 'terminated', 'superseded', 'draft']
+
+  - name: fct_obligations_current
+    description: Latest obligation per agreement+type (non-superseded)
+    columns:
+      - name: obligation_id
+        tests:
+          - unique
+          - not_null
+      - name: agreement_id
+        tests:
+          - relationships:
+              to: ref('dim_agreements')
+              field: agreement_id
+      - name: confidence
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "confidence BETWEEN 0 AND 1"</code></pre>
+  </div>
+</section>
+
+<section id="business-logic">
+  <h2>Business-logic tests</h2>
+  <p>Tests that enforce domain rules, not just structural constraints.</p>
+
+  <h3>No agreement without parties</h3>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>tests/no_agreement_without_parties.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- This test returns rows that FAIL the assertion.
+-- Empty result = passing test.
+SELECT a.agreement_id
+FROM {{ ref('dim_agreements') }} a
+LEFT JOIN {{ ref('fct_extractions_current') }} e
+  ON e.document_id IN (
+    SELECT document_id FROM {{ ref('document_agreement_links') }}
+    WHERE agreement_id = a.agreement_id AND role = 'master'
+  )
+WHERE a.status = 'active'
+  AND (e.fields-&gt;'parties' IS NULL
+       OR jsonb_array_length(e.fields-&gt;'parties'-&gt;'value') &lt; 2);</code></pre>
+  </div>
+
+  <h3>Current_term_end is after effective_date</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT agreement_id
+FROM {{ ref('dim_agreements') }}
+WHERE effective_date IS NOT NULL
+  AND current_term_end IS NOT NULL
+  AND current_term_end &lt;= effective_date;</code></pre>
+  </div>
+
+  <h3>Obligation amount is positive</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT obligation_id
+FROM {{ ref('fct_obligations_current') }}
+WHERE obligation_type = 'payment'
+  AND (value-&gt;&gt;'amount')::NUMERIC &lt;= 0;</code></pre>
+  </div>
+
+  <h3>No spend with non-existent supplier</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s.spend_id
+FROM {{ ref('fct_spend') }} s
+LEFT JOIN {{ ref('dim_suppliers') }} sup ON sup.supplier_id = s.supplier_id
+WHERE sup.supplier_id IS NULL;</code></pre>
+  </div>
+
+  <h3>No active agreements ending in the past</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">-- Suggests a status update job is broken
+SELECT agreement_id, current_term_end
+FROM {{ ref('dim_agreements') }}
+WHERE status = 'active'
+  AND current_term_end &lt; CURRENT_DATE - INTERVAL '7 days';</code></pre>
+  </div>
+</section>
+
+<section id="freshness">
+  <h2>Freshness</h2>
+  <p>dbt's source freshness tests fail if the upstream raw source hasn't received new data recently.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/staging/_sources.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">sources:
+  - name: contract_intelligence_raw
+    schema: raw
+    tables:
+      - name: documents
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 72, period: hour}
+      - name: extractions
+        loaded_at_field: extracted_at
+        freshness:
+          warn_after: {count: 12, period: hour}
+          error_after: {count: 48, period: hour}</code></pre>
+  </div>
+</section>
+
+<section id="row-counts">
+  <h2>Row-count thresholds</h2>
+  <p>Detect silent data outages. Custom dbt test or dbt_utils macro.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>tests/spend_volume_baseline.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Fail if last week's spend volume is &lt; 50% of the 30-day average
+WITH last_week AS (
+  SELECT COUNT(*) AS n
+  FROM {{ ref('fct_spend') }}
+  WHERE accrued_at &gt;= CURRENT_DATE - INTERVAL '7 days'
+),
+baseline AS (
+  SELECT COUNT(*) / 30.0 * 7 AS expected
+  FROM {{ ref('fct_spend') }}
+  WHERE accrued_at BETWEEN CURRENT_DATE - INTERVAL '37 days'
+                        AND CURRENT_DATE - INTERVAL '8 days'
+)
+SELECT 1 WHERE (SELECT n FROM last_week) &lt; (SELECT expected FROM baseline) * 0.5;</code></pre>
+  </div>
+</section>
+
+<section id="materialization">
+  <h2>Materialization patterns</h2>
+
+  <h3>Staging layer (views)</h3>
+  <p>One staging model per raw source. Light cleaning, no joins, type coercion. Materialized as views — cheap, always fresh.</p>
+
+  <h3>Intermediate layer (views or ephemeral)</h3>
+  <p>Joins between sources; entity resolution; date manipulation. Often ephemeral (inlined into downstream queries) for query performance.</p>
+
+  <h3>Marts layer (tables / incremental tables)</h3>
+  <p>The customer-facing layer. dim_agreements, dim_suppliers, dim_documents, fct_obligations_current, fct_spend. Materialized as tables for query performance.</p>
+
+  <p>For large fact tables (fct_spend on a large customer), incremental materialization:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/marts/fct_spend.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{{
+  config(
+    materialized='incremental',
+    unique_key='spend_id',
+    on_schema_change='append_new_columns'
+  )
+}}
+
+SELECT
+  s.spend_id, s.customer_id, s.supplier_id, s.agreement_id,
+  s.amount, s.currency, s.accrued_at, s.spend_category,
+  s.amount * fx.rate AS amount_usd
+FROM {{ source('contract_intelligence_raw', 'spend') }} s
+LEFT JOIN {{ ref('dim_fx_rates') }} fx
+  ON fx.from_currency = s.currency AND fx.rate_date = s.accrued_at
+
+{% if is_incremental() %}
+  WHERE s.accrued_at &gt; (SELECT MAX(accrued_at) FROM {{ this }})
+{% endif %}</code></pre>
+  </div>
+</section>
+
+<section id="layout">
+  <h2>Project layout</h2>
+  <div class="code-wrap">
+<pre><code class="language-text">models/
+├── staging/
+│   ├── _sources.yml
+│   ├── stg_documents.sql
+│   ├── stg_extractions.sql
+│   ├── stg_suppliers.sql
+│   ├── stg_agreements.sql
+│   └── stg_spend.sql
+├── intermediate/
+│   ├── int_extractions_current.sql      # latest extraction per document
+│   ├── int_obligations_current.sql      # latest obligation per agreement+type
+│   ├── int_supplier_hierarchy.sql       # recursive parent resolution
+│   └── int_spend_with_fx.sql
+└── marts/
+    ├── _models.yml
+    ├── dim_customers.sql
+    ├── dim_suppliers.sql
+    ├── dim_documents.sql
+    ├── dim_agreements.sql
+    ├── fct_obligations_current.sql
+    ├── fct_spend.sql
+    └── analytics/
+        ├── renewal_pipeline.sql         # business-facing rollups
+        ├── off_contract_spend.sql
+        └── supplier_consolidation_opportunities.sql</code></pre>
+  </div>
+  <p>The marts/analytics subdirectory is where customer-facing rollups live. dbt models, not raw queries — the customer's analysts can extend them.</p>
+</section>
+
+<section id="running">
+  <h2>Running &amp; alerting</h2>
+  <ul>
+    <li><strong>CI</strong>: every PR runs <code>dbt build</code> (run + test) against a sample dataset. Failures block merge.</li>
+    <li><strong>Production schedule</strong>: dbt builds on an Airflow / Dagster schedule, typically nightly with hourly incremental updates for fct_spend.</li>
+    <li><strong>Test failures</strong>: alert to ops Slack channel; SEV-3 by default; promote to SEV-2 if the failing test blocks customer-facing dashboards.</li>
+    <li><strong>Source freshness warnings</strong>: route to a daily digest, not paging.</li>
+    <li><strong>Documentation</strong>: dbt docs site generated and published; customer's data team has access. The data dictionary lives here.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

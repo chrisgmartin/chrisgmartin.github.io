@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Suppliers &amp; Entity Resolution</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#table">The suppliers table</a>
+    <a href="#why-resolve">Why entity resolution is hard</a>
+    <a href="#techniques">Resolution techniques</a>
+    <a href="#hierarchy">Parent hierarchy</a>
+    <a href="#raw-vs-canonical">Raw vs canonical names</a>
+    <a href="#customer-master">Working with the customer's supplier master</a>
+    <a href="#operations">Common operations</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-schema-overview.html">← Previous</a>
+    <a href="03-documents.html">Next: Documents →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Core entities</span>
+  <h1>Suppliers &amp; Entity Resolution</h1>
+  <p class="subtitle">The supplier model, parent hierarchies, resolution techniques (exact, fuzzy, customer-master, manual), and the raw-vs-canonical storage pattern that lets you re-resolve when the algorithm changes.</p>
+</header>
+
+<section id="table">
+  <h2>The suppliers table</h2>
+  <p>From chapter 01:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>suppliers.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE suppliers (
+  supplier_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers,
+  canonical_name TEXT NOT NULL,
+  parent_supplier_id TEXT REFERENCES suppliers,
+  country TEXT,
+  tax_id TEXT,
+  industry TEXT,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (customer_id, canonical_name)
+);</code></pre>
+  </div>
+
+  <h3>Field-by-field rationale</h3>
+  <ul>
+    <li><code>supplier_id</code>: platform-assigned. Stable across re-resolutions.</li>
+    <li><code>customer_id</code>: tenant boundary. Two customers' "Acme Corp" are distinct rows.</li>
+    <li><code>canonical_name</code>: the chosen canonical form. "Acme Corp" (stripped of suffixes; consistent casing).</li>
+    <li><code>parent_supplier_id</code>: self-reference for hierarchies. Null at the top of a chain.</li>
+    <li><code>country</code>: ISO country code. Important for tax / jurisdiction logic.</li>
+    <li><code>tax_id</code>: when available, the gold-standard resolution key. Often missing.</li>
+    <li><code>industry</code>: SIC / NAICS code or a flat string. Useful for category-level analytics.</li>
+    <li><code>first_seen_at</code>: when this supplier first entered the customer's data. Useful for cohort-style supplier analysis.</li>
+  </ul>
+</section>
+
+<section id="why-resolve">
+  <h2>Why entity resolution is hard</h2>
+  <p>The same supplier appears under many names across a customer's corpus:</p>
+  <ul>
+    <li>"Acme Corp"</li>
+    <li>"Acme Corporation"</li>
+    <li>"ACME Corp."</li>
+    <li>"Acme Corp, Inc."</li>
+    <li>"acme corp"</li>
+    <li>"Acme Cloud Services" (a subsidiary)</li>
+    <li>"AcmeCorp" (typo / abbreviation)</li>
+    <li>"Acme - Cloud Division" (internal naming)</li>
+  </ul>
+  <p>Some are the same entity; some are distinct (Acme Cloud Services might be a separate legal entity that bills separately). Without resolution, you have multiple supplier rows for what's actually one supplier — and your spend rollups, renewal counts, and supplier-count metrics are all wrong.</p>
+  <p>Customers typically have 3,000–10,000 supplier rows in their ERP, of which 50–70% are duplicates. Consolidation is one of the platform's headline value props.</p>
+</section>
+
+<section id="techniques">
+  <h2>Resolution techniques</h2>
+  <p>Resolution is layered. Each layer handles a fraction of the corpus.</p>
+
+  <h3>1. Exact tax_id match</h3>
+  <p>When you have the tax identifier (EIN, VAT number), exact match is definitive. Resolves the easy 30–50% of cases where tax_id is consistently captured.</p>
+
+  <h3>2. Exact name match (case-and-whitespace normalized)</h3>
+  <p>Normalize: lowercase, strip whitespace, strip common suffixes (Inc, Corp, LLC, Ltd). Exact match on normalized form. Catches another 20–30%.</p>
+
+  <h3>3. Fuzzy name match</h3>
+  <p>Edit-distance metrics (Levenshtein, Jaro-Winkler) or string similarity (trigram, n-gram). Below a threshold, candidate-match — route to validation. Catches typos and minor variations; ~15% of remaining.</p>
+
+  <h3>4. Embedding similarity</h3>
+  <p>Embed canonical names with a sentence-transformer; nearest-neighbor lookup. Handles paraphrasing better than edit distance. Catches "Acme Cloud" vs "Acme Cloud Services" pattern.</p>
+
+  <h3>5. Customer's supplier master</h3>
+  <p>The customer's ERP or procurement system often has an authoritative supplier list. Use it as a source-of-truth for canonical names. Pull it in at deployment time; sync periodically.</p>
+
+  <h3>6. LLM-assisted resolution</h3>
+  <p>For hard cases (one is a subsidiary of the other? a typo? a different legal entity?), send the candidate pair to an LLM with context. Expensive per call; reserve for ambiguous cases the cheaper layers couldn't resolve.</p>
+
+  <h3>7. Manual review</h3>
+  <p>The residual that nothing else resolved. Send to a human reviewer with the candidate matches and the supporting context. Standard part of the HITL workflow.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>layered_resolution.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def resolve_supplier(raw_name: str, raw_tax_id: str | None, customer_id: str) -&gt; dict:
+    # 1. Tax ID exact
+    if raw_tax_id:
+        match = db.query("SELECT supplier_id FROM suppliers WHERE customer_id=%s AND tax_id=%s",
+                         customer_id, raw_tax_id)
+        if match:
+            return {"supplier_id": match[0]["supplier_id"], "method": "exact_tax_id", "confidence": 1.0}
+
+    # 2. Exact name match (normalized)
+    norm = normalize_name(raw_name)
+    match = db.query("SELECT supplier_id FROM suppliers WHERE customer_id=%s AND canonical_name=%s",
+                     customer_id, norm)
+    if match:
+        return {"supplier_id": match[0]["supplier_id"], "method": "exact_name", "confidence": 0.95}
+
+    # 3. Fuzzy candidates
+    candidates = fuzzy_search(customer_id, raw_name, top_k=5)
+    if candidates and candidates[0]["score"] &gt; 0.85:
+        return {"supplier_id": candidates[0]["supplier_id"], "method": "fuzzy_name",
+                "confidence": candidates[0]["score"]}
+
+    # 4. Customer-master lookup
+    if customer_master_match := lookup_customer_master(customer_id, raw_name):
+        return {"supplier_id": customer_master_match, "method": "customer_map", "confidence": 0.9}
+
+    # 5. Create new supplier; flag for review if any candidates were close-but-below-threshold
+    return create_new_supplier(raw_name, raw_tax_id, customer_id, flag_for_review=bool(candidates))</code></pre>
+  </div>
+</section>
+
+<section id="hierarchy">
+  <h2>Parent hierarchy</h2>
+  <p>Suppliers reference parent suppliers via <code>parent_supplier_id</code>. The hierarchy is a tree (a supplier has at most one parent).</p>
+
+  <h3>Where parent assignments come from</h3>
+  <ul>
+    <li>The customer's procurement-master often encodes parent relationships explicitly.</li>
+    <li>Third-party corporate-hierarchy data (Dun & Bradstreet, OpenCorporates).</li>
+    <li>Manual assignment by the customer's data team.</li>
+  </ul>
+
+  <h3>Rolling up to root parent</h3>
+  <p>The standard query — find the root parent for each supplier — uses a recursive CTE:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>root_parent.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH RECURSIVE chain AS (
+  -- Roots: suppliers with no parent
+  SELECT supplier_id, supplier_id AS root_id, 0 AS depth
+  FROM suppliers WHERE parent_supplier_id IS NULL
+  UNION ALL
+  -- Recurse: children inherit their parent's root
+  SELECT s.supplier_id, c.root_id, c.depth + 1
+  FROM suppliers s
+  JOIN chain c ON c.supplier_id = s.parent_supplier_id
+)
+SELECT supplier_id, root_id, depth FROM chain;</code></pre>
+  </div>
+
+  <h3>Cycle protection</h3>
+  <p>If the data ever has a cycle (supplier A → B → A), the recursive CTE will loop. Add a depth cap or cycle-detection set in application code if you can't fully trust the data.</p>
+</section>
+
+<section id="raw-vs-canonical">
+  <h2>Raw vs canonical names</h2>
+  <p>The single most important practice in supplier resolution: <strong>never delete raw extracted names</strong>. Store both.</p>
+
+  <p>The reasons:</p>
+  <ul>
+    <li>If a resolution turns out to be wrong (Acme Corp was incorrectly merged with Acme Holdings), you can re-resolve without re-extracting.</li>
+    <li>If you change the resolution algorithm (new fuzzy-match threshold, new embedding model), you can re-run resolution over the historical raw names.</li>
+    <li>Audit: when a customer asks "where did Acme Cloud go?", you can show the raw extraction and the resolution decision.</li>
+  </ul>
+
+  <p>The <code>supplier_name_resolutions</code> table holds the raw-to-canonical mapping with method and confidence. The <code>suppliers</code> table holds the canonical form.</p>
+</section>
+
+<section id="customer-master">
+  <h2>Working with the customer's supplier master</h2>
+  <p>Almost every enterprise customer has an internal supplier master — usually in their ERP. Treating it as the source-of-truth for canonical names is the right default:</p>
+  <ul>
+    <li>Their master is what their finance / procurement teams already use.</li>
+    <li>Their downstream systems (BI dashboards, payment systems) reference IDs from their master.</li>
+    <li>Resolving to their master means platform output integrates cleanly with their existing workflows.</li>
+  </ul>
+
+  <h3>The sync pattern</h3>
+  <p>At deployment time, ingest the customer's supplier master via API or extract. Map their supplier IDs to your <code>suppliers</code> table. Sync periodically (weekly or daily) to keep up with their additions.</p>
+
+  <h3>What to do when their master is also wrong</h3>
+  <p>Customer's supplier master often has its own duplicates (Acme Corp + Acme Corporation as separate rows). Your platform can surface the duplicates as a cleanup recommendation. Don't silently merge — propose the merge and let them confirm.</p>
+</section>
+
+<section id="operations">
+  <h2>Common operations</h2>
+
+  <h3>Adding a new supplier</h3>
+  <p>When extraction encounters a name that doesn't resolve to any existing supplier:</p>
+  <ol>
+    <li>Create a new row in <code>suppliers</code> with the normalized name as canonical_name.</li>
+    <li>Log the raw name to <code>supplier_name_resolutions</code> with method <code>new_creation</code>.</li>
+    <li>If the new supplier looks similar to existing ones (below the resolution threshold), flag for human review.</li>
+  </ol>
+
+  <h3>Merging two suppliers</h3>
+  <p>Discovered that "Acme Corp" and "Acme Corporation" are the same:</p>
+  <ol>
+    <li>Pick the canonical supplier_id to keep (usually the older one).</li>
+    <li>Update all references to the to-be-merged supplier_id → the canonical one. <code>UPDATE agreements SET supplier_id = canonical WHERE supplier_id = to_merge;</code> Same for <code>spend</code> and <code>supplier_name_resolutions</code>.</li>
+    <li>Don't delete the merged supplier row; mark it with a status (or move to an <code>archived_suppliers</code> table). Future re-extractions that produce raw names matching the archived supplier should now resolve to the canonical.</li>
+  </ol>
+
+  <h3>Splitting a supplier</h3>
+  <p>Discovered that "Acme Corp" was incorrectly merged from two distinct entities:</p>
+  <ol>
+    <li>Create a new supplier_id for the split-off entity.</li>
+    <li>Move references that belong to the new entity: identify by the raw_supplier_name on extracted records.</li>
+    <li>Update <code>supplier_name_resolutions</code> rows for the raw names that should now point to the new ID.</li>
+  </ol>
+  <p>Splitting is risky — easy to move the wrong rows. Test on a sandbox first; require human sign-off.</p>
+
+  <h3>Setting a parent</h3>
+  <p>One-line update:</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">UPDATE suppliers SET parent_supplier_id = 'sup_acme_holdings'
+WHERE supplier_id = 'sup_acme_cloud';</code></pre>
+  </div>
+
+  <h3>Auditing a resolution</h3>
+  <p>When a customer asks "why does this contract show supplier X?":</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT
+  snr.raw_supplier_name,
+  s.canonical_name,
+  snr.resolution_method,
+  snr.confidence,
+  snr.resolved_at,
+  snr.resolved_by
+FROM supplier_name_resolutions snr
+JOIN suppliers s ON s.supplier_id = snr.resolved_supplier_id
+WHERE snr.raw_supplier_name ILIKE '%acme%'
+  AND snr.customer_id = 'cust_acme'
+ORDER BY snr.resolved_at DESC;</code></pre>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

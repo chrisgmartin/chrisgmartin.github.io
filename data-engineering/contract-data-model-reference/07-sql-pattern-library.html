@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Pattern Library</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#how">How to read this</a>
+    <a href="#a">A · Agreements &amp; renewals</a>
+    <a href="#b">B · Documents &amp; provenance</a>
+    <a href="#c">C · Obligations</a>
+    <a href="#d">D · Suppliers &amp; rollups</a>
+    <a href="#e">E · Spend</a>
+    <a href="#f">F · Quality &amp; auditability</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-spend.html">← Previous</a>
+    <a href="08-schema-evolution.html">Next: Evolution →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Query patterns</span>
+  <h1>SQL Pattern Library</h1>
+  <p class="subtitle">30+ named SQL patterns against the contract data model. Each with a rationale, a query, and the gotchas worth knowing.</p>
+</header>
+
+<section id="how">
+  <h2>How to read this</h2>
+  <p>Patterns are grouped by entity. Each entry has:</p>
+  <ul>
+    <li><strong>What it answers</strong> — the business question.</li>
+    <li><strong>The query</strong> — copy-paste ready (Postgres dialect; trivially portable).</li>
+    <li><strong>Notes</strong> — gotchas, dialect variations, when to materialize as a mart.</li>
+  </ul>
+  <p>These patterns assume the schema from chapter 01. Substitute table names as needed for your variant.</p>
+</section>
+
+<section id="a">
+  <h2>A · Agreements &amp; renewals</h2>
+
+  <h3>A1. Renewals due in next N days</h3>
+  <p><strong>Answers</strong>: which agreements end soon enough to warrant action.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT
+  a.agreement_id, s.canonical_name AS supplier,
+  a.current_term_end,
+  a.current_term_end - CURRENT_DATE AS days_until_renewal
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE a.customer_id = 'cust_acme'
+  AND a.status = 'active'
+  AND a.current_term_end BETWEEN CURRENT_DATE
+                              AND CURRENT_DATE + INTERVAL '90 days'
+ORDER BY days_until_renewal;</code></pre>
+  </div>
+
+  <h3>A2. Renewals with notice deadlines</h3>
+  <p><strong>Answers</strong>: when does the customer need to give notice to cancel.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">WITH renewal_obligations AS (
+  SELECT
+    agreement_id,
+    (value-&gt;&gt;'notice_period_days')::INT AS notice_days,
+    (value-&gt;&gt;'auto_renew')::BOOLEAN AS auto_renew
+  FROM obligations
+  WHERE obligation_type = 'renewal_notice' AND status != 'superseded'
+)
+SELECT
+  a.agreement_id, s.canonical_name,
+  a.current_term_end,
+  ro.notice_days,
+  a.current_term_end - INTERVAL '1 day' * COALESCE(ro.notice_days, 60) AS notice_deadline,
+  ro.auto_renew
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+LEFT JOIN renewal_obligations ro ON ro.agreement_id = a.agreement_id
+WHERE a.status = 'active'
+  AND a.current_term_end BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '120 days'
+ORDER BY notice_deadline;</code></pre>
+  </div>
+
+  <h3>A3. Auto-renew agreements about to renew silently</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name, a.current_term_end
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+JOIN obligations o
+  ON o.agreement_id = a.agreement_id
+ AND o.obligation_type = 'renewal_notice'
+ AND (o.value-&gt;&gt;'auto_renew')::BOOLEAN = true
+WHERE a.status = 'active'
+  AND a.current_term_end BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days';</code></pre>
+  </div>
+
+  <h3>A4. Latest amendment per agreement</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id,
+       MAX(d.ingested_at) AS latest_amendment_at
+FROM agreements a
+JOIN document_agreement_links dal ON dal.agreement_id = a.agreement_id
+JOIN documents d ON d.document_id = dal.document_id
+WHERE dal.role = 'amendment'
+GROUP BY a.agreement_id;</code></pre>
+  </div>
+
+  <h3>A5. Agreements expiring without SOWs</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name, a.current_term_end
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE a.current_term_end &lt;= CURRENT_DATE + INTERVAL '60 days'
+  AND a.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1 FROM document_agreement_links dal
+    WHERE dal.agreement_id = a.agreement_id AND dal.role = 'sow'
+  );</code></pre>
+  </div>
+</section>
+
+<section id="b">
+  <h2>B · Documents &amp; provenance</h2>
+
+  <h3>B1. Latest extraction per document</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT DISTINCT ON (e.document_id)
+  e.extraction_id, e.document_id, e.model_version, e.extracted_at
+FROM extractions e
+ORDER BY e.document_id, e.extracted_at DESC, e.model_version DESC;</code></pre>
+  </div>
+
+  <h3>B2. Orphaned amendments (no master MSA)</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT d.document_id, d.source_uri, d.ingested_at
+FROM documents d
+WHERE d.doc_class = 'amendment'
+  AND NOT EXISTS (
+    SELECT 1 FROM document_agreement_links dal
+    WHERE dal.document_id = d.document_id
+  );</code></pre>
+  </div>
+
+  <h3>B3. Documents not yet extracted with current model</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT d.document_id, d.doc_class, d.ingested_at
+FROM documents d
+LEFT JOIN extractions e
+  ON e.document_id = d.document_id
+ AND e.model_version = 'extract-v4.2.1'
+WHERE e.extraction_id IS NULL
+  AND d.customer_id = 'cust_acme'
+ORDER BY d.ingested_at;</code></pre>
+  </div>
+
+  <h3>B4. Documents with confidence below threshold</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT e.document_id, e.fields-&gt;'effective_date'-&gt;&gt;'confidence' AS conf,
+       d.doc_class
+FROM extractions e
+JOIN documents d ON d.document_id = e.document_id
+WHERE e.model_version = 'extract-v4.2.1'
+  AND (e.fields-&gt;'effective_date'-&gt;&gt;'confidence')::FLOAT &lt; 0.85
+ORDER BY conf;</code></pre>
+  </div>
+
+  <h3>B5. Full document trail for an agreement</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT dal.role, d.doc_class, d.document_id, d.ingested_at, d.source_uri
+FROM document_agreement_links dal
+JOIN documents d ON d.document_id = dal.document_id
+WHERE dal.agreement_id = 'agr_acme_msa_2020'
+ORDER BY d.ingested_at;</code></pre>
+  </div>
+</section>
+
+<section id="c">
+  <h2>C · Obligations</h2>
+
+  <h3>C1. Current obligations (latest extraction per agreement+type)</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT DISTINCT ON (o.agreement_id, o.obligation_type)
+  o.*
+FROM obligations o
+WHERE o.status != 'superseded'
+ORDER BY o.agreement_id, o.obligation_type,
+         o.extracted_at DESC, o.model_version DESC;</code></pre>
+  </div>
+
+  <h3>C2. Upcoming due obligations</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name, o.obligation_type, o.value, o.due_at,
+       o.due_at - CURRENT_DATE AS days_until_due
+FROM obligations o
+JOIN agreements a ON a.agreement_id = o.agreement_id
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE o.status = 'pending'
+  AND o.due_at BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days'
+ORDER BY o.due_at;</code></pre>
+  </div>
+
+  <h3>C3. Obligations missing required fields</h3>
+  <p>Quality check: payment obligations should have amount and due_at.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT o.obligation_id, o.agreement_id, o.value
+FROM obligations o
+WHERE o.obligation_type = 'payment'
+  AND (o.value IS NULL
+       OR o.value-&gt;&gt;'amount' IS NULL
+       OR o.due_at IS NULL);</code></pre>
+  </div>
+
+  <h3>C4. Agreements without an indemnification clause</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name
+FROM agreements a
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE a.agreement_type = 'master_service_agreement'
+  AND NOT EXISTS (
+    SELECT 1 FROM obligations o
+    WHERE o.agreement_id = a.agreement_id
+      AND o.obligation_type = 'indemnification'
+      AND o.status != 'superseded'
+  );</code></pre>
+  </div>
+
+  <h3>C5. Liability caps below a threshold</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT a.agreement_id, s.canonical_name,
+       (o.value-&gt;&gt;'cap_amount')::NUMERIC AS cap_amount
+FROM obligations o
+JOIN agreements a ON a.agreement_id = o.agreement_id
+JOIN suppliers s ON s.supplier_id = a.supplier_id
+WHERE o.obligation_type = 'liability_cap'
+  AND o.status != 'superseded'
+  AND (o.value-&gt;&gt;'cap_amount')::NUMERIC &lt; 100000;</code></pre>
+  </div>
+</section>
+
+<section id="d">
+  <h2>D · Suppliers &amp; rollups</h2>
+
+  <h3>D1. Supplier hierarchy (root parent per supplier)</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">WITH RECURSIVE chain AS (
+  SELECT supplier_id, supplier_id AS root_id, 0 AS depth
+  FROM suppliers WHERE parent_supplier_id IS NULL
+  UNION ALL
+  SELECT s.supplier_id, c.root_id, c.depth + 1
+  FROM suppliers s JOIN chain c ON c.supplier_id = s.parent_supplier_id
+)
+SELECT supplier_id, root_id, depth FROM chain;</code></pre>
+  </div>
+
+  <h3>D2. Supplier consolidation candidates (similar names)</h3>
+  <p>Suppliers within trigram similarity threshold of each other; surfaced for human review.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s1.supplier_id AS a_id, s1.canonical_name AS a_name,
+       s2.supplier_id AS b_id, s2.canonical_name AS b_name,
+       similarity(s1.canonical_name, s2.canonical_name) AS sim
+FROM suppliers s1
+JOIN suppliers s2
+  ON s1.customer_id = s2.customer_id
+ AND s1.supplier_id &lt; s2.supplier_id
+ AND s1.canonical_name % s2.canonical_name  -- pg_trgm operator
+WHERE similarity(s1.canonical_name, s2.canonical_name) &gt; 0.75
+ORDER BY sim DESC;</code></pre>
+  </div>
+
+  <h3>D3. Spend per supplier (rolled up to parent)</h3>
+  <p>See chapter 06 §operations.</p>
+
+  <h3>D4. Suppliers with no spend but active agreements</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s.supplier_id, s.canonical_name, a.agreement_id, a.effective_date
+FROM suppliers s
+JOIN agreements a ON a.supplier_id = s.supplier_id AND a.status = 'active'
+WHERE NOT EXISTS (
+  SELECT 1 FROM spend sp
+  WHERE sp.supplier_id = s.supplier_id
+    AND sp.accrued_at &gt;= a.effective_date
+);</code></pre>
+  </div>
+</section>
+
+<section id="e">
+  <h2>E · Spend</h2>
+
+  <h3>E1. Off-contract spend per supplier</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s.supplier_id, sp.canonical_name,
+       SUM(s.amount) AS off_contract_total,
+       s.currency
+FROM spend s
+JOIN suppliers sp ON sp.supplier_id = s.supplier_id
+LEFT JOIN agreements a
+  ON a.supplier_id = s.supplier_id
+ AND a.status = 'active'
+ AND s.accrued_at BETWEEN a.effective_date AND COALESCE(a.current_term_end, '9999-12-31')
+WHERE a.agreement_id IS NULL
+  AND s.customer_id = 'cust_acme'
+GROUP BY s.supplier_id, sp.canonical_name, s.currency
+ORDER BY off_contract_total DESC;</code></pre>
+  </div>
+
+  <h3>E2. Off-contract subcategorized</h3>
+  <p>Distinguish "no agreement ever" from "agreement expired."</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">WITH off_contract AS (
+  SELECT s.*
+  FROM spend s
+  LEFT JOIN agreements a
+    ON a.supplier_id = s.supplier_id
+   AND a.status = 'active'
+   AND s.accrued_at BETWEEN a.effective_date AND COALESCE(a.current_term_end, '9999-12-31')
+  WHERE a.agreement_id IS NULL
+)
+SELECT
+  oc.supplier_id,
+  CASE
+    WHEN EXISTS (SELECT 1 FROM agreements a2 WHERE a2.supplier_id = oc.supplier_id) THEN 'expired_agreement'
+    ELSE 'no_agreement'
+  END AS subcategory,
+  SUM(oc.amount) AS total
+FROM off_contract oc
+GROUP BY oc.supplier_id, subcategory;</code></pre>
+  </div>
+
+  <h3>E3. Spend trend by month</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT
+  DATE_TRUNC('month', s.accrued_at) AS month,
+  SUM(s.amount) AS total_spend
+FROM spend s
+WHERE s.customer_id = 'cust_acme'
+  AND s.currency = 'USD'
+GROUP BY 1
+ORDER BY 1;</code></pre>
+  </div>
+
+  <h3>E4. Top suppliers by spend in FY</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT s.canonical_name, SUM(sp.amount) AS fy_spend
+FROM spend sp
+JOIN suppliers s ON s.supplier_id = sp.supplier_id
+WHERE sp.customer_id = 'cust_acme'
+  AND sp.accrued_at &gt;= '2025-07-01' AND sp.accrued_at &lt; '2026-07-01'
+GROUP BY s.canonical_name
+ORDER BY fy_spend DESC
+LIMIT 20;</code></pre>
+  </div>
+</section>
+
+<section id="f">
+  <h2>F · Quality &amp; auditability</h2>
+
+  <h3>F1. Extraction confidence distribution</h3>
+  <p>Reliability-diagram input.</p>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT
+  WIDTH_BUCKET((fields-&gt;'effective_date'-&gt;&gt;'confidence')::FLOAT, 0, 1, 10) AS bucket,
+  COUNT(*) AS n
+FROM extractions
+WHERE model_version = 'extract-v4.2.1'
+GROUP BY bucket
+ORDER BY bucket;</code></pre>
+  </div>
+
+  <h3>F2. Documents where extraction differed between two model versions</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT e1.document_id,
+       e1.fields-&gt;'effective_date'-&gt;&gt;'value' AS v_old,
+       e2.fields-&gt;'effective_date'-&gt;&gt;'value' AS v_new
+FROM extractions e1
+JOIN extractions e2
+  ON e1.document_id = e2.document_id
+WHERE e1.model_version = 'extract-v4.1.0'
+  AND e2.model_version = 'extract-v4.2.1'
+  AND COALESCE(e1.fields-&gt;'effective_date'-&gt;&gt;'value', '') !=
+      COALESCE(e2.fields-&gt;'effective_date'-&gt;&gt;'value', '');</code></pre>
+  </div>
+
+  <h3>F3. Audit trail for a supplier</h3>
+  <div class="code-wrap">
+<pre><code class="language-sql">SELECT raw_supplier_name, canonical_name, resolution_method, confidence, resolved_at
+FROM supplier_name_resolutions snr
+JOIN suppliers s ON s.supplier_id = snr.resolved_supplier_id
+WHERE snr.customer_id = 'cust_acme'
+  AND s.canonical_name = 'Acme Corp'
+ORDER BY snr.resolved_at DESC;</code></pre>
+  </div>
+
+  <h3>F4. dbt test patterns</h3>
+  <p>See chapter 09 for the test taxonomy.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
