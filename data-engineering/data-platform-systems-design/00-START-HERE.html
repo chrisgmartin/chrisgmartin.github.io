@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Start Here — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what">What this guide is</a>
+    <a href="#company">The case study: VastDP</a>
+    <a href="#sources">The source systems</a>
+    <a href="#domains">Data domains</a>
+    <a href="#model">The canonical data model</a>
+    <a href="#stacks">The three reference stacks</a>
+    <a href="#scale">Scale numbers</a>
+    <a href="#consumers">Who consumes the data</a>
+    <a href="#order">Reading order</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-the-application-space.html">Next: The Application Space →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Read first</span>
+  <h1>Start Here</h1>
+  <p class="subtitle">A seventeen-chapter systems-design guide for building the data platform at a GPU-marketplace company. This chapter sets up the running case study — the company, its source systems, the canonical data model, the three reference stacks, and the scale numbers — that every later chapter builds on. Don't skip it: the rest of the guide assumes this vocabulary.</p>
+</header>
+
+<section id="what">
+  <h2>What this guide is (and isn't)</h2>
+  <p>This is a guide about <strong>designing the data platform itself</strong> — the ingestion, storage, modeling, transformation, serving, governance, and AI-enablement systems that a <strong>Data Platform Engineer (DPE)</strong> stands up so that everyone else in the company can answer questions with data and ship ML. It is a <em>systems-design</em> guide: it reasons about components, data flows, trade-offs, and failure modes.</p>
+
+  <p>It is <em>not</em> a guide about doing data-engineering tasks on rented GPUs, and it is not an interview cram sheet. For the former, read the sibling guide <a href="../data-engineering-for-neoclouds/index.html">Data Engineering for Neoclouds</a>; for the company itself, the <a href="../../neocloud/vast-ai/index.html">Vast.AI profile</a>.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Layered by design</span>
+    <p>Every chapter opens with foundational framing (what the concept is, why it exists) and then climbs to senior design-decision depth (the trade-offs, the schemas, the capacity math). New to the field? Read top-to-bottom. Senior? The first section of each chapter is skimmable; the value is in the later sections and the callouts.</p>
+  </div>
+</section>
+
+<section id="company">
+  <h2>The case study: VastDP</h2>
+  <p>Throughout the guide we design <strong>VastDP</strong> — the internal data platform for a GPU-rental <strong>marketplace</strong> modeled on the publicly observable shape of <a href="../../neocloud/vast-ai/index.html">Vast.AI</a>. A quick refresher on why a marketplace is a <em>fascinating</em> data-platform case study:</p>
+
+  <ul>
+    <li><strong>It is two-sided.</strong> Providers (GPU owners) list machines; clients rent them. Every event has two economic actors, which doubles the modeling and the metrics.</li>
+    <li><strong>The product emits a firehose of physical telemetry.</strong> Tens of thousands of GPUs report utilization, temperature, power, and benchmark scores every few seconds. This is the high-volume, time-series part of the platform.</li>
+    <li><strong>Pricing is a live market.</strong> On-demand prices and interruptible <em>bids</em> change by the hour. The platform needs event-time-correct pricing and clearing data.</li>
+    <li><strong>Trust is system-generated.</strong> DLPerf benchmarks, reliability scores, and fraud signals are <em>data products</em> the platform computes and feeds back into the marketplace ranking — the data platform is in the product's critical path, not just a back office.</li>
+    <li><strong>Money flows both ways.</strong> Clients are billed; providers are paid out; crypto and fiat rails, KYC, and a double-entry ledger all generate financial data with correctness requirements.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Illustrative, not official</span>
+    <p>VastDP's internal architecture is <em>invented for teaching</em>. Vast.AI has not published its data stack; everything here is a plausible design inferred from the product's external behavior. Treat the numbers and schemas as realistic teaching fixtures, not facts about Vast.</p>
+  </div>
+</section>
+
+<section id="sources">
+  <h2>The source systems (the application space)</h2>
+  <p>A data platform is only as good as its understanding of where data is born. Chapter 01 goes deep on this; here is the map you should hold in your head for the whole guide. VastDP ingests from nine source systems:</p>
+
+  <div class="flow">┌──────────────────────────────────────────────────────────────────────────┐
+│                        APPLICATION SPACE (sources)                         │
+├───────────────────────────┬────────────────────────────────────────────────┤
+│  TRANSACTIONAL (OLTP)      │  EVENTS / STREAMS            │  THIRD-PARTY     │
+│  Postgres, row-by-row      │  Kafka topics, append-only   │  external APIs   │
+│                            │                              │                  │
+│  1 marketplace-api         │  6 marketplace-events        │  8 payments      │
+│     accounts, listings,    │     search, click, rent,     │     Stripe (fiat)│
+│     rentals, bids          │     bid, preempt, cancel     │     crypto rails │
+│                            │                              │     KYC / AML    │
+│  2 billing-service         │  7 host-agent telemetry      │                  │
+│     meters, invoices,      │     ⚡ THE FIREHOSE ⚡        │  9 support       │
+│     credits, payouts,      │     per-GPU metrics every    │     Zendesk-like │
+│     double-entry ledger    │     ~10s: util, temp, power, │     tickets,     │
+│                            │     VRAM, DLPerf probes,     │     disputes     │
+│  3 instance-orchestrator   │     reliability heartbeats   │                  │
+│     instance lifecycle     │                              │                  │
+│                            │                              │                  │
+│  4 ranking-service         │                              │                  │
+│     DLPerf, reliability,   │                              │                  │
+│     search-rank features   │                              │                  │
+│                            │                              │                  │
+│  5 trust-safety            │                              │                  │
+│     fraud signals, bans    │                              │                  │
+└───────────────────────────┴──────────────────────────────┴──────────────────┘
+                                       │
+                                       ▼
+                            ┌────────────────────┐
+                            │       VastDP        │   ← everything in chapters
+                            │   the data platform │      03–16 is about this box
+                            └────────────────────┘</div>
+
+  <p>Two properties of this source map drive most of the architecture:</p>
+  <ol>
+    <li><strong>Heterogeneous shapes.</strong> Slowly-changing relational tables (accounts), high-frequency append-only events (telemetry), and external API pulls (payments) need fundamentally different ingestion patterns — CDC, streaming, and batch respectively. Chapter 04 is organized around exactly this split.</li>
+    <li><strong>One source dominates volume.</strong> The host-agent telemetry firehose is 2–3 orders of magnitude larger than everything else combined. A huge fraction of the platform's cost and design tension comes from this single source. Watch it recur in 04 (ingest), 05 (store), 14 (scale).</li>
+  </ol>
+</section>
+
+<section id="domains">
+  <h2>The data domains</h2>
+  <p>Source systems are an <em>engineering</em> view. The platform also needs a <em>business</em> view — the domains that analysts and ML models actually reason about. We organize VastDP into six domains; most chapters touch one or two explicitly.</p>
+
+  <table>
+    <thead>
+      <tr><th>Domain</th><th>Grain / core entities</th><th>Primary sources</th><th>Who cares</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Marketplace</strong></td><td>listing, search, match, rental, bid</td><td>marketplace-api, marketplace-events</td><td>Product, growth</td></tr>
+      <tr><td><strong>Supply / fleet</strong></td><td>host, machine, GPU, telemetry sample</td><td>host-agent, orchestrator</td><td>Supply ops, ML</td></tr>
+      <tr><td><strong>Billing &amp; finance</strong></td><td>meter, invoice, payout, ledger entry</td><td>billing-service, payments</td><td>Finance, execs</td></tr>
+      <tr><td><strong>Trust &amp; safety</strong></td><td>fraud signal, ban, dispute</td><td>trust-safety, support</td><td>T&amp;S, risk</td></tr>
+      <tr><td><strong>Quality / ranking</strong></td><td>DLPerf score, reliability score</td><td>ranking-service, host-agent</td><td>Product, ML</td></tr>
+      <tr><td><strong>Customer</strong></td><td>account, session, ticket</td><td>marketplace-api, clickstream, support</td><td>Growth, CX</td></tr>
+    </tbody>
+  </table>
+
+  <p>Domains are not just documentation — they become the ownership boundaries for <strong>data contracts</strong> (chapter 09), the seams for <strong>access control</strong> (chapter 11), and the top-level namespaces in the <strong>catalog</strong>. A platform without explicit domains becomes a swamp where no one owns anything.</p>
+</section>
+
+<section id="model">
+  <h2>The canonical data model</h2>
+  <p>Here is the core entity model in miniature. Chapter 06 develops the full dimensional model (with slowly-changing dimensions, fact grains, and DDL); this is the skeleton to memorize first. Note the two-sided spine: <strong>supply</strong> on the left, <strong>demand</strong> on the right, meeting at the <strong>rental</strong>.</p>
+
+  <div class="flow">       SUPPLY SIDE                                      DEMAND SIDE
+  ┌──────────────┐                                  ┌──────────────┐
+  │     host     │ 1                              1  │   customer   │
+  │  (provider)  │───┐                          ┌────│   (account)  │
+  └──────────────┘   │                          │    └──────────────┘
+                     │ *                      * │           │ 1
+  ┌──────────────┐   │                          │           │
+  │   machine    │◀──┘                          │           │ *
+  │ (physical box)│                              │    ┌──────────────┐
+  └──────────────┘                              │    │     bid      │
+         │ 1                                     │    │ (interruptible)│
+         │ *                                     │    └──────────────┘
+  ┌──────────────┐        ┌──────────────┐       │           │
+  │     gpu      │        │   listing/   │       │           │
+  │  (one card)  │        │    offer     │       │           │
+  └──────────────┘        └──────────────┘       │           │
+         │                       │ 1             │           │
+         │                       │ *             │           │
+         │ produces        ┌─────────────┐       │           │
+         ▼                 │   instance   │◀──────┘           │
+  ┌──────────────┐         │  (a running  │◀──────────────────┘
+  │  telemetry_  │         │   rental)    │
+  │   sample     │         └─────────────┘
+  │ (⚡firehose) │                │ 1
+  └──────────────┘                │ *
+                           ┌─────────────┐      ┌──────────────┐      ┌──────────────┐
+                           │  rental_    │ *  1 │   invoice    │ 1  * │ ledger_entry │
+                           │  meter      │──────│              │──────│ (double-entry)│
+                           └─────────────┘      └──────────────┘      └──────────────┘
+                                                       │ 1
+                                                       │ *
+                                                ┌──────────────┐
+                                                │   payout     │  → to provider
+                                                └──────────────┘</div>
+
+  <div class="callout tip">
+    <span class="callout-label">The grains that matter most</span>
+    <p>Three fact grains carry the business: <strong>one row per telemetry sample</strong> (billions, time-series), <strong>one row per rental-hour meter</strong> (the billing atom), and <strong>one row per bid event</strong> (the market). Almost every metric in the company is an aggregation over one of these three. Hold them; chapter 06 formalizes them.</p>
+  </div>
+</section>
+
+<section id="stacks">
+  <h2>The three reference stacks</h2>
+  <p>Rather than prescribe one toolchain, the guide carries three end-to-end reference architectures and compares them at every layer. When a chapter says "in Stack A…", this is what it means:</p>
+
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>Stack A — Open-source lakehouse</th><th>Stack B — Databricks-centric</th><th>Stack C — Snowflake-centric</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Streaming bus</td><td>Kafka / Redpanda</td><td>Kafka → Auto Loader</td><td>Kafka → Snowpipe Streaming</td></tr>
+      <tr><td>Ingest / CDC</td><td>Debezium, Flink</td><td>Delta Live Tables, Debezium</td><td>Fivetran, Snowpipe, connectors</td></tr>
+      <tr><td>Table format</td><td>Apache Iceberg on S3</td><td>Delta Lake</td><td>Snowflake tables (FDN) + Iceberg</td></tr>
+      <tr><td>Transform</td><td>dbt-core + Spark SQL</td><td>dbt or DLT (Spark)</td><td>dbt + Dynamic Tables</td></tr>
+      <tr><td>Orchestrate</td><td>Dagster (or Airflow)</td><td>Databricks Workflows</td><td>Snowflake Tasks / Airflow</td></tr>
+      <tr><td>Query engine</td><td>Trino / Spark</td><td>Databricks SQL (Photon)</td><td>Snowflake virtual warehouses</td></tr>
+      <tr><td>Telemetry / real-time</td><td>ClickHouse</td><td>Delta + Spark SS / ClickHouse</td><td>ClickHouse or Dynamic Tables</td></tr>
+      <tr><td>Catalog / governance</td><td>Polaris/Nessie + DataHub</td><td>Unity Catalog</td><td>Snowflake Horizon</td></tr>
+      <tr><td>ML / features</td><td>Feast + MLflow</td><td>Databricks Feature Store + MLflow</td><td>Snowflake Feature Store + Snowpark</td></tr>
+      <tr><td>Semantic layer</td><td>Cube / dbt MetricFlow</td><td>Unity Catalog metrics / dbt</td><td>Snowflake Semantic Views / dbt</td></tr>
+      <tr><td>NL-to-SQL / AI</td><td>self-hosted LLM + Cube</td><td>Databricks Genie / AI-BI</td><td>Snowflake Cortex Analyst</td></tr>
+    </tbody>
+  </table>
+
+  <p>Chapter 03 explains <em>why you would choose each</em> (capital model, team size, lock-in tolerance, cost curve). The short version: <strong>A</strong> minimizes vendor cost and lock-in at the price of engineering headcount; <strong>B</strong> excels when ML and large-scale Spark are central; <strong>C</strong> wins on time-to-value and SQL-analyst ergonomics. A real company at VastDP's stage usually runs a <em>hybrid</em> — and a marketplace's telemetry firehose pushes <em>all three</em> toward a specialist time-series engine (ClickHouse) on the side.</p>
+</section>
+
+<section id="scale">
+  <h2>Scale numbers (the fixtures)</h2>
+  <p>Design is meaningless without magnitudes. These are the numbers we size VastDP against; they recur in the capacity math in chapters 04, 05, 14, and 15.</p>
+
+  <table>
+    <thead>
+      <tr><th>Quantity</th><th>Figure</th><th>Implication</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GPUs on the marketplace</td><td>~17,000</td><td>The fleet whose telemetry we ingest</td></tr>
+      <tr><td>Telemetry interval</td><td>every 10 s / GPU</td><td>6 samples/min/GPU</td></tr>
+      <tr><td><strong>Telemetry samples/day</strong></td><td><strong>~150 M/day</strong> (17k × 6 × 1440)</td><td>~1,700 events/sec sustained; the firehose</td></tr>
+      <tr><td>Marketplace + clickstream events/day</td><td>~20–40 M/day</td><td>Bursty; spikes on model releases</td></tr>
+      <tr><td>Rentals (active concurrent)</td><td>~10–15 k</td><td>Rental-hour meter rows: ~10 M/day</td></tr>
+      <tr><td>Raw landed data growth</td><td>~150–250 GB/day compressed</td><td>~50–90 TB/yr → tiering matters</td></tr>
+      <tr><td>Accounts (lifetime)</td><td>hundreds of thousands</td><td>Small dimension; trivial to model</td></tr>
+      <tr><td>Core analyst/ML internal users</td><td>tens to low hundreds</td><td>Self-serve &gt; ticket queue (ch. 09)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">The 80/20 of this whole guide</span>
+    <p>~80% of the bytes and ~80% of the infrastructure cost come from one source (telemetry), while ~80% of the <em>questions</em> people ask come from the small relational domains (billing, marketplace, customer). Good platform design treats these two worlds with different tools and never forces the firehose through a row-oriented warehouse. Internalize this asymmetry now.</p>
+  </div>
+</section>
+
+<section id="consumers">
+  <h2>Who consumes the data</h2>
+  <p>A platform exists for its consumers. VastDP serves five, and chapters 08–13 are largely about serving them well:</p>
+  <ul>
+    <li><strong>Product &amp; growth</strong> — funnels, retention, marketplace liquidity, pricing experiments. Want self-serve dashboards and a trustworthy metrics layer (ch. 08–09).</li>
+    <li><strong>Finance &amp; execs</strong> — GMV, take-rate revenue, margins, payouts. Want <em>one</em> number for each metric, reconciled to the ledger (ch. 08, 11).</li>
+    <li><strong>Supply ops</strong> — fleet health, utilization, fill rate, provider economics. Heavy telemetry consumers (ch. 14).</li>
+    <li><strong>Trust &amp; safety / risk</strong> — fraud, abuse, disputes. Want low-latency signals and audited access to sensitive data (ch. 11–12).</li>
+    <li><strong>ML &amp; data science</strong> — ranking, fraud, churn, capacity forecasting, dynamic pricing. Want features, training data, and offline↔online parity (ch. 12).</li>
+    <li><strong>AI agents &amp; NL interfaces</strong> — increasingly, the "user" is an LLM answering questions in Slack. Accuracy depends entirely on the semantic layer (ch. 13).</li>
+  </ul>
+</section>
+
+<section id="order">
+  <h2>Reading order</h2>
+  <p>The chapters are grouped into five sections that follow the data's journey:</p>
+  <ul>
+    <li><strong>Section A · Orient</strong> (01–02) — the application space and the DPE role.</li>
+    <li><strong>Section B · Architecture foundations</strong> (03–07) — architectures, ingestion, storage, modeling, transformation. The load-bearing build chapters.</li>
+    <li><strong>Section C · Serving, quality &amp; governance</strong> (08–11) — getting trustworthy data to internal users.</li>
+    <li><strong>Section D · AI enablement</strong> (12–14) — the platform for ML, AI powering the platform, and performance at scale.</li>
+    <li><strong>Section E · Putting it together</strong> (15–16) — the end-to-end reference design and synthesis.</li>
+  </ul>
+  <p>Read in order if you're new to the space. If you're a senior engineer, the recommended deep-dive path is in the <a href="index.html">guide hub</a>. Next up: <a href="01-the-application-space.html">the application space</a> — every source system, in detail.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

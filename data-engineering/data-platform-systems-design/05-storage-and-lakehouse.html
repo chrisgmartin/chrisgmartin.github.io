@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Storage &amp; the Lakehouse — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#oltp-olap">The OLTP↔OLAP divide</a>
+    <a href="#parquet">Parquet internals</a>
+    <a href="#table-formats">Open table formats</a>
+    <a href="#partitioning">Partitioning &amp; clustering</a>
+    <a href="#object-store">Object storage &amp; small files</a>
+    <a href="#tiers">Storage tiering &amp; lifecycle</a>
+    <a href="#timeseries">The firehose store: ClickHouse</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-ingestion-and-pipelines.html">← Previous</a>
+    <a href="06-data-modeling.html">Next: Data Modeling →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Architecture foundations</span>
+  <h1>Storage &amp; the Lakehouse</h1>
+  <p class="subtitle">Once data is flowing in (chapter 04), the next decision is where it lands and in what physical shape — because storage layout silently dictates query cost, latency, and what questions are even answerable. This chapter builds VastDP's storage substrate from the bytes up: why analytics needs a columnar format, how Parquet makes scans cheap, how open table formats turn files into real tables, and why the firehose lives in a specialist store rather than the lakehouse at all.</p>
+</header>
+
+<section id="oltp-olap">
+  <h2>The OLTP↔OLAP divide</h2>
+  <p>The source systems in <a href="01-the-application-space.html#oltp">chapter 01</a> are <strong>row-oriented</strong>: Postgres stores all the columns of a <code>rental</code> together, contiguously, so that fetching <em>one</em> rental by primary key is a single seek and a single read. That layout is perfect for the OLTP workload — point lookups, single-row mutations, transactional consistency — which is exactly what the marketplace product does thousands of times per second.</p>
+
+  <p>Analytics is the opposite workload. An analyst asks "average GPU utilization by data-center region last month" — a query that touches <em>two columns</em> across <em>hundreds of millions of rows</em>. In a row store, the engine must read every row in full (all 11 telemetry columns) just to extract the 2 it needs, then discard the rest. The disk and decompression work is dominated by columns the query never references. This is why you copy data <em>out</em> of Postgres into a <strong>column-oriented</strong> analytical store rather than pointing dashboards at the production database: the access patterns are fundamentally adversarial, and so are the optimal physical layouts.</p>
+
+  <div class="flow">  ROW-ORIENTED (OLTP — Postgres)            COLUMN-ORIENTED (OLAP — Parquet/lakehouse)
+  point lookups, mutations                   scans, aggregations, projections
+
+  on disk, one row at a time:                on disk, one column at a time:
+  ┌─────────────────────────────┐           ┌──────────────────────────────────┐
+  │ r1: id│ts│util│temp│power│…  │           │ id   : a a a a a a a a a a a a …   │
+  │ r2: id│ts│util│temp│power│…  │           │ ts   : t t t t t t t t t t t t …   │
+  │ r3: id│ts│util│temp│power│…  │           │ util : 97 12 88 4 71 … (one run)   │
+  │ …                           │           │ temp : 71 44 69 …                  │
+  └─────────────────────────────┘           │ power: 402 110 …                   │
+  read 1 row  = cheap (1 seek)               └──────────────────────────────────┘
+  AVG(util)   = read EVERY column             AVG(util) = read ONE column,
+                of EVERY row (wasteful)                   skip the other 10
+                                              + compresses 5–20× (like values
+                                                sit next to like values)</div>
+
+  <p>Two free wins fall out of the columnar layout. First, <strong>projection pushdown</strong>: a query only reads the columns it names, so a 2-of-11-column query does ~18% of the I/O. Second, <strong>compression</strong>: a column is a run of same-typed, often-similar values (every <code>temp_c</code> near 70, every <code>gpu_index</code> in 0–7), which compresses far better than a heterogeneous row. VastDP's ~150–250 GB/day landed figure from <a href="00-START-HERE.html#scale">Start Here</a> is the <em>compressed</em> number precisely because we store columnar.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why "copy the data out" is non-negotiable</span>
+    <p>It is tempting to skip the warehouse and let analysts query a Postgres read-replica. It works until it doesn't: a single <code>GROUP BY</code> over a large table table-scans the replica, evicts the OLTP working set from cache, and the product's point lookups slow down. You are trading the platform's job (answer analytical questions) against the product's job (serve users). The columnar copy isn't bureaucracy — it's the only way both workloads run on their optimal physical layout.</p>
+  </div>
+</section>
+
+<section id="parquet">
+  <h2>Columnar file formats: Parquet internals</h2>
+  <p><strong>Apache Parquet</strong> is the de-facto on-disk format for analytical data — it's what Iceberg, Delta, and Hudi all store underneath. Understanding its internal layout is what separates an engineer who <em>uses</em> a lakehouse from one who can <em>tune</em> it, because every partitioning and clustering decision later in this chapter is really a decision about what Parquet's metadata lets the engine skip.</p>
+
+  <div class="flow">  ONE PARQUET FILE  (e.g. one telemetry file, ~256 MB)
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  Row Group 0   (~128 MB of rows, e.g. 1M telemetry samples)         │
+  │  ┌──────────────┬──────────────┬──────────────┬──────────────┐      │
+  │  │ Column Chunk │ Column Chunk │ Column Chunk │ Column Chunk │ …    │
+  │  │   event_time │   gpu_util   │    temp_c    │   machine_id │      │
+  │  │  ┌─────────┐ │  ┌─────────┐ │  ┌─────────┐ │  ┌─────────┐ │      │
+  │  │  │ page    │ │  │ page    │ │  │ page    │ │  │ page    │ │      │
+  │  │  │ page    │ │  │ page    │ │  │ page    │ │  │ page    │ │      │
+  │  │  │ +stats: │ │  │ +stats: │ │  │ +stats: │ │  │ +dict   │ │      │
+  │  │  │ min/max │ │  │ min=4   │ │  │ min=38  │ │  │ encode  │ │      │
+  │  │  │         │ │  │ max=100 │ │  │ max=84  │ │  │         │ │      │
+  │  │  └─────────┘ │  └─────────┘ │  └─────────┘ │  └─────────┘ │      │
+  │  └──────────────┴──────────────┴──────────────┴──────────────┘      │
+  │  Row Group 1   …                                                    │
+  │  Row Group 2   …                                                    │
+  ├────────────────────────────────────────────────────────────────────┤
+  │  FOOTER (file metadata): schema, row-group offsets,                 │
+  │          per-column-chunk min/max/null-count statistics  ◀── read   │
+  └────────────────────────────────────────────────────────────────────┘     this
+                                                                              FIRST</div>
+
+  <p>The structure is hierarchical: a file holds <strong>row groups</strong> (horizontal slices of ~64–256 MB), each row group holds one <strong>column chunk</strong> per column, and each chunk holds <strong>pages</strong> of encoded values. The footer at the end carries the schema and, crucially, <strong>min/max/null-count statistics for every column chunk</strong>. Engines read the footer first, then decide what to read next.</p>
+
+  <p>Three mechanisms make analytical scans cheap:</p>
+  <ul>
+    <li><strong>Projection pushdown</strong> — to read <code>gpu_util</code>, the engine seeks directly to that column chunk's byte offset (from the footer) and reads only those bytes. The other ten columns are never touched.</li>
+    <li><strong>Predicate pushdown via statistics</strong> — for <code>WHERE temp_c &gt; 90</code>, the engine checks each row group's <code>temp_c</code> min/max. A row group with <code>max=84</code> cannot contain a match, so it's skipped <em>without decompressing a single value</em>. On well-sorted data this prunes the vast majority of row groups. (Iceberg and Delta keep these same statistics at the <em>file</em> level too, so they can skip whole files before even opening them.)</li>
+    <li><strong>Encoding + compression</strong> — within a chunk, Parquet applies <strong>dictionary encoding</strong> (replace repeated values like <code>machine_id</code> with small integer codes), <strong>run-length encoding</strong> (RLE — store "97 repeated 40,000 times" once), and bit-packing, <em>then</em> a general codec (Snappy for speed, Zstd for ratio). Telemetry columns with low cardinality and physical locality routinely hit 10–20× compression.</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th>Knob</th><th>What it controls</th><th>VastDP guidance</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Row-group size</td><td>Granularity of stats-based skipping vs read parallelism</td><td>128 MB — small enough to prune, big enough to amortize seeks</td></tr>
+      <tr><td>Target file size</td><td>Files-per-query overhead (see small-files, below)</td><td>128–512 MB; never thousands of tiny files</td></tr>
+      <tr><td>Compression codec</td><td>CPU vs storage trade-off</td><td>Zstd for cold/archive, Snappy for hot scan paths</td></tr>
+      <tr><td>Sort within file</td><td>How tight min/max ranges are → how much skipping</td><td>Sort by the common predicate (event_time, machine_id)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Sorting is the cheat code</span>
+    <p>Min/max pruning only helps if values are <em>physically clustered</em>. If <code>event_time</code> is scattered randomly across row groups, every row group's min/max spans the whole day and nothing can be skipped. Sort the data on the column you filter on and the same Parquet file goes from "scan everything" to "skip 95%". This single fact drives the entire partitioning and clustering discussion next.</p>
+  </div>
+</section>
+
+<section id="table-formats">
+  <h2>Open table formats: from a pile of files to a real table</h2>
+  <p>A directory full of Parquet files is not a table. There's no atomic commit (a reader can see a half-finished write), no way to roll back, no schema enforcement, no record of what files belong to which version. <strong>Open table formats</strong> — Apache Iceberg, Delta Lake, and Apache Hudi — add a <em>metadata layer</em> on top of the Parquet files that supplies exactly these database properties while leaving the data in open, engine-agnostic files on object storage.</p>
+
+  <div class="flow">  THE LAKEHOUSE STACK (decoupled layers)
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  QUERY ENGINES          Trino   Spark   ClickHouse   dbt       │  ← compute,
+  │  (many, swappable)        \       |        /          /        │    scales
+  └────────────────────────────\─────|───────/──────────/─────────┘    independently
+                                 \    |      /          /
+  ┌──────────────────────────────\───|─────/──────────/───────────┐
+  │  TABLE FORMAT (metadata)   Iceberg / Delta / Hudi              │  ← ACID, time
+  │  manifests, snapshots, schema, stats, partition spec          │    travel, schema
+  └────────────────────────────────────────────────────────────────┘
+                                      │
+  ┌───────────────────────────────────────────────────────────────┐
+  │  FILE FORMAT               Parquet (columnar, compressed)      │  ← the bytes
+  └───────────────────────────────────────────────────────────────┘
+                                      │
+  ┌───────────────────────────────────────────────────────────────┐
+  │  OBJECT STORE              S3 / GCS / Azure Blob               │  ← cheap, durable,
+  │  cheap, durable, ~infinite, but no atomic rename               │    infinite
+  └───────────────────────────────────────────────────────────────┘</div>
+
+  <p>The decoupling is the whole point: storage is cheap object-store bytes, the table format is a thin metadata layer, and <em>any</em> engine that speaks the format can read and write. That's the lakehouse promise — the cheap-storage / open-format virtues of a data lake plus the ACID / transactional virtues of a warehouse, without copying data into a proprietary engine. The four capabilities every format provides:</p>
+  <ul>
+    <li><strong>ACID commits</strong> — a write either fully appears or doesn't; concurrent readers never see torn state (optimistic concurrency over a metadata log).</li>
+    <li><strong>Time travel</strong> — every commit is a <em>snapshot</em>; you can query the table "as of yesterday 14:00" or roll back a bad load. Invaluable for finance reconciliation and ML training-set reproducibility.</li>
+    <li><strong>Schema evolution</strong> — add, drop, rename, reorder columns by metadata change, without rewriting the data files.</li>
+    <li><strong>Partition evolution</strong> — change how the table is laid out going forward without rewriting history (an Iceberg specialty).</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th>Capability</th><th>Apache Iceberg</th><th>Delta Lake</th><th>Apache Hudi</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>ACID model</td><td>Snapshot isolation via metadata tree + catalog atomic swap</td><td>Optimistic concurrency via ordered transaction log (<code>_delta_log</code>)</td><td>Timeline of commits; MVCC with file groups</td></tr>
+      <tr><td>Time travel</td><td>Yes — by snapshot id or timestamp</td><td>Yes — by version or timestamp</td><td>Yes — by commit instant</td></tr>
+      <tr><td>Schema evolution</td><td>Full (add/drop/rename/reorder), ID-based — safest</td><td>Add/reorder; rename via column mapping</td><td>Add/reorder; evolving rename support</td></tr>
+      <tr><td>Partition evolution</td><td><strong>Yes — change spec without rewrite</strong> (unique)</td><td>No (rewrite required); liquid clustering instead</td><td>Limited</td></tr>
+      <tr><td>Hidden partitioning</td><td><strong>Yes</strong> — no derived partition column to maintain</td><td>No — partition column is explicit</td><td>No</td></tr>
+      <tr><td>Streaming upserts / CDC</td><td>Copy-on-write + merge-on-read (v2)</td><td>MERGE; Change Data Feed</td><td><strong>Best-in-class</strong> — built for upsert/incremental</td></tr>
+      <tr><td>Engine interop</td><td><strong>Broadest</strong> — Trino, Spark, Flink, Snowflake, ClickHouse, DuckDB, BigQuery</td><td>Strong via Spark/Databricks; open readers improving (UniForm exposes Iceberg)</td><td>Spark/Flink-centric; narrower</td></tr>
+      <tr><td>Community / governance</td><td>Vendor-neutral Apache project (Netflix origin); broad coalition</td><td>Linux Foundation, but Databricks-steered</td><td>Apache project (Uber origin); smaller community</td></tr>
+      <tr><td>Sweet spot</td><td>Open, multi-engine, no lock-in</td><td>Databricks/Spark-native ML + ETL</td><td>High-frequency upserts &amp; incremental CDC sinks</td></tr>
+    </tbody>
+  </table>
+
+  <p>Mapping back to the three reference stacks from <a href="00-START-HERE.html#stacks">Start Here</a>:</p>
+  <ul>
+    <li><strong>Stack A (open-source lakehouse)</strong> picks <strong>Iceberg on S3</strong>. Rationale: VastDP wants multiple engines (Trino for ad-hoc SQL, Spark for heavy transforms, ClickHouse and DuckDB for specialized reads) hitting <em>one</em> copy of the data, with zero vendor lock-in. Iceberg's interop and partition evolution win decisively.</li>
+    <li><strong>Stack B (Databricks-centric)</strong> uses <strong>Delta Lake</strong> — it's native, deeply optimized in Photon, and pairs with Unity Catalog and the Feature Store. UniForm can expose Delta as Iceberg for outside readers when needed.</li>
+    <li><strong>Stack C (Snowflake-centric)</strong> uses <strong>Snowflake-native tables for the core warehouse, plus Iceberg tables</strong> for the open/large-scale data Snowflake reads in place — getting Snowflake ergonomics without locking every byte into FDN format.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The pick is rarely religious</span>
+    <p>All three formats now converge on the same capabilities; the choice follows your <em>compute</em> choice, not the reverse. If you've committed to Databricks, fighting it to run Iceberg is wasted effort — use Delta. If you want engine optionality above all (Stack A's whole thesis), Iceberg's neutrality is the feature you're paying for. For Hudi, reach for it specifically when your dominant pattern is high-frequency upserts into a CDC sink.</p>
+  </div>
+</section>
+
+<section id="partitioning">
+  <h2>Partitioning, hidden partitioning &amp; clustering</h2>
+  <p>Recall the lesson from Parquet: the engine skips data it can prove is irrelevant. <strong>Partitioning</strong> and <strong>clustering</strong> are how you arrange data so it can prove that for the queries people actually run. Get this right and a query reads gigabytes; get it wrong and the same query reads terabytes for the same answer.</p>
+
+  <p><strong>Partitioning</strong> physically splits a table into directories by a column's value — <code>event_date=2026-06-16/</code>, <code>event_date=2026-06-15/</code>, and so on. A query with <code>WHERE event_date = '2026-06-16'</code> opens exactly one directory; the rest are pruned before any file is read. This is the single biggest lever for the telemetry table, where virtually every query is time-bounded.</p>
+
+  <p>The classic trap: with plain (Hive-style) partitioning, the partition column is a <em>separate, derived</em> column the writer must populate and the reader must filter on by its exact name. Query <code>WHERE event_time &gt; '2026-06-16'</code> instead of the derived <code>event_date</code> and you get no pruning — a silent full scan. <strong>Iceberg's hidden partitioning</strong> fixes this: you declare a partition <em>transform</em> (<code>days(event_time)</code>) and Iceberg derives and tracks the partition value itself. Analysts filter on the natural <code>event_time</code> column and pruning just works — no leaky derived column, and the spec can <em>evolve</em> later (e.g. from daily to hourly) without rewriting old data.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>iceberg — telemetry rollup table (Stack A)</span></div>
+  <pre><code class="language-sql">CREATE TABLE fleet.telemetry_hourly (
+    machine_id      STRING,
+    gpu_index       INT,
+    event_hour      TIMESTAMP,        -- truncated to the hour upstream
+    avg_gpu_util    DOUBLE,
+    max_temp_c      INT,
+    avg_power_w     DOUBLE,
+    p95_sm_clock    INT,
+    sample_count    BIGINT,
+    instance_id     STRING
+)
+USING iceberg
+PARTITIONED BY (days(event_hour))      -- HIDDEN partition transform
+TBLPROPERTIES (
+    'write.target-file-size-bytes' = '268435456',   -- 256 MB
+    'write.parquet.compression-codec' = 'zstd',
+    'write.distribution-mode' = 'range',             -- sort on write
+    'sort-order' = 'machine_id, event_hour'          -- cluster within partition
+);
+
+-- Later, with no rewrite of historical data, tighten to hourly partitions:
+ALTER TABLE fleet.telemetry_hourly
+  REPLACE PARTITION FIELD days(event_hour) WITH hours(event_hour);</code></pre>
+  </div>
+
+  <p>Within a partition, <strong>clustering / sort order</strong> decides how tight each file's min/max stats are. VastDP's telemetry is queried two ways: "the whole fleet over a time window" (handled by the date partition) and "one machine over time" (handled by clustering on <code>machine_id</code>). Sorting files by <code>machine_id, event_hour</code> means a single-machine query touches only the few files whose <code>machine_id</code> range covers it — the rest are pruned by file-level stats.</p>
+
+  <p>The same idea wears different names across engines: Delta calls it <strong>Z-ordering</strong> (or now <em>liquid clustering</em>), Snowflake uses <strong>clustering keys</strong> with automatic reclustering, ClickHouse uses the <strong>sorting key</strong> (next section). All answer one question: <em>given how this table is queried, how should rows be ordered on disk so the engine reads the least?</em></p>
+
+  <table>
+    <thead>
+      <tr><th>Technique</th><th>What it does</th><th>Best for</th><th>VastDP use</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Partitioning (by date)</td><td>Directory-level pruning by value</td><td>One dominant range filter (time)</td><td><code>days(event_hour)</code> on telemetry &amp; events</td></tr>
+      <tr><td>Hidden partitioning (Iceberg)</td><td>Derives partition from a transform; no leaky column; evolvable</td><td>Avoiding full-scan footguns</td><td>All Iceberg tables in Stack A</td></tr>
+      <tr><td>Clustering / sort order</td><td>Orders rows so file min/max are tight</td><td>A second, high-cardinality filter</td><td>Cluster by <code>machine_id</code> within day</td></tr>
+      <tr><td>Z-order (Delta) / clustering key (Snowflake)</td><td>Multi-column locality without explosive partition count</td><td>2–3 common filter columns together</td><td>Stack B/C equivalents of the above</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Don't over-partition</span>
+    <p>It's tempting to partition the telemetry table by <code>(event_date, machine_id)</code> to make machine queries instant. With 17,000 machines × 365 days that's ~6.2M partitions, each holding a sliver of data — millions of tiny files, a bloated metadata layer, and crippled planning. The rule: <strong>partition by a low-cardinality column you almost always filter on (date); cluster/sort by the high-cardinality one (machine_id).</strong> Partitioning controls coarse pruning; clustering handles the fine grain without the file explosion.</p>
+  </div>
+</section>
+
+<section id="object-store">
+  <h2>Object storage as the substrate — and the small-files problem</h2>
+  <p>Underneath every lakehouse table sits <strong>object storage</strong> — S3, GCS, Azure Blob. It's the right substrate for analytics because it is effectively infinite, extremely durable (eleven nines), and cheap (cents per GB-month), and it decouples storage from compute so you pay for each independently. But it is <em>not</em> a filesystem, and the differences bite:</p>
+  <ul>
+    <li><strong>Latency, not throughput, is the enemy.</strong> Each <code>GET</code> carries tens of milliseconds of overhead. Reading one 256 MB file is fast; reading 25,600 ten-KB files for the same bytes is dominated by per-request latency and will be orders of magnitude slower.</li>
+    <li><strong>No atomic rename.</strong> Object stores have no cheap "mv". This is precisely why table formats keep an explicit metadata log to make commits atomic, instead of relying on directory renames the way old Hive tables did.</li>
+    <li><strong>Eventually-consistent listings (historically).</strong> S3 is now strongly read-after-write consistent, but listing semantics and request throttling still make "just scan the directory" an anti-pattern at scale — another reason the format tracks the file list in metadata.</li>
+  </ul>
+
+  <p>The dominant operational pain is the <strong>small-files problem</strong>, and the firehose causes it directly. Streaming ingest (chapter 04) commits frequently to keep data fresh — every micro-batch writes a new small Parquet file. At ~1,700 telemetry events/sec with minute-level commits, a single day's partition accretes thousands of tiny files. Query planning now has to open and stat all of them, footer reads dominate, and the metadata layer balloons.</p>
+
+  <div class="flow">  THE SMALL-FILES PROBLEM (and the fix)
+
+  STREAMING WRITES (every ~60s commit)        AFTER COMPACTION / OPTIMIZE
+  partition event_date=2026-06-16/            partition event_date=2026-06-16/
+  ┌──────────────────────────────┐           ┌──────────────────────────────┐
+  │ part-0001.parquet   8 MB      │           │ part-A.parquet     256 MB     │
+  │ part-0002.parquet   6 MB      │   ──▶     │ part-B.parquet     256 MB     │
+  │ part-0003.parquet   9 MB      │  compact  │ part-C.parquet     201 MB     │
+  │ … 1,440 more tiny files …     │  + sort   │                              │
+  │ part-1443.parquet   7 MB      │           │  3 big, sorted files          │
+  └──────────────────────────────┘           └──────────────────────────────┘
+  ~1,440 GET + footer reads/query             ~3 GET, tight min/max stats,
+  bloated manifest, slow planning             fast planning, clean pruning</div>
+
+  <p>The fix is a background <strong>compaction</strong> job (Iceberg: <code>rewrite_data_files</code>; Delta: <code>OPTIMIZE</code> / auto-compaction; Hudi: clustering) that periodically rewrites the many small files into a few right-sized (128–512 MB), sorted files — and the ACID layer makes the rewrite an atomic, invisible-to-readers commit. A companion job (Iceberg <code>expire_snapshots</code> + <code>remove_orphan_files</code>; Delta <code>VACUUM</code>) reclaims storage from old snapshots after the time-travel window. <strong>Compaction is not optional on a streaming table</strong>; it's a permanent, scheduled part of the platform, and chapter 14 budgets for the compute it consumes.</p>
+</section>
+
+<section id="tiers">
+  <h2>Storage tiering &amp; lifecycle</h2>
+  <p>Not all data is equal in value, and object stores price that directly. VastDP's <a href="00-START-HERE.html#scale">~150–250 GB/day → 50–90 TB/year</a> growth means storage cost compounds, but the <em>access</em> pattern decays sharply: yesterday's telemetry is queried constantly; telemetry from 14 months ago is touched only for the occasional audit. Tiering matches storage class to access frequency.</p>
+
+  <table>
+    <thead>
+      <tr><th>Tier</th><th>Data &amp; age</th><th>Store / class</th><th>Access pattern</th><th>~$/TB-month</th><th>Retrieval</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Hot</strong></td><td>Last ~7–30 days; live rollups</td><td>ClickHouse SSD + S3 Standard</td><td>Dashboards, ops, ML serving — constant</td><td>~$23 (S3 Std)</td><td>Instant</td></tr>
+      <tr><td><strong>Warm</strong></td><td>~1–13 months; Iceberg lakehouse</td><td>S3 Standard-IA</td><td>Ad-hoc analytics, monthly reporting</td><td>~$12.50</td><td>Instant (higher per-GET)</td></tr>
+      <tr><td><strong>Cold</strong></td><td>13–24 months</td><td>S3 Glacier Instant Retrieval</td><td>Rare queries, model backfills</td><td>~$4</td><td>ms, premium per-GET</td></tr>
+      <tr><td><strong>Archive</strong></td><td>&gt; 24 months; compliance/audit</td><td>S3 Glacier Deep Archive</td><td>Legal/audit only</td><td>~$1</td><td>Hours</td></tr>
+    </tbody>
+  </table>
+
+  <p>Tiering is automated with <strong>lifecycle policies</strong>: a rule on the bucket transitions objects to a colder class after N days based on age. Because Iceberg/Delta tables are just objects on S3, the same policies apply — though you transition the <em>data</em> files while keeping recent <em>metadata</em> hot so planning stays fast. The downsampling pattern compounds the savings: raw 10-second telemetry need not live forever at full resolution. After 30 days, VastDP keeps hourly rollups (1/360 the rows) and lets the raw samples expire — covered concretely in the ClickHouse TTL below.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">The full-resolution-forever trap</span>
+    <p>Retaining every 10-second sample at full fidelity indefinitely is the quiet budget killer: 50–90 TB/year that almost no query reads. Decide retention <em>per resolution</em> — e.g. raw samples 30 days, hourly rollups 25 months, daily rollups indefinitely. The rollups answer ~99% of historical questions at a fraction of a percent of the storage. Set this policy on day one; retrofitting retention onto a 200 TB table is a migration project.</p>
+  </div>
+</section>
+
+<section id="timeseries">
+  <h2>The specialist store for the firehose: ClickHouse</h2>
+  <p>Everything above describes the lakehouse — the right home for business data and pre-aggregated rollups. But <a href="01-the-application-space.html#firehose">chapter 01's warning</a> stands: <strong>do not route the raw firehose through the warehouse.</strong> The 150 M raw samples/day belong in a purpose-built time-series engine. Across all three reference stacks, VastDP runs <strong>ClickHouse</strong> for this — a columnar database engineered specifically for high-ingest, time-ordered, append-mostly data.</p>
+
+  <p>ClickHouse's storage engine is <strong>MergeTree</strong>. It's conceptually the same columnar+sorted idea as Parquet, but as a live, continuously-merging database: data is written in parts, each part stores columns sorted by the table's <strong>sorting key</strong>, and a background process merges parts (its own built-in answer to small files). The sorting key is the equivalent of clustering — it determines what ClickHouse can skip via its sparse primary index.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>clickhouse — raw telemetry with TTL downsampling</span></div>
+  <pre><code class="language-sql">CREATE TABLE fleet.telemetry_raw (
+    machine_id     LowCardinality(String),
+    gpu_index      UInt8,
+    event_time     DateTime64(3),
+    gpu_util_pct   Float32,
+    mem_used_mb    UInt32,
+    temp_c         UInt8,
+    power_w        UInt16,
+    sm_clock_mhz   UInt16,
+    ecc_errors     UInt32,
+    instance_id    LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(event_time)
+ORDER BY (machine_id, gpu_index, event_time)     -- the sorting key
+TTL event_time + INTERVAL 30 DAY                  -- expire raw samples
+        GROUP BY machine_id, gpu_index, toStartOfHour(event_time)
+        SET gpu_util_pct = avg(gpu_util_pct),     -- downsample in place
+            temp_c       = max(temp_c),
+            power_w      = avg(power_w);
+
+-- a materialized view maintains hourly rollups on ingest, pushed to the lakehouse
+CREATE MATERIALIZED VIEW fleet.telemetry_hourly_mv
+TO fleet.telemetry_hourly AS
+SELECT
+    machine_id,
+    gpu_index,
+    toStartOfHour(event_time)            AS event_hour,
+    avg(gpu_util_pct)                     AS avg_gpu_util,
+    max(temp_c)                           AS max_temp_c,
+    avg(power_w)                          AS avg_power_w,
+    count()                               AS sample_count
+FROM fleet.telemetry_raw
+GROUP BY machine_id, gpu_index, event_hour;</code></pre>
+  </div>
+
+  <p>Three ClickHouse features carry the firehose:</p>
+  <ul>
+    <li><strong>Sorting key</strong> — <code>ORDER BY (machine_id, gpu_index, event_time)</code> matches the two query shapes (fleet-over-time and machine-over-time), so the sparse index prunes aggressively.</li>
+    <li><strong>TTL-based downsampling &amp; expiry</strong> — the <code>TTL … GROUP BY … SET</code> clause <em>rolls up</em> data older than 30 days in place (averaging utilization, max-ing temperature) and the rest expires. Retention-per-resolution from the tiering section, expressed declaratively in the schema.</li>
+    <li><strong>Materialized views for rollups</strong> — incremental aggregation computed <em>on insert</em>, not at query time. The hourly rollup is maintained continuously and is the exact dataset that flows into the Iceberg <code>telemetry_hourly</code> table for joining against business data in the warehouse.</li>
+  </ul>
+
+  <p>Why this is 10–100× cheaper than a warehouse for time-series: ClickHouse ingests millions of rows/sec on commodity hardware with no per-query compute billing, its sparse-index + sorting-key design is tuned for exactly the "metric over a time window for an entity" pattern, and TTL downsampling caps storage growth automatically. A general warehouse charges premium compute for every scan of data it stores row-expensively and never downsamples on its own.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">The warehouse-firehose anti-pattern (reprise)</span>
+    <p>This is the single most consequential storage decision at VastDP, so it earns a second mention. Loading raw 10-second telemetry into Snowflake/BigQuery/Databricks SQL and querying it with dashboards works at 1,000 GPUs and detonates — on cost first, then latency — at 17,000. The pattern that scales: <strong>raw firehose → ClickHouse (+ object-store landing) → hourly rollups → lakehouse/warehouse for joins.</strong> The warehouse sees <em>aggregates</em>, never the raw stream. Chapter 14 turns this into capacity math.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>OLTP is row-oriented (point lookups, mutations); OLAP is column-oriented (scans, aggregations). You copy data out of Postgres into a columnar store because the access patterns demand opposite physical layouts.</li>
+    <li>Parquet makes scans cheap via projection pushdown, predicate pushdown on min/max statistics, and dictionary/RLE/compression — and all of it only pays off when data is sorted on what you filter.</li>
+    <li>Open table formats (Iceberg, Delta, Hudi) add ACID, time travel, and schema/partition evolution over Parquet files. VastDP picks Iceberg in Stack A (open, multi-engine), Delta in Stack B (Databricks-native), Snowflake-native + Iceberg in Stack C.</li>
+    <li>Partitioning gives coarse pruning (by date); clustering/sort order gives the fine grain (by machine_id) without exploding partition counts. Iceberg's hidden partitioning removes the full-scan footgun.</li>
+    <li>Object storage is the cheap, durable, infinite substrate — but its latency and lack of atomic rename make small files (from streaming) a real problem that compaction jobs must continuously fix.</li>
+    <li>Tier by access frequency (hot/warm/cold/archive) and downsample by resolution; never keep full-fidelity telemetry forever.</li>
+    <li>The firehose lives in ClickHouse, not the warehouse — MergeTree, sorting keys, TTL downsampling, and materialized-view rollups serve time-series 10–100× cheaper.</li>
+  </ul>
+  <p>With the bytes laid down correctly, the next question is logical shape: how to model these landed files into facts, dimensions, and a canonical schema analysts can trust. → <a href="06-data-modeling.html">Data Modeling</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

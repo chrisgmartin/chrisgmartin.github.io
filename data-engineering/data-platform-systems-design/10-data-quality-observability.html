@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Quality, Observability &amp; Reliability — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Trust is the product</a>
+    <a href="#dimensions">The dimensions of quality</a>
+    <a href="#testing">Testing data</a>
+    <a href="#observability">Data observability</a>
+    <a href="#lineage">Lineage &amp; impact analysis</a>
+    <a href="#slos">Data SLAs &amp; SLOs</a>
+    <a href="#incidents">Data incident response</a>
+    <a href="#the-ledger-test">Worked example: guarding billing</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="09-self-serve-enablement.html">← Previous</a>
+    <a href="11-governance-security.html">Next: Governance &amp; Security →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Serving, quality &amp; governance</span>
+  <h1>Data Quality, Observability &amp; Reliability</h1>
+  <p class="subtitle">A platform's real product is not tables or dashboards — it is <em>trust</em> in the numbers they show. This chapter builds the system that earns that trust: the dimensions of data quality, the test pyramid that asserts the known, the observability layer that catches the unknown, the lineage that bounds the blast radius, and the SLOs and incident response that turn quality from a hope into an operated discipline.</p>
+</header>
+
+<section id="why">
+  <h2>Trust is the product</h2>
+  <p>Picture the Monday exec review. The GMV slide shows a number that is 12% lower than last week, and someone built a narrative around it before anyone notices the rental-meter feed silently stalled on Saturday. The number was wrong, the decision discussed off it was wrong — and worse, the <em>next</em> time the dashboard is right, no one believes it. That is the asymmetry that makes data quality a first-class system: <strong>one wrong number in an exec dashboard discredits the entire platform</strong>, including all the numbers that were correct.</p>
+
+  <p>The cost of bad data compounds across three channels. <strong>Decisions</strong> made on wrong numbers are wrong, and they are made by the most senior, most expensive people in the building. <strong>Money</strong> moves on billing and payout data — a double-counted <code>rental_meter</code> row (recall <a href="01-the-application-space.html#oltp">chapter 01</a>) is a real overcharge and a chargeback. <strong>ML</strong> trains silently on corrupted features: a reliability model that ingested a week of telemetry gaps as genuine downtime will mis-rank healthy hosts for months. The decision error is loud; the ML error is silent and slow, which makes it the more dangerous of the two.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Quality is a system, not a checklist</span>
+    <p>From <a href="01-the-application-space.html#why">chapter 01</a>: <strong>quality is set at the source, observed at the platform, and paid for downstream.</strong> A junior treats quality as a final QA step before launch. A senior DPE treats it as a standing system with the same components as any reliability practice: assertions (tests), telemetry (observability), a topology (lineage), targets (SLOs), and a response loop (incidents). The rest of this chapter is those five components, applied to VastDP.</p>
+  </div>
+</section>
+
+<section id="dimensions">
+  <h2>The dimensions of data quality</h2>
+  <p>"Is the data good?" is unanswerable until you decompose <em>good</em> into measurable dimensions. Each dimension catches a distinct failure class, and a mature platform monitors all seven. Map them to the case study so they stay concrete.</p>
+
+  <div class="flow">                         ┌─────────────────────────────┐
+                         │    IS THE DATA TRUSTWORTHY?  │
+                         └──────────────┬──────────────┘
+            ┌───────────────┬───────────┼───────────┬───────────────┐
+            ▼               ▼           ▼           ▼               ▼
+   ┌──────────────┐ ┌────────────┐ ┌─────────┐ ┌──────────┐ ┌──────────────┐
+   │  FRESHNESS   │ │   VOLUME   │ │ SCHEMA  │ │  VALUES  │ │  INTEGRITY   │
+   │ did it       │ │ how many   │ │ shape   │ │ in-range │ │ keys join,   │
+   │ arrive on    │ │ rows? too  │ │ &amp; types │ │ &amp; sane   │ │ uniqueness,  │
+   │ time?        │ │ few/many?  │ │ stable? │ │ distrib? │ │ ref. parents │
+   └──────┬───────┘ └─────┬──────┘ └────┬────┘ └────┬─────┘ └──────┬───────┘
+          │               │             │           │              │
+   meter feed        telemetry      a renamed   gpu_util_pct   ledger_entry
+   stalls Sat       drops to 0     column from   = 4000        → invoice_id
+   (→ wrong GMV)    (host outage)  marketplace   (impossible)  orphaned
+                                   contract break
+          └───────────────┴─────────────┴───────────┴──────────────┘
+                                       │
+                                       ▼
+                         ┌─────────────────────────────┐
+                         │  ACCURACY = ties to reality  │
+                         │  (warehouse GMV == ledger;   │
+                         │   telemetry == real GPU)     │
+                         └─────────────────────────────┘</div>
+
+  <table>
+    <thead>
+      <tr><th>Dimension</th><th>Question it answers</th><th>VastDP failure it catches</th><th>How you assert it</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Freshness</strong></td><td>Did the latest data arrive on time?</td><td>Rental-meter CDC stalls; dashboard shows stale GMV</td><td>max(event_time) vs now() &lt; threshold</td></tr>
+      <tr><td><strong>Volume</strong></td><td>Did roughly the expected row count land?</td><td>Telemetry partition drops from 150M to 9M (host outage)</td><td>Row count vs historical band</td></tr>
+      <tr><td><strong>Schema</strong></td><td>Is the shape and type stable?</td><td>marketplace-team renames <code>bid_usd_hr</code> (contract break)</td><td>Contract test on ingest; column-presence test</td></tr>
+      <tr><td><strong>Distribution / values</strong></td><td>Are values in range and sanely distributed?</td><td><code>gpu_util_pct</code> = 4000; null rate on <code>instance_id</code> jumps</td><td>accepted_values, min/max, null-rate monitor</td></tr>
+      <tr><td><strong>Uniqueness</strong></td><td>Are grain keys unique (no dupes)?</td><td>Telemetry replay double-loads a partition → double billing</td><td>unique / dbt_utils.unique_combination</td></tr>
+      <tr><td><strong>Referential integrity</strong></td><td>Do foreign keys find their parents?</td><td><code>ledger_entry</code> pointing at a missing <code>invoice</code></td><td>relationships test</td></tr>
+      <tr><td><strong>Accuracy</strong></td><td>Does the data match the real world?</td><td>Warehouse GMV ≠ billing ledger ≠ Stripe settlement</td><td>Reconciliation assertion (see §worked example)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">The first six are cheap; accuracy is the hard one</span>
+    <p>Freshness, volume, schema, values, uniqueness, and referential integrity are all checkable from <em>inside</em> the warehouse — you only need the data itself. <strong>Accuracy is different</strong>: it requires a second source of truth to reconcile against (the ledger, Stripe, the raw event log). Most platforms over-invest in the cheap six and under-invest in accuracy — and accuracy is precisely the dimension finance and execs actually feel. Budget for it.</p>
+  </div>
+</section>
+
+<section id="testing">
+  <h2>Testing: asserting what you know</h2>
+  <p>Tests encode <em>known</em> expectations as code that runs in the pipeline and fails loudly when violated. They are the foundation we introduced in <a href="07-transformation-orchestration.html">chapter 07</a> on transformation; here we organize them into a deliberate pyramid.</p>
+
+  <div class="flow">                  ▲  fewer, slower, broader
+                  │
+        ┌─────────┴─────────┐
+        │  RECONCILIATION   │   warehouse GMV == ledger == Stripe
+        │  &amp; ACCURACY        │   (cross-system; the §worked example)
+        ├───────────────────┤
+        │  BUSINESS-LOGIC   │   custom SQL: ledger balances, meter hours
+        │  ASSERTIONS       │   ≤ wall-clock hours, no negative revenue
+        ├───────────────────┤
+        │  RELATIONSHIP &amp;   │   relationships, unique_combination,
+        │  DISTRIBUTION      │   accepted_values, expression_is_true
+        ├───────────────────┤
+        │  COLUMN GENERICS  │   not_null, unique, accepted_values
+        │  (dbt built-ins)  │   — run on every model, cost ~nothing
+        └───────────────────┘
+                  │  many, fast, narrow
+                  ▼</div>
+
+  <p>The base of the pyramid is the four dbt built-in generic tests — declared in YAML next to the model and run on every build. They cost almost nothing and catch the bulk of mechanical breakage.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>models/marts/_billing.yml — dbt built-in tests on fct_rental_meter</span></div>
+  <pre><code class="language-yaml">models:
+  - name: fct_rental_meter
+    description: "One row per rental-hour. The billing atom (ch. 06)."
+    columns:
+      - name: meter_id
+        tests:
+          - not_null
+          - unique
+      - name: invoice_id
+        tests:
+          - not_null
+          - relationships:           # referential integrity
+              to: ref('dim_invoice')
+              field: invoice_id
+      - name: meter_status
+        tests:
+          - accepted_values:
+              values: ['open', 'billed', 'voided', 'credited']
+      - name: metered_hours
+        tests:
+          - dbt_utils.accepted_range:   # from the dbt_utils package
+              min_value: 0
+              max_value: 1     # a rental-hour row can't exceed one wall-clock hour</code></pre>
+  </div>
+
+  <p>One rung up, <strong>custom and <code>dbt_utils</code> tests</strong> express business invariants the generics can't. A custom singular test is just a SQL query that <em>should return zero rows</em>; if it returns any, the test fails.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>tests/assert_meter_hours_not_double_counted.sql — custom singular test</span></div>
+  <pre><code class="language-sql">-- A (rental_id, billing_hour) must appear exactly once.
+-- A duplicate means a telemetry/CDC replay double-billed the customer.
+select
+    rental_id,
+    date_trunc('hour', meter_start_ts) as billing_hour,
+    count(*) as n
+from {{ ref('fct_rental_meter') }}
+group by 1, 2
+having count(*) > 1      -- any returned row = test failure</code></pre>
+  </div>
+
+  <p>For the richer, suite-style checks — null-rate thresholds, distribution drift, freshness — teams reach for <strong>Great Expectations</strong> or <strong>Soda</strong>, which sit alongside dbt and express expectations declaratively, often against sources dbt doesn't transform (the raw telemetry landing zone, for instance).</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>soda/telemetry_checks.yml — Soda-style checks on the raw firehose</span></div>
+  <pre><code class="language-yaml">checks for raw_telemetry_sample:
+  - freshness(event_time) < 5m            # firehose should never lag 5 min
+  - row_count between 130000000 and 175000000   # ~150M/day expected band
+  - missing_percent(instance_id) < 60%    # idle GPUs are null; >60% is suspect
+  - invalid_percent(gpu_util_pct) = 0:
+      valid min: 0
+      valid max: 100                       # util is a percentage; 4000 is impossible
+  - duplicate_count(machine_id, gpu_index, event_time) = 0   # grain must be unique
+  - schema:
+      fail:
+        when required column missing: [machine_id, gpu_index, event_time, gpu_util_pct]
+        when wrong column type:
+          event_time: timestamp</code></pre>
+  </div>
+
+  <p>Finally, <strong>contract tests</strong> (from <a href="01-the-application-space.html#contracts">chapter 01</a>) run at the boundary — in the producing team's CI, before a schema change ships. They are the cheapest tests of all because they fail in a pull request rather than at 3 a.m. in production. The contract's declared <code>schema</code>, <code>required</code>, and <code>unique</code> fields become assertions the producer cannot break without bumping the major version and giving notice.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Tests only catch what you anticipated</span>
+    <p>Every test in this section asserts a <em>known</em> expectation. They are necessary and they are not sufficient. The failure that actually takes down the GMV dashboard is usually the one no one wrote a test for — a subtly skewed distribution, a partial late-arriving partition, a new enum value. Tests handle known-knowns; the next section handles unknown-unknowns.</p>
+  </div>
+</section>
+
+<section id="observability">
+  <h2>Data observability: catching what you didn't anticipate</h2>
+  <p>Testing scales linearly with foresight — you only catch the failures you imagined and wrote SQL for. At VastDP's surface area (dozens of sources, hundreds of models), that coverage is always incomplete. <strong>Data observability</strong> inverts the model: instead of you declaring expectations, the system <em>learns</em> the normal behavior of each table — its typical freshness, row volume, schema, and column distributions — and alerts on statistically significant deviations. This is the category occupied by tools like Monte Carlo and Anomalo.</p>
+
+  <p>The power is catching <strong>unknown-unknowns</strong>. No one wrote a test asserting "the null rate on <code>instance_id</code> in <code>fct_rental_meter</code> stays near 8%," but a monitor that learned the baseline fires the moment it jumps to 40% — surfacing a join bug the day it ships rather than the day finance notices revenue looks off. Observability monitors fall into two layers:</p>
+
+  <ul>
+    <li><strong>Table monitors</strong> — freshness, volume, schema, and per-column distribution anomalies, learned automatically across every table the platform registers. Coverage is broad and requires almost no per-table authoring.</li>
+    <li><strong>Pipeline monitors</strong> — instrument the <em>machinery</em>, not just the output: Kafka consumer lag on the telemetry topic, CDC replication slot lag off the Postgres WAL, dbt run duration and row deltas per model, Dagster/Airflow task failures and retries. A freshness problem is usually a <em>symptom</em>; the pipeline monitor names the <em>cause</em>.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">When to test vs when to monitor</span>
+    <p>Use a <strong>test</strong> when the expectation is exact, known, and a violation is unambiguously a bug — <code>ledger</code> must balance, <code>meter_status</code> is one of four values, the grain is unique. Tests should block the pipeline. Use a <strong>monitor</strong> when "normal" is statistical and best learned from history — row volume bands, freshness, distribution drift across hundreds of columns you'll never hand-write tests for. Monitors alert; they rarely block. The mature platform runs both: hard tests on a small set of load-bearing invariants, broad monitoring everywhere else.</p>
+  </div>
+</section>
+
+<section id="lineage">
+  <h2>Column-level lineage &amp; impact analysis</h2>
+  <p>When a test or monitor fires, the first two questions are always: <em>what broke upstream to cause this</em>, and <em>what downstream is now poisoned</em>. Both are answered by <strong>lineage</strong> — the dependency graph from source columns through transformations to the dashboards and ML features that consume them. Table-level lineage tells you which models depend on a table; <strong>column-level</strong> lineage tells you that the GMV metric depends specifically on <code>fct_rental_meter.amount_usd</code>, so a problem in an unrelated column doesn't spuriously page the GMV owner.</p>
+
+  <div class="flow">  UPSTREAM BREAK ──────────────────────────────────────────▶  DOWNSTREAM BLAST RADIUS
+
+  billing-service (Postgres)          silver / staging            marts (ch. 06)            serving
+  ┌────────────────────┐         ┌─────────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+  │ rental_meter        │  CDC    │ stg_rental_meter     │    │ fct_rental_meter  │    │ ▸ Exec GMV dash   │
+  │  .amount_usd  ✗─────┼────────▶│  .amount_usd  ─────────┐ │  .amount_usd ──────┬──▶│ ▸ Finance close   │
+  │  .metered_hours     │         │                      │ │ │                   │ ├──▶│ ▸ 6 more boards   │
+  └────────────────────┘         └─────────────────────┘ └▶│ metric: GMV        │ │   └──────────────────┘
+                                                            │  = Σ amount_usd ───┘ └──▶ ML: dynamic-pricing
+  ┌────────────────────┐         ┌─────────────────────┐    └──────────────────┘         feature (ch. 12)
+  │ invoice             │  CDC    │ stg_invoice          │            ▲
+  │  .invoice_id        │────────▶│                      │────────────┘ relationships
+  └────────────────────┘         └─────────────────────┘    join on invoice_id
+
+  ✗ amount_usd null-rate anomaly here  ──▶ impact analysis answers in one query:
+                                            "1 metric, 8 dashboards, 1 ML feature, the finance close — all blast radius."</div>
+
+  <p>This graph is what makes triage fast. The instant the <code>amount_usd</code> monitor fires on <code>stg_rental_meter</code>, impact analysis enumerates the blast radius — the GMV metric, the eight dashboards built on it, the finance close, and the dynamic-pricing feature (<a href="11-governance-security.html">downstream</a> and into <a href="07-transformation-orchestration.html">ch. 12</a>) — so on-call can quarantine the affected marts and <em>proactively</em> message the eight dashboard owners before they message us. Run in reverse, the same graph does <strong>root-cause</strong> analysis: walk upstream from the broken metric until you reach the first table where the anomaly appears, and that's your culprit. Lineage is harvested automatically from dbt's compiled DAG and the warehouse query logs, then surfaced in the catalog (DataHub / Unity Catalog / Horizon, per the Start Here stacks).</p>
+</section>
+
+<section id="slos">
+  <h2>Data SLAs &amp; SLOs: quality as a contract</h2>
+  <p>Not every dataset deserves the same rigor, and pretending otherwise either bankrupts the team (everything is tier-1) or burns trust (nothing is). The answer is to set <strong>SLOs per dataset tier</strong> — reusing exactly the tier model from <a href="09-self-serve-enablement.html">chapter 09</a>. An SLA is the promise made to consumers ("GMV is fresh within 15 minutes, 99.9% of the time"); the SLO is the internal target the platform engineers against; and the <strong>error budget</strong> is the allowed shortfall (0.1% of the time it may breach) that governs how hard you fight every minor blip.</p>
+
+  <table>
+    <thead>
+      <tr><th>Tier</th><th>Example datasets</th><th>Freshness SLO</th><th>Completeness SLO</th><th>Accuracy / reconciliation</th><th>On breach</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Tier 1 — Critical</strong></td><td><code>fct_rental_meter</code>, GMV metric, ledger marts, payout data</td><td>&lt; 15 min, 99.9%</td><td>100% (zero dropped meter rows)</td><td>Ties to ledger &amp; Stripe to the penny, daily</td><td>Page on-call 24/7; finance notified</td></tr>
+      <tr><td><strong>Tier 2 — Important</strong></td><td>marketplace funnels, fleet-utilization marts, reliability features</td><td>&lt; 2 h, 99%</td><td>≥ 99.5%, volume in band</td><td>Spot-checked weekly</td><td>Alert business-hours; ticket</td></tr>
+      <tr><td><strong>Tier 3 — Best-effort</strong></td><td>exploratory marts, ad-hoc analyst tables, support analytics</td><td>&lt; 24 h, best-effort</td><td>Monitored, not guaranteed</td><td>None</td><td>Slack the owner; no page</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Error budgets stop the alert treadmill</span>
+    <p>Borrowed from SRE: if a tier-1 dataset's freshness SLO is 99.9%, it has a budget of ~43 minutes of staleness per month. While the budget has room, a one-off 5-minute blip is logged, not escalated — the team keeps shipping. When the budget is <em>exhausted</em>, policy flips: freeze risky changes to that pipeline and pour effort into reliability until the budget recovers. This converts "is this blip worth a fire drill?" from a judgment call into a rule, and it tells you precisely <strong>who gets paged</strong> — tier-1 breaches page 24/7, tier-3 breaches never do.</p>
+  </div>
+</section>
+
+<section id="incidents">
+  <h2>Data incident response</h2>
+  <p>Quality fails eventually; what separates a mature platform is the <em>response loop</em>. Data incidents borrow the SRE lifecycle, adapted for the fact that the "outage" is a wrong number rather than a down service — which means the hardest stage is often <em>detection</em>, because wrong data looks exactly like right data until someone reconciles it.</p>
+
+  <div class="flow">  DETECT ──────▶ TRIAGE ──────▶ COMMUNICATE ──────▶ MITIGATE ──────▶ RCA &amp; FOLLOW-UP
+  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ monitor   │  │ severity? │  │ "#data-alerts │  │ QUARANTINE    │  │ blameless     │
+  │ or test   │  │ which     │  │  GMV mart is  │  │ the bad mart  │  │ post-mortem   │
+  │ fires —   │─▶│ tier?     │─▶│  stale, do    │─▶│ ── or ──      │─▶│ → action items│
+  │ OR a human│  │ blast     │  │  not trust    │  │ ROLLBACK to   │  │ → a NEW test  │
+  │ in Slack: │  │ radius?   │  │  it. ETA 40m."│  │ last-good run │  │   or monitor  │
+  │ "this dash│  │ (lineage  │  │ proactively   │  │ + backfill    │  │ so it can't   │
+  │  is wrong"│  │  §lineage)│  │ ping owners   │  │ once fixed    │  │ recur silently│
+  └──────────┘  └──────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+       ▲                                                                      │
+       └──────────────── the new test/monitor feeds back into DETECT ─────────┘</div>
+
+  <ul>
+    <li><strong>Detect.</strong> Best case, a monitor or test fires before a human notices. Worst case — and it happens — detection <em>is</em> the "this dashboard looks wrong" Slack message from an analyst. Treat that message as a sev signal, not an annoyance; it means your monitoring had a gap.</li>
+    <li><strong>Triage.</strong> Use lineage (<a href="#lineage">§lineage</a>) to fix severity by the highest tier in the blast radius and to decide who owns the fix. A tier-1 mart in the radius is an immediate page.</li>
+    <li><strong>Communicate.</strong> The single most trust-preserving action is <em>telling people the data is wrong before they act on it</em>. A pinned message in <code>#data-alerts</code> — "GMV dashboard is stale as of 09:14, root cause being investigated, do not trust until cleared, ETA 40m" — is worth more than a silent fast fix.</li>
+    <li><strong>Mitigate.</strong> Two standard moves: <strong>quarantine</strong> (flag the affected marts unhealthy / hide them in the BI layer so no one reads bad data) and <strong>rollback</strong> (revert the table to its last known-good run, e.g. via the table format's time-travel or by re-running from the last good partition), then backfill once the upstream fix lands.</li>
+    <li><strong>RCA.</strong> A blameless post-mortem whose mandatory output is a <em>new test or monitor</em>. An incident that doesn't tighten the safety net is an incident you'll have again. This is the feedback loop that makes the whole system get stronger over time.</li>
+  </ul>
+
+  <p>This implies <strong>on-call for data</strong> — a rotation, a sev scale, and <strong>runbooks</strong> per tier-1 dataset ("if the ledger reconciliation fails: here's the query to find the imbalanced entries, here's how to quarantine, here's who in finance to notify"). Data on-call is not yet universal, but at a company where data sits in the product's critical path, it is non-negotiable.</p>
+</section>
+
+<section id="the-ledger-test">
+  <h2>Worked example: guarding the billing domain</h2>
+  <p>The billing domain (<a href="01-the-application-space.html#oltp">chapter 01</a>) has the highest correctness bar in the company, so it is where the whole system earns its keep. We layer three defenses on it, one per relevant dimension.</p>
+
+  <p><strong>1 · A freshness monitor on <code>rental_meter</code></strong> — a tier-1 SLO of &lt; 15 min. If the CDC feed off the billing Postgres WAL stalls, this fires and pages on-call <em>before</em> the stale number reaches the Monday exec review. This is the Saturday-stall scenario from <a href="#why">§why</a>, now caught.</p>
+
+  <p><strong>2 · A hard assertion that the double-entry ledger balances.</strong> The invariant from chapter 01 is simple and absolute: every transaction's debits equal its credits, so the books must net to zero. This is a custom dbt test — a query that must return zero rows — and it <em>blocks</em> the pipeline, because a non-balancing ledger must never reach a dashboard.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>tests/assert_ledger_balances.sql — the load-bearing accuracy assertion</span></div>
+  <pre><code class="language-sql">-- INVARIANT (ch. 01): in double-entry accounting, every transaction's
+-- debits must equal its credits. Any transaction that nets non-zero is
+-- a corruption that must NEVER reach a financial dashboard.
+-- This test returns the offending transactions; zero rows = pass.
+with per_txn as (
+    select
+        transaction_id,
+        round(sum(case when entry_type = 'debit'  then amount_usd else 0 end), 4) as debits,
+        round(sum(case when entry_type = 'credit' then amount_usd else 0 end), 4) as credits
+    from {{ ref('fct_ledger_entry') }}
+    group by transaction_id
+)
+select
+    transaction_id,
+    debits,
+    credits,
+    debits - credits as imbalance
+from per_txn
+where debits &lt;&gt; credits        -- any row here fails the build</code></pre>
+  </div>
+
+  <p><strong>3 · Reconciliation to Stripe.</strong> The ledger balancing proves the books are <em>internally</em> consistent; it does <em>not</em> prove they match the money that actually moved. Accuracy demands a second source of truth. A daily reconciliation ties warehouse-side settled revenue to Stripe's own settlement report, flagging any day where the two diverge beyond a rounding tolerance — catching missed webhooks, the webhook/API gap from chapter 01, and silent integration drift.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>tests/assert_revenue_reconciles_to_stripe.sql — accuracy across systems</span></div>
+  <pre><code class="language-sql">-- Warehouse-computed settled revenue must tie to Stripe's settlement
+-- report to within a small tolerance (FX/rounding). Divergence = a real
+-- accuracy break (missed webhook, dropped meter row, double charge).
+with wh as (
+    select settle_date, sum(amount_usd) as wh_revenue
+    from {{ ref('fct_invoice_settled') }}
+    group by settle_date
+),
+stripe as (
+    select settle_date, sum(amount_usd) as stripe_revenue
+    from {{ ref('stg_stripe_settlement') }}
+    group by settle_date
+)
+select
+    coalesce(wh.settle_date, stripe.settle_date) as settle_date,
+    wh.wh_revenue,
+    stripe.stripe_revenue,
+    abs(coalesce(wh.wh_revenue, 0) - coalesce(stripe.stripe_revenue, 0)) as gap
+from wh
+full outer join stripe using (settle_date)
+where abs(coalesce(wh.wh_revenue, 0) - coalesce(stripe.stripe_revenue, 0)) > 1.00</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">Finance's trust hinges on these three queries</span>
+    <p>Together these defenses cover the three dimensions finance feels: <strong>freshness</strong> (the number is current), <strong>internal consistency</strong> (the ledger balances), and <strong>external accuracy</strong> (it ties to Stripe to the penny). The day the controller can run the close knowing those three assertions are green is the day finance stops maintaining its own shadow spreadsheet — which is the real, measurable payoff of the entire quality system. Every other mart can tolerate a 2% blip; the ledger cannot tolerate a cent.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Trust is the product. One wrong number in an exec dashboard discredits every correct number; bad data costs decisions, money, and silently-corrupted ML.</li>
+    <li>Decompose "good" into seven dimensions — freshness, volume, schema, distribution/values, uniqueness, referential integrity, accuracy. The first six are checkable from inside the warehouse; accuracy needs a second source of truth and is the one finance feels.</li>
+    <li>Tests assert the known (dbt generics → custom SQL → contract tests) and block the pipeline; observability learns the normal and catches the unknown-unknowns. Run both.</li>
+    <li>Column-level lineage turns "something broke" into a bounded blast radius and a fast root cause; it is the connective tissue of triage.</li>
+    <li>Set freshness/completeness/accuracy SLOs per dataset tier (ch. 09), give each an error budget, and let the tier decide who gets paged.</li>
+    <li>Operate quality with a real incident loop — detect, triage, communicate, mitigate, RCA — whose every post-mortem ships a new test or monitor.</li>
+    <li>The billing domain is where it all pays off: a freshness monitor, a ledger-balance assertion, and Stripe reconciliation are the three queries finance's trust hinges on.</li>
+  </ul>
+  <p>Quality earns trust in the numbers; the next chapter earns trust in <em>who may see them and prove it</em> — access control, PII, lineage for compliance, and audit. → <a href="11-governance-security.html">Governance &amp; Security</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

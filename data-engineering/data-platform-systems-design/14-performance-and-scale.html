@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance &amp; Scale Engineering — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#model">A mental model of performance</a>
+    <a href="#query-opt">Query optimization</a>
+    <a href="#partition-cluster">Partitioning &amp; clustering in practice</a>
+    <a href="#materialization">Materialization strategy</a>
+    <a href="#caching">Caching layers</a>
+    <a href="#firehose-scale">Taming the telemetry firehose</a>
+    <a href="#cost-perf">Cost/performance &amp; FinOps</a>
+    <a href="#scaling-with-gmv">Scaling as the fleet grows</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="13-ai-powered-platform.html">← Previous</a>
+    <a href="15-reference-design.html">Next: Reference Design →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · AI enablement</span>
+  <h1>Performance &amp; Scale Engineering</h1>
+  <p class="subtitle">Every chapter so far has assumed the queries run and the bill is payable. This chapter earns that assumption. It is about the physics of analytical compute — where time and money actually go — and the handful of levers (pruning, materialization, caching, rollups, elastic compute) that keep VastDP fast and affordable as the fleet, the firehose, and the GMV all grow. The headline problem is the same one that has shadowed the whole guide: ~150 M telemetry samples a day.</p>
+</header>
+
+<section id="model">
+  <h2>A mental model of performance: what actually costs time and money</h2>
+  <p>Before reaching for a tuning trick, internalize the cost structure of an analytical query. Unlike an OLTP point lookup — which is an index seek measured in microseconds — an analytical query is a <strong>bulk data-movement pipeline</strong>. Its cost is dominated not by CPU cleverness but by how many bytes move, and how far. Four terms account for nearly all of it:</p>
+
+  <div class="flow">  THE ANATOMY OF AN ANALYTICAL QUERY — where the time and the $ go
+
+  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+  │   1 SCAN    │──▶│  2 SHUFFLE  │──▶│   3 JOIN    │──▶│ 4 AGGREGATE │
+  │  read bytes │   │  move bytes │   │ match rows  │   │  reduce rows│
+  │ off storage │   │ over network│   │ across keys │   │  to results │
+  └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
+   ███████████████   ████████          ████              █
+   DOMINANT TERM     network-bound     CPU + spill        cheap if rows
+   (often 70-90% of  (re-partition      risk if one        already small
+   total cost)        by join key)      side is huge)
+
+  ── if a step spills to disk (not enough RAM) ──▶  ✖ 10-100× slowdown
+
+  The senior heuristic in one line:  "Don't scan what you don't need,
+  and don't move what you don't have to."</div>
+
+  <p>Walk the four terms, biggest first:</p>
+  <ul>
+    <li><strong>Scan — the dominant term.</strong> Reading bytes off object storage (S3) or local SSD is where most queries spend most of their time and where every serverless warehouse meters its bill. On a columnar lakehouse you are billed and slowed almost in proportion to <em>bytes scanned</em>. Cutting scan is the single highest-leverage thing you can do, and it is mostly a matter of layout (partitioning, clustering) and predicates (pruning, projection) — not faster hardware.</li>
+    <li><strong>Shuffle / network.</strong> A distributed join or a <code>GROUP BY</code> on a high-cardinality key forces the engine to <em>re-partition</em> data across workers by that key. Moving terabytes over the network is the second-biggest cost, and it is the one beginners never see because it is invisible in the SQL text.</li>
+    <li><strong>Join strategy.</strong> A broadcast join (ship the small side to every worker) is cheap; a shuffle join (re-partition both sides) is expensive. Choosing wrong — or letting the optimizer choose wrong because statistics are stale — turns a 2-second query into a 2-minute one.</li>
+    <li><strong>Spill.</strong> When an intermediate result does not fit in memory, the engine spills to disk. This is the cliff: a query that was humming along suddenly runs 10–100× slower. Spill is usually a <em>symptom</em> of one of the first three going unmanaged (scanning too much, joining unfiltered, aggregating high cardinality).</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The one principle this whole chapter serves</span>
+    <p><strong>Don't scan what you don't need.</strong> Partitioning, clustering, predicate pushdown, projection pushdown, pre-aggregation, materialized views, and the rollup cascade are all variations on a single idea: arrange data and rewrite queries so the engine touches the smallest possible number of bytes. Every other lever is secondary to this one.</p>
+  </div>
+</section>
+
+<section id="query-opt">
+  <h2>Query optimization: touch fewer bytes</h2>
+  <p>Most "slow warehouse" tickets are not warehouse problems — they are queries asking the engine to read far more than the answer requires. The optimizer can only help if the data layout and the query give it something to prune. The core techniques, in rough order of payoff:</p>
+  <ul>
+    <li><strong>Partition pruning.</strong> If the table is partitioned by <code>event_date</code> and the query filters on it, the engine skips entire partitions without reading them. A query over one day of a year-partitioned table reads ~1/365th of the bytes.</li>
+    <li><strong>Predicate pushdown.</strong> Filters are pushed down to the scan layer (and into Parquet/ORC footers and ClickHouse skip indexes) so rows are discarded <em>before</em> they are decoded, not after.</li>
+    <li><strong>Projection pushdown — i.e., stop writing <code>SELECT *</code>.</strong> On a columnar store, selecting 4 columns out of 40 reads ~10% of the bytes. <code>SELECT *</code> on a wide telemetry table is the most common self-inflicted cost in the building.</li>
+    <li><strong>Broadcast vs shuffle joins.</strong> Keep dimension tables small and let the optimizer broadcast them; keep statistics fresh so it makes the right call.</li>
+    <li><strong>Pre-aggregation.</strong> If a dashboard always asks for daily totals, do not make it re-scan raw rows every load — aggregate once and read the small result (this is the through-line into <a href="#materialization">materialization</a> and the <a href="#firehose-scale">rollup cascade</a>).</li>
+  </ul>
+
+  <p>A concrete before/after on VastDP's rollup table. Supply ops wants average utilization for one machine on one day. The naïve query and the layout-aware query return the <em>same answer</em> but scan ~100× different volumes:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>BEFORE — full scan: no pruning, no projection (~150 GB scanned)</span></div>
+  <pre><code class="language-sql">-- Reads every column of every partition, then filters.
+SELECT *
+FROM telemetry_hourly
+WHERE machine_id = 'm_8f21a'
+  AND CAST(event_hour AS DATE) = DATE '2026-06-15';
+-- ✖ event_hour wrapped in CAST() defeats partition pruning
+-- ✖ SELECT * decodes all 18 columns
+-- ✖ filter applied AFTER the scan</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>AFTER — prune + project + push down (~1.5 GB scanned, ~100× less)</span></div>
+  <pre><code class="language-sql">-- Filters on the bare partition column, selects only what's needed.
+SELECT machine_id, avg(gpu_util_pct) AS avg_util
+FROM telemetry_hourly
+WHERE event_date = DATE '2026-06-15'   -- partition prune: 1 of 365 days
+  AND machine_id = 'm_8f21a'           -- cluster/skip-index prune within day
+GROUP BY machine_id;
+-- ✔ partition pruning skips 364 days unread
+-- ✔ clustering on machine_id skips most files within the day
+-- ✔ projection reads 2 columns, not 18</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Never wrap the partition column in a function</span>
+    <p><code>WHERE CAST(event_hour AS DATE) = …</code> or <code>WHERE date_trunc('day', event_hour) = …</code> hides the partition column from the planner, which then cannot prune and falls back to a full scan. Filter on the <em>bare</em> partition column (<code>event_date = DATE '…'</code>). This single anti-pattern accounts for a startling share of runaway warehouse bills.</p>
+  </div>
+</section>
+
+<section id="partition-cluster">
+  <h2>Partitioning, clustering, Z-order &amp; sort keys — in practice</h2>
+  <p><a href="05-storage-and-lakehouse.html">Chapter 05</a> introduced these as storage concepts; here we choose concrete keys for VastDP and avoid the classic traps. The rule is simple to state and easy to get wrong: <strong>layout must mirror the query predicates.</strong> You partition and cluster on the columns people filter by, because those are the columns the engine can use to skip data.</p>
+
+  <ul>
+    <li><strong>Partition key = the coarse, almost-always-filtered dimension.</strong> For every fact in the platform that is time-series or event-shaped, that is <code>event_date</code>. Nearly every analytical query has a time bound, so date partitioning prunes first and hardest.</li>
+    <li><strong>Cluster / sort key = the next-most-filtered, higher-cardinality dimension.</strong> For telemetry that is <code>machine_id</code> (or <code>(machine_id, gpu_index)</code>). Within a day's partition, clustering co-locates one machine's rows so the engine reads a handful of files instead of all of them. On Iceberg/Delta this is a sort order or Z-order; on Snowflake a clustering key; on ClickHouse the <code>ORDER BY</code> of the <code>MergeTree</code>.</li>
+    <li><strong>Z-order</strong> is for when two dimensions are both common filters (e.g. <code>machine_id</code> <em>and</em> <code>gpu_index</code>) and you want both to prune reasonably well from a single physical ordering. It is a multi-column locality trick, not a free lunch — it trades a little single-column locality for balanced two-column locality.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Over-partitioning is the trap that kills the firehose first</span>
+    <p>The instinct after learning that partitioning prunes is to partition on everything — <code>event_date</code> <em>and</em> <code>machine_id</code> <em>and</em> <code>gpu_index</code>. At 17,000 machines that produces tens of millions of tiny partitions, each a tiny file. Now every query pays a per-file open-and-list tax, the metadata layer groans, and compaction never catches up. The fix: <strong>partition coarse (date), cluster fine (machine_id).</strong> Aim for partition files in the hundreds-of-MB range, not kilobytes. The "small files problem" is the firehose's revenge on naïve partitioning.</p>
+  </div>
+</section>
+
+<section id="materialization">
+  <h2>Materialization strategy: precompute the common, leave the rare on-demand</h2>
+  <p>Every transformation in the platform sits somewhere on a spectrum from "compute it fresh every time someone asks" to "compute it once and store the answer." Moving right buys speed and cheaper reads; it costs storage, compute to refresh, and staleness. The art is putting each workload at the right point — not defaulting everything to one end.</p>
+
+  <div class="flow">  THE MATERIALIZATION SPECTRUM — freshness ↔ cost ↔ latency
+
+  fresher, cheaper to store                       faster reads, cheaper to query
+  recompute every read                            store the answer, read it back
+  ◀──────────────────────────────────────────────────────────────────────────▶
+
+   VIEW            INCREMENTAL MODEL       MATERIALIZED VIEW        ROLLUP TABLE
+   (just SQL)      (dbt incremental,       (auto-refresh on write   (precomputed
+                    ch.07: process only     — ClickHouse MV,         aggregates,
+   0 storage        new rows)               Snowflake Dynamic        the firehose
+   always fresh                             Table)                   answer)
+   re-scans                                                          §firehose-scale
+   every read      ▲ the workhorse for      ▲ near-real-time         ▲ 150M rows/day
+                     facts that grow          aggregates without       → a few thousand
+                     append-only              a scheduler              queryable rows
+
+  RULE: precompute the EXPENSIVE + COMMON.  Leave the CHEAP or RARE on-demand.</div>
+
+  <table>
+    <thead>
+      <tr><th>Option</th><th>Storage</th><th>Freshness</th><th>Read latency</th><th>Refresh cost</th><th>Use it for…</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>View</strong></td><td>None</td><td>Always live</td><td>Slow (re-scans every read)</td><td>None</td><td>Light, rarely-queried logic; thin renames over a table</td></tr>
+      <tr><td><strong>Table (full rebuild)</strong></td><td>Full</td><td>As of last run</td><td>Fast</td><td>High (re-reads all source)</td><td>Small dimensions; logic too complex to increment</td></tr>
+      <tr><td><strong>Incremental table</strong> (ch.07)</td><td>Full</td><td>As of last run</td><td>Fast</td><td>Low (only new rows)</td><td>Large append-only facts: meters, events, telemetry rollups</td></tr>
+      <tr><td><strong>Materialized view</strong></td><td>Aggregate only</td><td>Near-real-time</td><td>Very fast</td><td>Continuous, small</td><td>Hot aggregates that must stay current with no scheduler</td></tr>
+      <tr><td><strong>Rollup table</strong></td><td>Tiny vs source</td><td>Per cascade tier</td><td>Fastest</td><td>Amortized at write</td><td>The telemetry firehose (next section)</td></tr>
+    </tbody>
+  </table>
+
+  <p>A ClickHouse materialized view is the workhorse for keeping a hot aggregate current with zero orchestration — it fires on every insert into the source table and folds the new rows into a pre-aggregated target:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>ClickHouse: rollup materialized view — raw telemetry → per-GPU-minute</span></div>
+  <pre><code class="language-sql">-- Target: an aggregating table keyed by the rollup grain.
+CREATE TABLE telemetry_1min
+(
+  event_minute  DateTime,
+  machine_id    String,
+  gpu_index     UInt8,
+  util_avg      AggregateFunction(avg, Float32),
+  temp_max      AggregateFunction(max, Int16),
+  power_avg     AggregateFunction(avg, Float32),
+  samples       AggregateFunction(count, UInt8)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toDate(event_minute)          -- coarse: date
+ORDER BY (machine_id, gpu_index, event_minute);  -- fine: cluster key
+
+-- The MV: runs on every insert into raw telemetry, no scheduler needed.
+CREATE MATERIALIZED VIEW telemetry_1min_mv TO telemetry_1min AS
+SELECT
+  toStartOfMinute(event_time) AS event_minute,
+  machine_id, gpu_index,
+  avgState(gpu_util_pct) AS util_avg,
+  maxState(temp_c)       AS temp_max,
+  avgState(power_w)      AS power_avg,
+  countState(*)          AS samples       -- count drives downsampling decisions
+FROM telemetry_raw
+GROUP BY event_minute, machine_id, gpu_index;</code></pre>
+  </div>
+
+  <p>For warehouse-side facts that grow append-only, the incremental model from <a href="07-transformation-orchestration.html">chapter 07</a> is the right tool — process only the new rows, never the whole history:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>dbt incremental model — only fold in rows newer than what's loaded</span></div>
+  <pre><code class="language-sql">{{ config(
+    materialized='incremental',
+    unique_key=['event_date','machine_id'],
+    incremental_strategy='merge',
+    partition_by={'field': 'event_date', 'data_type': 'date'},
+    cluster_by=['machine_id']
+) }}
+
+SELECT
+  event_date,
+  machine_id,
+  avg(gpu_util_pct) AS avg_util,
+  max(temp_c)       AS max_temp,
+  sum(rented_seconds) AS rented_seconds
+FROM {{ ref('telemetry_hourly') }}
+{% if is_incremental() %}
+  -- only reprocess the trailing window, not all 365 days
+  WHERE event_date >= (SELECT max(event_date) - interval '2' day FROM {{ this }})
+{% endif %}
+GROUP BY event_date, machine_id</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Don't materialize the long tail</span>
+    <p>Materialization earns its keep on the <em>expensive and frequent</em>: the daily fleet-utilization rollup that 30 dashboards hit. The ad-hoc question an analyst asks once a quarter should stay a plain query or a view — paying continuous refresh and storage to keep a rarely-read result warm is pure waste. Precompute the head of the distribution; serve the tail on demand.</p>
+  </div>
+</section>
+
+<section id="caching">
+  <h2>Caching layers: answer without computing</h2>
+  <p>Materialization avoids re-computing transformations; caching avoids re-running <em>identical work</em>. The two compound. VastDP has four caches stacked between a question and the storage layer, each with its own invalidation story:</p>
+  <ul>
+    <li><strong>Warehouse result cache.</strong> Snowflake/BigQuery/Databricks return a byte-identical repeat query from cache for free, with no compute. It is automatic and invalidates the instant the underlying tables change. The catch: it only helps <em>identical</em> SQL, so a semantic layer that emits stable, normalized queries (ch. 08) dramatically raises the hit rate.</li>
+    <li><strong>BI extracts.</strong> Tools like Tableau/Power BI snapshot a query result into a local columnar extract refreshed on a schedule. Great for fast dashboards over slowly-changing data; the trade-off is explicit staleness equal to the refresh interval — fine for a daily exec dashboard, wrong for a live fleet-health view.</li>
+    <li><strong>Semantic-layer / metric cache.</strong> The metrics layer from <a href="08-serving-and-semantic-layer.html">chapter 08</a> caches computed metric values keyed by (metric, dimensions, time grain). This is the highest-value cache because it is shared across every consumer — a dashboard, a Slack bot, and an <a href="13-ai-powered-platform.html">AI agent</a> all asking for "GMV last week" hit one warm entry. Invalidate on the upstream model's freshness signal.</li>
+    <li><strong>CDN for embedded dashboards.</strong> When dashboards are embedded in a provider-facing portal, the rendered JSON/payload can sit behind a CDN with a short TTL — turning thousands of provider page-loads into edge hits instead of warehouse queries.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Caching is easy; invalidation is the whole job</span>
+    <p>Every cache trades freshness for speed, and a stale number that looks authoritative is worse than a slow correct one — especially for finance. Make staleness <em>explicit and bounded</em>: tie each cache's invalidation to a freshness signal from the model that feeds it, and surface "as of" timestamps in the UI. The cardinal rule: never cache a money metric longer than the reconciliation window.</p>
+  </div>
+</section>
+
+<section id="firehose-scale">
+  <h2>Taming the telemetry firehose — the headline scale problem</h2>
+  <p>This is the problem the whole guide has pointed at since <a href="00-START-HERE.html#scale">Start Here</a>: ~150 M raw telemetry rows a day, growing linearly with the fleet. <a href="01-the-application-space.html#firehose">Chapter 01</a> warned never to route it through the warehouse; here is how. The mechanism is a <strong>rollup cascade</strong> — successive aggregations to coarser time grains, each with a TTL that expires the finer tier once the coarser one captures what matters.</p>
+
+  <div class="flow">  THE ROLLUP CASCADE — 150M raw rows/day → a few thousand queryable rows
+
+  ┌──────────────┐  MV   ┌──────────────┐  MV   ┌──────────────┐  MV   ┌──────────────┐
+  │  RAW 10s     │──────▶│   1-MINUTE   │──────▶│   1-HOUR     │──────▶│   1-DAY      │
+  │ telemetry_raw│       │telemetry_1min│       │telemetry_1hr │       │telemetry_1day│
+  ├──────────────┤       ├──────────────┤       ├──────────────┤       ├──────────────┤
+  │ ~150 M / day │       │  ~24 M / day │       │ ~408 k / day │       │ ~17 k / day  │
+  │ 17k×6×1440   │       │ 17k GPU×1440 │       │ 17k GPU× 24  │       │ 1 row/GPU/day│
+  ├──────────────┤       ├──────────────┤       ├──────────────┤       ├──────────────┤
+  │ TTL 7 days   │       │ TTL 30 days  │       │ TTL 13 mo    │       │ TTL years    │
+  │ then DELETE  │       │ then DELETE  │       │              │       │              │
+  └──────────────┘       └──────────────┘       └──────────────┘       └──────┬───────┘
+       │                                                                       │
+       │ raw NEVER leaves ClickHouse / object storage                          ▼
+       └────────────────────────────────────────────────▶  ┌─────────────────────────┐
+                  ONLY the per-GPU-hour & per-GPU-day        │   THE WAREHOUSE         │
+                  rollups land in the warehouse, where       │ joins rollups to billing│
+                  they join to billing, rentals, ranking     │ rentals, ranking, GMV   │
+                                                             └─────────────────────────┘
+
+  Compression of the live problem:  150,000,000  ──▶  ~17,000  rows/day  (~10,000×)</div>
+
+  <p>Each tier is just a ClickHouse <code>AggregatingMergeTree</code> fed by a materialized view like the one above, chained: raw → 1min, 1min → 1hr, 1hr → 1day. The finer tiers carry detail for recent incident debugging; the coarse tiers carry the long history. TTL does the cleanup automatically:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>ClickHouse TTL — raw expires after 7 days; rollups live long</span></div>
+  <pre><code class="language-sql">-- Raw stays only as long as anyone debugs at 10s resolution.
+ALTER TABLE telemetry_raw
+  MODIFY TTL event_time + INTERVAL 7 DAY;          -- then auto-DELETE
+
+-- 1-minute rollup: enough for a month of incident forensics.
+ALTER TABLE telemetry_1min
+  MODIFY TTL event_minute + INTERVAL 30 DAY;
+
+-- Optional: downsample older 1-min data to colder/cheaper storage
+-- before deleting (tiering, ch.05) rather than dropping outright.
+ALTER TABLE telemetry_1min
+  MODIFY TTL event_minute + INTERVAL 14 DAY TO VOLUME 'cold',
+            event_minute + INTERVAL 30 DAY DELETE;</code></pre>
+  </div>
+
+  <p>The payoff is structural. Operational dashboards ("is machine m_8f21a healthy right now?") hit the 1-minute tier in ClickHouse with sub-second latency. Analytics and ML ("utilization by GPU model by week, joined to GMV") read the per-GPU-hour and per-GPU-day rollups that have already flowed into the warehouse — a few thousand rows a day instead of 150 million. The expensive raw firehose never touches a SQL analyst, never inflates a warehouse bill, and never has to be scanned for a question a rollup can answer.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why this is the single most important scale decision</span>
+    <p>Recall the 80/20 from <a href="00-START-HERE.html#scale">Start Here</a>: ~80% of the bytes come from telemetry, ~80% of the <em>questions</em> from the small relational domains. The rollup cascade is what lets you honor both: keep the firehose in a specialist engine where bytes are cheap, and feed the warehouse only the small, pre-aggregated rows that join to billing and marketplace. Get this one design right and the platform scales with the fleet; get it wrong and the warehouse bill scales with the fleet instead.</p>
+  </div>
+</section>
+
+<section id="cost-perf">
+  <h2>Cost/performance &amp; FinOps</h2>
+  <p>Performance and cost are the same lever viewed from two sides: bytes you don't scan are seconds you don't wait <em>and</em> dollars you don't spend. Beyond layout, the big FinOps levers are about <em>elastic, right-sized, workload-isolated compute</em> — tying back to the cost governance of <a href="11-governance-security.html">chapter 11</a>.</p>
+
+  <table>
+    <thead>
+      <tr><th>Lever</th><th>What it does</th><th>Where it applies at VastDP</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Auto-suspend / auto-resume</strong></td><td>Warehouse spins down to $0 when idle, resumes on first query</td><td>Every analyst-facing warehouse; the default, not the exception</td></tr>
+      <tr><td><strong>Right-sizing</strong></td><td>Match cluster size to the workload; don't run XL for a dashboard</td><td>Separate small WH for BI, large WH only for heavy transforms</td></tr>
+      <tr><td><strong>Workload isolation</strong></td><td>Separate heavy/light so a runaway transform can't starve dashboards</td><td>Distinct warehouses/pools per workload class; protects interactive SLAs</td></tr>
+      <tr><td><strong>Spot / preemptible compute</strong></td><td>Run interruptible nodes at 60–90% discount for retry-safe batch</td><td>Nightly rollup rebuilds, backfills, ML training — all checkpointable</td></tr>
+      <tr><td><strong>Scheduled scaling</strong></td><td>Bigger pools during business hours, minimal overnight</td><td>Analyst concurrency is diurnal; the firehose is not</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">The meta-point a GPU marketplace shouldn't miss</span>
+    <p>Batch jobs that are idempotent and checkpointable — telemetry rollup rebuilds, historical backfills, ML training — are exactly the workloads that tolerate interruption. And VastDP works for a company that <em>sells</em> interruptible compute. The platform could run its own batch tier on cheap preemptible/spot GPUs and CPUs, even on the marketplace's own interruptible inventory: dogfooding the product to shrink the data platform's own bill. Just keep money-path jobs (billing reconciliation) on reliable compute — interruptibility is for retry-safe work only.</p>
+  </div>
+</section>
+
+<section id="scaling-with-gmv">
+  <h2>How the platform scales as the fleet &amp; GMV grow</h2>
+  <p>Capacity planning is not "buy a bigger warehouse." It is knowing the <em>order</em> in which things break, so you fix them in the order they hurt. As VastDP's fleet and GMV grow, three pressure points fail in a predictable sequence:</p>
+  <ol>
+    <li><strong>The firehose breaks first.</strong> Telemetry volume grows linearly and unavoidably with the GPU count — double the fleet, double the raw rows. This is the first wall, and the rollup cascade is the answer. If the cascade is in place, telemetry scale becomes a near-non-event; if it isn't, this is what falls over at ~2× today's fleet.</li>
+    <li><strong>Concurrency breaks second.</strong> As headcount and embedded/AI consumers grow, more queries arrive at once. Symptoms: dashboards queueing, the AI agent timing out. Fixes: result + metric caching (raise the hit rate), workload isolation (heavy can't starve light), and scheduled scale-up during business hours.</li>
+    <li><strong>The warehouse bill breaks third.</strong> The slow, creeping one. More data and more users mean more bytes scanned, and the monthly bill outruns revenue if layout discipline lapses. Fixes: the materialization and pruning levers above, auto-suspend, right-sizing, and spot for batch.</li>
+  </ol>
+
+  <div class="flow">  COST vs SCALE — the curve you design against
+
+  $/mo │                                          ╱  NAÏVE: firehose in the
+       │                                       ╱     warehouse, no rollups,
+       │                                    ╱        SELECT * everywhere
+       │                                 ╱           → cost scales with GMV
+       │                              ╱
+       │                          ╱
+       │                     ╱ ╱
+       │              ╱ ╱           ___________________  ENGINEERED: rollup
+       │        ╱ ╱      __________/                     cascade + pruning +
+       │   ╱ _________ /                                 caching + elastic
+       │ _/                                              → cost grows sub-linearly
+       └───────────────────────────────────────────────▶  fleet size / GMV
+         today              2×                4×
+
+  Same data, same questions — the gap between the curves is engineering.</div>
+
+  <div class="callout insight">
+    <span class="callout-label">The capacity-planning mindset</span>
+    <p>Size against the dominant term and the next-to-break component, not against everything at once. For VastDP that means: project the telemetry rate from fleet growth, confirm the cascade absorbs it, then watch concurrency, then watch spend. The full capacity math — rows/sec, GB/day, warehouse credits, the dollar model across all three stacks — is worked end-to-end in the <a href="15-reference-design.html">reference design</a>.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li><strong>Bytes scanned is the dominant cost term.</strong> Every lever in this chapter — pruning, projection, partitioning, clustering, materialization, rollups, caching — exists to touch fewer bytes. "Don't scan what you don't need."</li>
+    <li><strong>Layout must mirror predicates:</strong> partition coarse on <code>event_date</code>, cluster fine on <code>machine_id</code>; avoid over-partitioning and the small-files trap.</li>
+    <li><strong>Materialize the expensive and common; leave the rare on-demand.</strong> Views, incremental tables (ch.07), MVs, and rollups are points on one spectrum — place each workload deliberately.</li>
+    <li><strong>The rollup cascade is the headline scale move:</strong> 150 M raw rows/day become a few thousand queryable rows; raw telemetry never enters the warehouse, only pre-aggregated rollups do.</li>
+    <li><strong>Cost = performance from the other side:</strong> auto-suspend, right-size, isolate workloads, and run retry-safe batch on cheap interruptible compute — possibly the marketplace's own.</li>
+    <li><strong>Plan capacity in failure order:</strong> firehose, then concurrency, then bill — and fix in that order.</li>
+  </ul>
+  <p>With the platform fast and affordable at scale, every piece is now on the table. Next we assemble them into one coherent blueprint with the full capacity math. → <a href="15-reference-design.html">the end-to-end reference design</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

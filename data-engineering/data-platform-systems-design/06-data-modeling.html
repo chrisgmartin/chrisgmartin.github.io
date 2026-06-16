@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Modeling — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#medallion">The medallion architecture</a>
+    <a href="#paradigms">Modeling paradigms compared</a>
+    <a href="#scd">Slowly-changing dimensions</a>
+    <a href="#grains">Fact-table grain</a>
+    <a href="#vastdp-model">The VastDP dimensional model</a>
+    <a href="#conformed">Conformed dimensions</a>
+    <a href="#modeling-telemetry">Modeling the firehose</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-storage-and-lakehouse.html">← Previous</a>
+    <a href="07-transformation-orchestration.html">Next: Transformation &amp; Orchestration →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Architecture foundations</span>
+  <h1>Data Modeling</h1>
+  <p class="subtitle">Ingestion lands raw bytes; storage holds them cheaply. Modeling is where bytes become <em>answers</em>. This chapter turns VastDP's nine sources into a layered, queryable model: the medallion refinement path, the paradigm choice, slowly-changing dimensions that preserve history, and a full star schema built on the three canonical grains from <a href="00-START-HERE.html#model">Start Here</a> — with the DDL to back it.</p>
+</header>
+
+<section id="medallion">
+  <h2>The medallion architecture</h2>
+  <p>Raw source data is not safe to query and not safe to delete. The <strong>medallion architecture</strong> resolves that tension by refining data through three named layers — bronze, silver, gold — each with a different contract about cleanliness, structure, and audience. It is the organizing skeleton for every transformation that follows in <a href="07-transformation-orchestration.html">chapter 07</a>.</p>
+
+  <div class="flow">  SOURCES (ch.01)            BRONZE                  SILVER                    GOLD
+  ──────────────            ───────────             ───────────               ──────────
+  marketplace-api ─CDC─┐                                                   ┌─ marketplace mart
+  billing-service ─CDC─┤    raw, immutable          cleaned, deduped,      │   (liquidity, funnel)
+  orchestrator    ─CDC─┼──▶ landing as-received ──▶ conformed, typed,  ──▶ ├─ billing mart
+  ranking-service ─CDC─┤    schema-on-read          CDC-merged into        │   (GMV, take-rate)
+  trust-safety   ─strm─┤    1 table / source        current + history      ├─ supply/fleet mart
+  mkt-events    ─strm──┤    append-only             (dims + facts)         │   (utilization, fill)
+  host-agent ⚡ ─strm──┤                                                   └─ ML feature tables
+  payments      ─batch─┤    "what arrived"          "what is true"            "what the business
+  support       ─batch─┘                                                       measures"
+                            ▲                        ▲                         ▲
+                            no business logic        SCD2, dedupe, joins,      star schema,
+                            replayable, audit        type casting, contracts   metrics, OBT
+                            kept ~30–90d hot         the integration layer      the serving layer</div>
+
+  <p>Each hop has a job, and only that job:</p>
+  <ul>
+    <li><strong>Bronze — raw, immutable landing.</strong> Data lands exactly as it arrived: CDC change events from <code>marketplace-api</code>, Kafka payloads from <code>marketplace-events</code>, JSON pulls from <code>payments</code>. One table per source stream, append-only, <strong>schema-on-read</strong>, no business logic. Its only promises are <em>completeness</em> and <em>replayability</em> — if silver logic is wrong, you reprocess from bronze rather than re-pulling from the source. This is the audit floor and the reason a DPE can sleep.</li>
+    <li><strong>Silver — cleaned, conformed, integrated.</strong> Here the transforms happen: deduplicate on the contract's <code>event_id</code>, cast strings to typed columns, apply the <strong>CDC merge</strong> that collapses an insert/update/delete change stream into a current-state table <em>and</em> a history table (the SCD2 work of <a href="#scd">the next section</a>), conform keys across sources, enforce data contracts. Silver is the integration layer — entity-centric, not source-centric. An analyst <em>could</em> query it; mostly machines do.</li>
+    <li><strong>Gold — business-facing marts.</strong> Dimensional models and metric tables shaped for a question, not a source: a marketplace mart, a billing mart, a supply mart, wide ML feature tables. Aggregated, denormalized, documented, governed. This is what the semantic layer (<a href="07-transformation-orchestration.html">ch. 07</a> and ch. 08) and dashboards point at.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Why three layers and not one</span>
+    <p>The layers separate three independent concerns that drift at different rates: <strong>fidelity</strong> (bronze never changes — it's what happened), <strong>truth</strong> (silver changes when your cleaning/conforming logic improves), and <strong>shape</strong> (gold changes when the business asks a new question). Collapse them and a pricing-logic fix forces a full re-pull from production Postgres, or a renamed metric silently rewrites history. Keep them and each can evolve without dragging the others.</p>
+  </div>
+</section>
+
+<section id="paradigms">
+  <h2>Modeling paradigms compared</h2>
+  <p>Bronze and silver are mechanical; the interesting choice is <em>how to shape gold</em>. Three paradigms dominate, and a mature platform uses more than one.</p>
+
+  <ul>
+    <li><strong>Kimball dimensional (star schema).</strong> Split the world into <em>facts</em> (measurable events at a declared grain — a rental-hour, a bid) and <em>dimensions</em> (the descriptive context you filter and group by — customer, machine, date). Facts hold foreign keys to dimensions; queries fan out from a central fact table into surrounding dims, forming a star. Optimized for analyst query ergonomics.</li>
+    <li><strong>Data Vault 2.0.</strong> Decompose into <em>hubs</em> (business keys, e.g. a machine's natural key), <em>links</em> (relationships between hubs, e.g. machine↔rental), and <em>satellites</em> (the descriptive, time-stamped attributes that hang off hubs and links). Built for auditability and schema agility under many fast-changing sources; not pleasant to query directly — you still build dimensional marts on top.</li>
+    <li><strong>One Big Table (OBT) / wide denormalized.</strong> Pre-join everything into a single very wide table, one row per event with every attribute inlined. No joins at query time. Cheap and fast on columnar engines, brilliant for ML feature tables and embedded analytics; painful for history, storage, and any change to a dimension's definition.</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th>Dimension</th><th>Kimball dimensional</th><th>Data Vault 2.0</th><th>One Big Table</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Modeling complexity</td><td>Moderate</td><td>High (many small tables)</td><td>Low</td></tr>
+      <tr><td>Query ergonomics</td><td><strong>Excellent</strong> (intuitive star joins)</td><td>Poor (must assemble)</td><td>Excellent (no joins)</td></tr>
+      <tr><td>History handling</td><td>Good (via SCD2)</td><td><strong>Excellent</strong> (native, time-stamped sats)</td><td>Poor (duplication explodes)</td></tr>
+      <tr><td>Schema agility</td><td>Moderate (refactor on change)</td><td><strong>Excellent</strong> (add sats/links freely)</td><td>Poor (rewrite the table)</td></tr>
+      <tr><td>Storage / compute</td><td>Efficient</td><td>Heavy (joins + sat sprawl)</td><td>Heavy (wide, redundant)</td></tr>
+      <tr><td>When to use</td><td>Business-facing marts, BI, metrics</td><td>Highly regulated, many volatile sources</td><td>ML features, single-purpose wide tables</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">VastDP's choice</span>
+    <p>Gold marts are <strong>Kimball dimensional</strong>. VastDP has a small, stable set of sources (nine) and a consumer base that lives in SQL and BI — exactly where star schemas shine, and exactly where the semantic layer (ch. 08) expects facts-and-dimensions to map metrics onto. We reserve <strong>OBT</strong> for ML feature tables and the embedded supply-ops views where a single wide row per machine-hour beats a six-way join. We <em>skip</em> Data Vault: its agility tax only pays off with dozens of churning sources and hard audit mandates we don't have. The double-entry ledger's audit need is met by bronze immutability plus reconciliation tests (ch. 10), not by vaulting the whole warehouse.</p>
+  </div>
+</section>
+
+<section id="scd">
+  <h2>Slowly-changing dimensions</h2>
+  <p>Dimensions describe entities — but entities change. A <code>customer</code> upgrades tiers; a <code>host</code> relocates; an <code>offer</code>'s <code>price</code> and a machine's <code>DLPerf</code> score move with the market. How a dimension table handles those changes is its <strong>slowly-changing dimension (SCD)</strong> type.</p>
+
+  <table>
+    <thead>
+      <tr><th>Type</th><th>Behavior on change</th><th>History preserved?</th><th>VastDP use</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Type 1</strong></td><td>Overwrite the column in place</td><td>None — only "now" is knowable</td><td>Cosmetic attrs (display name, email)</td></tr>
+      <tr><td><strong>Type 2</strong></td><td>Close the old row, insert a new versioned row</td><td><strong>Full</strong> — every version, time-bounded</td><td><code>dim_offer</code>, <code>dim_host</code>, <code>dim_customer</code></td></tr>
+      <tr><td><strong>Type 3</strong></td><td>Keep a <code>previous_value</code> column alongside current</td><td>One prior value only</td><td>Rare — e.g. <code>prior_tier</code> for a single report</td></tr>
+    </tbody>
+  </table>
+
+  <p>The reason SCD2 is <em>load-bearing</em> at VastDP, not a nicety: billing and analytics constantly ask <strong>"what was true at the time of the event?"</strong> What was the <code>offer.price</code> at the hour this rental was metered? What was the machine's <code>DLPerf</code> score when the customer chose it? With a Type 1 dimension you only know today's price, so you mis-bill historical rentals and mis-train the ranking model. SCD2 makes the dimension <em>temporal</em>: every fact joins to the dimension version that was current at the fact's event time.</p>
+
+  <div class="flow">  dim_offer — SCD2 history for offer_id = "off_55a2"  (price changes over time)
+
+  surrogate_key  offer_id   price_usd_hr   valid_from            valid_to              is_current
+  ────────────── ────────── ───────────── ───────────────────── ───────────────────── ──────────
+  9001           off_55a2   1.20          2026-06-01 00:00:00Z   2026-06-08 09:00:00Z   false
+  9044           off_55a2   0.95          2026-06-08 09:00:00Z   2026-06-14 17:30:00Z   false   ◀── price drop
+  9098           off_55a2   1.40          2026-06-14 17:30:00Z   9999-12-31 00:00:00Z   true    ◀── current
+
+  a rental metered at  2026-06-10 12:00Z  →  joins to surrogate_key 9044  →  bills at $0.95/hr  ✓
+  not today's $1.40. The fact carries the surrogate key it matched at event time; the price is frozen correct.</div>
+
+  <p>The mechanics tie straight back to <strong>CDC</strong> from <a href="01-the-application-space.html#oltp">chapter 04</a>. Debezium streams each <code>offer.price</code> <code>UPDATE</code> off the Postgres WAL into bronze; the silver merge turns that change stream into the versioned rows above. A new natural-key change closes the prior row (sets <code>valid_to</code> and <code>is_current = false</code>) and inserts a fresh version with a new surrogate key. The merge:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>silver: SCD2 merge for dim_offer</span></div>
+  <pre><code class="language-sql">-- 1. Close the currently-open version when an incoming change differs.
+MERGE INTO dim_offer AS tgt
+USING (
+  -- latest CDC state per offer from bronze, this batch
+  SELECT offer_id, machine_id, price_usd_hr, is_interruptible,
+         min_bid_usd_hr, cdc_commit_ts
+  FROM   bronze_marketplace_cdc
+  WHERE  table_name = 'offer'
+    AND  op IN ('c','u')               -- create / update
+    AND  cdc_commit_ts > (SELECT COALESCE(MAX(valid_from), '1970-01-01') FROM dim_offer)
+) AS src
+ON  tgt.offer_id = src.offer_id
+AND tgt.is_current = TRUE
+WHEN MATCHED AND (
+       tgt.price_usd_hr     <> src.price_usd_hr
+    OR tgt.is_interruptible <> src.is_interruptible
+    OR tgt.min_bid_usd_hr   <> src.min_bid_usd_hr )   -- a tracked attribute changed
+  THEN UPDATE SET valid_to = src.cdc_commit_ts, is_current = FALSE;
+
+-- 2. Insert the new version row (new surrogate key) for changed / new offers.
+INSERT INTO dim_offer
+  (offer_sk, offer_id, machine_id, price_usd_hr, is_interruptible,
+   min_bid_usd_hr, valid_from, valid_to, is_current)
+SELECT
+  nextval('offer_sk_seq'), src.offer_id, src.machine_id, src.price_usd_hr,
+  src.is_interruptible, src.min_bid_usd_hr,
+  src.cdc_commit_ts, TIMESTAMP '9999-12-31 00:00:00', TRUE
+FROM bronze_marketplace_cdc AS src
+WHERE /* offer is new, or its current row was just closed above */ TRUE;</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">Surrogate keys, not natural keys</span>
+    <p>Facts must reference the SCD2 dimension by its <strong>surrogate key</strong> (<code>offer_sk = 9044</code>), never the natural key (<code>offer_id = "off_55a2"</code>). The natural key is shared by every version; only the surrogate identifies <em>which version was current at event time</em>. Join a fact on the natural key and you silently re-bill all history at today's price — the exact bug SCD2 exists to prevent.</p>
+  </div>
+</section>
+
+<section id="grains">
+  <h2>Fact-table grain</h2>
+  <p>The first decision in any fact table — before columns, before keys — is <strong>declaring the grain</strong>: what does exactly one row mean? Skip this and you get tables where some rows are per-event and some pre-aggregated, additivity breaks, and no one trusts a <code>SUM()</code>. Kimball's rule: <em>declare the grain, then add only dimensions and measures true at that grain.</em></p>
+
+  <p>VastDP's three grains are the ones memorized in <a href="00-START-HERE.html#model">Start Here</a>:</p>
+
+  <table>
+    <thead>
+      <tr><th>Fact table</th><th>Grain — one row per…</th><th>Source</th><th>Volume/day</th><th>Key measures</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>fct_telemetry_hourly</code></td><td>machine + GPU + hour (rollup of raw samples)</td><td>host-agent ⚡</td><td>~17k × 24 GPU-hrs</td><td>avg_util_pct, max_temp_c, energy_wh, dlperf</td></tr>
+      <tr><td><code>fct_rental_meter</code></td><td>rental-hour — <strong>the billing atom</strong></td><td>billing-service</td><td>~10 M</td><td>billed_hours, amount_usd, gpu_seconds</td></tr>
+      <tr><td><code>fct_bid_event</code></td><td>bid event (placed / outbid / cleared)</td><td>marketplace-events</td><td>~part of 20–40 M</td><td>bid_usd_hr, cleared_flag</td></tr>
+    </tbody>
+  </table>
+
+  <p>Each grain demands the right treatment of its measures — the <strong>additivity</strong> classification:</p>
+  <ul>
+    <li><strong>Additive</strong> — sums correctly across <em>every</em> dimension, including time. <code>amount_usd</code>, <code>billed_hours</code>, <code>energy_wh</code>, <code>gpu_seconds</code>. These are the safe, default measures: <code>SUM</code> them across any slice.</li>
+    <li><strong>Semi-additive</strong> — sums across some dimensions but <em>not</em> time. A point-in-time balance like <code>ledger_entry</code>-derived account balance, or "active rentals at the hour": you sum across customers but you average (or take the last value) across time, never sum hourly snapshots into a day.</li>
+    <li><strong>Non-additive</strong> — cannot be summed across <em>any</em> dimension; must be recomputed from its components. <strong>Utilization %</strong> is the canonical VastDP trap: you cannot average hourly <code>avg_util_pct</code> to get daily utilization (hours have different GPU-second denominators). Store the additive numerator and denominator (<code>busy_gpu_seconds</code>, <code>total_gpu_seconds</code>) and divide at query time. Same for fill rate and take-rate %.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Store ratios as their parts</span>
+    <p>The single most common modeling defect in a marketplace warehouse is a stored percentage. Utilization, fill rate, take-rate, and CSAT are all non-additive ratios. Persist the <em>additive components</em> in the fact and let the semantic layer (ch. 08) compute the ratio at the requested grain. A column literally named <code>utilization_pct</code> in a fact table is a bug waiting to be averaged.</p>
+  </div>
+</section>
+
+<section id="vastdp-model">
+  <h2>The VastDP dimensional model</h2>
+  <p>Putting it together: the gold layer is a set of star schemas sharing conformed dimensions, with the three fact tables at their centers. Here is the full ERD.</p>
+
+  <div class="flow">                                    dim_date
+                                  (calendar, hr)
+                                        │
+        dim_host (SCD2)                 │                  dim_customer (SCD2)
+        ┌───────────────┐               │                  ┌────────────────┐
+        │ host_sk  (PK) │               │                  │ customer_sk(PK)│
+        │ host_id  (NK) │               │                  │ customer_id(NK)│
+        │ region        │               │                  │ tier, kyc_level│
+        │ payout_rail   │               │                  │ valid_from/to  │
+        │ valid_from/to │               │                  └───────┬────────┘
+        └──────┬────────┘               │                          │
+               │              ┌─────────┴──────────┐               │
+               │              ▼                    ▼               │
+        ┌──────┴────────┐  ┌─────────────────┐  ┌──────────────────┴─┐
+        │  dim_machine  │  │ fct_rental_meter│  │   fct_bid_event     │
+        │ machine_sk PK │◀─┤ rental_meter_sk │  │  bid_event_sk  PK   │
+        │ machine_id NK │  │ ─ FKs ─         │  │  ─ FKs ─            │
+        │ host_sk    FK │  │ machine_sk  FK  │  │  customer_sk   FK   │
+        │ gpu_model     │  │ customer_sk FK  │  │  offer_sk      FK   │
+        └──────┬────────┘  │ offer_sk    FK  │  │  machine_sk    FK   │
+               │           │ date_sk     FK  │  │  date_sk       FK   │
+               │ 1         │ ─ measures ─    │  │  ─ measures ─       │
+               │ *         │ billed_hours    │  │  bid_usd_hr         │
+        ┌──────┴────────┐  │ amount_usd      │  │  cleared_flag       │
+        │   dim_gpu     │  │ gpu_seconds     │  │  event_type         │
+        │ gpu_sk    PK  │  └─────────────────┘  └─────────────────────┘
+        │ machine_sk FK │           ▲
+        │ gpu_index     │           │ joins on machine_sk + hour
+        │ vram_gb       │  ┌────────┴────────────┐         dim_offer (SCD2)
+        └───────────────┘  │ fct_telemetry_hourly│         ┌────────────────┐
+                           │ machine_sk     FK   │         │ offer_sk    PK │
+                           │ gpu_index           │         │ offer_id    NK │
+                           │ date_sk (hour)  FK  │         │ machine_sk  FK │
+                           │ avg_util_pct  (ratio│         │ price_usd_hr   │
+                           │   parts: busy/total)│         │ is_interruptible│
+                           │ energy_wh, dlperf   │         │ valid_from/to  │
+                           └─────────────────────┘         └────────────────┘
+                           ◀── the bridge from ClickHouse (raw) to the warehouse ──▶</div>
+
+  <p>The DDL for the load-bearing tables (Stack-A Iceberg / ANSI-SQL flavor; partition hints noted):</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>gold: SCD2 dimensions</span></div>
+  <pre><code class="language-sql">CREATE TABLE dim_customer (
+  customer_sk    BIGINT       NOT NULL,           -- surrogate (PK)
+  customer_id    VARCHAR      NOT NULL,           -- natural key from marketplace-api.account
+  tier           VARCHAR,                          -- free / pro / enterprise
+  kyc_level      VARCHAR,                          -- from payments KYC/AML source
+  country        VARCHAR,
+  is_provider    BOOLEAN,                          -- two-sided: a customer can also be a host owner
+  valid_from     TIMESTAMP    NOT NULL,
+  valid_to       TIMESTAMP    NOT NULL DEFAULT TIMESTAMP '9999-12-31 00:00:00',
+  is_current     BOOLEAN      NOT NULL,
+  PRIMARY KEY (customer_sk)
+);                                                 -- small dim; no partitioning needed
+
+CREATE TABLE dim_host (
+  host_sk        BIGINT       NOT NULL,
+  host_id        VARCHAR      NOT NULL,           -- natural key (provider)
+  region         VARCHAR,
+  payout_rail    VARCHAR,                          -- fiat / crypto (ch.01 payments)
+  reliability_tier VARCHAR,
+  valid_from     TIMESTAMP    NOT NULL,
+  valid_to       TIMESTAMP    NOT NULL DEFAULT TIMESTAMP '9999-12-31 00:00:00',
+  is_current     BOOLEAN      NOT NULL,
+  PRIMARY KEY (host_sk)
+);
+
+CREATE TABLE dim_offer (
+  offer_sk         BIGINT     NOT NULL,
+  offer_id         VARCHAR    NOT NULL,           -- natural key
+  machine_sk       BIGINT     NOT NULL,           -- FK -> dim_machine
+  price_usd_hr     DECIMAL(10,4),
+  is_interruptible BOOLEAN,
+  min_bid_usd_hr   DECIMAL(10,4),
+  valid_from       TIMESTAMP  NOT NULL,
+  valid_to         TIMESTAMP  NOT NULL DEFAULT TIMESTAMP '9999-12-31 00:00:00',
+  is_current       BOOLEAN    NOT NULL,
+  PRIMARY KEY (offer_sk)
+);</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>gold: Type-1 dimensions</span></div>
+  <pre><code class="language-sql">CREATE TABLE dim_machine (
+  machine_sk   BIGINT   NOT NULL,                 -- surrogate (PK)
+  machine_id   VARCHAR  NOT NULL,                 -- natural key (the physical box)
+  host_sk      BIGINT   NOT NULL,                 -- FK -> dim_host
+  gpu_model    VARCHAR,                            -- e.g. RTX 4090, H100
+  gpu_count    INT,
+  cpu_cores    INT,
+  ram_gb       INT,
+  datacenter   BOOLEAN,                            -- true=DC, false=hobbyist/residential
+  PRIMARY KEY (machine_sk)
+);
+
+CREATE TABLE dim_gpu (
+  gpu_sk       BIGINT   NOT NULL,                 -- one row per physical card
+  machine_sk   BIGINT   NOT NULL,                 -- FK -> dim_machine
+  gpu_index    INT      NOT NULL,                 -- which slot in the box (0..n)
+  vram_gb      INT,
+  pcie_gen     INT,
+  PRIMARY KEY (gpu_sk)
+);</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>gold: fact tables (declared grains)</span></div>
+  <pre><code class="language-sql">-- GRAIN: one row per rental-hour. The billing atom. Reconciles to ledger_entry.
+CREATE TABLE fct_rental_meter (
+  rental_meter_sk BIGINT     NOT NULL,
+  rental_id       VARCHAR    NOT NULL,            -- degenerate dimension (the rental)
+  customer_sk     BIGINT     NOT NULL,            -- FK -> dim_customer (version at event time)
+  machine_sk      BIGINT     NOT NULL,            -- FK -> dim_machine
+  offer_sk        BIGINT     NOT NULL,            -- FK -> dim_offer  (SCD2: price AT this hour)
+  date_sk         INT        NOT NULL,            -- FK -> dim_date (hour grain)
+  meter_hour      TIMESTAMP  NOT NULL,
+  billed_hours    DECIMAL(8,4),                   -- additive
+  gpu_seconds     BIGINT,                         -- additive
+  amount_usd      DECIMAL(12,4),                  -- additive; ties to invoice/ledger
+  PRIMARY KEY (rental_meter_sk)
+) PARTITIONED BY (days(meter_hour));              -- partition by day
+
+-- GRAIN: one row per bid event.
+CREATE TABLE fct_bid_event (
+  bid_event_sk  BIGINT     NOT NULL,
+  bid_id        VARCHAR    NOT NULL,              -- degenerate dimension
+  customer_sk   BIGINT     NOT NULL,              -- FK -> dim_customer
+  offer_sk      BIGINT     NOT NULL,              -- FK -> dim_offer
+  machine_sk    BIGINT     NOT NULL,              -- FK -> dim_machine
+  date_sk       INT        NOT NULL,              -- FK -> dim_date
+  event_time    TIMESTAMP  NOT NULL,              -- producer-stamped (ch.04)
+  event_type    VARCHAR,                          -- placed / outbid / cleared / cancelled
+  bid_usd_hr    DECIMAL(10,4),                    -- additive only within same event_type
+  cleared_flag  BOOLEAN,
+  PRIMARY KEY (bid_event_sk)
+) PARTITIONED BY (days(event_time));
+
+-- GRAIN: one row per machine + GPU + hour. The rolled-up firehose (raw stays in ClickHouse).
+CREATE TABLE fct_telemetry_hourly (
+  machine_sk        BIGINT    NOT NULL,           -- FK -> dim_machine
+  gpu_index         INT       NOT NULL,
+  date_sk           INT       NOT NULL,           -- FK -> dim_date (hour grain)
+  metric_hour       TIMESTAMP NOT NULL,
+  busy_gpu_seconds  BIGINT,                        -- additive NUMERATOR for utilization
+  total_gpu_seconds BIGINT,                        -- additive DENOMINATOR (do NOT store the %)
+  max_temp_c        SMALLINT,                      -- non-additive across time (it's a max)
+  energy_wh         DECIMAL(12,3),                 -- additive
+  dlperf_avg        DECIMAL(8,2),                  -- semi-additive (average, not sum)
+  sample_count      INT,                           -- rows rolled up; gap detection
+  PRIMARY KEY (machine_sk, gpu_index, date_sk)
+) PARTITIONED BY (days(metric_hour));</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Reading the model</span>
+    <p>Three things to notice. (1) Every fact carries <strong>surrogate FKs</strong> to dimensions, and the SCD2 dims (<code>dim_offer</code>, <code>dim_host</code>, <code>dim_customer</code>) resolve to the <em>version current at the fact's event time</em>. (2) <code>rental_id</code> and <code>bid_id</code> live on the fact as <strong>degenerate dimensions</strong> — IDs with no descriptive attributes of their own. (3) <code>fct_telemetry_hourly</code> stores utilization as <code>busy_gpu_seconds</code> / <code>total_gpu_seconds</code>, never a percentage — the non-additive rule from <a href="#grains">the grain section</a>.</p>
+  </div>
+</section>
+
+<section id="conformed">
+  <h2>Conformed dimensions</h2>
+  <p>Notice that <code>dim_customer</code>, <code>dim_machine</code>, and <code>dim_date</code> appear in <em>multiple</em> stars — the marketplace mart, the billing mart, and the supply mart all reference the same physical dimension tables. That is the definition of a <strong>conformed dimension</strong>: a single, shared dimension used identically across fact tables and marts.</p>
+
+  <p>Conformance is what lets metrics from different domains line up. "GMV per customer tier" (billing mart) and "bids per customer tier" (marketplace mart) only join meaningfully if both use the <em>same</em> <code>dim_customer</code> with the <em>same</em> <code>tier</code> definition and the <em>same</em> surrogate keys. The moment two teams build their own customer dimension with subtly different tier logic, the company gets two different "enterprise customer" counts in two dashboards — and weeks are lost reconciling numbers that should have been one number.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Conformance prevents metric divergence</span>
+    <p>The failure mode of an un-conformed warehouse is not a crash — it's a meeting where Finance and Product disagree on a number and no one can say who's right. A conformed-dimension bus (Kimball's term) is the structural defense: define each shared entity <em>once</em>, version it once with SCD2, and point every mart at it. This is also the seam the <strong>semantic layer</strong> (ch. 08) binds to — it can only guarantee one definition per metric if the underlying dimensions are themselves singular. Conformance in the model and the semantic layer above it are two halves of the same promise.</p>
+  </div>
+
+  <p><code>dim_date</code> is the simplest and most important conformed dimension: one row per hour, with calendar attributes (day, week, month, quarter, fiscal period, is-weekend). Every fact in VastDP joins to it, so "by month" means the same month everywhere — including the fiscal calendar Finance reconciles against.</p>
+</section>
+
+<section id="modeling-telemetry">
+  <h2>Modeling the firehose alongside the marts</h2>
+  <p>The dimensional model above is a row-and-column world built for joins. The telemetry firehose is a different world: ~150 M samples/day, time-series access, served from <strong>ClickHouse</strong> per <a href="05-storage-and-lakehouse.html">chapter 05</a>. The modeling question is how the two worlds meet — because supply ops and Finance both need to join physical GPU behavior to business facts.</p>
+
+  <p>The answer is the <strong>rollup as a bridge</strong>. Raw per-sample telemetry never enters the warehouse; it stays in ClickHouse where time-series queries are cheap. A scheduled job aggregates raw samples into <code>fct_telemetry_hourly</code> — one row per <code>machine_id + gpu_index + hour</code> — and <em>that</em> table flows into the lakehouse/warehouse, keyed so it joins cleanly to <code>dim_machine</code> (via <code>machine_sk</code>) and aligns hour-for-hour with <code>fct_rental_meter</code>.</p>
+
+  <div class="flow">  ClickHouse (raw, ch.05)                rollup job              Lakehouse / warehouse (gold)
+  ───────────────────────                ──────────              ─────────────────────────────
+  telemetry_sample                                               fct_telemetry_hourly
+  ~150 M rows/day              ──hourly──▶  GROUP BY     ──▶      key: machine_sk + gpu_index + hour
+  machine_id, gpu_index,                   machine_id,           busy/total_gpu_seconds (util parts)
+  event_time (10s),                        gpu_index,            energy_wh, max_temp_c, dlperf_avg
+  util, temp, power, dlperf                date_trunc(hour)      ▲
+                                                                 │ joins on machine_sk + hour
+  stays here for sub-second                ~17k × 24             ▼
+  time-series dashboards                   = ~400k rows/day      fct_rental_meter (was the GPU
+  (ops, "is GPU X hot now?")               (a 375× reduction)    actually delivering this hour?)</div>
+
+  <p>This single design decision earns its keep three ways. It keeps the firehose out of an engine that would choke on it (the <a href="01-the-application-space.html#firehose">chapter-01 anti-pattern</a>). It makes telemetry <em>joinable</em> to business data — you can now answer "was this billed rental-hour actually delivering compute?" by joining <code>fct_rental_meter</code> to <code>fct_telemetry_hourly</code> on <code>machine_sk</code> + hour, the exact reconciliation Finance and supply ops need. And it shrinks ~150 M raw rows to ~400 k hourly rows — a ~375× reduction — so the warehouse-side telemetry fact is small enough to be a first-class star participant.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The rollup is a modeling artifact, not just an optimization</span>
+    <p>It is tempting to think of the hourly rollup as purely a cost trick. It is also a <em>modeling</em> decision: by declaring the rollup grain (machine + GPU + hour) you make telemetry conform to the same time and machine dimensions as the rest of the warehouse. The grain you choose for the bridge <em>is</em> the resolution at which physical behavior can ever be joined to money. Choose hourly because that is the billing-meter grain; the two facts then align perfectly.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The <strong>medallion architecture</strong> refines data through bronze (raw, immutable, replayable), silver (cleaned, deduped, conformed, CDC-merged), and gold (business-facing marts) — separating fidelity, truth, and shape.</li>
+    <li>VastDP models gold as <strong>Kimball dimensional</strong> stars for BI and metrics, with <strong>OBT</strong> reserved for ML feature tables; Data Vault's agility tax isn't warranted here.</li>
+    <li><strong>SCD2</strong> dimensions make history queryable — joining a fact to the dimension version current <em>at event time</em> is what lets VastDP bill a rental at the offer price that was live that hour, not today's.</li>
+    <li>Every fact <strong>declares its grain first</strong>; the three canonical grains are telemetry-hourly, rental-hour (the billing atom), and bid event. Non-additive ratios like utilization are stored as additive numerator/denominator parts.</li>
+    <li><strong>Conformed dimensions</strong> (<code>dim_customer</code>, <code>dim_machine</code>, <code>dim_date</code>) shared across marts are the structural defense against metric divergence.</li>
+    <li>The firehose joins the marts through an <strong>hourly rollup</strong> — raw stays in ClickHouse, <code>fct_telemetry_hourly</code> bridges into the warehouse at the billing grain.</li>
+  </ul>
+  <p>The model is the contract for <em>what</em> the data should look like. Next we build the machinery that produces and maintains it on a schedule, with tests and lineage. → <a href="07-transformation-orchestration.html">Transformation &amp; Orchestration</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

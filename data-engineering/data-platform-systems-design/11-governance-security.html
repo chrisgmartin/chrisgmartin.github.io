@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Governance, Security &amp; Compliance — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Governance as an enabler</a>
+    <a href="#access">Access control</a>
+    <a href="#pii">PII &amp; KYC handling</a>
+    <a href="#multitenant">The marketplace isolation twist</a>
+    <a href="#residency">Data residency &amp; export controls</a>
+    <a href="#audit">Audit &amp; compliance</a>
+    <a href="#cost-gov">Cost governance / FinOps</a>
+    <a href="#stack-mapping">Governance per stack</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="10-data-quality-observability.html">← Previous</a>
+    <a href="12-platform-for-ai-ml.html">Next: The Platform for AI/ML →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Serving, quality &amp; governance</span>
+  <h1>Governance, Security &amp; Compliance</h1>
+  <p class="subtitle">Governance is the layer that decides who can see what, proves who saw it, and keeps the most sensitive data — KYC identities, crypto wallets, payment rails — from leaking across a two-sided marketplace. This chapter frames governance not as the team that says <em>no</em>, but as the system that lets the platform safely say <em>yes</em> to self-serve and AI for everyone.</p>
+</header>
+
+<section id="why">
+  <h2>Governance as an enabler, not a blocker</h2>
+  <p>The default mental model of "data governance" is a compliance officer with a clipboard who slows everything down. That model is backwards for a platform team. Everything we built toward in <a href="09-self-serve-enablement.html">chapter 09</a> — self-serve analytics for tens to low hundreds of internal users — and everything we will build in <a href="12-platform-for-ai-ml.html">chapter 12</a> and <a href="13-ai-powered-platform.html">chapter 13</a> — features, training data, and an LLM answering questions in Slack — only works if governance is <em>good enough that you can open the doors</em>.</p>
+
+  <p>The balance is the whole game. There are two failure modes, and they are symmetric:</p>
+  <ul>
+    <li><strong>Too loose</strong> — and you leak. A growth analyst's exploratory query touches raw KYC identity documents; an LLM agent retrieves a customer's crypto wallet address into a Slack thread; one provider's payout data shows up in another provider's dashboard. Each of these is a breach, a regulatory event, and a trust collapse for a company whose product <em>is</em> trust.</li>
+    <li><strong>Too tight</strong> — and you ossify. Everything routes through a ticket queue to the one person with the keys. Self-serve dies, shadow data pipelines bloom in spreadsheets and personal laptops (which is <em>worse</em> for security), and the AI initiatives stall because no one will let the model near the data.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The governance thesis of this guide</span>
+    <p>Good governance is what makes openness <em>safe</em>. The goal is a platform where a new analyst can self-serve 90% of the catalog on day one without a ticket, precisely <em>because</em> the 10% that is sensitive is fenced off by automated policy rather than by a human gatekeeper. Governance you can trust is governance you can be generous with.</p>
+  </div>
+
+  <p>This reframing has a concrete consequence: governance must be <strong>declarative, attached to the data, and enforced by the engine</strong> — not a set of conventions in a wiki that analysts are trusted to follow. The rest of the chapter is about how to express and enforce policy so that the platform can default to open.</p>
+
+  <div class="flow">  GOVERNANCE LAYERS  (each is enforced by machinery, not goodwill)
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ 5  AUDIT &amp; LINEAGE     who queried what, when, traced to source│
+  ├──────────────────────────────────────────────────────────────┤
+  │ 4  RESIDENCY           where bytes &amp; workloads physically live  │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 3  POLICY              row-level + column-level masking by tag  │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 2  CLASSIFICATION      every column tagged: public … restricted │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 1  ACCESS CONTROL      principals → roles → grants on objects   │
+  └──────────────────────────────────────────────────────────────┘
+            ▲ the catalog (ch. 09) is where layers 1–3 are declared</div>
+</section>
+
+<section id="access">
+  <h2>Access control: the model that authorizes a query</h2>
+  <p>Access control answers one question billions of times a day: <em>is this principal allowed to read this data?</em> The two dominant models are <strong>RBAC</strong> (role-based) and <strong>ABAC</strong> (attribute-based), and a mature platform uses both — RBAC for the coarse grant, ABAC for the fine-grained policy.</p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>RBAC (role-based)</th><th>ABAC (attribute-based)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Decision input</td><td>The role(s) a principal holds</td><td>Attributes of principal, data, and context (tag, region, time)</td></tr>
+      <tr><td>Granularity</td><td>Coarse — object/schema level</td><td>Fine — row, column, cell</td></tr>
+      <tr><td>Example</td><td><code>finance_analyst</code> can read schema <code>billing</code></td><td>Mask any column tagged <code>pii</code> unless principal has clearance <code>restricted</code></td></tr>
+      <tr><td>Scales with</td><td>Number of roles (can explode combinatorially)</td><td>Number of policy rules (stays small)</td></tr>
+      <tr><td>Strength</td><td>Simple to reason about, easy to audit</td><td>Expressive; one rule covers thousands of columns</td></tr>
+      <tr><td>Weakness</td><td>Role explosion; "just give them admin" pressure</td><td>Harder to reason about the effective grant of a user</td></tr>
+      <tr><td>Where VastDP uses it</td><td>Domain &amp; tier access: who reaches <code>marketplace</code> vs <code>billing</code></td><td>PII masking, residency filtering, tenant isolation</td></tr>
+    </tbody>
+  </table>
+
+  <p>The practical pattern: <strong>RBAC gets you into the room; ABAC decides which seats you can sit in.</strong> A <code>finance_analyst</code> role grants access to the <code>billing</code> domain (RBAC), but an attribute policy still masks the customer's tax ID inside it unless that analyst additionally carries a <code>restricted_pii</code> attribute (ABAC). You get a small number of human-legible roles <em>and</em> fine control without role explosion.</p>
+
+  <h3>Principals, roles, grants</h3>
+  <p>The model is a chain. Principals (humans, service accounts, the AI agent) are assigned <strong>roles</strong>; roles hold <strong>grants</strong> on catalog objects; and on top of the grant sit <strong>row- and column-level policies</strong> that the engine evaluates at query time. Crucially, roles map to the <strong>data domains</strong> from <a href="00-START-HERE.html#domains">Start Here</a> — domains are the seam for access control, exactly as promised there.</p>
+
+  <div class="flow">  PRINCIPALS              ROLES (≈ domains)        GRANTS              POLICIES (ABAC)
+  ┌──────────────┐        ┌──────────────────┐     ┌────────────┐      ┌─────────────────────┐
+  │ alice (human)│───────▶│ growth_analyst   │────▶│ SELECT on  │─────▶│ row:  region filter │
+  │ bob (human)  │───┐    │                  │     │ marketplace│      │ col:  mask pii tags │
+  │ feast (svc)  │   ├───▶│ finance_analyst  │────▶│ SELECT on  │─────▶│ row:  none          │
+  │ genie (AI)   │   │    │                  │     │ billing    │      │ col:  mask tax_id   │
+  │ ...          │   └───▶│ supply_ops       │────▶│ SELECT on  │─────▶│ row:  provider scope│
+  └──────────────┘        │ trust_safety ★   │     │ supply     │      │ col:  unmask pii ★  │
+                          └──────────────────┘     └────────────┘      └─────────────────────┘
+   least privilege:        a principal gets the      grants are on       policies run for EVERY
+   default = no access     fewest roles that         catalog objects,    query, regardless of
+   to anything sensitive   let them do the job        not ad-hoc tables   how data is reached</div>
+
+  <p>Two principles keep this from rotting:</p>
+  <ul>
+    <li><strong>Least privilege by default.</strong> A new principal starts with access to <em>nothing</em> sensitive — the public and internal tiers only. Elevated access is requested, time-boxed where possible, and granted to a <em>role</em>, never to an individual. This is what lets you onboard fast: open data is open by default, sensitive data requires an explicit, audited step.</li>
+    <li><strong>Grant on objects, enforce in the engine.</strong> The grant lives on a catalog object (a table, a view, a domain namespace), and the policy is evaluated by the query engine on every read. There is no path — not a dashboard, not a notebook, not the AI agent, not a CSV export — that bypasses the policy, because the policy lives below all of them at the engine boundary.</li>
+  </ul>
+
+  <h3>How a query gets authorized</h3>
+  <p>When <code>alice</code> (a <code>growth_analyst</code>) runs <code>SELECT * FROM marketplace.fct_rental</code>, the engine: (1) resolves her principal to her active roles; (2) checks that a role holds a <code>SELECT</code> grant on the object — deny if not; (3) rewrites the query to apply any <strong>row-level policy</strong> (e.g. only rows in her permitted regions); (4) applies any <strong>column-level policy</strong> (mask or null out columns whose tag she lacks clearance for); (5) executes, and (6) writes an audit record of the access. The analyst sees a clean result set and never knows a policy fired — which is the point.</p>
+</section>
+
+<section id="pii">
+  <h2>PII &amp; KYC handling: minimizing blast radius</h2>
+  <p>VastDP's most sensitive data comes from <a href="01-the-application-space.html#thirdparty">source 8 — payments</a>: the <strong>KYC/AML provider</strong> emits identity-verification outcomes and the documents behind them; the <strong>crypto rails</strong> carry wallet addresses; Stripe carries card and bank details. This is the data a regulator, an attacker, and a journalist all care about most. The governing discipline is to <strong>classify everything, then minimize the blast radius of the sensitive slice.</strong></p>
+
+  <table>
+    <thead>
+      <tr><th>Class</th><th>Definition</th><th>VastDP examples</th><th>Default access</th><th>At rest</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Public</strong></td><td>Safe to expose externally</td><td>Aggregate GPU-type availability, public DLPerf leaderboard</td><td>Everyone</td><td>Plain</td></tr>
+      <tr><td><strong>Internal</strong></td><td>Business data, no personal/financial sensitivity</td><td>Fleet utilization, funnel metrics, rollup telemetry</td><td>All internal staff</td><td>Encrypted</td></tr>
+      <tr><td><strong>Confidential</strong></td><td>Commercially sensitive or pseudonymous personal</td><td>Per-account spend, provider payout amounts, ledger</td><td>Domain role only</td><td>Encrypted</td></tr>
+      <tr><td><strong>Restricted</strong></td><td>Regulated PII / financial credentials</td><td>KYC identity docs, tax IDs, raw wallet &amp; card numbers</td><td>Named role + audited</td><td>Tokenized + encrypted</td></tr>
+    </tbody>
+  </table>
+
+  <p>The key move for the <em>Restricted</em> tier is that raw values should ideally <strong>never land in the lake at all</strong>. We tokenize on ingest: the pipeline replaces the sensitive value with a non-reversible (or vault-reversible) token at the moment it enters the platform, and the raw value lives only in a dedicated, separately-controlled vault. Analysts join and count on the <em>token</em>; almost no one ever needs the raw value, and the few who do (a T&amp;S investigator following a fraud ring across wallets) go through an audited de-tokenization path.</p>
+
+  <div class="flow">  PII / KYC DATA FLOW — tokenize on ingest, the lake never holds raw
+
+  KYC / crypto / Stripe                 INGEST (ch. 04)                 THE LAKE
+  ┌────────────────────┐         ┌──────────────────────────┐      ┌────────────────────┐
+  │ wallet 0x9af3…c21d │         │  detect tagged field      │      │ wallet_token  tkn_… │
+  │ tax_id  900-12-7788│────────▶│  ──▶ swap for token       │─────▶│ tax_id_token  tkn_… │
+  │ id_doc  passport.png│        │  ──▶ raw → secure vault    │      │ kyc_status    PASS  │
+  └────────────────────┘         └────────────┬─────────────┘      │ id_doc_ref    vlt_… │
+                                              │                     └────────────────────┘
+                                              ▼                         analysts query
+                                    ┌───────────────────┐              tokens + status,
+                                    │   SECRETS VAULT    │              never raw PII
+                                    │ token ⇄ raw, KMS,  │◀── audited de-tokenize only,
+                                    │ separate IAM, logs │     by named role, logged
+                                    └───────────────────┘</div>
+
+  <p>Layered on top of tokenization are two more controls, applied in priority order — and this is the order a senior reviewer will check them in:</p>
+  <ol>
+    <li><strong>Minimize at the source.</strong> The cheapest PII to govern is the PII you never ingest. Following the data-contract discipline from <a href="01-the-application-space.html#contracts">chapter 01</a>, the platform refuses to load fields it doesn't need — a behavioral event does not need to carry an email; flag it in the contract (<code>pii: false</code> is an assertion the platform <em>checks</em>).</li>
+    <li><strong>Tokenize / pseudonymize on ingest.</strong> What must be ingested for joins (wallet, tax ID) lands as a token, not a value, as above.</li>
+    <li><strong>Mask in queries.</strong> The handful of confidential columns that <em>do</em> live in the lake (e.g. a partial card suffix for support) are masked by a column-level policy keyed on a classification tag, so the masking applies everywhere the column is read — view, dashboard, or AI.</li>
+    <li><strong>Restricted domains.</strong> The KYC and raw-payments tables live in a separate <code>restricted</code> namespace with its own role, so even getting <em>near</em> them is an explicit, audited grant.</li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="callout-label">The AI agent is a principal too</span>
+    <p>When the NL-to-SQL agent from <a href="13-ai-powered-platform.html">chapter 13</a> answers a Slack question, it runs as a service principal subject to the <em>same</em> policies as a human. If your masking lives in a BI tool instead of the engine, the agent — which bypasses the BI tool — will happily surface a raw wallet address. Enforce at the engine, and the LLM inherits least privilege for free.</p>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>tagging + masking policy (column-level, tag-driven)</span></div>
+  <pre><code class="language-sql">-- 1. Classify the column once, in the catalog. Policy follows the tag,
+--    not the column name, so it applies everywhere the column appears.
+ALTER TABLE billing.dim_customer
+  ALTER COLUMN tax_id        SET TAG classification = 'restricted';
+ALTER TABLE billing.dim_customer
+  ALTER COLUMN card_last4    SET TAG classification = 'confidential';
+
+-- 2. One masking policy, applied to a tag, covers thousands of columns.
+CREATE MASKING POLICY mask_by_classification AS (val STRING) RETURNS STRING ->
+  CASE
+    WHEN is_role_in_session('restricted_pii')              THEN val          -- full reveal
+    WHEN is_role_in_session('finance_analyst')             THEN 'XXXX'       -- redacted
+    ELSE NULL                                                                 -- invisible
+  END;
+
+-- 3. Bind the policy to the tag. New restricted columns are protected on creation.
+ALTER TAG classification SET MASKING POLICY mask_by_classification
+  FOR COLUMNS WITH TAG classification IN ('restricted','confidential');</code></pre>
+  </div>
+</section>
+
+<section id="multitenant">
+  <h2>The marketplace isolation twist</h2>
+  <p>Here is the wrinkle that makes a marketplace harder than a typical SaaS company. VastDP holds data about <strong>both sides of the market</strong>: providers (GPU owners) <em>and</em> clients (renters), per the two-sided spine in <a href="00-START-HERE.html#model">Start Here</a>. Governance must guarantee that internal access never leaks <strong>one customer's data to another</strong>, nor to <strong>the wrong internal team</strong>.</p>
+
+  <p>The risks are not hypothetical:</p>
+  <ul>
+    <li>A <strong>supply-ops</strong> analyst studying provider economics should see provider payouts and fleet behavior — but must not be able to pull a <em>client's</em> rental history or spend.</li>
+    <li>A <strong>growth</strong> analyst optimizing client funnels should see client behavior — but not a competing provider's machine inventory and pricing strategy, which is commercially sensitive to that provider.</li>
+    <li>No analyst building a dashboard for Provider A should be able to construct a view that exposes Provider B's utilization or earnings.</li>
+  </ul>
+
+  <p>The mechanism is <strong>multi-tenant row-level security</strong>: a single physical table (e.g. <code>supply.fct_provider_economics</code>) is sliced by a row-level policy that scopes each principal to the rows their role legitimately covers. Internal analysts get a <em>cross-tenant</em> view only when their role explicitly authorizes aggregate analytics, and even then the policy can force aggregation (no single-provider drill-down) for roles that should only see the market in the large.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Two distinct isolation questions</span>
+    <p>Don't conflate them. <strong>(1) Tenant-vs-tenant:</strong> can data about customer X ever reach customer Y? (Hard wall — both sides of the market.) <strong>(2) Internal-team scoping:</strong> can the supply team see demand-side data and vice versa? (Soft wall by role.) The same row-level-security machinery enforces both, but the policies and the consequences of a leak differ. A tenant-vs-tenant leak is a breach; an internal over-scope is a hygiene problem.</p>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>row-level security: tenant + internal-team scoping</span></div>
+  <pre><code class="language-sql">-- Row policy on a shared provider-facing table. Evaluated on EVERY read.
+CREATE ROW ACCESS POLICY provider_scope AS (provider_id STRING) RETURNS BOOLEAN ->
+  CASE
+    -- Cross-tenant aggregate analytics: market-wide, no single-provider rows
+    WHEN is_role_in_session('supply_ops')        THEN TRUE
+    -- A provider self-serve seat sees ONLY its own rows (the hard tenant wall)
+    WHEN is_role_in_session('provider_portal')   THEN provider_id = current_tenant_id()
+    -- Demand-side roles have no business in supply-side provider data
+    ELSE FALSE
+  END;
+
+ALTER TABLE supply.fct_provider_economics
+  ADD ROW ACCESS POLICY provider_scope ON (provider_id);</code></pre>
+  </div>
+
+  <p>The same pattern, keyed on <code>account_id</code>, walls off client-side tables from supply roles. The win: tenant isolation is a property of <em>the data</em>, enforced once, rather than a discipline every dashboard author must remember.</p>
+</section>
+
+<section id="residency">
+  <h2>Data residency &amp; export controls</h2>
+  <p>This section is where VastDP's specific reality bites hardest, and it's a topic most generic data-platform guides skip entirely. A GPU marketplace is <strong>directly exposed to chip export-control regimes.</strong> US export controls restrict who may access high-end accelerators and from which countries; Vast.AI's own operating posture involves <strong>filtering by host country</strong> and screening access to controlled hardware. That regulatory exposure flows straight into the data platform, because the platform is where you <em>prove</em> the controls were honored.</p>
+
+  <p>Two distinct concerns, often muddled:</p>
+  <ul>
+    <li><strong>Data residency</strong> — <em>where the bytes physically live.</em> A client in the EU has GDPR expectations; some jurisdictions require that personal data not leave the region. The platform must be able to model and enforce regional storage, so EU-subject PII lands in EU-region object storage and is queried by EU-region compute.</li>
+    <li><strong>Export controls</strong> — <em>which hardware may serve which counterparties.</em> The marketplace must not match a controlled GPU to a client in a sanctioned/embargoed jurisdiction, and the data platform must retain the host-country and screening attributes needed to demonstrate compliance after the fact.</li>
+  </ul>
+
+  <p>Because the marketplace spans <em>many countries on both sides</em>, this is not abstract: a single rental can pair a provider host in one jurisdiction with a client in another, and both the match logic (upstream) and the audit record (in the platform) must capture the country attributes. The platform models <strong>where data lives</strong> and <strong>where workloads run</strong> as first-class governed attributes.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Residency is an ABAC attribute, not a separate system</span>
+    <p>The elegant implementation: <code>region</code> is just another attribute the row-level policy reads. A query from EU compute sees only EU-resident rows; a US analyst without a residency-cleared role cannot pull EU personal data into a US warehouse. You don't build a parallel residency engine — you extend the same ABAC policy layer with a region predicate, which is why investing in attribute-based control (above) pays off twice.</p>
+  </div>
+
+  <div class="flow">  REGIONAL STORAGE &amp; WORKLOAD PLACEMENT
+
+  ┌─────────────── EU REGION ───────────────┐   ┌─────────────── US REGION ───────────────┐
+  │  s3://vastdp-eu/   (EU-subject PII)      │   │  s3://vastdp-us/   (US + global data)    │
+  │  compute: eu-warehouse                   │   │  compute: us-warehouse                   │
+  │  policy: region='EU' rows only           │   │  policy: region='US'|'GLOBAL'            │
+  └──────────────────────────────────────────┘   └──────────────────────────────────────────┘
+        ▲ EU personal data never replicated cross-region; only
+          aggregate, non-personal rollups flow to a global tier ▲
+
+  EXPORT-CONTROL ATTRIBUTES carried on the rental fact (for audit):
+    host_country · client_country · gpu_class (controlled?) · screening_result</div>
+</section>
+
+<section id="audit">
+  <h2>Audit &amp; compliance</h2>
+  <p>Access control decides what <em>can</em> happen; audit proves what <em>did</em>. For a company holding KYC data and exposed to export controls, the audit trail is not bureaucratic overhead — it is the evidence that satisfies a SOC 2 auditor, a GDPR regulator, and an export-control review.</p>
+
+  <ul>
+    <li><strong>Access logging.</strong> Every read of <em>Confidential</em> or <em>Restricted</em> data writes an immutable audit record: principal, role, object, columns, row count, query text, timestamp, source region. The de-tokenization vault logs every reveal. "Who queried KYC last quarter?" must be a one-query answer — and the answer itself goes to a restricted log only the security team reads.</li>
+    <li><strong>SOC 2.</strong> Most of the controls in this chapter <em>are</em> the SOC 2 evidence: least-privilege provisioning, periodic access reviews (recertify role membership), separation of duties, and the audit log itself. Build them as platform features and the audit becomes a query, not a fire drill.</li>
+    <li><strong>GDPR &amp; right-to-be-forgotten.</strong> A deletion request must propagate across the lake. With tokenization, the cheapest implementation is <strong>crypto-shredding</strong>: destroy the subject's key in the vault and every token referencing them becomes permanently unresolvable — the personal data is effectively erased everywhere at once, without rewriting petabytes of immutable lake files. Where raw values do exist, schedule hard deletes (Iceberg/Delta row-level deletes, then compaction) on the relevant partitions.</li>
+    <li><strong>Retention policies.</strong> Different classes have different clocks: behavioral events may be kept long in aggregate but pruned at row-grain after N months; KYC docs are kept exactly as long as AML regulation requires and no longer (keeping PII past its purpose is itself a liability). Retention is declared as policy on the catalog object and enforced by a scheduled job.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">Crypto-shredding turns "forget me" from a migration into a key delete</span>
+    <p>In an immutable lakehouse, physically deleting one person's rows from billions across thousands of Parquet files is brutal. If their PII only ever existed as tokens resolvable via a per-subject key, then deleting that one key satisfies erasure instantly and verifiably. This is the single biggest reason to tokenize on ingest — it makes GDPR tractable. It connects directly back to the <a href="#pii">PII flow</a> above.</p>
+  </div>
+</section>
+
+<section id="cost-gov">
+  <h2>Cost governance / FinOps for data</h2>
+  <p>Governance is not only about <em>access</em> — it is also about <em>spend</em>. Recall the <a href="00-START-HERE.html#scale">scale numbers</a>: ~150 M telemetry samples a day and 50–90 TB/yr of growth. An open self-serve platform without cost guardrails is a way to discover, via an invoice, that an analyst left a <code>SELECT *</code> against the raw firehose running over the weekend. FinOps is the governance discipline that keeps openness affordable.</p>
+
+  <p>The core idea mirrors access control: make cost <strong>visible and attributable</strong>, then put automated guardrails on it. Chargeback/showback assigns each query's cost back to the team that ran it — showback (visibility only) changes behavior surprisingly well; chargeback (actual budget) is the escalation when it doesn't.</p>
+
+  <table>
+    <thead>
+      <tr><th>Lever</th><th>What it does</th><th>VastDP application</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Showback / chargeback</strong></td><td>Attributes cost to team via tags on warehouse/query</td><td>Tag every warehouse &amp; service principal by domain; monthly cost-by-team report</td></tr>
+      <tr><td><strong>Warehouse auto-suspend</strong></td><td>Spins compute down when idle</td><td>Suspend after 60s idle; nobody pays for an idle warehouse overnight</td></tr>
+      <tr><td><strong>Query cost / timeout limits</strong></td><td>Caps bytes scanned or runtime per query</td><td>Hard limit on raw-firehose scans; force analysts onto rollups (ch. 14)</td></tr>
+      <tr><td><strong>Runaway detection</strong></td><td>Alerts/kills queries exceeding a cost threshold</td><td>Kill any single query &gt; $X; alert the owner with the offending SQL</td></tr>
+      <tr><td><strong>Resource monitors / budgets</strong></td><td>Throttle a warehouse when a monthly budget is hit</td><td>Per-domain monthly credit budget; soft-warn at 80%, suspend at 100%</td></tr>
+      <tr><td><strong>Storage tiering &amp; TTL</strong></td><td>Moves cold data to cheap tiers; expires it</td><td>Hot telemetry in TS engine; cold raw to cheap object tier; TTL per retention policy</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">The firehose is a cost-governance problem, not just a storage one</span>
+    <p>The most expensive mistake at VastDP's scale (from <a href="01-the-application-space.html#firehose">chapter 01</a>) is letting self-serve users query raw per-10-second telemetry in the warehouse. The cost guardrail and the architecture guardrail are the same move: a query-cost limit on the raw tier that <em>forces</em> people onto the pre-aggregated per-GPU-hour rollups. Governance and architecture reinforce each other — the cheap path and the safe path are designed to be the same path.</p>
+  </div>
+</section>
+
+<section id="stack-mapping">
+  <h2>Governance per stack</h2>
+  <p>Every concept above — classification tags, masking, row policies, lineage, audit — has a concrete home in each of the three reference stacks from <a href="00-START-HERE.html#stacks">Start Here</a>. The capabilities converge; the seams and the lock-in differ.</p>
+
+  <table>
+    <thead>
+      <tr><th>Capability</th><th>Stack A — Open (Polaris + OPA + DataHub)</th><th>Stack B — Databricks (Unity Catalog)</th><th>Stack C — Snowflake (Horizon)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Catalog &amp; grants</td><td>Polaris/Nessie + Iceberg RBAC</td><td>Unity Catalog (3-level namespace)</td><td>Snowflake roles &amp; grants</td></tr>
+      <tr><td>Row / column policy</td><td>Open Policy Agent (OPA) at engine boundary</td><td>UC row filters &amp; column masks</td><td>Row access &amp; masking policies</td></tr>
+      <tr><td>Classification tags</td><td>DataHub tags / glossary terms</td><td>UC tags + system tables</td><td>Object tagging + tag-based policy</td></tr>
+      <tr><td>Lineage &amp; discovery</td><td>DataHub</td><td>UC lineage</td><td>Horizon lineage &amp; access history</td></tr>
+      <tr><td>Audit log</td><td>Trino/engine logs → lake + DataHub</td><td>UC audit / system tables</td><td><code>ACCESS_HISTORY</code> views</td></tr>
+      <tr><td>Trade-off</td><td>Most flexible &amp; portable; you assemble &amp; run it</td><td>Unified across data &amp; ML; Databricks-bound</td><td>Turnkey &amp; SQL-native; Snowflake-bound</td></tr>
+    </tbody>
+  </table>
+
+  <p>The strategic note from <a href="03-reference-architectures.html">chapter 03</a> holds here too: Stack A buys portability and fine-grained control (OPA can express <em>any</em> policy) at the cost of operating the governance plane yourself; B and C give you a coherent, audited governance surface out of the box in exchange for lock-in. For a marketplace with real regulatory exposure, a turnkey, well-audited governance layer is often worth the lock-in — the cost of a governance gap is measured in breaches, not credits.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Govern to <em>enable</em>: good, declarative, engine-enforced policy is what lets the platform default to open for self-serve (ch. 09) and AI (ch. 13). Too loose leaks; too tight ossifies into shadow pipelines.</li>
+    <li>Use <strong>RBAC to get into the room, ABAC to choose the seat</strong>: domain roles for coarse access, attribute policies (tags, region, tenant) for row- and column-level control without role explosion.</li>
+    <li>For KYC/crypto/payment PII, <strong>minimize, then tokenize on ingest</strong> so raw values never land in the lake; mask the rest by classification tag; fence restricted domains. This also makes GDPR erasure a key-delete (crypto-shredding).</li>
+    <li>A marketplace holds <em>both</em> providers' and clients' data — multi-tenant row-level security must wall tenant-from-tenant (a breach if it fails) and scope internal teams (hygiene if it fails).</li>
+    <li>VastDP is really exposed to <strong>chip export controls and residency</strong>: model where bytes and workloads live as governed attributes, enforced through the same ABAC layer.</li>
+    <li>Audit proves what happened (SOC 2, GDPR); FinOps governs the firehose's cost — and the cheap path and the safe path are designed to be the same path.</li>
+  </ul>
+  <p>With trustworthy data now governed and safely served, we turn to the consumer that pushes the platform hardest: machine learning. Next → <a href="12-platform-for-ai-ml.html">the platform for AI/ML</a> — features, training data, and offline↔online parity.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

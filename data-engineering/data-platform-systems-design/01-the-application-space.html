@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Application Space — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why start at the source</a>
+    <a href="#oltp">Transactional systems (OLTP)</a>
+    <a href="#events">Event streams</a>
+    <a href="#firehose">The telemetry firehose</a>
+    <a href="#thirdparty">Third-party systems</a>
+    <a href="#shapes">Data shapes &amp; ingest patterns</a>
+    <a href="#contracts">Source ownership &amp; contracts</a>
+    <a href="#antipatterns">Source anti-patterns</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-the-dpe-role.html">Next: The DPE Role →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Orient</span>
+  <h1>The Application Space</h1>
+  <p class="subtitle">Every data platform begins with a faithful map of where data is born. This chapter walks all nine of VastDP's source systems — what each emits, in what shape, at what volume, and with what correctness needs — because those properties determine the ingestion, storage, and modeling decisions in every chapter that follows.</p>
+</header>
+
+<section id="why">
+  <h2>Why a DPE starts at the source, not the warehouse</h2>
+  <p>The instinct of a new data engineer is to start at the warehouse: pick Snowflake, write some dbt, build a dashboard. The instinct of a <em>senior</em> DPE is to spend the first weeks mapping the application space — because the source systems impose constraints that no amount of downstream cleverness can undo. If a source overwrites rows in place with no change-data-capture, you cannot reconstruct history. If an event stream has no idempotency key, you cannot dedupe. If telemetry arrives without event-time timestamps, every time-window aggregation is wrong.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The load-bearing principle</span>
+    <p><strong>Data quality is set at the source, observed at the platform, and paid for downstream.</strong> The cheapest place to fix a data problem is in the producing service; the most expensive is in 40 dbt models and a dozen dashboards that already depend on the broken shape. A DPE's first job is to understand — and then negotiate — what the sources emit.</p>
+  </div>
+
+  <p>So we begin with the three structural categories from <a href="00-START-HERE.html#sources">Start Here</a>: transactional systems, event streams, and third-party systems. Each maps to a different ingestion pattern (chapter 04), and the split is the single most useful lens for the whole platform.</p>
+</section>
+
+<section id="oltp">
+  <h2>Transactional systems (OLTP)</h2>
+  <p>These are the application databases that run the product. They are <strong>row-oriented, normalized, mutable, and authoritative</strong> — the system of record for the business state. VastDP has four.</p>
+
+  <h3>1 · marketplace-api (Postgres)</h3>
+  <p>The heart of the product: accounts, listings/offers, search configuration, rentals, and bids. Highly normalized, heavily indexed for point lookups, updated thousands of times per second.</p>
+  <ul>
+    <li><strong>Key tables:</strong> <code>account</code>, <code>host</code>, <code>machine</code>, <code>gpu</code>, <code>offer</code>, <code>rental</code>, <code>bid</code>.</li>
+    <li><strong>Mutation pattern:</strong> rows update in place — an <code>offer.price</code> changes, a <code>rental.status</code> moves <code>pending → active → stopped</code>. <strong>This is the central challenge:</strong> without capturing those transitions, the warehouse only ever sees the latest state.</li>
+    <li><strong>Ingest implication:</strong> needs <strong>log-based CDC</strong> (Debezium reading the Postgres WAL) to stream every insert/update/delete as an event. We design this in chapter 04 and turn it into history with slowly-changing dimensions in chapter 06.</li>
+  </ul>
+
+  <h3>2 · billing-service (Postgres)</h3>
+  <p>Metering, invoices, credits, payouts, and a <strong>double-entry ledger</strong>. The correctness bar here is the highest in the company: this data reconciles to money.</p>
+  <ul>
+    <li><strong>Key tables:</strong> <code>rental_meter</code> (the per-rental-hour usage atom), <code>invoice</code>, <code>credit</code>, <code>payout</code>, <code>ledger_entry</code>.</li>
+    <li><strong>Correctness need:</strong> <em>exactly-once</em> semantics end-to-end. A double-counted meter row is a double charge. The ledger must always balance (debits = credits) — a property we assert as a data test in chapter 10.</li>
+    <li><strong>Ingest implication:</strong> CDC again, but with stricter reconciliation. Finance will want the warehouse total to tie to the ledger to the penny (chapter 08, 11).</li>
+  </ul>
+
+  <h3>3 · instance-orchestrator (Postgres + emits events)</h3>
+  <p>Manages the lifecycle of a running instance on a host: scheduling a container, starting it, stopping it, handling a preemption when a higher interruptible bid arrives. It is half OLTP (current instance state) and half event producer (lifecycle transitions).</p>
+  <ul>
+    <li><strong>Key tables/events:</strong> <code>instance</code> (state), and lifecycle events <code>instance.created/started/stopped/preempted/destroyed</code>.</li>
+    <li><strong>Why it matters:</strong> the join between an <code>instance</code> and its <code>telemetry_sample</code> stream is how we attribute physical GPU behavior to a specific paying rental. Get the lifecycle timestamps wrong and utilization, billing, and reliability all drift.</li>
+  </ul>
+
+  <h3>4 · ranking-service (Postgres + recomputed)</h3>
+  <p>Stores the trust signals that the marketplace surfaces in search: DLPerf benchmark scores, reliability scores, and the derived search-ranking features. Interesting because it is <em>both</em> a source and a consumer — it reads telemetry-derived features the platform computes and writes back scores the product shows. This feedback loop is why the data platform sits in the product's critical path, not just the back office.</p>
+
+  <table>
+    <thead>
+      <tr><th>OLTP source</th><th>Volume</th><th>Mutability</th><th>Correctness bar</th><th>Ingest pattern</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>marketplace-api</td><td>Medium</td><td>High (in-place updates)</td><td>High</td><td>Log-based CDC</td></tr>
+      <tr><td>billing-service</td><td>Medium</td><td>Append-mostly</td><td><strong>Highest (money)</strong></td><td>CDC + reconciliation</td></tr>
+      <tr><td>instance-orchestrator</td><td>Medium-high</td><td>High</td><td>High</td><td>CDC + lifecycle events</td></tr>
+      <tr><td>ranking-service</td><td>Low</td><td>Recomputed</td><td>Medium</td><td>CDC / snapshot</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="events">
+  <h2>Event streams</h2>
+  <p>Where OLTP captures <em>state</em>, event streams capture <em>things that happened</em> — append-only, immutable, high-volume, ordered (within a partition). VastDP publishes these to Kafka topics.</p>
+
+  <h3>6 · marketplace-events</h3>
+  <p>The behavioral and market stream: <code>search.performed</code>, <code>offer.viewed</code>, <code>rental.requested</code>, <code>bid.placed</code>, <code>bid.outbid</code>, <code>instance.preempted</code>, <code>rental.cancelled</code>, plus web/app clickstream. This is what powers funnels, liquidity analysis, and the bid-market reconstruction.</p>
+  <ul>
+    <li><strong>Shape:</strong> JSON or Avro/Protobuf messages with an <code>event_id</code>, <code>event_time</code>, <code>actor_id</code>, and a typed payload. The presence of <code>event_id</code> (for dedupe) and <code>event_time</code> (for correct windowing) is non-negotiable — chapter 04 explains why.</li>
+    <li><strong>Volume:</strong> bursty. A popular open-model release triggers a fine-tuning rush and the bid stream spikes 10×. The platform must absorb spikes without backpressure into the product.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">Event-time vs processing-time</span>
+    <p>A <code>bid.placed</code> event may arrive at the platform seconds or minutes after it occurred (mobile client offline, retry, broker lag). If you bucket it by <em>arrival</em> time instead of <em>event</em> time, your "bids per minute" chart is wrong and your interruptible-clearing-price model trains on corrupted features. Always carry and key on producer-stamped <code>event_time</code>; handle lateness explicitly (watermarks, ch. 04).</p>
+  </div>
+</section>
+
+<section id="firehose">
+  <h2>The telemetry firehose</h2>
+  <p>This source deserves its own section because it dominates the platform. Every GPU on every machine runs a <strong>host-agent</strong> that reports physical metrics on a tight interval.</p>
+
+  <h3>7 · host-agent telemetry ⚡</h3>
+  <div class="flow">  17,000 GPUs  ×  1 sample / 10s  =  ~1,700 samples/sec  =  ~150,000,000 / day
+
+  one telemetry_sample:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ machine_id        m_8f21a       (which physical box)           │
+  │ gpu_index         3             (which card in the box)        │
+  │ event_time        2026-06-16T14:03:10.114Z   ← KEY ON THIS     │
+  │ gpu_util_pct      97.4                                         │
+  │ mem_used_mb       72180                                        │
+  │ temp_c            71                                           │
+  │ power_w           402                                          │
+  │ sm_clock_mhz      1980                                         │
+  │ ecc_errors        0                                           │
+  │ dlperf_probe      28.6          (periodic benchmark result)    │
+  │ instance_id       inst_4471     (null if idle / unrented)      │
+  └──────────────────────────────────────────────────────────────┘</div>
+
+  <p>What makes the firehose hard is the combination of properties:</p>
+  <ul>
+    <li><strong>Volume:</strong> ~150 M rows/day, growing linearly with fleet size. A naïve load into a columnar warehouse is both slow and expensive.</li>
+    <li><strong>Time-series access pattern:</strong> almost every query is "metric X for entity Y over time window W" — which a purpose-built engine (ClickHouse) serves 10–100× more cheaply than a general warehouse.</li>
+    <li><strong>Lateness &amp; gaps:</strong> a host with flaky residential internet (recall Vast's hobbyist providers) drops offline and backfills. Gaps are themselves signal — they feed the <em>reliability score</em>.</li>
+    <li><strong>Dual use:</strong> it powers operational dashboards (is the fleet healthy <em>now</em>?) <em>and</em> ML features (predict reliability, detect throttling) <em>and</em> billing inputs (was the GPU actually delivering during the rented hour?). One source, three very different SLAs.</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="callout-label">Do not route the firehose through the warehouse</span>
+    <p>The most common expensive mistake at a company like this is loading raw per-second telemetry into Snowflake/BigQuery and querying it with SQL dashboards. It works at 1,000 GPUs and falls over (on cost, then latency) at 17,000. The pattern that scales: land raw telemetry to object storage + a time-series engine, and only <em>pre-aggregated</em> rollups (per-GPU-hour) flow into the warehouse for joining with business data. We design exactly this in chapters 05 and 14.</p>
+  </div>
+</section>
+
+<section id="thirdparty">
+  <h2>Third-party systems</h2>
+  <p>Data the company does not produce but must integrate. These are pulled, not pushed, and carry their own rate limits, schemas, and compliance weight.</p>
+
+  <h3>8 · payments — Stripe, crypto rails, KYC/AML</h3>
+  <ul>
+    <li><strong>Stripe:</strong> charges, refunds, disputes, payout transfers. Ingested via webhooks (events) plus a nightly API reconciliation pull. The webhook/API pair is classic: webhooks are timely but can be missed; the batch pull is the source of truth.</li>
+    <li><strong>Crypto rails:</strong> on-chain deposits/withdrawals (recall Vast's crypto-native providers). Confirmation latency and reorgs make "is this payment final?" a genuine data-modeling question.</li>
+    <li><strong>KYC/AML provider:</strong> identity verification outcomes. <strong>PII-heavy</strong> — drives the governance design in chapter 11 (tokenization, restricted domains, audited access).</li>
+  </ul>
+
+  <h3>9 · support — Zendesk-like</h3>
+  <p>Tickets, disputes, CSAT. Lower volume, but joins to the customer and trust-and-safety domains to answer questions like "do reliability complaints predict churn?" Ingested by batch API pull (Fivetran-style connector in Stack C; a scheduled extract in Stack A).</p>
+</section>
+
+<section id="shapes">
+  <h2>Data shapes &amp; ingest patterns — the master map</h2>
+  <p>Pulling it together, here is the decision table that drives chapter 04. <strong>Match the ingest pattern to the source's shape, not to your favorite tool.</strong></p>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>Source</th><th>Category</th><th>Shape</th><th>Volume/day</th><th>Latency need</th><th>Ingest pattern</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>marketplace-api</td><td>OLTP</td><td>Mutable rows</td><td>~10 M changes</td><td>Minutes</td><td>Log-based CDC</td></tr>
+      <tr><td>2</td><td>billing-service</td><td>OLTP</td><td>Mutable rows + ledger</td><td>~10 M</td><td>Minutes</td><td>CDC + reconcile</td></tr>
+      <tr><td>3</td><td>instance-orchestrator</td><td>OLTP + events</td><td>State + transitions</td><td>~5 M</td><td>Seconds–min</td><td>CDC + stream</td></tr>
+      <tr><td>4</td><td>ranking-service</td><td>OLTP</td><td>Recomputed scores</td><td>~1 M</td><td>Hours</td><td>Snapshot/CDC</td></tr>
+      <tr><td>5</td><td>trust-safety</td><td>OLTP + events</td><td>Signals, bans</td><td>~1 M</td><td>Seconds</td><td>Stream + CDC</td></tr>
+      <tr><td>6</td><td>marketplace-events</td><td>Events</td><td>Append-only JSON</td><td>~20–40 M</td><td>Seconds–min</td><td>Stream → lake</td></tr>
+      <tr><td>7</td><td><strong>host-agent telemetry</strong></td><td>Events</td><td>Time-series</td><td><strong>~150 M</strong></td><td>Sec (ops) / hr (analytics)</td><td>Stream → TS engine + lake</td></tr>
+      <tr><td>8</td><td>payments</td><td>Third-party</td><td>Webhooks + API</td><td>~0.5 M</td><td>Min–hours</td><td>Webhook + batch reconcile</td></tr>
+      <tr><td>9</td><td>support</td><td>Third-party</td><td>API objects</td><td>~50 k</td><td>Hours</td><td>Batch pull</td></tr>
+    </tbody>
+  </table>
+
+  <p>Three ingest patterns cover all nine sources: <strong>log-based CDC</strong> for mutable OLTP, <strong>streaming</strong> for append-only events, and <strong>batch API pull</strong> for third-party systems. The firehose is "streaming, but routed to a specialist store." That's the whole ingestion design in one sentence — chapter 04 fills in the mechanics.</p>
+</section>
+
+<section id="contracts">
+  <h2>Source ownership &amp; data contracts</h2>
+  <p>Sources are owned by <em>product</em> engineering teams who did not build them for analytics. The schema can change without warning the moment a feature ships — a renamed column, a new enum value, a dropped field — and your pipeline breaks at 3 a.m. The senior-level answer is the <strong>data contract</strong>: an explicit, versioned agreement between the producing team and the platform about the schema, semantics, and SLAs of what a source emits.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>data-contract: marketplace-events / bid.placed</span></div>
+  <pre><code class="language-yaml">contract: bid.placed
+owner: marketplace-team
+version: 2.1.0
+schema:
+  event_id:   { type: uuid,      required: true,  unique: true }   # dedupe key
+  event_time: { type: timestamp, required: true }                  # producer-stamped, UTC
+  account_id: { type: string,    required: true }
+  offer_id:   { type: string,    required: true }
+  bid_usd_hr: { type: decimal,   required: true,  min: 0 }
+  is_interruptible: { type: bool, required: true }
+guarantees:
+  freshness_p99: 60s          # platform may assume data lands within 60s
+  ordering: per-account_id    # ordered within a partition key
+  pii: false
+breaking_change_policy: major-version-bump + 2-week notice</code></pre>
+  </div>
+
+  <p>Contracts move data quality <em>left</em> — to the source, where it's cheapest to fix. They're how a platform scales past the point where the DPE can personally know every schema. We operationalize them (tests, CI checks, registry) in chapters 09 and 10.</p>
+</section>
+
+<section id="antipatterns">
+  <h2>Source anti-patterns to catch early</h2>
+  <table>
+    <thead>
+      <tr><th>Anti-pattern</th><th>Why it hurts</th><th>The fix</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>No CDC; nightly <code>SELECT *</code> snapshot</td><td>Loses intra-day history; full-table scans hammer the OLTP DB</td><td>Log-based CDC off the WAL (ch. 04)</td></tr>
+      <tr><td>Events without <code>event_id</code></td><td>Cannot dedupe; at-least-once delivery double-counts</td><td>Mandate idempotency key in the contract</td></tr>
+      <tr><td>Processing-time timestamps only</td><td>Late data silently corrupts time windows</td><td>Producer-stamped <code>event_time</code> + watermarks</td></tr>
+      <tr><td>PII fields scattered across sources</td><td>Compliance blast radius; can't isolate access</td><td>Tag at source; tokenize on ingest (ch. 11)</td></tr>
+      <tr><td>Firehose into the warehouse</td><td>Cost and latency blow up at fleet scale</td><td>Time-series engine + rollups (ch. 05, 14)</td></tr>
+      <tr><td>Mutable "current value" only, no event log</td><td>Can't answer "what was the price at time T?"</td><td>Capture transitions → SCD2 (ch. 06)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A DPE maps the application space before touching the warehouse, because sources impose constraints downstream work cannot undo.</li>
+    <li>VastDP's nine sources fall into three categories — OLTP (CDC), events (streaming), third-party (batch) — and the category, not the tool, dictates the ingest pattern.</li>
+    <li>One source, the telemetry firehose, dominates volume and cost; treating it like the others is the signature scaling mistake.</li>
+    <li>Data contracts push quality to the source and let the platform scale past tribal knowledge.</li>
+  </ul>
+  <p>Next we zoom out from the data to the <em>role</em>: what a data platform actually is, how the DPE differs from adjacent roles, and the stakeholder map the platform must serve. → <a href="02-the-dpe-role.html">The Data Platform &amp; the DPE Role</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

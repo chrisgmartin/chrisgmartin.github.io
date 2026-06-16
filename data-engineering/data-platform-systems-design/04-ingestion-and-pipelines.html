@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ingestion &amp; Data Pipelines — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#patterns">Three patterns, nine sources</a>
+    <a href="#cdc">Log-based Change Data Capture</a>
+    <a href="#streaming">Event streaming &amp; watermarks</a>
+    <a href="#firehose">Designing the telemetry firehose</a>
+    <a href="#batch">Third-party batch ingestion</a>
+    <a href="#elt-etl">ELT vs ETL</a>
+    <a href="#schema-registry">Schema registry &amp; evolution</a>
+    <a href="#reliability">Pipeline reliability primitives</a>
+    <a href="#stack-mapping">How A/B/C ingest</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-reference-architectures.html">← Previous</a>
+    <a href="05-storage-and-lakehouse.html">Next: Storage &amp; the Lakehouse →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Architecture foundations</span>
+  <h1>Ingestion &amp; Data Pipelines</h1>
+  <p class="subtitle">Ingestion is where the platform meets reality: nine source systems, three shapes, and one firehose that dwarfs the rest. This chapter turns the source map from chapter 01 into working pipelines — CDC off the Postgres WAL, exactly-once-ish streaming with watermarks, a dual-path design for 150 M telemetry samples a day, and the reliability primitives (idempotency, dead-letter queues, replay) that keep all of it correct at 3 a.m.</p>
+</header>
+
+<section id="patterns">
+  <h2>Three patterns, nine sources</h2>
+  <p>Chapter 01 ended on a single load-bearing sentence: <strong>three ingest patterns cover all nine VastDP sources</strong> — log-based CDC for mutable OLTP, streaming for append-only events, and batch API pull for third-party systems. The firehose is "streaming, routed to a specialist store." This chapter fills in the mechanics, but the organizing principle never changes:</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Match the pattern to the shape, not the tool</span>
+    <p>The shape of the source — mutable rows vs. immutable events vs. pull-only API objects — dictates the ingestion pattern. The tool (Debezium, Flink, Fivetran, DLT) is an implementation detail you choose <em>after</em> the pattern. A DPE who picks the tool first ends up forcing the firehose through a warehouse or polling an OLTP database with <code>SELECT *</code> — the two signature mistakes from chapter 01.</p>
+  </div>
+
+  <p>Here is the master map from <a href="01-the-application-space.html#shapes">chapter 01</a>, collapsed to the one column this chapter is about — and the section that designs each:</p>
+
+  <table>
+    <thead>
+      <tr><th>Source</th><th>Shape</th><th>Pattern</th><th>Designed in</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>marketplace-api</td><td>Mutable rows</td><td>Log-based CDC</td><td><a href="#cdc">§ CDC</a></td></tr>
+      <tr><td>billing-service</td><td>Mutable rows + ledger</td><td>CDC + reconcile</td><td><a href="#cdc">§ CDC</a></td></tr>
+      <tr><td>instance-orchestrator</td><td>State + transitions</td><td>CDC + stream</td><td><a href="#cdc">§ CDC</a> / <a href="#streaming">§ Streaming</a></td></tr>
+      <tr><td>ranking-service</td><td>Recomputed scores</td><td>Snapshot / CDC</td><td><a href="#cdc">§ CDC</a></td></tr>
+      <tr><td>trust-safety</td><td>Signals, bans</td><td>Stream + CDC</td><td><a href="#streaming">§ Streaming</a></td></tr>
+      <tr><td>marketplace-events</td><td>Append-only JSON</td><td>Stream → lake</td><td><a href="#streaming">§ Streaming</a></td></tr>
+      <tr><td><strong>host-agent telemetry</strong></td><td>Time-series</td><td><strong>Stream → TS engine + lake</strong></td><td><a href="#firehose">§ Firehose</a></td></tr>
+      <tr><td>payments</td><td>Webhooks + API</td><td>Webhook + batch reconcile</td><td><a href="#batch">§ Batch</a></td></tr>
+      <tr><td>support</td><td>API objects</td><td>Batch pull</td><td><a href="#batch">§ Batch</a></td></tr>
+    </tbody>
+  </table>
+
+  <p>The rest of the chapter walks these three patterns in depth, then the cross-cutting concerns every pipeline shares: ELT-vs-ETL placement, schema evolution, and reliability.</p>
+</section>
+
+<section id="cdc">
+  <h2>Log-based Change Data Capture</h2>
+  <p>The four OLTP sources (marketplace-api, billing-service, instance-orchestrator, ranking-service) are <strong>mutable</strong>: an <code>offer.price</code> changes, a <code>rental.status</code> walks <code>pending → active → stopped</code>. The naïve way to ingest them is a nightly <code>SELECT *</code> snapshot. The senior way is log-based CDC. The difference is not cosmetic — it is the difference between a platform that can answer "what was the price at 14:00?" and one that can only ever see the latest state.</p>
+
+  <h3>Why CDC beats nightly SELECT *</h3>
+  <ul>
+    <li><strong>History.</strong> A nightly snapshot sees only the row's final state for the day. If an offer's price changed five times between snapshots, four of those states are gone forever. CDC streams <em>every</em> insert/update/delete, so the platform reconstructs the full timeline — the raw material for slowly-changing dimensions (chapter 06).</li>
+    <li><strong>No OLTP load.</strong> A full-table <code>SELECT *</code> scans every row and competes with production traffic for buffer cache and I/O. Log-based CDC reads the database's <em>write-ahead log</em> — a sequential file the database already writes for crash recovery — so it imposes near-zero load on query paths.</li>
+    <li><strong>Deletes are visible.</strong> A snapshot diff can <em>infer</em> a delete (a row that was there yesterday is gone today) but cannot tell a delete from a filtered query or a transient outage. The WAL records the delete explicitly.</li>
+  </ul>
+
+  <h3>How Debezium reads the Postgres WAL</h3>
+  <p>Postgres exposes its WAL through <strong>logical replication</strong>: you create a replication slot and a publication, and Postgres decodes committed changes into a logical stream of row-level events. Debezium connects as a replication client, consumes that stream, and publishes one Kafka message per change — typically one topic per table.</p>
+
+  <div class="flow">  marketplace-api (Postgres)
+  ┌───────────────────────────┐
+  │  offer, rental, bid, …     │   row UPDATE offer SET price=0.42 WHERE id=…
+  │                            │             │
+  │   write-ahead log (WAL)    │◀────────────┘  (already written for durability)
+  │   logical replication slot │
+  └─────────────┬──────────────┘
+                │  decoded change events (insert/update/delete)
+                ▼
+        ┌───────────────┐     one msg per row change      ┌──────────────┐
+        │   Debezium    │────────────────────────────────▶│    Kafka     │
+        │  (connector)  │   topic: vastdp.public.offer     │  partitioned │
+        └───────────────┘                                  │  by PK       │
+                                                           └──────┬───────┘
+                                                                  │  sink connector
+                                                                  ▼
+                                                        ┌────────────────────┐
+                                                        │  raw lake (Iceberg/ │
+                                                        │  Delta) — append    │
+                                                        │  every change row   │
+                                                        └────────────────────┘</div>
+
+  <p>A Debezium change event carries a <code>before</code> image, an <code>after</code> image, the operation (<code>c</code>reate / <code>u</code>pdate / <code>d</code>elete / <code>r</code>ead-snapshot), and source metadata including the log position (Postgres LSN) and commit timestamp. That LSN is the offset that makes the stream replayable and exactly-once-friendly.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>debezium: marketplace-api connector (sketch)</span></div>
+  <pre><code class="language-json">{
+  "name": "marketplace-api-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "marketplace-db.internal",
+    "database.dbname": "marketplace",
+    "plugin.name": "pgoutput",
+    "slot.name": "vastdp_cdc",
+    "publication.name": "vastdp_pub",
+    "table.include.list": "public.offer,public.rental,public.bid,public.account",
+    "snapshot.mode": "initial",          // snapshot once, then tail the WAL
+    "tombstones.on.delete": "true",       // emit a null-value tombstone after a delete
+    "topic.prefix": "vastdp",
+    "decimal.handling.mode": "precise",   // money must not become a float
+    "heartbeat.interval.ms": "10000"      // advance the slot even on idle tables
+  }
+}</code></pre>
+  </div>
+
+  <h3>Initial snapshot, then tail the stream</h3>
+  <p>A connector cannot start from "now" — the lake would be missing every row that existed before CDC turned on. So the lifecycle is two phases. First, an <strong>initial snapshot</strong>: Debezium reads the current table contents as a batch of synthetic <code>read</code> events, establishing the baseline. Then it switches to <strong>streaming</strong>, tailing the WAL from the LSN captured at snapshot time. Done right the two phases are seamless — no gap, no overlap — because the snapshot LSN is the exact handoff point. The <code>heartbeat.interval.ms</code> above matters here: on a low-traffic table the slot would otherwise never advance, and Postgres would retain WAL indefinitely until the disk fills.</p>
+
+  <h3>Deletes and tombstones</h3>
+  <p>A delete in Postgres becomes a Debezium event with a populated <code>before</code> and a null <code>after</code>. With <code>tombstones.on.delete</code> enabled, Debezium then emits a second message with a <em>null value</em> on the same key — a <strong>tombstone</strong>. Kafka log compaction uses the tombstone to physically drop the key. Downstream, the platform must treat the delete as data, not absence: a deleted <code>offer</code> is not "never existed," it is "withdrawn at time T," which the reliability and liquidity metrics genuinely care about.</p>
+
+  <h3>From CDC events to SCD2 history</h3>
+  <p>The reason CDC is worth the operational weight is what it enables downstream. Each change event is timestamped with its commit time; a stream of them for one key <em>is</em> a history. In chapter 06 we turn that history into a <strong>slowly-changing dimension type 2</strong> — one row per version of an entity, with <code>valid_from</code> / <code>valid_to</code> bounds — so an analyst can ask "what was this offer's price when that rental started?" and get the right answer. CDC is the ingestion-layer prerequisite for that; without it the question is unanswerable.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">billing-service is CDC with a higher bar</span>
+    <p>The ledger reconciles to money, so its CDC pipeline carries two extra obligations. First, <code>decimal.handling.mode: precise</code> — never let a currency amount round-trip through a float. Second, a reconciliation job (chapter 08, 11) periodically asserts that the sum of landed <code>ledger_entry</code> rows ties to the source ledger to the penny. CDC gets you the events; reconciliation proves you lost none of them.</p>
+  </div>
+</section>
+
+<section id="streaming">
+  <h2>Event streaming &amp; watermarks</h2>
+  <p>The append-only sources — marketplace-events, the trust-safety signal stream, and orchestrator lifecycle events — are published to <strong>Kafka</strong>. Streaming ingestion looks simple ("just read the topic") and is full of correctness traps. Two concepts decide whether you get it right: delivery semantics and event-time handling.</p>
+
+  <h3>Topics, partitions, keys</h3>
+  <p>A Kafka <strong>topic</strong> is an append-only log split into <strong>partitions</strong> for parallelism. Ordering is guaranteed only <em>within</em> a partition, and a message's partition is chosen by its <strong>key</strong>. For VastDP the key choice is a modeling decision: key <code>bid.placed</code> by <code>account_id</code> and all of one account's bids stay ordered and land on one consumer; key by <code>offer_id</code> and you can reconstruct a single offer's bid history in order. The data contract from chapter 01 pinned this down — <code>ordering: per-account_id</code>.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>kafka message: marketplace-events / bid.placed</span></div>
+  <pre><code class="language-json">{
+  "key": "acct_91f2",
+  "headers": { "schema_id": 412, "content_type": "avro/binary" },
+  "value": {
+    "event_id":    "5b1c…-uuid",          // idempotency / dedupe key
+    "event_type":  "bid.placed",
+    "event_time":  "2026-06-16T14:03:07.220Z",  // producer-stamped, UTC
+    "account_id":  "acct_91f2",
+    "offer_id":    "offer_77c0",
+    "bid_usd_hr":  0.41,
+    "is_interruptible": true
+  },
+  "partition": 3,
+  "offset": 88412290
+}</code></pre>
+  </div>
+
+  <h3>Delivery semantics &amp; idempotency</h3>
+  <p>Kafka, like most streaming systems, defaults to <strong>at-least-once</strong> delivery: on retry or rebalance a message can be redelivered, so a consumer that naïvely inserts will double-count. <strong>Exactly-once</strong> is achievable (Kafka transactions, idempotent producers, transactional sinks) but it is expensive and end-to-end only as strong as its weakest hop. The pragmatic VastDP default: <strong>at-least-once delivery plus idempotent consumers</strong>. Because every event carries an <code>event_id</code> (mandated by the contract), the sink dedupes on it — a redelivered <code>bid.placed</code> is dropped, and effective semantics are exactly-once <em>without</em> the full transactional machinery.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Idempotency is cheaper than exactly-once</span>
+    <p>Chase end-to-end exactly-once everywhere and you will spend your year on it. Demand an idempotency key in every contract and dedupe at the sink, and at-least-once delivery becomes effectively exactly-once for a fraction of the cost. Reserve true transactional exactly-once for the places that truly cannot tolerate a duplicate even transiently — the billing meter being the obvious one.</p>
+  </div>
+
+  <h3>Event-time vs processing-time — the crucial distinction</h3>
+  <p>Chapter 01 flagged this with the <code>bid.placed</code> example: a bid can arrive at the platform seconds or minutes after it occurred — a mobile client was offline, a retry fired, the broker lagged. There are two clocks:</p>
+  <ul>
+    <li><strong>Event time</strong> — when the thing actually happened, stamped by the producer (<code>event_time</code> in the message above).</li>
+    <li><strong>Processing time</strong> — when the platform happened to read it.</li>
+  </ul>
+  <p>Bucket your "bids per minute" chart by <em>processing</em> time and a flurry of late-arriving bids all pile into the wrong minute — the chart is wrong, and the interruptible-clearing-price model trains on corrupted features. Correct windowing always keys on <strong>event time</strong>. But that raises the question: if data can arrive late, when is a time window "done" and safe to emit?</p>
+
+  <h3>Watermarks &amp; late data</h3>
+  <p>A <strong>watermark</strong> is the stream processor's assertion: "I believe I have now seen all events with <code>event_time ≤ T</code>." It trails real time by a configured <em>allowed lateness</em> (say, 2 minutes). When the watermark passes a window's end, the window <strong>fires</strong> and emits its aggregate. Events that arrive after the watermark are <strong>late</strong> and handled by an explicit policy — drop, route to a side output, or trigger a window update — never silently mis-bucketed.</p>
+
+  <div class="flow">  event-time windows (1-min tumbling), watermark = max event_time − 2 min
+
+  events (by event_time):  ▏14:00▕ ▏14:01▕ ▏14:02▕ ▏14:03▕ →
+                              ●●●     ●● ●    ●●●●    ●●
+  late arrival (event_time 14:01, seen at 14:03):  ◆
+                                       ▲
+                                       └─ routed into the 14:01 window
+                                          (still open: watermark < 14:02)
+
+  wall clock ───────────────────────────────────────────────▶
+                14:02            14:03            14:04
+  watermark ──────────────●──────────────●──────────────●
+                       (=14:00)        (=14:01)        (=14:02)
+                          │               │               │
+                          ▼               ▼               ▼
+                     FIRE 14:00 win   FIRE 14:01 win   FIRE 14:02 win
+                                      (incl. the ◆ late event)
+
+  any event_time ≤ 14:01 arriving AFTER its watermark → side output (DLQ),
+  never folded silently into the wrong minute.</div>
+
+  <p>The allowed-lateness knob is a direct latency-vs-correctness trade. A long horizon catches the flaky-residential-internet stragglers (recall Vast's hobbyist providers) but delays every result; a short horizon is snappy but drops more late data. There is no universally right value — it is a per-pipeline decision driven by how much lateness the source actually exhibits and how much the consumer can tolerate.</p>
+</section>
+
+<section id="firehose">
+  <h2>Designing the telemetry firehose</h2>
+  <p>Now the source that dominates the platform: <strong>~17,000 GPUs × one sample / 10 s = ~1,700 samples/sec = ~150 M/day</strong>. It is technically "streaming," but its volume and its dual use-case force a design the other event streams do not need.</p>
+
+  <h3>The dual-path pattern</h3>
+  <p>The telemetry stream serves three SLAs at once (chapter 01): operational dashboards that ask "is the fleet healthy <em>now</em>?", ML features that predict reliability and detect throttling, and a billing input that proves a GPU was delivering during a rented hour. No single store serves all three well. So the stream <strong>forks</strong>: one path to a time-series engine for real-time ops, one path to object storage for analytics and ML.</p>
+
+  <div class="flow">  17,000 host-agents  ──→  Kafka topic: telemetry.samples (partition by machine_id)
+                                       │
+                  ┌────────────────────┴─────────────────────┐
+                  │                                            │
+         REAL-TIME / OPS PATH                          ANALYTICS / ML PATH
+                  │                                            │
+                  ▼                                            ▼
+        ┌────────────────────┐                    ┌──────────────────────────┐
+        │     ClickHouse     │                    │  buffer + batch + compress │
+        │  (time-series TS)  │                    │  (Flink / Kafka Connect)   │
+        │                    │                    └─────────────┬──────────────┘
+        │  • sub-second p99  │                                  │  Parquet, snappy
+        │  • fleet-now dashb.│                                  ▼
+        │  • last-N-min       │                    ┌──────────────────────────┐
+        │    rollups          │                    │  object storage (S3/ADLS)│
+        └────────────────────┘                    │  raw zone, partitioned:   │
+                                                   │   dt=2026-06-16/hr=14/    │
+                                                   │   machine_bucket=…/       │
+                                                   └─────────────┬─────────────┘
+                                                                 │
+                                                                 ▼
+                                                   per-GPU-HOUR rollups → warehouse
+                                                   (join to billing/marketplace)</div>
+
+  <p>The two paths have opposite optimizations. The <strong>ops path</strong> into ClickHouse optimizes for freshness and cheap recent-window queries — it is the "is the fleet on fire right now" path, and it intentionally retains only a short window of fine-grained data. The <strong>analytics path</strong> optimizes for cost-per-byte-at-rest and replayability: it lands the <em>raw</em> samples untouched so any future ML feature can be recomputed, then derives the small per-GPU-hour rollups that flow into the warehouse for joining with business data.</p>
+
+  <h3>Batching, compression, partitioning</h3>
+  <p>Writing 1,700 tiny rows per second straight to object storage is a disaster — millions of small files, ruinous request costs, unusable scan performance (the "small files problem," chapter 05). The analytics path therefore <strong>buffers</strong> samples and writes them in batches — e.g. flush every 60 seconds or every 128 MB, whichever comes first — as <strong>columnar Parquet</strong> with compression. Files are <strong>partitioned by time</strong> (<code>dt=…/hr=…</code>) and bucketed by <code>machine_id</code>, because nearly every query is "metric for entities over a time window" and time-partitioning lets the engine prune to the relevant hours.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Do not route the firehose through the warehouse</span>
+    <p>Chapter 01 warned about this and it is worth repeating because it is the single most expensive mistake at a company like VastDP: loading raw per-10-second telemetry into Snowflake/BigQuery and querying it with SQL dashboards. It works at 1,000 GPUs and falls over — on cost first, then latency — at 17,000. <strong>Only pre-aggregated rollups (per-GPU-hour) enter the warehouse.</strong> Raw fine-grained telemetry lives in the time-series engine (recent) and object storage (history), never the row-or-general-columnar warehouse. We size this in chapters 05 and 14.</p>
+  </div>
+
+  <h3>Backpressure &amp; buffering</h3>
+  <p>The firehose is also where backpressure bites. If a sink slows (ClickHouse compaction, an object-store throttle), the system must not push back into the host-agents — they cannot buffer indefinitely on a hobbyist's home box, and lost telemetry corrupts billing and reliability. Kafka is the shock absorber: it durably retains the stream, so a temporarily slow consumer simply falls behind and catches up by replaying from its committed offset. <strong>Consumer lag</strong> (offset distance behind the head) is therefore the firehose's vital sign — the metric the on-call watches, covered under reliability below.</p>
+</section>
+
+<section id="batch">
+  <h2>Third-party batch ingestion</h2>
+  <p>The third-party sources — payments (Stripe, crypto rails, KYC/AML) and support (Zendesk-like) — are <strong>pulled, not pushed</strong>. The company does not own them, so they come with rate limits, pagination, and schemas that change on the vendor's schedule. Two patterns cover them.</p>
+
+  <h3>Webhook for timeliness, batch pull for truth</h3>
+  <p>Stripe (chapter 01) illustrates the canonical pairing. A <strong>webhook</strong> fires the moment a charge succeeds — timely, but webhooks can be missed (your endpoint was down, the delivery was dropped). A <strong>nightly API reconciliation pull</strong> re-fetches the day's objects and is the source of truth. The webhook gives you low latency; the batch pull guarantees completeness. You need both, and they must converge — the same charge arriving via both paths is deduped on its Stripe object id (idempotency again).</p>
+
+  <div class="flow">  STRIPE
+   │
+   ├── webhook: charge.succeeded ──▶ event endpoint ──▶ Kafka ──▶ lake
+   │     (timely, may be missed)                                   │
+   │                                                          dedupe on
+   │                                                         stripe object id
+   │                                                               │
+   └── nightly API pull (paginated, incremental since high-watermark)
+         GET /charges?created[gte]=<last_run>&limit=100 → cursor → …
+                              │
+                              ▼
+                       reconcile: any object in the pull
+                       not already in the lake → backfill
+                       (this path is the source of truth)</div>
+
+  <h3>Pagination, rate limits, incremental extraction</h3>
+  <p>A batch puller is mostly plumbing, and the plumbing is where it breaks:</p>
+  <ul>
+    <li><strong>Pagination.</strong> APIs return pages via cursors or offsets; the puller must follow them to completion and survive resuming mid-walk.</li>
+    <li><strong>Rate limits.</strong> Vendors throttle. The puller respects <code>429</code> / <code>Retry-After</code> with backoff, or it gets blocked and the pull fails half-done.</li>
+    <li><strong>Incremental high-watermark extraction.</strong> Never re-pull all history every night. Track the maximum <code>updated_at</code> (or a cursor) from the last successful run and request only records changed since — the <em>high-watermark</em>. This bounds cost and runtime as the vendor's data grows. (Note: this is the <em>extraction</em> high-watermark, a different mechanism from the streaming watermark in the firehose section, which governs window completeness.)</li>
+  </ul>
+
+  <h3>Connector tools</h3>
+  <p>Hand-writing pullers for dozens of SaaS APIs does not scale, so managed connectors exist precisely for this pattern. In <strong>Stack C</strong>, Fivetran handles pagination, rate limits, incremental extraction, and schema drift for support and payments out of the box; in <strong>Stack B</strong> the equivalent is Fivetran or Airbyte feeding Auto Loader. <strong>Stack A</strong> leans on Airbyte or bespoke extracts — cheaper in license, dearer in engineering time. The trade-off (buy vs. build the connector) is the same capital-vs-headcount choice chapter 03 framed for the whole stack.</p>
+</section>
+
+<section id="elt-etl">
+  <h2>ELT vs ETL — land raw, then transform</h2>
+  <p>Every pattern above ends with data <em>landing</em> somewhere. What happens next — transform-then-load or load-then-transform — is the ELT/ETL question, and the modern default has flipped.</p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>ETL — transform in flight</th><th>ELT — land raw, transform in-warehouse</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Order</td><td>Extract → Transform → Load</td><td>Extract → Load → Transform</td></tr>
+      <tr><td>Transform engine</td><td>Pipeline / streaming job (Flink, Spark)</td><td>Warehouse / lakehouse SQL (dbt, Dynamic Tables)</td></tr>
+      <tr><td>Raw kept?</td><td>Often discarded after transform</td><td>Raw zone retained, immutable</td></tr>
+      <tr><td>Reprocess on logic change</td><td>Re-run the pipeline; raw may be gone</td><td>Re-run SQL over retained raw — cheap</td></tr>
+      <tr><td>Best for</td><td>In-flight enrichment, PII redaction, heavy stream compute</td><td>Most warehouse modeling; analyst-owned logic</td></tr>
+    </tbody>
+  </table>
+
+  <p>Modern stacks default to <strong>ELT</strong>: land raw to the lake or warehouse <em>first</em>, transform with SQL <em>after</em>. The reasons are decisive. Storage is cheap, so keeping the raw zone is affordable; warehouses are now fast enough to transform at scale; and — most importantly — <strong>retained raw means a logic change is a re-run, not a re-ingest</strong>. Discover a bug in how you derive a feature six months in, and with ELT you just re-run the transform over data you still have. With pure ETL, the untransformed truth may be gone.</p>
+
+  <p>ETL still earns its place at ingestion time for things that <em>must</em> happen before landing: redacting or tokenizing PII before it touches the lake (KYC/AML data, chapter 11), and heavy stream computation like the firehose's windowed rollups, which are cheaper to compute once in flight than repeatedly in SQL.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Rule of thumb</span>
+    <p>Land raw and transform in-warehouse (<strong>ELT</strong>) by default. Reach for in-flight transformation (<strong>ETL</strong>) only when the data <em>cannot</em> be allowed to land in raw form (PII you must not store), or when the transform is a genuine stream-compute that would be wasteful to redo in SQL (windowed aggregations). When in doubt, keep the raw.</p>
+  </div>
+</section>
+
+<section id="schema-registry">
+  <h2>Schema registry &amp; evolution</h2>
+  <p>Chapter 01's anti-pattern list warned that a producing team can rename a column or add an enum value the moment a feature ships, and your pipeline breaks at 3 a.m. The data contract is the <em>agreement</em>; the <strong>schema registry</strong> is the runtime that <em>enforces</em> it.</p>
+
+  <p>Instead of embedding JSON shapes by convention, producers serialize events with <strong>Avro</strong> or <strong>Protobuf</strong> and register each schema in a central registry, which assigns a <code>schema_id</code> (note it in the Kafka message header above). Consumers fetch the schema by id to deserialize. Crucially, the registry <strong>rejects</strong> a producer's attempt to register a schema that violates the configured compatibility rule — so an incompatible change fails in the producer's CI, not in your pipeline at 3 a.m.</p>
+
+  <table>
+    <thead>
+      <tr><th>Compatibility mode</th><th>Allows the producer to…</th><th>Protects…</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Backward</strong></td><td>Add optional fields, remove fields</td><td>New consumers reading old data</td></tr>
+      <tr><td><strong>Forward</strong></td><td>Add fields, remove optional fields</td><td>Old consumers reading new data</td></tr>
+      <tr><td><strong>Full</strong></td><td>Only changes safe in both directions</td><td>Both — the strict default for VastDP contracts</td></tr>
+      <tr><td><strong>None</strong></td><td>Anything (no check)</td><td>Nothing — avoid</td></tr>
+    </tbody>
+  </table>
+
+  <p>Handling drift <em>without</em> breaking the pipeline comes down to this: under a backward-compatible regime, a producer may add a new optional field and old consumers simply ignore it; a consumer may be upgraded to read the new field with a default for historical events that lack it. The pipeline keeps flowing throughout. A truly breaking change (renaming a required field, changing a type) is forced through the contract's <code>breaking_change_policy</code> — the <code>major-version-bump + 2-week notice</code> from chapter 01 — giving the platform time to migrate consumers. The registry is how a contract stops being a wiki page and becomes an enforced invariant; we wire it into CI and governance in chapters 09 and 10.</p>
+</section>
+
+<section id="reliability">
+  <h2>Pipeline reliability primitives</h2>
+  <p>Ingestion runs unattended, so the design must assume every hop can fail, duplicate, or stall. A small set of primitives, applied consistently, is what separates a pipeline that pages weekly from one that self-heals.</p>
+
+  <ul>
+    <li><strong>Idempotency.</strong> Every record carries a stable key (<code>event_id</code>, Stripe object id, CDC LSN). Sinks upsert/dedupe on it, so a replay or redelivery is harmless. This is the foundation everything else rests on.</li>
+    <li><strong>Exactly-once sinks.</strong> Where a duplicate is intolerable even transiently (the billing meter), use a transactional sink that atomically commits the write and the consumer offset together.</li>
+    <li><strong>Dead-letter queues (DLQ).</strong> A poison message — unparseable, fails the schema, violates a constraint — is routed to a DLQ instead of crashing the consumer or, worse, being dropped. The pipeline keeps moving; the bad records wait for inspection and replay. (The late-data side output from the streaming section is the watermark-world cousin of a DLQ.)</li>
+    <li><strong>Replay / reprocessing.</strong> Because Kafka retains the log and the lake retains raw (ELT), you can re-run a pipeline from a past offset or re-derive a table from raw after a logic fix — without re-ingesting from the source.</li>
+    <li><strong>Monitoring lag.</strong> The single best health signal for a streaming pipeline is <strong>consumer lag</strong>: how far behind the head the consumer is. Rising lag means a sink is struggling before any data is actually lost — the early warning. Pair it with freshness SLOs derived from the contract's <code>freshness_p99</code>.</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th>Failure mode</th><th>Symptom</th><th>Mitigation</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Message redelivered (at-least-once)</td><td>Double-counted bids / charges</td><td>Idempotent sink, dedupe on <code>event_id</code></td></tr>
+      <tr><td>Poison / unparseable message</td><td>Consumer crash-loops or drops data</td><td>Route to dead-letter queue; alert; replay after fix</td></tr>
+      <tr><td>Sink slow / down (firehose)</td><td>Rising consumer lag</td><td>Kafka buffers; consumer catches up via offset replay</td></tr>
+      <tr><td>Producer ships breaking schema</td><td>Deserialization failures</td><td>Registry rejects in CI; contract version bump</td></tr>
+      <tr><td>Late event past the watermark</td><td>Window already fired</td><td>Side output + lateness policy; never silent mis-bucket</td></tr>
+      <tr><td>CDC slot not advancing (idle table)</td><td>Postgres WAL disk fills</td><td>Heartbeat interval keeps the slot moving</td></tr>
+      <tr><td>Bad transform logic deployed</td><td>Corrupted downstream tables</td><td>Reprocess from retained raw (ELT); no re-ingest</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="stack-mapping">
+  <h2>How A/B/C each implement ingestion</h2>
+  <p>The three patterns are universal; the tools differ by stack (chapter 03). Each stack expresses CDC, streaming/firehose, and batch differently:</p>
+
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Stack A — Open-source lakehouse</th><th>Stack B — Databricks-centric</th><th>Stack C — Snowflake-centric</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>OLTP CDC</td><td>Debezium → Kafka → Flink/sink</td><td>Debezium / DLT (Apply Changes Into)</td><td>Fivetran CDC connectors</td></tr>
+      <tr><td>Stream processing</td><td>Flink (windows, watermarks)</td><td>Spark Structured Streaming / DLT</td><td>Snowpipe Streaming + Dynamic Tables</td></tr>
+      <tr><td>Land to lake</td><td>Kafka Connect → Iceberg</td><td>Auto Loader → Delta</td><td>Snowpipe / Snowpipe Streaming</td></tr>
+      <tr><td>Firehose ops path</td><td>ClickHouse</td><td>Delta + Spark SS / ClickHouse</td><td>ClickHouse or Dynamic Tables</td></tr>
+      <tr><td>Batch / third-party</td><td>Airbyte / bespoke extracts</td><td>Fivetran or Airbyte → Auto Loader</td><td>Fivetran connectors</td></tr>
+      <tr><td>Schema registry</td><td>Confluent / Apicurio</td><td>Unity Catalog + registry</td><td>Native typing + registry</td></tr>
+      <tr><td>Transform style</td><td>ELT (dbt + Spark SQL)</td><td>ELT (DLT / dbt)</td><td>ELT (dbt + Dynamic Tables)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Read across the rows and the chapter's thesis holds: every stack lands raw and transforms in-warehouse (ELT), every stack forks the firehose to a time-series engine, and every stack reaches for a managed connector for the messy third-party pulls. The differences are ergonomics and cost, not architecture — exactly the framing chapter 03 set up. The short version of the stack choice for ingestion: <strong>A</strong> assembles best-of-breed open-source (most control, most glue code), <strong>B</strong> unifies streaming and batch under Spark/DLT (strongest when ML and large-scale stream compute dominate), <strong>C</strong> minimizes ingestion engineering by leaning on Fivetran and Snowpipe (fastest time-to-value).</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Three patterns cover all nine sources: <strong>log-based CDC</strong> for mutable OLTP, <strong>streaming</strong> for append-only events, <strong>batch pull</strong> for third-party APIs — match the pattern to the source's shape, never the tool.</li>
+    <li>CDC off the Postgres WAL (Debezium) preserves history and spares the OLTP database; the initial-snapshot-then-tail lifecycle and tombstones-as-data feed the SCD2 history of chapter 06.</li>
+    <li>Streaming correctness lives in two ideas: idempotency (dedupe on <code>event_id</code> to make at-least-once effectively exactly-once) and event-time windowing with watermarks to handle late, out-of-order data without silent corruption.</li>
+    <li>The firehose forks: stream to ClickHouse for real-time ops, land raw (batched, compressed, time-partitioned) to object storage for analytics/ML, and let <em>only</em> per-GPU-hour rollups into the warehouse.</li>
+    <li>Default to <strong>ELT</strong> — land raw, transform in-warehouse — so a logic change is a re-run, not a re-ingest. A schema registry turns data contracts into enforced invariants, and idempotency + DLQs + replay + lag monitoring keep pipelines correct unattended.</li>
+  </ul>
+  <p>We have the data flowing in. Next: where it lands and how it is laid out for cost and query speed. → <a href="05-storage-and-lakehouse.html">Storage &amp; the Lakehouse</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

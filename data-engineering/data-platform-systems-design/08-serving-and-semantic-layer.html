@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serving &amp; the Semantic Layer — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#consumers">The serving problem</a>
+    <a href="#bi">BI &amp; dashboards</a>
+    <a href="#reverse-etl">Reverse ETL</a>
+    <a href="#data-api">Data APIs for apps</a>
+    <a href="#semantic-problem">The metric-definition chaos</a>
+    <a href="#semantic-layer">The semantic layer</a>
+    <a href="#vastdp-metrics">The VastDP metric catalog</a>
+    <a href="#why-hinge">Why it's THE hinge</a>
+    <a href="#stack-mapping">Semantic layer per stack</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-transformation-orchestration.html">← Previous</a>
+    <a href="09-self-serve-enablement.html">Next: Self-Serve &amp; Enablement →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Serving, quality &amp; governance</span>
+  <h1>Serving &amp; the Semantic Layer</h1>
+  <p class="subtitle">The gold marts from chapter 06 are correct, conformed, and joined — but no consumer wants them in that exact shape. This chapter covers the four interfaces that reshape modeled data for its audience (BI, reverse ETL, data APIs, and the semantic layer) and argues that one of them — the semantic layer — is the single most load-bearing component in the whole platform, because it is simultaneously the contract that makes self-serve safe and the grounding that makes AI accurate.</p>
+</header>
+
+<section id="consumers">
+  <h2>The serving problem: one mart, many shapes</h2>
+  <p>By the end of chapter 06 we have <strong>gold marts</strong> — conformed dimensions and fact tables at well-defined grains, tested and documented. It is tempting to declare victory: the data is correct, so just point people at it. But "correct in the warehouse" and "useful to a consumer" are different problems. Each consumer from <a href="00-START-HERE.html#consumers">Start Here</a> needs the same modeled data in a <em>different shape, at a different latency, through a different interface</em>:</p>
+  <ul>
+    <li>A <strong>finance analyst</strong> wants a governed dashboard where "GMV" is a clickable metric, not a SQL expression they reconstruct (and get wrong).</li>
+    <li>The <strong>CRM / sales tooling</strong> wants a churn-risk score pushed <em>into the operational tool</em> next to the customer record — not in a dashboard nobody opens.</li>
+    <li>The <strong>marketplace product</strong> wants the reliability score served back to the public listing page in tens of milliseconds — the feedback loop from <a href="01-the-application-space.html#oltp">ch. 01</a>.</li>
+    <li>An <strong>LLM agent</strong> in Slack wants a machine-readable definition of every metric so its generated SQL is correct.</li>
+  </ul>
+  <p>Four needs, four <strong>serving interfaces</strong>. The job of this chapter's layer is to take gold marts and project them through whichever interface the consumer requires — without re-deriving the business logic each time.</p>
+
+  <div class="flow">                         ┌──────────────────────────────┐
+                         │      GOLD MARTS (ch. 06)      │
+                         │  conformed dims + fact tables │
+                         └───────────────┬──────────────┘
+                                         │
+            ┌────────────────┬───────────┼────────────┬─────────────────┐
+            ▼                ▼            ▼            ▼                 │
+   ┌────────────────┐ ┌────────────┐ ┌──────────┐ ┌──────────────────┐ │
+   │  SEMANTIC LAYER │ │  REVERSE   │ │ DATA API │ │  DIRECT BI EXTRACT│ │
+   │  (metrics layer)│ │    ETL     │ │ low-lat. │ │  (live or cached) │ │
+   │  ★ the hinge ★  │ │            │ │  store   │ │                   │ │
+   └───────┬─────────┘ └─────┬──────┘ └────┬─────┘ └─────────┬─────────┘ │
+           │  compiles SQL   │ push        │ serve           │           │
+   ┌───────┼─────────┐       ▼             ▼                 ▼           │
+   ▼       ▼         ▼   ┌────────┐   ┌──────────┐     ┌──────────┐      │
+ ┌────┐ ┌─────┐  ┌──────┐│  CRM   │   │ product  │     │ dashboards│     │
+ │ BI │ │ APIs│  │ AI / ││  ops   │   │ features │     │ (exec/ops)│     │
+ │    │ │     │  │NL-SQL ││ console│   │(public)  │     │          │      │
+ └────┘ └─────┘  └──────┘└────────┘   └──────────┘     └──────────┘      │
+   PRODUCT · FINANCE · SUPPLY OPS · TRUST &amp; SAFETY · ML · AI AGENTS ◀────┘
+                         (the consumers)</div>
+
+  <p>Notice where the semantic layer sits: it is not a peer of the dashboards — it is a layer <em>above the marts and below every consumer</em>, including BI itself. That placement is the whole argument of this chapter, and we build up to it through the three simpler interfaces first.</p>
+</section>
+
+<section id="bi">
+  <h2>BI &amp; dashboards — the dominant consumer</h2>
+  <p>For all the attention AI gets, the overwhelming majority of data consumption at a company like VastDP is still a human looking at a chart. BI is the default serving interface, and getting it right covers most of the value. Two axes shape the design.</p>
+
+  <h3>Embedded vs exploratory</h3>
+  <p><strong>Embedded BI</strong> is a small set of curated, pixel-stable dashboards — the exec GMV view, the supply-ops fleet-health board — that load fast and never surprise the viewer. <strong>Exploratory BI</strong> lets analysts pivot, drill, and build new charts against the modeled data. The same tool can do both, but the governance posture differs: embedded boards are change-controlled and reviewed; exploratory workspaces are sandboxes. Conflating them is how an unreviewed analyst chart ends up screenshotted in a board deck.</p>
+
+  <h3>Extract vs live query</h3>
+  <p>An <strong>extract</strong> (Tableau hyper, a Power BI import, a cached Superset dataset) snapshots query results into a fast columnar cache — great latency, but stale and a second copy of the truth. A <strong>live query</strong> hits the warehouse on every interaction — always fresh, but every dashboard refresh is a billed query. The senior pattern: live-query the small business marts (cheap), and extract or pre-aggregate the telemetry-derived rollups (otherwise every fleet dashboard re-scans <a href="00-START-HERE.html#scale">150 M rows/day</a>). Match the strategy to the grain, just like ingestion in ch. 04.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Governed dashboards beat a dashboard graveyard</span>
+    <p>Every BI tool accumulates thousands of abandoned dashboards, each encoding a slightly different definition of the same metric. The fix is not better naming conventions — it's removing the ability to redefine the metric in the dashboard at all. When the metric is defined <em>once</em> in the semantic layer (below) and the dashboard merely <em>references</em> it, a "dashboard graveyard" can't drift, because there's nothing local to drift.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Stack</th><th>Primary BI tools</th><th>Strengths for VastDP</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>A — OSS lakehouse</strong></td><td>Superset, Metabase</td><td>No per-seat cost; live-query Trino; pairs with Cube as the metrics source</td></tr>
+      <tr><td><strong>B — Databricks</strong></td><td>Databricks AI/BI (Dashboards + Genie), Sigma</td><td>Native to Unity Catalog; Genie reuses Unity metrics for NL queries</td></tr>
+      <tr><td><strong>C — Snowflake</strong></td><td>Sigma, Looker, Snowsight</td><td>Looker's LookML and Snowflake Semantic Views give a governed metrics tier</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="reverse-etl">
+  <h2>Reverse ETL — operational analytics</h2>
+  <p>The interfaces above bring the consumer <em>to</em> the data. <strong>Reverse ETL</strong> inverts the flow: it takes modeled data from the warehouse and pushes it <em>back into operational tools</em> where people already work. The platform computes a value once, then syncs it to the system that needs to act on it.</p>
+  <ul>
+    <li>A <strong>churn-risk score</strong> (an ML output, ch. 12) lands as a field on the customer record in the CRM, so a sales rep sees "high churn risk" without opening a dashboard.</li>
+    <li>A <strong>fleet-health flag</strong> ("provider X's reliability dropped below threshold") appears in the supply-ops console, triggering an outreach workflow.</li>
+    <li>A <strong>spend tier</strong> or <strong>credit-balance</strong> attribute syncs to the marketing tool to gate a campaign.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">When reverse ETL beats a dashboard</span>
+    <p>Reverse ETL wins whenever the consumer is a <em>person mid-workflow in another tool</em> or an <em>automated action</em>, not an analyst exploring. A dashboard asks the human to remember to go look; reverse ETL delivers the number to the point of decision. The rule of thumb: if the desired outcome is "someone does X in tool Y," push the data into tool Y. If the outcome is "someone understands a trend," build the dashboard.</p>
+  </div>
+
+  <p>Mechanically, reverse ETL (Hightouch/Census, or a hand-rolled sync job in Stack A) reads a gold mart on a schedule, diffs against the destination, and writes only changes through the operational tool's API. The critical design constraint: the <em>definition</em> of "churn risk" or "healthy fleet" must be the one canonical definition — which, again, points at the semantic layer. A score pushed into the CRM under a definition that disagrees with the churn number on the exec dashboard is worse than no score at all.</p>
+</section>
+
+<section id="data-api">
+  <h2>Data APIs — serving platform data back to apps</h2>
+  <p>Sometimes the consumer is the <strong>product itself</strong>. Recall the feedback loop from <a href="00-START-HERE.html#company">Start Here</a>: VastDP computes <strong>DLPerf</strong> and <strong>reliability scores</strong> from the telemetry firehose, and those scores are surfaced on the public marketplace to rank listings. That is not a dashboard or a back-office sync — it is a low-latency read path from the platform into the live product, in the critical path of every search.</p>
+
+  <div class="flow">  telemetry firehose ─▶ rollups (ch. 05/14) ─▶ reliability/DLPerf model (ch. 12)
+                                                          │
+                                                          ▼
+                                          ┌───────────────────────────┐
+                                          │   SERVING STORE (online)   │
+                                          │  key-value / OLAP, p99<50ms │
+                                          │  e.g. Redis, DynamoDB,      │
+                                          │       ClickHouse, KV cache  │
+                                          └─────────────┬─────────────┘
+                                                        │  data API (REST/gRPC)
+                                                        ▼
+                                          ┌───────────────────────────┐
+                                          │   MARKETPLACE PRODUCT      │
+                                          │  ranks listings by score   │ ◀─ public users
+                                          └───────────────────────────┘</div>
+
+  <p>The defining requirement is <strong>latency and availability under product traffic</strong> — utterly different from analytics. You do not point the marketplace at the warehouse; a warehouse query taking 800 ms at p99 is fine for a dashboard and fatal on a search page. The pattern is a <strong>low-latency serving store</strong>: the platform computes the score in batch or streaming, writes it to a key-value or OLAP store optimized for point reads (Redis, DynamoDB, ClickHouse), and the product reads through a thin data API. This is the same offline→online split as the feature store in ch. 12, and the same store often does both jobs.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">The data platform is now in the product's blast radius</span>
+    <p>The moment a data API serves the live product, an analytics outage becomes a <em>product</em> outage, and a bad score becomes a bad ranking that loses real revenue. Data APIs need product-grade SLAs, versioning, and rollback — and the score's <em>definition</em> must be governed, because a silent change to "reliability" reorders the entire marketplace. This is the strongest possible argument that metric definitions cannot live scattered in dashboards.</p>
+  </div>
+</section>
+
+<section id="semantic-problem">
+  <h2>The metric-definition chaos</h2>
+  <p>Now the problem this chapter exists to solve. The four interfaces above all need business metrics — GMV, utilization, churn, active GPUs. In a platform <em>without</em> a semantic layer, each metric gets <strong>re-derived in SQL by whoever builds each artifact</strong>. And those derivations quietly diverge.</p>
+
+  <p>Take "<strong>active GPU</strong>" — a number the CEO quotes in board meetings. Watch it fracture across five teams:</p>
+
+  <div class="flow">                       "How many ACTIVE GPUs do we have?"
+                                     │
+        ┌───────────┬───────────────┼───────────────┬───────────────┐
+        ▼           ▼               ▼               ▼               ▼
+  ┌──────────┐ ┌──────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+  │ SUPPLY    │ │ FINANCE  │  │  PRODUCT   │  │  EXEC DECK  │  │   ML TEAM  │
+  │ "reported │ │ "billed  │  │ "in an     │  │ "listed on  │  │ "util>5%   │
+  │  in last  │ │  for ≥1  │  │  active    │  │  the market │  │  this hour"│
+  │  10 min"  │ │  hour"   │  │  rental"   │  │  right now" │  │            │
+  └────┬─────┘ └────┬─────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+       │            │              │               │              │
+     17,020       15,900         11,400          16,800         13,250
+        └────────────┴──────────────┴───────────────┴──────────────┘
+                                     ▼
+                    FIVE DASHBOARDS, FIVE DIFFERENT NUMBERS
+                  "Why do the two dashboards disagree?" — every exec, eventually</div>
+
+  <p>Every one of those numbers is "correct" given its query — they are answering subtly different questions while wearing the same label. The same fracture happens to <strong>GMV</strong> (does it include credits? cancelled rentals? interruptible spend?), <strong>utilization</strong> (allocated time, or time the GPU was actually computing?), and <strong>churn</strong> (no rental in 30 days, or formally closed account?).</p>
+
+  <div class="callout warn">
+    <span class="callout-label">The executive-trust crisis</span>
+    <p>The damage isn't just a wrong number — it's the <em>loss of trust in the platform itself</em>. The first time two dashboards disagree in a leadership meeting, the next hour is spent debugging definitions instead of deciding anything, and from then on every number is met with "but is <em>this one</em> right?" A platform that can't give one trusted answer per metric has failed at its core job, no matter how clean the pipelines are. This is a governance failure, not a SQL bug — and you cannot conformance-test your way out of it after the fact.</p>
+  </div>
+</section>
+
+<section id="semantic-layer">
+  <h2>The semantic layer (headless BI)</h2>
+  <p>The fix is structural: define each dimension and metric <strong>exactly once</strong>, in a version-controlled, code-reviewed spec that lives <em>above</em> the warehouse, and have every consumer compile its query <em>through</em> that spec. This is the <strong>semantic layer</strong> (a.k.a. the metrics layer, or "headless BI" — BI logic decoupled from any single BI tool).</p>
+
+  <p>It is not another database. It is a thin compilation layer: a consumer asks for a metric (<code>gmv</code>) sliced by dimensions (<code>by gpu_model, by week</code>), and the semantic layer <strong>compiles that request into the one correct SQL</strong> against the gold marts and runs it on the warehouse. The business logic — the join, the filter, the aggregation — lives in the spec, not in the consumer.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>semantic-layer: vastdp / metrics.yml (MetricFlow / Cube style)</span></div>
+  <pre><code class="language-yaml">semantic_model:
+  name: rental_economics
+  defaults: { agg_time_dimension: rental_day }
+  model: ref('fct_rental_meter')          # the gold fact from ch. 06
+
+  entities:
+    - { name: rental,   type: primary,   expr: rental_id }
+    - { name: account,  type: foreign,   expr: account_id }
+    - { name: gpu,      type: foreign,   expr: gpu_id }
+
+  dimensions:
+    - { name: rental_day, type: time, type_params: { time_granularity: day } }
+    - { name: gpu_model,  type: categorical, expr: gpu_model }
+    - { name: is_interruptible, type: categorical }
+
+  measures:
+    - { name: gross_spend_usd, agg: sum, expr: meter_usd }
+    - { name: credits_usd,     agg: sum, expr: credit_applied_usd }
+    - { name: take_rate_usd,   agg: sum, expr: meter_usd * take_rate }
+
+metrics:
+  - name: gmv
+    label: "GMV (Gross Marketplace Value)"
+    description: "Gross client spend on settled rentals, net of credits.
+                  Excludes cancelled rentals. The ONE definition."
+    type: derived
+    type_params:
+      expr: gross_spend - credits
+      metrics:
+        - { name: gross_spend_usd, alias: gross_spend }
+        - { name: credits_usd,     alias: credits }</code></pre>
+  </div>
+
+  <p>When any consumer — Superset, a Python notebook, a reverse-ETL job, or an LLM — requests <code>gmv by gpu_model for last_week</code>, the layer compiles it deterministically to:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>compiled SQL (what the semantic layer generates)</span></div>
+  <pre><code class="language-sql">SELECT
+    gpu_model,
+    SUM(meter_usd)            - SUM(credit_applied_usd) AS gmv
+FROM analytics.fct_rental_meter
+WHERE rental_day &gt;= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'
+  AND rental_day &lt;  DATE_TRUNC('week', CURRENT_DATE)
+  AND rental_status = 'settled'        -- the "excludes cancelled" rule, applied ONCE
+GROUP BY gpu_model
+ORDER BY gmv DESC;</code></pre>
+  </div>
+
+  <p>Every consumer that asks for GMV gets <em>this exact SQL shape</em>. The "excludes cancelled" rule and the "net of credits" rule are applied in one place, by one definition. There is no longer a way for the finance dashboard and the exec deck to disagree, because neither one writes the SQL — the layer does.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why it lives ABOVE the warehouse, not in it</span>
+    <p>You could bake metrics into a dbt model, but then only SQL-on-the-warehouse consumers benefit, and you re-materialize a table per slice. The semantic layer sits one level up so it is <em>consumer-agnostic</em>: the same <code>gmv</code> definition serves a BI tool, a REST/GraphQL metrics API, a reverse-ETL sync, and an LLM's tool call — each gets correct, governed SQL for free. One definition, every interface. That universality is exactly why it can be the hinge.</p>
+  </div>
+
+  <p>The implementations differ by stack but the concept is identical: <strong>dbt MetricFlow</strong> and <strong>Cube</strong> (Stack A), <strong>Unity Catalog metric views</strong> + Databricks AI/BI (Stack B), <strong>Snowflake Semantic Views</strong> consumed by Cortex Analyst (Stack C). All compile a declared metric to warehouse SQL on demand.</p>
+</section>
+
+<section id="vastdp-metrics">
+  <h2>The VastDP metric catalog</h2>
+  <p>Here is the catalog the semantic layer encodes for VastDP. Each metric has a <strong>precise definition</strong>, a <strong>grain</strong>, and a <strong>source fact</strong> (one of the three grains from <a href="00-START-HERE.html#model">Start Here</a>). This table <em>is</em> the contract — getting it written down and agreed is half the battle.</p>
+
+  <table>
+    <thead>
+      <tr><th>Metric</th><th>Precise definition</th><th>Grain</th><th>Source fact</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>GMV</strong></td><td>Gross client spend on <code>settled</code> rentals, net of credits; excludes cancelled. On-demand + interruptible.</td><td>per day</td><td><code>fct_rental_meter</code></td></tr>
+      <tr><td><strong>Take-rate revenue</strong></td><td>VastDP's cut: <code>SUM(meter_usd × take_rate)</code> on settled rentals. The company's actual top line.</td><td>per day</td><td><code>fct_rental_meter</code></td></tr>
+      <tr><td><strong>Utilization %</strong></td><td>GPU-seconds with <code>gpu_util_pct &gt; 5</code> ÷ GPU-seconds the card was <em>rentable</em>. Measures real compute, not allocation.</td><td>per GPU-hour</td><td><code>fct_telemetry_hourly</code> (telemetry rollup)</td></tr>
+      <tr><td><strong>Fill rate</strong></td><td>Rented GPU-hours ÷ available (listed) GPU-hours. Marketplace liquidity from the supply side.</td><td>per day, per gpu_model</td><td><code>fct_telemetry_hourly</code></td></tr>
+      <tr><td><strong>Active GPUs</strong></td><td>Distinct GPUs reporting telemetry in the last 10 min AND attached to a non-stopped instance. The <em>one</em> definition that ends the 5-way fight.</td><td>point-in-time</td><td><code>fct_telemetry_hourly</code> + <code>dim_instance</code></td></tr>
+      <tr><td><strong>ARPU</strong></td><td>Take-rate revenue ÷ active billing accounts in the period.</td><td>per month</td><td><code>fct_rental_meter</code> + <code>dim_account</code></td></tr>
+      <tr><td><strong>Churn</strong></td><td>Accounts with ≥1 rental in prior period and zero in current period ÷ prior-period active accounts. (Behavioral, not account-closure.)</td><td>per month</td><td><code>fct_rental_meter</code> + <code>dim_account</code></td></tr>
+      <tr><td><strong>Gross margin per GPU-hour</strong></td><td>(Take-rate revenue − payout to provider − attributable infra cost) ÷ rented GPU-hours.</td><td>per GPU-hour, per gpu_model</td><td><code>fct_rental_meter</code> + <code>fct_payout</code></td></tr>
+      <tr><td><strong>Bid clearing price</strong></td><td>Lowest winning interruptible <code>bid_usd_hr</code> per gpu_model per hour — the market-clearing line.</td><td>per hour, per gpu_model</td><td><code>fct_bid_event</code> (the bid grain)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">The catalog is mostly a negotiation, not a coding task</span>
+    <p>The hard part of this table is not the YAML — it's getting finance, product, and supply ops to <em>agree</em> that "active GPU" means the one thing in row five. The DPE's role is to force that conversation, write down the winner, and make the spec the single source. Once agreed, encoding it is an afternoon; the agreement is what was missing for years.</p>
+  </div>
+</section>
+
+<section id="why-hinge">
+  <h2>Why the semantic layer is THE hinge</h2>
+  <p>This is the chapter's thesis. The semantic layer is not just a nice-to-have de-duplication of SQL — it is the <strong>single component that two of the platform's highest-value capabilities both depend on</strong>, and neither works without it:</p>
+  <ul>
+    <li><strong>Self-serve (ch. 09) is only safe because of it.</strong> Letting hundreds of analysts and PMs query freely is dangerous if "query freely" means "write your own GMV SQL." With a semantic layer, self-serve means "pick from governed metrics and dimensions" — the user composes, the layer guarantees correctness. The layer is what makes self-serve <em>safe</em> instead of a chaos multiplier.</li>
+    <li><strong>AI / text-to-SQL (ch. 13) is only accurate because of it.</strong> An LLM pointed at raw tables hallucinates joins and invents metric logic — it will happily compute GMV five different wrong ways, just like the five teams above. Pointed at the semantic layer, the LLM doesn't write the metric SQL at all; it picks <em>metrics and dimensions by name</em> and the layer compiles the correct query. The semantic layer is the <strong>grounding</strong> that turns a plausible-but-wrong text-to-SQL toy into something an exec can trust in Slack.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">One contract, two superpowers</span>
+    <p>The same artifact — a version-controlled definition of dimensions and metrics — is simultaneously the <strong>contract</strong> that makes human self-serve safe and the <strong>grounding</strong> that makes AI self-serve accurate. That is why it is the hinge of Section C and D both. Skip it, and self-serve degrades into a definition free-for-all <em>and</em> your AI confidently returns wrong numbers. Build it, and you've solved the trust problem for every consumer at once — human and machine. No other component in the platform has that leverage.</p>
+  </div>
+</section>
+
+<section id="stack-mapping">
+  <h2>Semantic layer per stack</h2>
+  <p>Same concept, three implementations — consistent with the stack table in <a href="00-START-HERE.html#stacks">Start Here</a>.</p>
+
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Stack A — OSS lakehouse</th><th>Stack B — Databricks</th><th>Stack C — Snowflake</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Metrics engine</td><td>dbt MetricFlow or Cube</td><td>Unity Catalog metric views</td><td>Snowflake Semantic Views</td></tr>
+      <tr><td>Compiles SQL to</td><td>Trino / Spark</td><td>Databricks SQL (Photon)</td><td>Snowflake warehouses</td></tr>
+      <tr><td>Serves BI via</td><td>Cube REST/SQL API → Superset</td><td>AI/BI Dashboards + Genie</td><td>Sigma / Looker / Snowsight</td></tr>
+      <tr><td>Serves AI via</td><td>self-hosted LLM → Cube API</td><td>Genie (Unity metrics)</td><td>Cortex Analyst (Semantic Views)</td></tr>
+      <tr><td>Definition lives in</td><td>Git (dbt/Cube YAML)</td><td>Unity Catalog + Git</td><td>Git + Snowflake objects</td></tr>
+    </tbody>
+  </table>
+
+  <p>The decision driver is the same as elsewhere: Stack A maximizes portability (Cube/MetricFlow are vendor-neutral and front every engine), while B and C trade some portability for a metrics layer that's <em>native</em> to their BI and AI surfaces, so Genie and Cortex Analyst inherit the definitions automatically. In practice a hybrid keeps the canonical definition in Git (dbt/MetricFlow) and projects it into whichever native surface each consumer uses.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Gold marts are correct but shapeless; four serving interfaces reshape them per consumer — <strong>BI</strong> (the dominant one), <strong>reverse ETL</strong> (push into operational tools), <strong>data APIs</strong> (low-latency serving back to the product), and the <strong>semantic layer</strong>.</li>
+    <li>Without a semantic layer, every metric — active GPUs, GMV, utilization, churn — gets re-derived per artifact and silently diverges, producing the executive-trust crisis where two dashboards disagree.</li>
+    <li>The semantic layer defines each dimension and metric <em>once</em>, in version-controlled YAML above the warehouse, and compiles every consumer's request to the one correct SQL.</li>
+    <li>It is the platform's hinge: the same contract makes human <strong>self-serve safe</strong> and AI <strong>text-to-SQL accurate</strong>. Skip it and both fail; build it and you solve trust for every consumer at once.</li>
+  </ul>
+  <p>With one trusted definition per metric in place, we can finally hand the keys to the consumers without fear. Next: turning that foundation into a real self-serve practice — contracts, documentation, and the cultural shift from ticket queue to platform. → <a href="09-self-serve-enablement.html">Self-Serve &amp; Enablement</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

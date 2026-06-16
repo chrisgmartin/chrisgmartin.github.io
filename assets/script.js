@@ -33,7 +33,9 @@
         { name: 'Build a Contract-Intelligence Pipeline', folder: 'build-contract-intelligence-pipeline' },
         { name: 'The FDE-DE Playbook', folder: 'fde-de-playbook' },
         { name: 'Contract Data Model — Reference', folder: 'contract-data-model-reference' },
-        { name: 'Enterprise Integration Atlas', folder: 'enterprise-integration-atlas' }
+        { name: 'Enterprise Integration Atlas', folder: 'enterprise-integration-atlas' },
+        { name: 'Data Engineering for Neoclouds', folder: 'data-engineering-for-neoclouds' },
+        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
       ]
     },
     {
@@ -41,7 +43,8 @@
       folder: 'data-science',
       guides: [
         { name: 'Product & Analytics Data Science', folder: 'product-analytics-ds' },
-        { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' }
+        { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' },
+        { name: 'Data Science for Neoclouds', folder: 'data-science-for-neoclouds' }
       ]
     },
     {

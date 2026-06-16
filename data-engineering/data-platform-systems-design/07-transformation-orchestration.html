@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transformation &amp; Orchestration — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#dbt">dbt as the T in ELT</a>
+    <a href="#incremental">Incremental models &amp; strategies</a>
+    <a href="#orchestration">Orchestration</a>
+    <a href="#dags">DAG / asset-graph design</a>
+    <a href="#freshness">Freshness SLAs &amp; cadence</a>
+    <a href="#backfills">Backfills &amp; reprocessing</a>
+    <a href="#testing">Testing in the pipeline</a>
+    <a href="#stack-mapping">Stacks A/B/C</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-data-modeling.html">← Previous</a>
+    <a href="08-serving-and-semantic-layer.html">Next: Serving &amp; the Semantic Layer →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Architecture foundations</span>
+  <h1>Transformation &amp; Orchestration</h1>
+  <p class="subtitle">Modeling (chapter 06) decided <em>what</em> tables exist; this chapter decides how they get <em>built and rebuilt</em>, reliably, on a schedule, for years. We cover dbt as version-controlled SQL transformation, incremental strategies for the high-volume rollups, and the orchestration layer — the shift from cron-driven tasks to data-aware asset scheduling — that turns a pile of SELECTs into a dependable, observable production pipeline.</p>
+</header>
+
+<section id="dbt">
+  <h2>dbt as the T in ELT</h2>
+  <p>In the ELT pattern this guide commits to (chapter 03), raw data lands first and is transformed <em>in place</em> by the warehouse or query engine. dbt is the tool that owns that <strong>T</strong>. Its central, almost-too-simple idea: <strong>a model is a <code>SELECT</code> statement in a file, and dbt materializes it as a table or view.</strong> You never write <code>CREATE TABLE</code> or <code>INSERT</code>; you describe the shape you want and dbt manages the DDL/DML, the dependency order, and the build.</p>
+
+  <p>The reason this reorganized the entire field is governance, not convenience. Before dbt, transformation logic lived in stored procedures, hand-scheduled SQL scripts, and BI-tool "custom SQL" boxes — un-versioned, untested, and impossible to reason about as a system. dbt put transformations in <strong>git</strong>: code-reviewed, tested in CI, documented, and assembled into a dependency graph that the tool derives automatically. SQL became software.</p>
+
+  <p>That graph comes from two functions that are the whole magic:</p>
+  <ul>
+    <li><code>source('billing', 'rental_meter')</code> — references a raw landed table declared in a <code>sources:</code> block. The indirection lets you point staging at the real raw schema in one place.</li>
+    <li><code>ref('stg_billing__rental_meter')</code> — references another model. Every <code>ref()</code> is an <em>edge</em> in the DAG. dbt reads the refs, topologically sorts them, and builds in order. You never hand-maintain dependency order; you just write <code>ref()</code> and the graph emerges.</li>
+  </ul>
+
+  <h3>Layering: staging → intermediate → marts, mapped onto medallion</h3>
+  <p>dbt's conventional project layering is the same medallion idea from chapter 06, expressed as folders. Bronze is the raw landed data dbt does <em>not</em> own; staging/intermediate are silver; marts are gold.</p>
+
+  <div class="flow">  RAW (bronze, dbt sources)          dbt-owned transformations                CONSUMERS
+  ┌────────────────────┐      ┌────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ raw.billing.       │      │  STAGING   │  │ INTERMEDIATE │  │    MARTS     │
+  │   rental_meter     │─────▶│ stg_*      │─▶│ int_*        │─▶│ fct_*, dim_* │──▶ BI
+  │ raw.mktplace.bid   │      │ 1:1 w/src  │  │ joins, fan-  │  │ business-    │──▶ semantic
+  │ raw.telemetry.*    │ src()│ rename,    │  │ out, reusable│  │ grain facts  │──▶ ML
+  │ (rolled up, ch.05) │      │ cast, dedup│  │ logic        │  │ + dimensions │──▶ ledger recon
+  └────────────────────┘      └────────────┘  └──────────────┘  └──────────────┘
+   bronze / silver-in            SILVER          SILVER             GOLD
+        ref() ─────────────────────▶ ref() ─────────▶ ref() ─────────▶ (DAG edges)</div>
+
+  <ul>
+    <li><strong>Staging</strong> (<code>stg_</code>): exactly one model per source table. Rename to the project's conventions, cast types, coalesce nulls, light dedup. No joins, no business logic. These are the clean atoms.</li>
+    <li><strong>Intermediate</strong> (<code>int_</code>): the messy middle — fan-out joins, window functions, reusable sub-grains that more than one mart needs. Materialized as ephemeral or views unless reused heavily.</li>
+    <li><strong>Marts</strong> (<code>fct_</code>, <code>dim_</code>): the business-grain facts and dimensions from chapter 06 — <code>fct_rental_meter</code>, <code>fct_telemetry_hourly</code>, <code>dim_machine</code>, <code>dim_account</code>. This is what analysts, the semantic layer, and ML features read.</li>
+  </ul>
+
+  <h3>A model: building fct_rental_meter</h3>
+  <p>Here is the mart for the billing atom from chapter 06 — one row per rental-hour — built by joining the staged meter to its dimensions. Note there is no DDL: just a config block, refs, and a SELECT.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>models/marts/billing/fct_rental_meter.sql</span></div>
+  <pre><code class="language-sql">{{
+  config(
+    materialized   = 'incremental',
+    incremental_strategy = 'merge',
+    unique_key     = 'rental_meter_id',
+    partition_by   = {'field': 'meter_hour', 'data_type': 'timestamp', 'granularity': 'day'},
+    cluster_by     = ['machine_key'],
+    on_schema_change = 'append_new_columns'
+  )
+}}
+
+with meter as (
+    select * from {{ ref('stg_billing__rental_meter') }}
+    {% if is_incremental() %}
+      -- only reprocess recent hours; lookback absorbs late-arriving meter rows
+      where meter_hour &gt;= (select dateadd(hour, -36, max(meter_hour)) from {{ this }})
+    {% endif %}
+),
+
+machine as ( select * from {{ ref('dim_machine') }} ),
+account as ( select * from {{ ref('dim_account') }} )
+
+select
+    m.rental_meter_id,
+    m.meter_hour,
+    m.rental_id,
+    mc.machine_key,
+    ac.account_key,
+    m.gpu_seconds,
+    m.gpu_seconds / 3600.0                       as gpu_hours,
+    m.usd_per_hour,
+    round(m.gpu_seconds / 3600.0 * m.usd_per_hour, 4) as gross_revenue_usd,
+    m.is_interruptible,
+    current_timestamp()                          as _loaded_at
+from meter m
+left join machine mc on m.machine_id = mc.machine_id and mc.is_current
+left join account ac on m.account_id = ac.account_id and ac.is_current</code></pre>
+  </div>
+
+  <p>And its companion <code>schema.yml</code> — where dbt's tests and documentation live. The tests run as part of every build and in CI; the descriptions render into the auto-generated docs site and feed the catalog (chapter 09).</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>models/marts/billing/_billing__models.yml</span></div>
+  <pre><code class="language-yaml">models:
+  - name: fct_rental_meter
+    description: "One row per rental per hour — the billing atom. Reconciles to the ledger."
+    columns:
+      - name: rental_meter_id
+        description: "Surrogate grain key (rental_id + meter_hour)."
+        data_tests:
+          - not_null
+          - unique
+      - name: machine_key
+        data_tests:
+          - relationships:
+              to: ref('dim_machine')
+              field: machine_key
+      - name: gross_revenue_usd
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range: { min_value: 0 }
+      - name: is_interruptible
+        data_tests:
+          - accepted_values: { values: [true, false] }</code></pre>
+  </div>
+
+  <div class="callout insight">
+    <span class="callout-label">The DAG is a side effect of writing refs</span>
+    <p>You never declare "build staging before marts." Because <code>fct_rental_meter</code> calls <code>ref('dim_machine')</code>, dbt knows the edge and orders the build. This is the deep idea: <strong>dependency order is derived from the code, not maintained by hand.</strong> Add a model, add a <code>ref()</code>, and the graph — and the docs, and the lineage — update themselves. Jinja macros (e.g. a shared <code>cents_to_usd()</code> or a <code>dbt_utils.star()</code> column selector) let you DRY the repeated SQL without losing that derived-lineage property.</p>
+  </div>
+</section>
+
+<section id="incremental">
+  <h2>Incremental models &amp; strategies</h2>
+  <p>The default materialization rebuilds the whole table every run — fine for <code>dim_account</code> (a small dimension), ruinous for <code>fct_telemetry_hourly</code> built off ~150 M telemetry samples a day (chapter 00's firehose). <strong>Incremental models</strong> solve this: on the first run dbt builds the full table; on every run after, it processes only <em>new or changed</em> rows and merges them in.</p>
+
+  <p>The mechanics are two pieces working together: the <code>is_incremental()</code> macro gates a <code>WHERE</code> clause that filters the source to a recent window, and the <code>incremental_strategy</code> decides how those filtered rows combine with what's already in the table. The <code>unique_key</code> tells <code>merge</code> what counts as "the same row."</p>
+
+  <div class="flow">  FULL REFRESH (small dims)              INCREMENTAL MERGE (high-volume facts)
+  ┌──────────────────┐                   ┌──────────────────────────────────┐
+  │ drop &amp; rebuild   │                   │ 1. filter source to recent window│
+  │ whole table      │                   │    WHERE event_hour &gt;= max - LB   │
+  │ every run        │                   │ 2. stage the new/changed rows     │
+  └──────────────────┘                   │ 3. MERGE on unique_key:           │
+   simple, always                        │      matched   → UPDATE           │
+   correct, expensive                    │      unmatched → INSERT           │
+                                         └──────────────────────────────────┘
+                                          cheap, but you own correctness:
+                                          unique_key + lookback must be right</div>
+
+  <h3>Choosing a strategy</h3>
+  <table>
+    <thead>
+      <tr><th>Strategy</th><th>How it combines rows</th><th>Needs</th><th>Use when…</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>append</strong></td><td>Inserts new rows; never touches existing</td><td>nothing</td><td>Immutable event log that never restates — raw clickstream landing. Fast, but no dedup: a re-run double-counts.</td></tr>
+      <tr><td><strong>merge / upsert</strong></td><td><code>MATCHED → UPDATE</code>, else <code>INSERT</code></td><td><code>unique_key</code></td><td>The default for facts that can restate — <code>fct_rental_meter</code>, where a late meter correction must overwrite, not duplicate. Idempotent by construction.</td></tr>
+      <tr><td><strong>insert_overwrite</strong></td><td>Replaces whole partitions present in the new batch</td><td>partition column</td><td>High-volume partitioned rollups — <code>fct_telemetry_hourly</code> by day. Re-running a day cleanly replaces it; cheaper than row-level merge at billions of rows.</td></tr>
+      <tr><td><strong>delete+insert</strong></td><td>Deletes matching keys, then inserts</td><td><code>unique_key</code></td><td>Engines without efficient MERGE; or when merge predicates get expensive. Semantically like merge.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Late data eats incremental models for breakfast</span>
+    <p>If your filter is <code>WHERE event_hour &gt;= max(event_hour)</code>, a telemetry sample that arrives 20 minutes late (flaky residential host, ch. 01) lands <em>after</em> the watermark and is silently dropped forever. The fix is a <strong>lookback window</strong>: filter to <code>max - N hours</code> and reprocess that overlap every run. With <code>merge</code>/<code>insert_overwrite</code> the overlap is idempotent — re-emitting the same hour corrects it instead of duplicating it. Size the lookback to your contract's <code>freshness_p99</code> plus margin; for the firehose, 24–36 hours is typical because hosts backfill after reconnecting.</p>
+  </div>
+</section>
+
+<section id="orchestration">
+  <h2>Orchestration</h2>
+  <p>dbt builds the graph; something has to <em>run</em> it — on time, in order, with retries, and tell you when it breaks. That is the orchestrator. Its job has five parts:</p>
+  <ul>
+    <li><strong>Schedule</strong> — trigger work on a cadence (cron) or on an event (a file landed, an upstream finished).</li>
+    <li><strong>Dependencies</strong> — run B only after A succeeds, across tools (CDC → dbt → semantic-layer refresh → ML feature build).</li>
+    <li><strong>Retries &amp; alerting</strong> — re-run transient failures with backoff; page a human on real ones.</li>
+    <li><strong>Backfills</strong> — re-run a date range on demand, without hand-editing SQL.</li>
+    <li><strong>Observability</strong> — run history, durations, lineage, and which run produced which data.</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Airflow</th><th>Dagster</th><th>Prefect</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Core abstraction</td><td><strong>Task</strong> in a DAG</td><td><strong>Asset</strong> (a data artifact)</td><td><strong>Task / flow</strong> (Pythonic)</td></tr>
+      <tr><td>Scheduling model</td><td>Time/cron-driven</td><td>Asset- &amp; freshness-driven</td><td>Time- or event-driven</td></tr>
+      <tr><td>Mental model</td><td>"What should run, when?"</td><td>"What data should exist, and is it fresh?"</td><td>"Run this Python on a schedule"</td></tr>
+      <tr><td>Partitions / backfill</td><td>Logical date, manual backfill</td><td>First-class partitioned assets</td><td>Parameterized runs</td></tr>
+      <tr><td>Lineage / observability</td><td>Task graph; lineage bolted on</td><td>Built-in asset lineage + catalog</td><td>Flow/run views</td></tr>
+      <tr><td>dbt integration</td><td>Operator (often one big task)</td><td>Each dbt model → an asset</td><td>dbt task wrapper</td></tr>
+      <tr><td>Sweet spot</td><td>Mature, ubiquitous, big ecosystem</td><td>Data-aware platforms, strong dev UX</td><td>Light, dynamic, code-first flows</td></tr>
+      <tr><td>In our stacks</td><td>Stack C alt; legacy default</td><td><strong>Stack A default</strong></td><td>Niche / Stack B alt</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">The modern shift: schedule on data, not on the clock</span>
+    <p>Airflow's model is task-centric: "at 02:00, run these tasks." It works, but it forces you to <em>infer</em> the state of your data from the state of your tasks — and the two drift. Dagster's model is <strong>asset-centric</strong>: you declare the data artifacts (<code>fct_rental_meter</code>, <code>telemetry_gpu_hour</code>) and their dependencies, attach a <strong>freshness policy</strong> ("this should be no more than 1 hour stale"), and the orchestrator runs whatever is needed to satisfy it. You stop scheduling jobs and start declaring SLAs on data. For a platform where finance, ops, and ML each need different freshness on the same lineage, this is the difference between a maintainable system and a thicket of cron expressions.</p>
+  </div>
+</section>
+
+<section id="dags">
+  <h2>DAG / asset-graph design</h2>
+  <p>Whatever the tool, the graph design principles are the same: explicit dependencies, the right scheduling trigger, partitioned units of work, and — above all — <strong>no monolith</strong>. A single giant DAG that ingests everything, runs all of dbt, and refreshes every downstream is the most common orchestration anti-pattern: one slow source stalls everything, a retry re-runs work that already succeeded, and the blast radius of any failure is the entire platform.</p>
+
+  <p>The VastDP graph is layered to match the data's journey, with each layer a separately schedulable, separately retryable set of assets:</p>
+
+  <div class="flow">        SOURCES                 SILVER                MARTS (gold)          DOWNSTREAM
+  ┌────────────────┐      ┌──────────────┐      ┌──────────────────┐
+  │ cdc_marketplace│─────▶│ stg_offer    │──┐   │                  │   ┌────────────────┐
+  │ cdc_billing    │─────▶│ stg_meter    │──┼──▶│ fct_rental_meter │──▶│ semantic layer │
+  │ events_kafka   │─────▶│ stg_bid      │──┤   │ dim_machine      │   │ (ch.08)        │
+  └────────────────┘      └──────────────┘  │   │ dim_account      │   └────────────────┘
+                                            │   └──────────────────┘            │
+  ┌────────────────┐      ┌──────────────┐  │   ┌──────────────────┐   ┌────────────────┐
+  │ telemetry      │═════▶│ rollup_gpu_  │══╪══▶│ fct_telemetry_   │══▶│ ML features    │
+  │ firehose (ch05)│ part │   hour (part)│  │   │   hourly (part)  │   │ (Feast, ch.12) │
+  └────────────────┘ /day └──────────────┘  │   └──────────────────┘   └────────────────┘
+                                            ▼
+                                   ┌──────────────────┐    ═══ = partitioned, one
+                                   │ sensor: ledger    │          partition per day
+                                   │ recon (event-     │    ──▶ = ref / asset edge
+                                   │ triggered, ch.10) │    sensor = data-aware trigger
+                                   └──────────────────┘</div>
+
+  <ul>
+    <li><strong>Dependencies</strong> are the <code>ref()</code> edges, surfaced to the orchestrator (Dagster ingests the dbt manifest so each model is an asset with its true upstreams).</li>
+    <li><strong>Sensors</strong> trigger on events rather than time — e.g. the ledger-reconciliation asset fires when a new billing CDC batch lands, not on a fixed cron, so reconciliation is never stale relative to the data.</li>
+    <li><strong>Partitioned assets</strong> — <code>fct_telemetry_hourly</code> is partitioned <strong>one partition per day</strong>. The orchestrator tracks each partition's materialization state independently, so "rebuild June 3rd" is a first-class operation and a failed day doesn't force a full rebuild.</li>
+    <li><strong>Data-aware scheduling</strong> — attach a freshness policy to the marts and let the orchestrator materialize upstreams on demand, instead of one cron firing the whole chain.</li>
+  </ul>
+
+  <p>Here is the telemetry rollup as a Dagster partitioned asset — the silver layer that turns the firehose into the per-GPU-hour grain the warehouse can afford to store (chapters 05 and 14):</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>vastdp/assets/telemetry.py</span></div>
+  <pre><code class="language-python">import dagster as dg
+
+daily = dg.DailyPartitionsDefinition(start_date="2026-01-01")
+
+@dg.asset(
+    partitions_def=daily,
+    deps=["raw_telemetry_sample"],                      # upstream asset edge
+    automation_condition=dg.AutomationCondition.eager(), # materialize when upstream updates
+    freshness_policy=dg.FreshnessPolicy(maximum_lag_minutes=90),  # ML wants hourly
+    group_name="silver",
+)
+def fct_telemetry_hourly(context: dg.AssetExecutionContext, clickhouse):
+    """One row per GPU per hour: utilization, power, uptime, throttle flags."""
+    day = context.partition_key                          # e.g. "2026-06-03"
+    # Idempotent by partition: replace this day's rows, never append.
+    clickhouse.run(f"""
+        INSERT INTO fct_telemetry_hourly
+        SELECT machine_id, gpu_index,
+               toStartOfHour(event_time)       AS gpu_hour,
+               avg(gpu_util_pct)               AS avg_util_pct,
+               max(temp_c)                     AS max_temp_c,
+               avg(power_w)                    AS avg_power_w,
+               countIf(gpu_util_pct IS NULL)   AS missing_samples
+        FROM   raw_telemetry_sample
+        WHERE  toDate(event_time) = '{day}'              -- one partition
+        GROUP  BY machine_id, gpu_index, gpu_hour
+    """)
+    context.add_output_metadata({"partition": day})</code></pre>
+  </div>
+</section>
+
+<section id="freshness">
+  <h2>Freshness SLAs &amp; cadence</h2>
+  <p>"How often should this run?" is the wrong first question. The right one is: <strong>how stale can each consumer tolerate this data being?</strong> Freshness is a property of the <em>consumer's need</em>, and it should drive the schedule — not the other way around. The same lineage serves consumers with wildly different tolerances:</p>
+
+  <table>
+    <thead>
+      <tr><th>Consumer</th><th>Asset</th><th>Acceptable staleness</th><th>Cadence it implies</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Finance / execs</td><td><code>fct_rental_meter</code>, GMV</td><td>~1 day (close-of-day)</td><td>Daily batch, post-midnight</td></tr>
+      <tr><td>Supply ops</td><td>Fleet health, fill rate</td><td>Minutes (near-real-time)</td><td>Micro-batch / streaming rollup</td></tr>
+      <tr><td>ML / data science</td><td><code>fct_telemetry_hourly</code> features</td><td>~1 hour</td><td>Hourly partition materialization</td></tr>
+      <tr><td>Trust &amp; safety</td><td>Fraud signals</td><td>Seconds–minutes</td><td>Streaming / event-triggered</td></tr>
+      <tr><td>Product / growth</td><td>Funnels, liquidity</td><td>Hours</td><td>Hourly or 4× daily</td></tr>
+    </tbody>
+  </table>
+
+  <p>This is exactly where data-aware scheduling pays off. Rather than encode these as five cron expressions you keep in sync by hand, you attach a <code>FreshnessPolicy</code> to each asset (as in the telemetry code above) and let the orchestrator compute the schedule. Finance's daily mart and ML's hourly features can share the same staging models while expressing different SLAs on the marts — the orchestrator builds shared upstreams just often enough to satisfy the tightest downstream consumer.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Freshness SLAs are the cousin of the SLOs in chapter 10</span>
+    <p>A freshness policy ("no more than 90 minutes stale") is an operational <strong>SLO</strong> on a data asset, and it should be monitored like one: alert when an asset misses its policy, track the miss rate as a reliability metric, and tie it back to the source's contracted <code>freshness_p99</code> (chapter 01). Chapter 10 develops freshness, completeness, and correctness as the three pillars of data-quality SLOs; here it is enough to internalize that <em>the schedule is downstream of the SLA.</em></p>
+  </div>
+</section>
+
+<section id="backfills">
+  <h2>Backfills &amp; reprocessing</h2>
+  <p>Every long-lived pipeline eventually needs to rebuild the past: a logic bug shipped 30 days ago, a source backfilled corrected data, a new column was added to a mart, or an upstream schema changed. The property that makes this survivable is <strong>idempotency</strong>: re-running a transform for a given period produces the same result whether it's the first time or the fifth — no double-counting, no drift.</p>
+
+  <p>Idempotency is not free; it is designed in. The patterns from earlier sections are exactly what buy it: <code>merge</code> on a <code>unique_key</code> (a re-run overwrites, never duplicates) and <code>insert_overwrite</code> on partitions (a re-run replaces a whole day). The telemetry asset above is idempotent by partition — re-materializing <code>2026-06-03</code> cleanly replaces that day's rows. Contrast with a naïve <code>append</code> model: re-running it <em>doubles</em> the data. The rule is blunt: <strong>if a transform isn't safe to re-run, it isn't done.</strong></p>
+
+  <div class="flow">  Scenario: a bug in gross_revenue_usd shipped 30 days ago.
+
+  Day -30 ─────────────────────────────────────────── Day 0 (bug found)
+   │                                                      │
+   │  fct_rental_meter built daily with the WRONG formula │
+   ▼                                                      ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 1. fix the SQL, code-review, merge to main            │
+  │ 2. orchestrator: backfill partitions [Day-30 .. Day-1]│   one partition
+  │ 3. each day re-materializes via MERGE / overwrite     │ = one unit of work,
+  │    → corrects in place, no duplicates (idempotent)    │   parallelizable,
+  │ 4. downstream assets (semantic, ML) auto-invalidate   │   independently
+  │    and rebuild for affected partitions only           │   retryable
+  └──────────────────────────────────────────────────────┘
+                          ▼
+              corrected history, no full rebuild, auditable run log</div>
+
+  <ul>
+    <li><strong>Partitioned backfills</strong> turn "rebuild 30 days" into 30 independent units the orchestrator can run in parallel, retry individually, and track to completion — not one monstrous query.</li>
+    <li><strong>Schema-change reprocessing:</strong> a new column on <code>fct_rental_meter</code> needs a full backfill to populate history; <code>on_schema_change = 'append_new_columns'</code> (see the model config) lets the column appear without a manual <code>ALTER</code>, then you backfill to fill it.</li>
+    <li><strong>Separate logic from schedule:</strong> because the transform is parameterized by partition (<code>context.partition_key</code>), backfilling is just running the same code over a different date range — no forked "backfill script" to drift from production.</li>
+  </ul>
+</section>
+
+<section id="testing">
+  <h2>Testing in the pipeline</h2>
+  <p>Transformation code is code, so it gets tested like code — but data pipelines need a <em>second</em> axis of testing: the data flowing through them, not just the logic. Both run in CI on every pull request and again on every production build.</p>
+
+  <h3>The data-test pyramid</h3>
+  <div class="flow">                        ▲ fewer, broader, slower
+          ┌──────────────────────────────────┐
+          │  e2e / recon: ledger balances,    │   run in prod after build
+          │  GMV ties to source (ch.10)       │
+        ┌─┴──────────────────────────────────┴─┐
+        │  relationship &amp; business-rule tests:   │  dbt tests, every build
+        │  FK integrity, accepted_values, ranges │
+      ┌─┴────────────────────────────────────────┴─┐
+      │  schema / column tests: not_null, unique,    │  cheap, run constantly
+      │  data types — caught earliest &amp; cheapest     │
+      └──────────────────────────────────────────────┘
+                        ▼ many, narrow, fast</div>
+
+  <ul>
+    <li><strong>Built-in dbt tests</strong> — the four generic tests cover most ground: <code>not_null</code>, <code>unique</code>, <code>relationships</code> (foreign-key integrity to another model), and <code>accepted_values</code> (enum guard). They live in <code>schema.yml</code> (see the <code>fct_rental_meter</code> example) and turn assumptions into assertions.</li>
+    <li><strong>dbt_utils &amp; packages</strong> — <code>dbt_utils.accepted_range</code>, <code>recency</code> (a freshness test), <code>equal_rowcount</code>, and expression tests cover the next tier without writing SQL.</li>
+    <li><strong>Custom singular tests</strong> — a SQL file that returns failing rows. The classic for VastDP: <em>"sum of ledger debits = sum of credits"</em>, the money-correctness assertion promised in chapter 01.</li>
+    <li><strong>Unit tests for SQL logic</strong> — dbt unit tests feed fixed input rows to a model and assert the output, so you can prove the <code>gross_revenue_usd</code> formula is right against tiny fixtures, without touching warehouse data.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">CI on a sample is the cheap insurance</span>
+    <p>On every PR, CI should <code>dbt build --select state:modified+</code> against a <em>small sample</em> or a cloned dev schema — building only the changed models and their downstream, then running their tests. This catches a broken <code>ref()</code>, a failed <code>not_null</code>, or a regression in the revenue formula <em>before</em> merge, for pennies, instead of at 3 a.m. in production. Schema-change tests here are also where data-contract violations (chapter 01) get caught in code review.</p>
+  </div>
+
+  <p>Tests in the pipeline are the bridge into chapter 10: the same assertions, run on a schedule against production and wired to alerts, <em>become</em> the data-quality monitors and SLOs. A test you run in CI to block a bad merge is the same test you run in prod to detect a bad source.</p>
+</section>
+
+<section id="stack-mapping">
+  <h2>How the three stacks transform &amp; orchestrate</h2>
+  <p>The principles are stack-agnostic; the tooling differs. dbt is the near-universal transform layer across all three (chapter 00's stack table) — what changes is where it runs and what schedules it.</p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Transform</th><th>Orchestrate</th><th>Incremental mechanism</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>A · OSS lakehouse</strong></td><td>dbt-core on Spark/Trino</td><td><strong>Dagster</strong> (assets, freshness policies); Airflow alt</td><td>dbt incremental → Iceberg merge / overwrite</td></tr>
+      <tr><td><strong>B · Databricks</strong></td><td>dbt <em>or</em> DLT (Spark)</td><td>Databricks <strong>Workflows</strong>; DLT pipelines</td><td>dbt-on-Delta merge, or DLT streaming tables</td></tr>
+      <tr><td><strong>C · Snowflake</strong></td><td>dbt + <strong>Dynamic Tables</strong></td><td>Snowflake <strong>Tasks</strong>; dbt Cloud / Airflow</td><td>dbt incremental, or Dynamic Tables (declarative refresh)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Two patterns are worth noting. In <strong>Stack C</strong>, Snowflake <em>Dynamic Tables</em> push the data-aware idea into the warehouse itself: you declare a target lag ("refresh to within 1 hour") and Snowflake schedules the incremental refresh — freshness-driven scheduling without a separate orchestrator, at the cost of warehouse lock-in. In <strong>Stack B</strong>, Delta Live Tables blurs the transform/orchestrate line similarly. The trade-off is the recurring theme of chapter 03: Stack A keeps the orchestrator (Dagster) explicit and portable; B and C absorb more of it into the platform for less operational burden and more lock-in. Ingestion-side, a lightweight tool like DLT (data load tool) can cover the EL for third-party sources in Stack B before dbt does the T.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>dbt makes transformation <strong>version-controlled software</strong>: models are SELECTs, <code>ref()</code>/<code>source()</code> derive the DAG, and staging→intermediate→marts maps directly onto the medallion layers of chapter 06.</li>
+    <li><strong>Incremental models</strong> with the right strategy (<code>merge</code> for restating facts, <code>insert_overwrite</code> for partitioned rollups) plus a <strong>lookback window</strong> are what make the firehose-scale rollups affordable and correct.</li>
+    <li>The orchestrator schedules, sequences, retries, and observes — and the modern shift is from <strong>task/cron scheduling (Airflow)</strong> to <strong>asset/freshness-aware scheduling (Dagster)</strong>: declare the data and its SLA, not the job.</li>
+    <li>Design the graph in <strong>partitioned, separately schedulable layers</strong>; avoid the monolithic DAG. Partitions make backfills first-class.</li>
+    <li><strong>Freshness SLAs are downstream of consumer need</strong> and become the SLOs of chapter 10; <strong>idempotency</strong> makes backfills and reprocessing safe; <strong>tests in CI</strong> are the same assertions that become production monitors.</li>
+  </ul>
+  <p>We now have trustworthy, fresh, well-tested marts. The next question is how internal users — and AI agents — actually <em>consume</em> them without re-deriving every metric. → <a href="08-serving-and-semantic-layer.html">Serving &amp; the Semantic Layer</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

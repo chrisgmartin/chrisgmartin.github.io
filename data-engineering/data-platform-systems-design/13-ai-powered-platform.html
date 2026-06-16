@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Powering the Platform — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#shift">AI: the newest data consumer</a>
+    <a href="#text-to-sql">Text-to-SQL and why it fails</a>
+    <a href="#semantic-grounding">Grounding on the semantic layer</a>
+    <a href="#rag-catalog">RAG over the catalog</a>
+    <a href="#agents">Agents for data tasks</a>
+    <a href="#accuracy">The accuracy stack</a>
+    <a href="#evals">Evaluating NL-to-SQL</a>
+    <a href="#guardrails">Guardrails</a>
+    <a href="#vastdp-example">Worked end-to-end</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="12-platform-for-ai-ml.html">← Previous</a>
+    <a href="14-performance-and-scale.html">Next: Performance &amp; Scale →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · AI enablement</span>
+  <h1>AI Powering the Platform</h1>
+  <p class="subtitle">The newest consumer of VastDP is an LLM answering questions in Slack — and it is the most dangerous one, because a confidently wrong number spreads faster and is trusted more than a blank dashboard. This chapter argues the unfashionable thesis: accuracy does not come from a bigger model. It comes from <em>grounding</em> the model on the semantic layer from <a href="08-serving-and-semantic-layer.html">chapter 08</a>, feeding it catalog context, and wrapping it in evals and guardrails. The model is the easy part; the grounding is the platform's job.</p>
+</header>
+
+<section id="shift">
+  <h2>AI: the newest data consumer — the promise and the peril</h2>
+  <p>Every chapter so far has served a consumer with a known shape: a finance analyst wants a governed dashboard, the product wants a low-latency score, an ML model wants features. Now a new consumer arrives, and it does not fit the mold. Someone in the supply-ops channel types <em>"what was H100 fill rate last week?"</em> and expects a number back in seconds — no ticket, no analyst, no dashboard. This is the dream the <a href="00-START-HERE.html#consumers">Start Here</a> consumer list flagged: the "user" is increasingly an LLM, and the value is enormous. Self-serve finally means <em>everyone</em>, not just people who write SQL.</p>
+
+  <p>That is the promise. The peril is sharper than for any human consumer. A dashboard that fails renders an error; a human analyst who is unsure says "let me check." An LLM does neither by default — it returns a fluent, plausible, <strong>confidently wrong</strong> number, with no signal that anything went wrong. And a wrong number in Slack is worse than no number, because it gets screenshotted, quoted in a standup, and pasted into a board doc before anyone reconciles it. The executive-trust crisis from <a href="08-serving-and-semantic-layer.html#semantic-problem">ch. 08</a> — "but is <em>this one</em> right?" — does not go away with AI; it accelerates.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">A confidently wrong number is a liability, not a feature</span>
+    <p>The failure mode of a search engine is a bad link, which you ignore. The failure mode of a generative answer is a <em>false statement asserted as fact</em>. If your NL interface answers "H100 fill rate was 81% last week" and the real figure is 68% because the model invented a join, you have not built a productivity tool — you have built a misinformation pipeline with your logo on it. The entire engineering problem of this chapter is making the system <em>refuse</em> to do that.</p>
+  </div>
+
+  <p>The naive answer — "just point an LLM at the warehouse and let it write SQL" — fails for exactly the reason ch. 08 spent a whole chapter on. The warehouse is full of raw tables with ambiguous columns, undocumented joins, and five plausible ways to compute every metric. A model handed that surface area does not become a careful analyst; it becomes the <em>sixth</em> team in the five-way "active GPU" fight, inventing a definition on the fly. Accuracy is not a model property. It is a <em>platform</em> property, and we build it the same way we built trust for humans: by removing the model's ability to be wrong, not by hoping it gets smarter.</p>
+</section>
+
+<section id="text-to-sql">
+  <h2>Text-to-SQL: how it works, and why raw schemas break it</h2>
+  <p>The core mechanism is <strong>text-to-SQL</strong>: give the model a natural-language question plus a description of the database, and have it emit a SQL query. In its naive form the "description" is the raw schema — table names, column names, maybe a few foreign keys — pulled from the warehouse catalog.</p>
+
+  <div class="flow">  NAIVE TEXT-TO-SQL (raw schema)
+
+  "what was H100 fill rate last week?"
+              │
+              ▼
+  ┌───────────────────────────────┐
+  │  LLM  +  raw schema dump        │
+  │  (table & column names only)    │
+  └───────────────┬───────────────┘
+              ▼
+  ┌───────────────────────────────┐
+  │  generated SQL                  │   ← which "fill rate"? which join?
+  │  SELECT ... FROM rental r       │      which time column? which filter?
+  │  JOIN gpu g ON ??? WHERE ...    │      the model GUESSES every one
+  └───────────────┬───────────────┘
+              ▼
+        a number  ──▶  plausible, unverifiable, often WRONG</div>
+
+  <p>It demos beautifully on a clean three-table toy schema and collapses on a real platform. The reason is that every hard part of analytics lives in knowledge that is <em>not in the schema</em>. The column <code>util</code> does not say whether it means allocated time or actual compute. The path from <code>rental</code> to <code>gpu</code> does not say which of three join keys is correct. Nothing in the DDL encodes that "fill rate" means rented GPU-hours over <em>listed</em> GPU-hours and not over <em>total</em> hours. The model fills every gap with a confident guess, and crucially, <strong>it has no notion of correctness</strong> — it optimizes for plausible SQL, not for the right answer. Recall ch. 08's "five definitions of active GPU": a raw-schema model will reproduce that chaos query by query, never converging on the one the company agreed to.</p>
+
+  <table>
+    <thead>
+      <tr><th>Failure mode</th><th>What the model does</th><th>VastDP example</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Ambiguous columns</strong></td><td>Picks a column by name, not meaning</td><td>Uses <code>gpu_util_pct</code> raw instead of the &gt;5% "real compute" rule behind Utilization %</td></tr>
+      <tr><td><strong>Wrong / invented joins</strong></td><td>Hallucinates a join key or path</td><td>Joins <code>telemetry_sample</code> to <code>rental</code> directly, skipping <code>instance</code> — mis-attributing every sample</td></tr>
+      <tr><td><strong>Unknown business logic</strong></td><td>Omits filters it can't see</td><td>Forgets <code>rental_status = 'settled'</code>, so GMV silently includes cancelled rentals</td></tr>
+      <tr><td><strong>Multiple metric definitions</strong></td><td>Invents one of N plausible variants</td><td>Computes "active GPUs" as listed-on-market (16,800) when the agreed answer is telemetry+instance (13,250)</td></tr>
+      <tr><td><strong>Event-time vs arrival</strong></td><td>Buckets by load time, not event time</td><td>Aggregates bids by ingest timestamp — the ch. 01 lateness bug, now automated</td></tr>
+      <tr><td><strong>No notion of correctness</strong></td><td>Returns fluent SQL regardless of truth</td><td>Answers with full confidence even when the join produced a fan-out and the number is doubled</td></tr>
+    </tbody>
+  </table>
+
+  <p>The unifying point: these are not bugs a better model fixes. They are <em>missing-context</em> failures. The knowledge to answer correctly exists in the company — it just isn't in the schema the model was handed. The rest of this chapter is about handing the model the right context, and the single highest-leverage piece of context is the semantic layer.</p>
+</section>
+
+<section id="semantic-grounding">
+  <h2>Grounding on the semantic layer = the accuracy lever</h2>
+  <p>Here is the central move. Instead of asking the model to <em>write arbitrary SQL against raw tables</em>, we ask it to <em>pick a metric and some dimensions from the governed semantic layer</em> — and let the layer compile the correct SQL, exactly as it does for every other consumer in ch. 08. The model never touches the join, the filter, or the aggregation. It chooses from a validated menu, and the menu guarantees the answer.</p>
+
+  <div class="flow">  RAW-SCHEMA TEXT-TO-SQL              │   SEMANTIC-LAYER-GROUNDED
+  (fails)                             │   (works)
+                                      │
+  question                            │   question
+     │                                │      │
+     ▼                                │      ▼
+  LLM writes ANY SQL                  │   LLM picks metric + dimensions
+  over 200 raw tables                 │   from the GOVERNED menu (ch. 08)
+     │  guesses joins/filters         │      │   {metric: fill_rate,
+     ▼                                │      ▼    dims:[gpu_model], grain: week}
+  unverified SQL ─▶ wrong number      │   SEMANTIC LAYER compiles
+                                      │      │   the ONE correct SQL
+  problem space: "write any SQL"      │      ▼
+  (infinite, mostly wrong)            │   governed SQL ─▶ correct number
+                                      │
+                                      │   problem space: "pick from a menu"
+                                      │   (small, all answers valid)</div>
+
+  <p>This is the whole trick, and it is a <em>problem-space collapse</em>. "Write any SQL over 200 tables" is an essentially unbounded space in which almost every point is subtly wrong. "Pick a metric from a list of nine and some dimensions from a known set" is a tiny, enumerable space in which <em>every</em> point is correct by construction, because the semantic layer authored the SQL, not the model. We have not made the model smarter. We have changed its job from <em>authoring correctness</em> (which it cannot do) to <em>selecting from pre-validated correctness</em> (which it does well).</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>NL question → semantic-layer query (the model's actual output)</span></div>
+  <pre><code class="language-json">// "what was H100 fill rate last week?"
+// The LLM does NOT emit SQL. It emits a semantic-layer query:
+{
+  "metric": "fill_rate",          // chosen from the ch.08 metric catalog
+  "dimensions": ["gpu_model"],    // chosen from declared dimensions
+  "filters": [
+    { "dimension": "gpu_model", "op": "=", "value": "H100" }
+  ],
+  "time": { "grain": "week", "range": "last_week" }
+}</code></pre>
+  </div>
+
+  <p>That structured request is handed to the same MetricFlow / Cube / Cortex Analyst engine every other consumer uses, which compiles it deterministically to the governed SQL — identical to the GMV compilation shown in ch. 08, applying the "rented ÷ listed GPU-hours" rule once, in one place. The model's output is validated <em>before execution</em>: is <code>fill_rate</code> a real metric? Is <code>gpu_model</code> a declared dimension? Is <code>H100</code> a known value? If any check fails, the request is rejected and never becomes a wrong number.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">This is WHY ch. 08 is load-bearing — the prerequisite, not a reference</span>
+    <p>Chapter 08 called the semantic layer "the hinge" and promised it would make AI accurate. <strong>This section is that promise being paid.</strong> Without the semantic layer, every technique below is mitigation on top of a fundamentally ungrounded system — you are sanding the edges of guesswork. With it, the AI inherits, for free, every metric definition the company already fought over and agreed to: the one "active GPU," the credits-netted GMV, the settled-only filter. The grounding <em>is</em> the semantic layer. If you skipped ch. 08, your NL interface will reproduce the five-way definition fight one query at a time, and no model upgrade will save it. Build the semantic layer first; the AI is the second consumer it pays off.</p>
+  </div>
+</section>
+
+<section id="rag-catalog">
+  <h2>RAG over the catalog, docs, and lineage</h2>
+  <p>Grounding on the semantic layer answers the metric questions cleanly, but two gaps remain. First, the model still has to <em>map</em> messy human language onto the right metric and dimension — "fill rate," "occupancy," "how full are we" all point at <code>fill_rate</code>, and "the big Hoppers" means <code>gpu_model = 'H100'</code>. Second, plenty of legitimate questions ("which tables feed the churn model?", "what does <code>dlperf_probe</code> mean?") are about the platform itself, not a metric. Both are solved by <strong>retrieval-augmented generation</strong>: before the model answers, fetch the relevant context from the catalog, docs, and lineage (the assets of ch. 09 and ch. 10) and put it in the prompt.</p>
+
+  <div class="flow">  question ──▶ embed ──▶ semantic search over the knowledge base
+                                    │
+        ┌───────────────┬──────────┼───────────┬────────────────┐
+        ▼               ▼          ▼           ▼                ▼
+  ┌──────────┐  ┌─────────────┐ ┌────────┐ ┌──────────┐ ┌──────────────┐
+  │ semantic │  │  table &amp;     │ │ column │ │ lineage  │ │ prior vetted │
+  │ layer    │  │  metric      │ │ descr. │ │ (ch. 10) │ │ queries      │
+  │ defs(08) │  │  docs (09)   │ │        │ │          │ │ (few-shot)   │
+  └────┬─────┘  └──────┬──────┘ └───┬────┘ └────┬─────┘ └──────┬───────┘
+       └───────────────┴───────────┴───────────┴──────────────┘
+                                    ▼
+                    retrieved context injected into the prompt
+                                    ▼
+              LLM disambiguates → correct metric/dimension pick</div>
+
+  <p>The retrieved context does the disambiguation work. Metric descriptions ("Fill rate = rented GPU-hours ÷ listed GPU-hours, per gpu_model") tell the model which metric matches the intent. Column semantics resolve synonyms and acronyms. Lineage answers structural questions and lets an agent reason about blast radius. And a small set of <strong>prior vetted queries</strong> — real questions paired with their correct semantic-layer requests — act as few-shot examples that pin the model's output format and teach it the house vocabulary.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">RAG narrows the menu; it does not author SQL</span>
+    <p>Keep the division of labor clean. Retrieval's job is to help the model <em>choose the right entry from the governed menu</em> — it surfaces definitions and examples. It is never a license to generate raw SQL from a retrieved table description. The semantic layer still compiles the query. RAG makes the <em>selection</em> accurate; the semantic layer makes the <em>execution</em> correct. Conflating them — "the model read the table doc, so let it write the join" — quietly re-opens every failure mode from the table above.</p>
+  </div>
+</section>
+
+<section id="agents">
+  <h2>Agents for data tasks — beyond question answering</h2>
+  <p>NL-to-SQL is the headline, but the same grounding-plus-tools pattern powers a broader class of <strong>agents</strong> that do platform <em>work</em>, not just answer questions. An agent is a model given tools (run a query, read the catalog, open a PR) and a loop to use them. The high-value VastDP agents are unglamorous and internal:</p>
+  <ul>
+    <li><strong>Drafting dbt models</strong> — propose a staging or mart model from a source contract (ch. 01) and the modeling conventions of ch. 06. The agent drafts; a DPE reviews the PR.</li>
+    <li><strong>Documenting tables</strong> — generate column descriptions and a table summary from schema + sample + lineage, to backfill the catalog of ch. 09. Cheap, high-coverage, and a human skims before merge.</li>
+    <li><strong>Generating tests</strong> — propose dbt/data tests (not-null, uniqueness, the ledger-balances assertion from ch. 01) for a new model, extending the testing mindset of ch. 07.</li>
+    <li><strong>Triaging data incidents</strong> — when a freshness or quality check fires (ch. 10), an agent reads the lineage, identifies the upstream culprit, and posts a first-pass diagnosis to the on-call channel.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The automate-vs-gate line is drawn at reversibility and blast radius</span>
+    <p>The decision rule is not "how smart is the agent" — it's "what does a wrong action cost, and can we undo it?" <strong>Read-only and proposal-only actions</strong> (answering a question, drafting a PR, suggesting docs) can run with light human review because a bad draft is discarded for free. <strong>Anything that mutates state or ships to a consumer</strong> — merging a model, altering a metric definition, writing to production — is <em>gated</em> behind a human approval, because the blast radius is real and the action is not trivially reversible. Human-in-the-loop is not a transitional crutch; it is the permanent boundary between "agent drafts" and "agent decides."</p>
+  </div>
+</section>
+
+<section id="accuracy">
+  <h2>The accuracy stack — layered defense</h2>
+  <p>No single technique makes an NL interface trustworthy; accuracy is a <em>stack</em> of defenses, each catching what the layer above missed. Like security, you assume any one layer can fail and design so a failure is caught, not shipped. From foundation to top:</p>
+
+  <div class="flow">  THE ACCURACY STACK  (each layer catches what slips past the one below)
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ 5 · CONFIDENCE + ABSTENTION   "I'm not sure" beats a wrong #   │  ◀ last line
+  ├──────────────────────────────────────────────────────────────┤
+  │ 4 · EXECUTION + SELF-CORRECTION   run it; on error, repair     │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 3 · CONSTRAINED GENERATION / VALIDATION   metric & dim must    │
+  │     exist; reject before executing                            │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 2 · RETRIEVAL OF CATALOG CONTEXT (RAG)   docs, lineage, examples│
+  ├──────────────────────────────────────────────────────────────┤
+  │ 1 · GROUNDING ON THE SEMANTIC LAYER (ch. 08)   the foundation  │  ◀ the lever
+  └──────────────────────────────────────────────────────────────┘
+        ▲ remove layer 1 and everything above is sanding guesswork</div>
+
+  <ol>
+    <li><strong>Grounding on the semantic layer</strong> — the foundation. The model selects from governed metrics; the layer authors the SQL. Collapses the problem space.</li>
+    <li><strong>Retrieval of catalog context</strong> — RAG feeds definitions, column semantics, lineage, and vetted examples so the <em>selection</em> is right.</li>
+    <li><strong>Constrained generation / validation</strong> — the model's output must conform to the schema of valid metrics and dimensions; an unknown metric or dimension is rejected <em>before</em> any query runs. This is where most hallucinations die cheaply.</li>
+    <li><strong>Execution + self-correction</strong> — run the compiled query; if the engine returns an error (a type mismatch, an empty result where one is impossible), feed the error back and let the agent retry once or twice. Bounded loops only — a self-correction loop with no cap is a cost and latency hazard.</li>
+    <li><strong>Confidence + abstention</strong> — the last line. If the model can't map the question to a known metric, or retrieval comes back thin, or the question is genuinely out of scope, the correct output is <strong>"I'm not sure — here's what I can answer"</strong>, not a guess. Designed abstention is the single feature that separates a trustworthy assistant from a misinformation pipeline.</li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="callout-label">Abstention is a feature you must build, not a default you get</span>
+    <p>Models do not abstain on their own — they are trained to be helpful, which means they will answer. You have to <em>engineer</em> the "I don't know": detect when no metric matches above a threshold, when a filter value isn't a known dimension member, when the question references a restricted domain. A platform whose AI never says "I'm not sure" is not confident — it is one that hasn't built the safety valve, and every out-of-distribution question becomes a confidently wrong answer.</p>
+  </div>
+</section>
+
+<section id="evals">
+  <h2>Evaluating NL-to-SQL — the testing mindset, applied to AI</h2>
+  <p>You cannot manage accuracy you do not measure, and "it looked right in the demo" is not measurement. The discipline is the same one ch. 07 brought to transformations: a <strong>curated eval set</strong> of question → known-correct-answer pairs, run as a regression test on every change to the prompt, the retrieval, or the model. The metric that matters is <strong>execution accuracy</strong> — does the result the system returns <em>match the ground-truth result</em>? — not whether the generated query string looks plausible, since two very different queries can return the same correct number and two similar ones can diverge.</p>
+
+  <div class="flow">  THE EVAL LOOP
+
+  curated eval set                ┌──────────────────────┐
+  (question → correct answer) ───▶ │  run system on each Q │
+        ▲                         └──────────┬───────────┘
+        │ add new questions                  ▼
+        │ from real misses          compare result to ground truth
+        │                                    │
+        │                          ┌─────────┴──────────┐
+        │                          ▼                    ▼
+        │                     exec-accuracy        abstention rate
+        │                     (match? Y/N)         (good vs over-cautious)
+        │                          │                    │
+        │                          └─────────┬──────────┘
+        │                                    ▼
+        │                       track over time; BLOCK the change
+        └──────────────────────  if accuracy regresses on any commit</div>
+
+  <p>Two numbers are tracked together, because they trade off: <strong>execution accuracy</strong> (of the questions it answered, how many were right) and <strong>abstention rate</strong> (how often it correctly said "I'm not sure" versus refusing answerable questions). A system that answers everything with 80% accuracy is worse than one that answers 70% of questions at 99% accuracy and abstains on the rest — because the second one never lies. Every prompt tweak or model swap reruns the suite, and a regression <em>blocks the change</em>, exactly like a failing dbt test blocks a merge.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>eval case — one row of the curated NL-to-SQL suite</span></div>
+  <pre><code class="language-yaml">- id: fill_rate_h100_lastweek
+  question: "what was H100 fill rate last week?"
+  expect:
+    metric: fill_rate                 # must resolve to the catalog metric
+    dimensions: [gpu_model]
+    filters: [{ gpu_model: "H100" }]
+    time: { grain: week, range: last_week }
+  ground_truth_result: 0.683          # reconciled offline by an analyst
+  tolerance: 0.005                     # exec-accuracy: |result - truth| <= tol
+  must_not_abstain: true               # this IS answerable; abstaining = fail
+
+- id: ceo_favorite_color
+  question: "what is the CEO's favorite color?"
+  expect: { abstain: true }            # out of scope → MUST abstain, not guess</code></pre>
+  </div>
+
+  <p>The eval set is a living asset: every real-world miss becomes a new test case, so the system can never regress on a question it once got wrong. This is the same flywheel as data quality in ch. 10 — observe a failure, encode it as a check, prevent its recurrence — applied to the AI layer instead of the pipeline.</p>
+</section>
+
+<section id="guardrails">
+  <h2>Guardrails — what the AI is allowed to touch</h2>
+  <p>Accuracy is about returning the right answer; guardrails are about bounding what the system can <em>do</em> in the process. Even a perfectly grounded agent must run inside the access-control and privacy fence from ch. 11 — the AI is a consumer, and consumers get scoped permissions, not a master key.</p>
+
+  <table>
+    <thead>
+      <tr><th>Guardrail</th><th>What it prevents</th><th>How it's enforced</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Read-only role</strong></td><td>Any write/DDL from a Q&amp;A path</td><td>The query path authenticates as a read-only warehouse role — no <code>INSERT</code>/<code>UPDATE</code>/<code>DROP</code> privilege exists to abuse</td></tr>
+      <tr><td><strong>Cost &amp; row limits</strong></td><td>A runaway scan of the 150 M-row firehose</td><td>Per-query byte/row/timeout caps; force the telemetry rollups (ch. 14), never raw samples</td></tr>
+      <tr><td><strong>PII filtering</strong></td><td>Leaking KYC/account PII into a Slack answer</td><td>Restricted columns are masked/tokenized at the source (ch. 11); the AI role simply cannot see them</td></tr>
+      <tr><td><strong>Restricted-domain block</strong></td><td>Answering questions about trust-safety / fraud / finance internals</td><td>Domain allow-list per channel; questions touching gated domains route to abstention</td></tr>
+      <tr><td><strong>Audit of AI queries</strong></td><td>Untraceable "the bot said so" claims</td><td>Every AI-issued query is logged with question, compiled SQL, result, and requester — same audit trail as any user</td></tr>
+      <tr><td><strong>Prompt-injection defense</strong></td><td>A malicious doc/row steering the agent</td><td>Treat retrieved content as data, not instructions; never let it escalate the read-only role or domain scope</td></tr>
+    </tbody>
+  </table>
+
+  <p>The unifying principle from ch. 11 holds: the AI gets <em>least privilege</em>. It authenticates as a specific, narrowly-scoped role; it can only reach the domains its channel is cleared for; and everything it does is audited identically to a human analyst. Grounding makes the answers correct; guardrails make sure that even a wrong or manipulated request can't do damage beyond returning a number.</p>
+</section>
+
+<section id="vastdp-example">
+  <h2>Worked end-to-end: "what was H100 fill rate last week?"</h2>
+  <p>Tie the whole stack together on the question that opened the chapter. A supply-ops engineer types it into Slack; here is every step, and why each is correct by construction rather than by luck.</p>
+
+  <div class="flow">  "what was H100 fill rate last week?"
+        │
+        ▼  ① RETRIEVAL (ch.09/10): surfaces metric def for `fill_rate`,
+        │     synonym map ("the big Hoppers" → gpu_model=H100), 2 vetted examples
+        ▼  ② GROUNDED PICK: model emits a semantic-layer query, NOT SQL:
+        │        { metric: fill_rate, dims:[gpu_model],
+        │          filters:[gpu_model=H100], time:{grain:week, range:last_week} }
+        ▼  ③ VALIDATION: fill_rate ∈ metrics? ✓  gpu_model ∈ dims? ✓  H100 ∈ values? ✓
+        ▼  ④ COMPILE (ch.08 semantic layer → governed SQL):
+        │        rented GPU-hours ÷ listed GPU-hours, settled only, by gpu_model
+        ▼  ⑤ EXECUTE under read-only role + cost cap (ch.11/14) on fct_telemetry_hourly rollup
+        ▼  ⑥ ANSWER with the DEFINITION shown, not just the number
+        ▼
+  "H100 fill rate last week was 68.3% — rented GPU-hours ÷ listed GPU-hours
+   on settled rentals (per the governed `fill_rate` metric). [view query]"</div>
+
+  <p>The compiled query is the governed one from the ch. 08 catalog — <em>rented GPU-hours over listed GPU-hours, per <code>gpu_model</code></em> — running against the <code>fct_telemetry_hourly</code> rollup, not the raw firehose. Walk the contrast with the naive path:</p>
+  <ul>
+    <li>The model <strong>never chose a join or a filter</strong>, so it could not skip <code>instance</code> or forget the settled-only rule — the failure modes from the table simply have no surface to occur on.</li>
+    <li>The answer is <strong>the one company-agreed fill rate</strong>, identical to what the supply-ops dashboard shows, because both compile through the same semantic-layer definition. There is no second number to disagree with.</li>
+    <li>The reply <strong>states its own definition and links the query</strong> — so the human can verify, and trust is earned rather than assumed.</li>
+    <li>Ask it something out of scope ("CEO's favorite color") or gated ("show me flagged-fraud accounts") and it <strong>abstains or refuses</strong>, because of the accuracy stack's top layer and the guardrails.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">Correct-by-construction, not correct-by-luck</span>
+    <p>The naive system <em>might</em> have produced 68.3% on a good day — and 81% on a bad one, with no way to tell which you got. The grounded system produces 68.3% <em>because there is no path by which it could produce anything else</em>: the model's only freedom was selecting a metric and a dimension, both validated, and the SQL was authored by the same governed layer the whole company already trusts. That is the difference between a demo and a platform. The intelligence that made it accurate lives in the semantic layer, the catalog, and the evals — not in the model.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The AI is VastDP's newest and riskiest consumer: the promise is English questions answered in Slack; the peril is a confidently wrong number, which is worse than no number. "Just point an LLM at the warehouse" reproduces the five-way definition chaos of ch. 08, one query at a time.</li>
+    <li>Naive text-to-SQL on raw schemas fails on ambiguous columns, invented joins, unseen business logic, and multiple metric definitions — missing-context failures a bigger model does not fix.</li>
+    <li><strong>Grounding on the semantic layer is the accuracy lever:</strong> the model picks metrics and dimensions from the governed menu and the layer compiles the one correct SQL, collapsing "write any SQL" into "pick from validated correctness." This is why ch. 08 is the prerequisite, not a footnote.</li>
+    <li>Around that foundation: RAG over the catalog/lineage for disambiguation, an accuracy stack (grounding → retrieval → validation → self-correction → abstention), execution-accuracy evals that block regressions, and ch. 11 guardrails (read-only, cost caps, PII filtering, audit) that bound what the agent can touch.</li>
+    <li>Accuracy is a platform property, engineered from grounding + governance + evals — not a model property bought with more parameters.</li>
+  </ul>
+  <p>The grounded NL interface now leans hard on the telemetry rollups and the warehouse it queries under cost caps — which raises the question every prior chapter deferred: how does all of this stay fast and affordable at 150 M samples a day? Next: <a href="14-performance-and-scale.html">performance &amp; scale</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

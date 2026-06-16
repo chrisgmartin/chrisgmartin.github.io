@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Training-Data Pipelines — Data Engineering for Neoclouds</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#stages">Pipeline stages</a>
+    <a href="#formats">File formats</a>
+    <a href="#sharding">Sharding</a>
+    <a href="#movement">Moving data to GPUs</a>
+    <a href="#dedup">Deduplication &amp; quality</a>
+    <a href="#versioning">Versioning</a>
+    <a href="#streaming">Streaming vs pre-materialized</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-choosing-a-provider.html">← Previous</a>
+    <a href="04-orchestration.html">Next: Orchestration →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · DE using neoclouds</span>
+  <h1>Training-Data Pipelines</h1>
+  <p class="subtitle">The pipeline from raw source data to GPU-ready shards. Format choices, deduplication, sharding strategy, and the mechanics of moving terabytes of data into a training cluster without burning idle GPU hours.</p>
+</header>
+
+<section id="stages">
+  <h2>Pipeline stages</h2>
+  <p>A representative training-data pipeline for an LLM fine-tune or pre-train:</p>
+  <ol>
+    <li><strong>Ingest.</strong> Pull raw data from sources — web crawls, customer data, partner feeds, public datasets.</li>
+    <li><strong>Filter and clean.</strong> Language detection, content quality scoring, PII redaction, dedup, license filtering.</li>
+    <li><strong>Tokenize / pre-process.</strong> Convert to tokens (for LLM) or features (for other modalities).</li>
+    <li><strong>Shard.</strong> Split into shards that parallel readers can consume.</li>
+    <li><strong>Stage near GPU.</strong> Move to storage adjacent to the training cluster.</li>
+    <li><strong>Register.</strong> Catalog the dataset version with provenance metadata.</li>
+  </ol>
+
+  <p>Each stage has its own DE design decisions. Mistakes compound — bad sharding upstream means slow training downstream.</p>
+</section>
+
+<section id="formats">
+  <h2>File formats</h2>
+  <p>Common formats and their tradeoffs:</p>
+
+  <h3>Parquet</h3>
+  <p>The default for batch DE work. Columnar, well-compressed, broadly supported. Works for tokenized data when the workload reads selected columns.</p>
+
+  <h3>WebDataset</h3>
+  <p>Tar files containing record-per-file (image + label, etc.). Optimized for sequential streaming reads. Common in vision-and-multimodal work; useful when training jobs want to stream large media.</p>
+
+  <h3>Mosaic Streaming (MDS)</h3>
+  <p>A format designed for cloud-streaming during training. Includes shard manifests for resumable streaming. Common in modern LLM training stacks.</p>
+
+  <h3>Arrow / Feather</h3>
+  <p>In-memory columnar; useful for intermediate storage. Less common as final training-data format.</p>
+
+  <h3>Raw JSONL or text</h3>
+  <p>Common in research and early pipelines. Inefficient at scale; expensive to read; useful for inspection.</p>
+
+  <p>For LLM training, the realistic choice is between Parquet (warehouse-friendly, batched) and MDS or WebDataset (streaming-optimized). Pick based on whether you're feeding warehouse pipelines downstream or feeding training jobs directly.</p>
+</section>
+
+<section id="sharding">
+  <h2>Sharding</h2>
+  <p>Sharding strategy determines how parallel training readers split the data:</p>
+  <ul>
+    <li><strong>Shard size.</strong> Too small → metadata overhead and slow reads; too large → uneven work distribution. 100 MB to 1 GB is a common sweet spot.</li>
+    <li><strong>Number of shards.</strong> Should be a multiple of the number of parallel readers (typically GPU count × data loaders per GPU).</li>
+    <li><strong>Random ordering.</strong> Training expects to see varied data per batch. Either pre-shuffle the shards or randomize within them.</li>
+    <li><strong>Deterministic sharding.</strong> For reproducibility, the same dataset version should produce the same shards.</li>
+  </ul>
+
+  <p>Sharding mistakes show up as GPU utilization gaps. If GPUs sit idle waiting for data, look at the shard size and reader parallelism first.</p>
+</section>
+
+<section id="movement">
+  <h2>Moving data to GPUs</h2>
+  <p>Three patterns for getting data into the GPU instance:</p>
+
+  <h3>Pattern 1: Local SSD</h3>
+  <p>Copy the dataset to the instance's local NVMe before training starts. Best throughput during training; longest startup time; fails if dataset exceeds local disk.</p>
+  <p>Use when dataset fits comfortably on local disk and the instance is dedicated (worth the staging cost).</p>
+
+  <h3>Pattern 2: Network-attached storage</h3>
+  <p>Mount a shared filesystem (provider-native or self-hosted) and read directly. No staging cost; ongoing network bandwidth cost; depends on storage throughput.</p>
+  <p>Use when storage and compute are co-located in the same cluster and the filesystem can deliver sufficient throughput.</p>
+
+  <h3>Pattern 3: Streaming from object storage</h3>
+  <p>Stream data from S3 (or equivalent) during training. Modern frameworks (Mosaic Streaming, WebDataset over HTTP, etc.) support this. No staging; tolerates resumption; depends on egress economics.</p>
+  <p>Use when the dataset is large enough that staging would be impractical and the provider has reasonable egress to your object store.</p>
+
+  <p>Mixed patterns work too — small shards local for speed, large shards streamed.</p>
+</section>
+
+<section id="dedup">
+  <h2>Deduplication &amp; quality</h2>
+  <p>The classic pre-train data engineering problems:</p>
+  <ul>
+    <li><strong>Exact-string deduplication.</strong> Removes literal duplicates. MinHash + LSH is standard at scale.</li>
+    <li><strong>Near-duplicate detection.</strong> Same content with minor variation. More expensive; uses SimHash or learned embeddings.</li>
+    <li><strong>Quality scoring.</strong> Heuristic or model-based; filter out junk (gibberish, boilerplate, low-quality web content).</li>
+    <li><strong>Language detection.</strong> If training a specific-language model, filter accordingly.</li>
+    <li><strong>License compliance.</strong> Filter to licenses your training is allowed to use.</li>
+    <li><strong>PII removal.</strong> Names, emails, addresses scrubbed where required.</li>
+  </ul>
+
+  <p>These stages can themselves run on neocloud compute when dataset scale exceeds warehouse practicality. Spark on a managed cluster or Ray-based pipelines on a GPU cloud are both viable.</p>
+</section>
+
+<section id="versioning">
+  <h2>Versioning</h2>
+  <p>Every training run must reference a specific dataset version. Versioning approaches:</p>
+  <ul>
+    <li><strong>Path-based.</strong> Datasets at <code>s3://bucket/datasets/llm-train/2026-05-15/</code>. Simplest; relies on convention.</li>
+    <li><strong>Content-addressed.</strong> Hash the shards; store under content hash. Stronger guarantees; harder to navigate.</li>
+    <li><strong>Catalog-tracked.</strong> A registry (Unity Catalog, MLflow, custom) tracks dataset versions with metadata.</li>
+    <li><strong>Lakehouse table versions.</strong> Iceberg / Delta tables versioned at the table level; training reads a specific snapshot.</li>
+  </ul>
+
+  <p>For serious shops, catalog-tracked + content-addressed is the durable answer. Cheaper shops get by with path-based + convention until something breaks.</p>
+</section>
+
+<section id="streaming">
+  <h2>Streaming vs pre-materialized</h2>
+  <p>Two philosophies for training data:</p>
+  <ul>
+    <li><strong>Pre-materialized.</strong> The entire dataset is processed, sharded, and staged before training begins. Training reads a fixed corpus.</li>
+    <li><strong>Streaming.</strong> Training reads from a streaming source (live data or a streaming representation of static data). Useful when data continues to update or when staging is impractical.</li>
+  </ul>
+
+  <p>Pre-materialized is more common for big training runs because it's reproducible. Streaming is more common for inference-side feedback loops and for very large pre-train datasets where staging the entire corpus is uneconomic.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <p>Training-data pipelines are where DE work most directly meets GPU economics. Bad pipelines burn GPU hours; good pipelines keep GPUs saturated. The next chapter covers orchestration — how all this gets scheduled.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

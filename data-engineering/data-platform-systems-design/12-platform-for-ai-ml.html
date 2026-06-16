@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Platform for AI/ML — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#usecases">VastDP's ML use cases</a>
+    <a href="#feature-store">The feature store</a>
+    <a href="#training-data">Training-data pipelines</a>
+    <a href="#embeddings">Embeddings &amp; vector storage</a>
+    <a href="#versioning">Reproducibility &amp; versioning</a>
+    <a href="#serving">Online feature serving</a>
+    <a href="#ml-observability">ML observability</a>
+    <a href="#parity">Offline↔online parity</a>
+    <a href="#stack-mapping">ML platform per stack</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="11-governance-security.html">← Previous</a>
+    <a href="13-ai-powered-platform.html">Next: AI Powering the Platform →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · AI enablement</span>
+  <h1>The Platform for AI/ML</h1>
+  <p class="subtitle">VastDP is not just a back office — it sits in the marketplace's critical path, because its models rank offers, score reliability, catch fraud, and clear the bid market. This chapter is about the platform as the <em>data substrate for the company's own models</em>: the feature store, training-data pipelines, embeddings, reproducibility, online serving, and the offline↔online parity that separates a model that works in a notebook from one that works in production.</p>
+</header>
+
+<section id="usecases">
+  <h2>VastDP's ML use cases — grounded in data we already modeled</h2>
+  <p>A platform-for-ML chapter that opens with "what is a feature store" in the abstract teaches nothing. So we start where a DPE actually starts: with the <em>models the business wants to ship</em>, and the tables those models pull from. Every feature below already lives somewhere in VastDP's source map (<a href="01-the-application-space.html">ch. 01</a>) and its dimensional model (ch. 06). The DPE's job is not to invent features — it is to make the data that already exists <em>reachable, correct, and reproducible</em> for training and serving.</p>
+
+  <p>VastDP has five models in or near production, and they are deliberately varied — a ranking model, a classifier, a churn predictor, a forecaster, and a market-pricing model — because each stresses the platform differently.</p>
+
+  <table>
+    <thead>
+      <tr><th>Use case</th><th>Target / output</th><th>Key features</th><th>Source tables (ch. 06)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Search ranking</strong></td>
+        <td>P(rent | offer shown), ordering offers in search</td>
+        <td>DLPerf score, reliability score, price vs market, recent uptime, host tenure, GPU model popularity</td>
+        <td><code>dim_offer</code>, <code>dim_host</code>, <code>fct_telemetry_hourly</code>, <code>fct_reliability</code></td>
+      </tr>
+      <tr>
+        <td><strong>Fraud detection</strong></td>
+        <td>P(fraud) on signup, listing, and payment</td>
+        <td>payment method age, chargeback history, device/IP velocity, KYC outcome, bid-pattern anomalies</td>
+        <td><code>dim_account</code>, <code>fct_ledger_entry</code>, <code>fct_trust_signal</code>, payments</td>
+      </tr>
+      <tr>
+        <td><strong>Churn prediction</strong></td>
+        <td>P(account inactive in next 30d)</td>
+        <td>rentals last 30/60/90d, spend trend, last-session recency, support-ticket count, reliability complaints</td>
+        <td><code>dim_account</code>, <code>fct_rental</code>, <code>fct_session</code>, <code>fct_ticket</code></td>
+      </tr>
+      <tr>
+        <td><strong>Capacity / utilization forecasting</strong></td>
+        <td>Fleet free-GPU-hours by region/GPU-model, next 7d</td>
+        <td>hourly utilization rollups, fill rate, seasonality, marketplace demand events, preemption rate</td>
+        <td><code>fct_telemetry_hourly</code>, <code>fct_rental</code>, <code>fct_marketplace_event</code></td>
+      </tr>
+      <tr>
+        <td><strong>Dynamic pricing</strong></td>
+        <td>Suggested on-demand price &amp; expected interruptible clearing price</td>
+        <td>live bid depth, supply by GPU model, recent clearing prices, demand velocity, competitor floor</td>
+        <td><code>fct_bid_event</code>, <code>fct_offer_snapshot</code>, <code>fct_rental</code>, <code>fct_marketplace_event</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">The feedback loop is the whole point</span>
+    <p>Ranking and pricing are not read-only consumers — their outputs are written <em>back</em> into the product (the <code>ranking-service</code>, ch. 01) and change user behavior, which changes the data the platform ingests tomorrow. That closed loop is exactly why a DPE must care about training/serving correctness here in a way a pure-analytics shop never has to. A subtly wrong feature does not just produce a bad chart; it ships a bad ranking to real renters.</p>
+  </div>
+</section>
+
+<section id="feature-store">
+  <h2>The feature store: why it exists</h2>
+  <p>Notice the overlap in the table above. <code>reliability score</code> feeds ranking <em>and</em> churn. <code>hourly utilization rollups</code> feed forecasting <em>and</em> ranking. <code>bid depth</code> feeds pricing <em>and</em> fraud. Without a shared layer, each team re-implements these computations in their own training notebook, slightly differently, and then re-implements them <em>again</em> in production serving code — three forks of "reliability score" that quietly disagree. The feature store exists to solve two problems at once:</p>
+  <ul>
+    <li><strong>Reuse.</strong> Define a feature once (<code>host_reliability_7d</code>), register it, and every model — and every engineer — consumes the same definition.</li>
+    <li><strong>Train/serve consistency.</strong> Serve the <em>same</em> feature values offline (for training, as a point-in-time history) and online (for inference, at low latency). This is the deep problem we return to in <a href="#parity">offline↔online parity</a>.</li>
+  </ul>
+
+  <p>Architecturally a feature store is three components — an <strong>offline store</strong> (history, in the lakehouse), an <strong>online store</strong> (latest values, in a low-latency KV), and a <strong>registry</strong> (the definitions, the source of truth for what a feature <em>means</em>) — fed by <strong>feature pipelines</strong> that can be batch or streaming.</p>
+
+  <div class="flow">                        FEATURE DEFINITIONS (registry)
+                  ┌──────────────────────────────────────────┐
+                  │  host_reliability_7d, price_vs_market,     │
+                  │  acct_rentals_30d, bid_depth_5m  …          │
+                  │  = name · entity · dtype · source · TTL     │
+                  └──────────────────────────────────────────┘
+                          │ governs both pipelines below
+        ┌─────────────────┴───────────────────────────────┐
+        ▼                                                  ▼
+  BATCH feature pipeline                          STREAMING feature pipeline
+  (dbt / Spark, hourly–daily)                     (Flink / Spark SS, seconds)
+  telemetry rollups, rental                       live bid depth, device/IP
+  aggregates, spend trends                        velocity, last-session recency
+        │                                                  │
+        ▼                                                  ▼
+  ┌──────────────────────┐      materialize        ┌──────────────────────┐
+  │   OFFLINE STORE       │ ───────────────────────▶│    ONLINE STORE       │
+  │  lakehouse (Iceberg/  │   (latest value per     │  low-latency KV       │
+  │  Delta) — FULL HISTORY│    entity is pushed)    │  (Redis / DynamoDB)   │
+  │  point-in-time joins  │                         │  single-key lookups   │
+  └──────────────────────┘                         └──────────────────────┘
+        │                                                  │
+        ▼  training datasets                               ▼  &lt;10 ms reads
+  ┌──────────────────────┐                         ┌──────────────────────┐
+  │  model training       │                         │  online inference     │
+  │  (MLflow, ch. #vers)  │                         │  ranking / fraud API  │
+  └──────────────────────┘                         └──────────────────────┘</div>
+
+  <table>
+    <thead>
+      <tr><th>Property</th><th>Offline store</th><th>Online store</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Backing tech</td><td>Lakehouse — Iceberg / Delta / Snowflake tables</td><td>Low-latency KV — Redis, DynamoDB, Cassandra</td></tr>
+      <tr><td>Contents</td><td>Full feature <em>history</em>, every version over time</td><td>Only the <em>latest</em> value per entity</td></tr>
+      <tr><td>Read pattern</td><td>Large point-in-time joins over millions of rows</td><td>Single-entity key lookup</td></tr>
+      <tr><td>Latency</td><td>Seconds–minutes (batch, offline)</td><td>Single-digit milliseconds (online inference)</td></tr>
+      <tr><td>Serves</td><td>Training &amp; backfills</td><td>Real-time inference</td></tr>
+      <tr><td>Written by</td><td>Batch + streaming feature pipelines</td><td>Materialization from offline + streaming writes</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Stack mapping in brief</span>
+    <p><strong>Stack A</strong> uses <strong>Feast</strong> — Iceberg/Parquet as the offline store, Redis or DynamoDB as the online store, a Git-tracked feature repo as the registry. <strong>Stack B</strong> uses the <strong>Databricks Feature Store</strong>, where features are Delta tables governed by Unity Catalog and published to an online table. <strong>Stack C</strong> uses the <strong>Snowflake Feature Store</strong>, where feature views are built on Dynamic Tables and served via Snowpark. Same three-component shape; different blast radius and lock-in (full table in <a href="#stack-mapping">#stack-mapping</a>).</p>
+  </div>
+</section>
+
+<section id="training-data">
+  <h2>Training-data pipelines &amp; point-in-time correctness</h2>
+  <p>Building a training set sounds trivial — join labels to features — and that one join is where most production ML quietly breaks. The pitfall has a name: <strong>label leakage</strong>, the use of information that would not have been available at prediction time. A churn model that "knows" the account already closed; a fraud model that includes the chargeback it is supposed to predict; a ranking model trained on a reliability score computed <em>after</em> the rental completed. Every one inflates offline metrics and collapses in production.</p>
+
+  <p>The defense is <strong>point-in-time correctness</strong>: for each training row, you may only use feature values that were <em>known as of the prediction timestamp</em>. Concretely — to build a churn label for account <code>a_88</code> with a prediction time of <code>2026-04-01</code>, you join the features that existed on <code>2026-04-01</code>, never the value the feature held on <code>2026-05-01</code>, even though that newer value sits in the same table today.</p>
+
+  <div class="flow">  PREDICTION TIME for one training row = 2026-04-01  (everything to the LEFT is allowed)
+                                                  │
+  feature: host_reliability_7d  ──●────────●──────┼──●──────●─────────────▶ time
+   value history:                0.91     0.88    │ 0.40   0.95
+                                          ▲       │
+                                  USE THIS (last  │   ✗ LEAKAGE: 0.40 and 0.95
+                                  value known     │   happen AFTER prediction time —
+                                  at 2026-04-01)  │   using them = training on the future
+                                                  │
+  label window:                                   ├──────── 30d ────────┤  → churn? yes/no
+                                                  (label is measured AFTER; features must not be)</div>
+
+  <p>The mechanism that makes this <em>possible</em> is something we built three chapters earlier: <strong>slowly-changing dimensions (SCD2)</strong> from ch. 06. Because the offline store keeps every version of a feature with its valid-from / valid-to interval, a point-in-time join can ask "what was the value <em>as of</em> the prediction time" rather than "what is the value now." A feature store's offline join is, under the hood, an <code>AS OF</code> join against SCD2-style history.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span>point-in-time-correct feature join — churn training set</span></div>
+  <pre><code class="language-sql">-- For each (account, prediction_ts) we want the LAST feature value
+-- whose validity started at or before prediction_ts. No future leakage.
+WITH labels AS (
+  SELECT account_id,
+         prediction_ts,
+         churned_30d            -- label: measured in the 30d AFTER prediction_ts
+  FROM   ml.churn_labels
+)
+SELECT
+  l.account_id,
+  l.prediction_ts,
+  l.churned_30d,
+  f_rel.value  AS host_reliability_7d,
+  f_spend.value AS acct_spend_trend_30d
+FROM labels l
+-- ASOF join: pick the feature row valid AS OF the prediction timestamp
+ASOF JOIN feature_store.host_reliability_7d f_rel
+       MATCH_CONDITION (l.prediction_ts &gt;= f_rel.valid_from)   -- only past values
+       ON l.account_id = f_rel.account_id
+ASOF JOIN feature_store.acct_spend_trend_30d f_spend
+       MATCH_CONDITION (l.prediction_ts &gt;= f_spend.valid_from)
+       ON l.account_id = f_spend.account_id;</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">The most expensive bug in applied ML</span>
+    <p>Leakage does not throw an error. It makes your offline AUC look <em>great</em> — which is precisely why it survives review and ships. The fraud model that scored 0.97 offline and 0.71 in production almost always leaked. Bake point-in-time joins into the feature-store API so the easy path is the correct path; never let a data scientist hand-write a naïve <code>JOIN ON account_id</code> against a mutable current-state table.</p>
+  </div>
+</section>
+
+<section id="embeddings">
+  <h2>Embeddings &amp; vector storage</h2>
+  <p>Not every feature is a number in a table. Several VastDP problems are fundamentally about <em>similarity</em>, and similarity wants <strong>embeddings</strong> — dense vectors where "close" means "alike":</p>
+  <ul>
+    <li><strong>Marketplace search &amp; similarity</strong> — "find offers like this one" or semantic matching of a free-text workload description ("fine-tune a 70B model") to suitable GPU configurations.</li>
+    <li><strong>Host clustering</strong> — embedding a host's telemetry-behavior signature to find machines that behave alike (useful for both reliability scoring and fraud rings).</li>
+    <li><strong>RAG over internal data</strong> — retrieval for the AI interfaces in <a href="13-ai-powered-platform.html">ch. 13</a> (docs, runbooks, metric definitions). The same vector infrastructure serves the platform-for-AI and the AI-for-platform sides.</li>
+  </ul>
+
+  <p>An embedding pipeline is just another feature pipeline: a model (hosted or API) turns rows or documents into vectors on a schedule or a stream, and the vectors land in a store with an approximate-nearest-neighbour (ANN) index. Where they land is the decision:</p>
+  <ul>
+    <li><strong>pgvector</strong> — a Postgres extension. Right when volumes are modest and you already run Postgres; co-locates vectors with relational filters.</li>
+    <li><strong>Warehouse-native vector types</strong> — Snowflake <code>VECTOR</code>, Databricks Vector Search, BigQuery vectors. Right when the embeddings live next to the rest of your governed data and you want one access-control plane.</li>
+    <li><strong>Dedicated vector DBs</strong> — Milvus, Qdrant, Weaviate, Pinecone. Right at high vector volume / high QPS where ANN index quality and recall tuning are first-class concerns.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">When you actually need a vector store</span>
+    <p>The honest answer for VastDP: most of the five flagship models in <a href="#usecases">#usecases</a> need <em>no</em> embeddings at all — gradient-boosted trees on tabular features win at ranking, fraud, churn, forecasting, and pricing. Reach for embeddings when the input is unstructured (text, behavioral sequences) or the task is semantic retrieval/similarity. Adding a vector DB "because ML" before you have a similarity problem is the same anti-pattern as routing the firehose through the warehouse: the wrong specialist store for the actual access pattern.</p>
+  </div>
+</section>
+
+<section id="versioning">
+  <h2>Reproducibility: versioning data, features, and models together</h2>
+  <p>The question a regulator, an incident review, or a "why did ranking change last Tuesday?" investigation all ask is the same: <strong>can you retrain this exact model on the exact data it originally saw?</strong> If the answer is no, you have a model you cannot debug, audit, or roll back. Reproducibility requires versioning <em>three</em> things in lockstep:</p>
+  <ul>
+    <li><strong>Data</strong> — pin the training set to immutable table snapshots. Iceberg/Delta time-travel (a snapshot ID or commit version) makes "the data as of this commit" a first-class, queryable thing.</li>
+    <li><strong>Features</strong> — pin the feature <em>definitions</em> (the registry version) and the materialization, so <code>host_reliability_7d v3</code> is unambiguous.</li>
+    <li><strong>Model</strong> — pin the trained artifact, hyperparameters, code version, and metrics in a <strong>model registry</strong> (MLflow).</li>
+  </ul>
+
+  <p>Tie all three together and you get the chain that matters: <em>model run → feature versions → table snapshots → source tables</em>. That is the same <strong>lineage</strong> graph from ch. 10, extended past the warehouse into the model. When ranking degrades, lineage lets you walk from the deployed model back to the precise telemetry rollups it trained on — and discover, say, that a host-agent schema change three weeks ago silently shifted a feature distribution.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Lineage doesn't stop at the warehouse</span>
+    <p>Most lineage tooling traces source → staging → mart and stops. For a platform-for-ML, the lineage graph must extend one hop further — into features and into model runs — or your most consequential data products (the models in the product's critical path) are the one place you <em>cannot</em> trace impact. Register models with their input feature views and table snapshot IDs so the graph is unbroken end to end.</p>
+  </div>
+</section>
+
+<section id="serving">
+  <h2>Online feature serving</h2>
+  <p>Training tolerates minutes; inference does not. When a renter loads search results, the ranking model must score dozens of offers inside the page's latency budget — call it <strong>~50 ms end-to-end</strong>, of which feature retrieval gets maybe 10 ms. You cannot run a point-in-time join over the lakehouse in 10 ms. This is the entire reason the <strong>online store</strong> exists: it holds the <em>latest</em> value of each feature, keyed by entity, for single-digit-millisecond lookups.</p>
+
+  <p>The design tension is <strong>precompute vs on-demand</strong>:</p>
+  <ul>
+    <li><strong>Precomputed (materialized) features</strong> — batch/streaming pipelines write the latest values to the online store ahead of time. Cheap and fast at read time; the lookup is a single key fetch. Use for anything that doesn't depend on request context: <code>host_reliability_7d</code>, <code>acct_rentals_30d</code>, DLPerf scores.</li>
+    <li><strong>On-demand features</strong> — computed at request time from the request payload (e.g. price-vs-<em>this</em>-search's-filters, distance from the renter's requested region). Necessary when the value can't be precomputed, but every on-demand computation eats the latency budget.</li>
+  </ul>
+
+  <p>The rule of thumb: <strong>precompute everything you can, compute on-demand only what depends on the live request</strong>. Fraud scoring leans more on streaming-fresh features (device/IP velocity in the last five minutes) — which is why the streaming feature pipeline writes straight to the online store, not just to the offline lakehouse.</p>
+</section>
+
+<section id="ml-observability">
+  <h2>ML observability: drift, decay, and the feedback loop</h2>
+  <p>A deployed model is a data pipeline whose output happens to be predictions — and like any pipeline it degrades silently. ML observability is monitoring built as a data pipeline over four things:</p>
+  <ul>
+    <li><strong>Feature drift</strong> — the distribution of an <em>input</em> feature shifts vs training (a new GPU model floods the fleet; <code>price_vs_market</code> re-centres). The model is now extrapolating.</li>
+    <li><strong>Prediction drift</strong> — the distribution of the model's <em>output</em> shifts (fraud scores creep up across the board). Often the first visible symptom.</li>
+    <li><strong>Performance decay</strong> — measured accuracy/AUC falls as ground-truth labels arrive. Lags reality, because labels (did the account actually churn?) take 30 days to land.</li>
+    <li><strong>The feedback loop</strong> — the dangerous, marketplace-specific one. A new ranking model demotes a class of hosts → those hosts get fewer rentals → their measured utilization drops → which the <em>reliability</em> feature reads as degradation → which demotes them further. The model's own deployment corrupts its future inputs.</li>
+  </ul>
+
+  <p>Mechanically this is the same machinery as ch. 10 data quality, pointed at features and predictions: log every prediction with its feature vector and model version, compare distributions on a schedule (PSI, KL-divergence), and alert on drift. <strong>Because predictions are logged with their inputs, the feedback loop is detectable</strong> — you can correlate a ranking deployment with a subsequent shift in fleet-level reliability and catch the doom loop before it compounds.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">Monitor the loop, not just the model</span>
+    <p>Standard ML monitoring watches a model in isolation. In a marketplace where the model's output re-enters the product, you must also watch the <em>system-level</em> effect: does the ranking change degrade overall fleet reliability or marketplace liquidity? That requires joining prediction logs back to downstream business metrics — a pipeline only the data platform is positioned to build.</p>
+  </div>
+</section>
+
+<section id="parity">
+  <h2>Offline↔online parity (training/serving skew)</h2>
+  <p>This is the bug the feature store was invented to kill, and it deserves its own section. <strong>Training/serving skew</strong> is when the features a model trains on differ from the features it sees in production — even subtly — so a model that validated beautifully offline makes worse, weirder predictions live. The causes are mundane and ubiquitous:</p>
+  <ul>
+    <li><strong>Two implementations.</strong> The training feature is computed in a dbt/Spark batch job; the serving feature is re-implemented in the inference service's application code. They round differently, default nulls differently, define "last 7 days" differently. Two code paths, one definition — they <em>will</em> diverge.</li>
+    <li><strong>Time semantics.</strong> Offline you (correctly) take the value as of prediction time; online you take "now." If the offline join wasn't point-in-time-correct (<a href="#training-data">above</a>), training saw future-tinged values production never has.</li>
+    <li><strong>Freshness gaps.</strong> Training uses a fully-backfilled feature; production reads a stale online value because the materialization job lagged.</li>
+  </ul>
+
+  <div class="flow">  THE SKEW BUG                                  THE FIX: one definition, two reads
+  ┌────────────────────────┐                    ┌──────────────────────────────┐
+  │ TRAINING                │                    │   FEATURE DEFINITION (single)  │
+  │  reliability_7d  =      │   ≠  divergence    │   reliability_7d = f(telemetry)│
+  │  dbt SQL avg over 7d    │ ◀───────────────▶  └──────────────┬─────────────────┘
+  ├────────────────────────┤                          materialize│
+  │ SERVING                 │                       ┌─────────────┴────────────┐
+  │  reliability_7d  =      │                       ▼                          ▼
+  │  Python loop in the     │                  OFFLINE store              ONLINE store
+  │  ranking service (oops) │                  (training reads)          (serving reads)
+  └────────────────────────┘                  ── SAME numbers, by construction ──</div>
+
+  <p>The feature store's structural answer: a feature is <strong>defined once</strong> in the registry, the <em>same</em> computed values are written to both the offline store (for training) and the online store (for serving), and both training and inference call the <em>same</em> retrieval API. Skew doesn't get "reduced" — it's eliminated by construction, because there is only one definition and one set of values. Streaming features get materialized to both stores from the same pipeline for the same reason.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why parity is a platform problem, not an ML problem</span>
+    <p>Data scientists cannot fix skew with better models — it is born in the seam <em>between</em> the training data layer and the serving layer, which is exactly the DPE's territory. Owning the feature definitions and the dual-write is the single highest-leverage thing the data platform does for ML. It is the difference between "the model works in the notebook" and "the model works."</p>
+  </div>
+</section>
+
+<section id="stack-mapping">
+  <h2>The ML / feature platform per stack</h2>
+  <p>Same three-component shape (offline store, online store, registry) across all three reference stacks; what changes is integration, governance, and lock-in. This is the row "ML / features" from <a href="00-START-HERE.html#stacks">Start Here</a>, expanded.</p>
+
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Stack A — OSS lakehouse</th><th>Stack B — Databricks</th><th>Stack C — Snowflake</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Feature store</td><td>Feast</td><td>Databricks Feature Store</td><td>Snowflake Feature Store</td></tr>
+      <tr><td>Offline store</td><td>Iceberg / Parquet on S3</td><td>Delta tables (Unity Catalog)</td><td>Snowflake tables / Dynamic Tables</td></tr>
+      <tr><td>Online store</td><td>Redis / DynamoDB</td><td>Databricks Online Tables</td><td>Snowflake online feature serving</td></tr>
+      <tr><td>Registry</td><td>Git-tracked Feast repo</td><td>Unity Catalog</td><td>Snowflake schema + Horizon</td></tr>
+      <tr><td>Model registry</td><td>MLflow (self-hosted)</td><td>MLflow on Databricks</td><td>MLflow / Snowflake Model Registry</td></tr>
+      <tr><td>Embeddings / vectors</td><td>pgvector / Qdrant</td><td>Databricks Vector Search</td><td>Snowflake <code>VECTOR</code> type</td></tr>
+      <tr><td>Lineage to model</td><td>DataHub + MLflow links</td><td>Unity Catalog lineage</td><td>Horizon lineage</td></tr>
+    </tbody>
+  </table>
+
+  <p>The trade-off mirrors ch. 03: <strong>A</strong> is maximally composable and lock-in-free but you wire the offline/online/registry pieces together yourself; <strong>B</strong> is the strongest if Spark-scale ML and a unified governance plane (Unity Catalog) are central; <strong>C</strong> wins when your ML lives close to SQL-modeled data and you want the warehouse to be the feature store too. A marketplace at VastDP's scale typically runs the warehouse-native feature store for tabular models and bolts on a dedicated vector store only when a genuine similarity workload appears.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>VastDP's five models — ranking, fraud, churn, capacity forecasting, dynamic pricing — all pull from data already modeled in ch. 06; the DPE's job is to make it reachable, correct, and reproducible, not to invent features.</li>
+    <li>The feature store earns its keep by giving you <strong>reuse</strong> (one definition, many models) and <strong>train/serve consistency</strong> (same values offline and online), via three components: offline store, online store, registry.</li>
+    <li><strong>Point-in-time correctness</strong> — powered by SCD2 history from ch. 06 — is what prevents label leakage, the most expensive and most invisible bug in applied ML.</li>
+    <li>Reach for <strong>embeddings/vector stores</strong> only for genuine similarity/unstructured problems; most tabular models don't need them.</li>
+    <li><strong>Reproducibility</strong> means versioning data, features, and models together, with lineage that extends from ch. 10 all the way into the model run.</li>
+    <li><strong>Online serving</strong> lives or dies on latency budgets: precompute everything you can, compute on-demand only what depends on the live request.</li>
+    <li><strong>ML observability</strong> is monitoring-as-a-pipeline over feature drift, prediction drift, and decay — plus the marketplace-specific feedback loop only the platform can see.</li>
+    <li><strong>Offline↔online parity</strong> is the platform's highest-leverage gift to ML: eliminate training/serving skew by construction with one definition and a dual write.</li>
+  </ul>
+  <p>We have built the platform <em>for</em> the company's models. Next we flip the arrow: how AI is increasingly the consumer and operator of the platform itself — the semantic layer, NL-to-SQL, and agents. → <a href="13-ai-powered-platform.html">AI powering the platform</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

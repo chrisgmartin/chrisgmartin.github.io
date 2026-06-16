@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reference Design: End-to-End — Data Platform Systems Design</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#recap">The journey, in one breath</a>
+    <a href="#architecture">The reference architecture</a>
+    <a href="#dataflow">One rental, end to end</a>
+    <a href="#stack-choice">The stack we'd actually pick</a>
+    <a href="#org">Team &amp; org shape</a>
+    <a href="#roadmap">The crawl → walk → run roadmap</a>
+    <a href="#capacity-cost">Capacity &amp; cost math</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="14-performance-and-scale.html">← Previous</a>
+    <a href="16-synthesis-and-outlook.html">Next: Synthesis &amp; Outlook →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · Putting it together</span>
+  <h1>Reference Design: End-to-End</h1>
+  <p class="subtitle">This is the capstone. Every prior chapter built one organ; here we assemble the whole animal. We draw the full VastDP architecture as a single diagram, trace one real rental from a lifecycle event all the way to an exec dashboard <em>and</em> a churn feature, commit to the specific stack we'd actually choose and defend it layer by layer, sketch the team that runs it, lay out an 18-month roadmap, and do the capacity-and-cost math that decides where the money goes. One coherent system, from source to served metric.</p>
+</header>
+
+<section id="recap">
+  <h2>The journey, in one breath</h2>
+  <p>We started at the <a href="01-the-application-space.html">application space</a> — nine sources, three shapes (OLTP, events, third-party) — and learned that the source dictates the pattern. We met the <a href="02-the-dpe-role.html">DPE role</a> and the stakeholders, then weighed <a href="03-reference-architectures.html">three reference architectures</a>. We <a href="04-ingestion-and-pipelines.html">ingested</a> via CDC, streaming, and batch; <a href="05-storage-and-lakehouse.html">stored</a> the lake on object storage with a specialist time-series engine beside it; <a href="06-data-modeling.html">modeled</a> a two-sided dimensional spine with SCD2 history; <a href="07-transformation-orchestration.html">transformed</a> raw into bronze→silver→gold marts. We <a href="08-serving-and-semantic-layer.html">served</a> trustworthy numbers through a semantic layer, <a href="09-self-serve-enablement.html">enabled</a> self-serve with contracts and a catalog, enforced <a href="10-data-quality-observability.html">quality</a> and <a href="11-governance-security.html">governance</a>, built the platform <a href="12-platform-for-ai-ml.html">for ML</a> and one powered <a href="13-ai-powered-platform.html">by AI</a>, and made it all <a href="14-performance-and-scale.html">fast and affordable at scale</a>. The thesis of the whole guide: <strong>a data platform is not a warehouse plus dashboards — it is a single pipeline of trust</strong> that turns physical events at 17,000 GPUs into a number a CFO will sign her name to and a feature a model will bet a churn prediction on. This chapter shows that pipeline as one machine.</p>
+</section>
+
+<section id="architecture">
+  <h2>The reference architecture</h2>
+  <p>Here is the entire VastDP platform on one canvas. Read it left to right: sources are born on the left, flow through ingest into the dual-store core, get refined through the medallion transform tier, are named once in the semantic layer, and fan out to every consumer on the right. The single most important structural decision — the firehose taking the lower path into ClickHouse rather than through the warehouse — is visible as the bold lane.</p>
+
+  <div class="flow">┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                        VASTDP  REFERENCE  ARCHITECTURE                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  SOURCES (ch.01)            INGEST (ch.04)         STORE (ch.05)         TRANSFORM (ch.07)      SERVE (ch.08)        CONSUMERS
+ ─────────────────         ────────────────       ───────────────       ─────────────────     ─────────────       ───────────
+
+ 1 marketplace-api ─┐                                                                                              ┌─▶ Product / growth
+ 2 billing-service ─┤   ┌─▶ Debezium CDC ─┐    ┌──────────────────┐    ┌──────────────────┐                       │
+ 3 orchestrator ───┤───┤                  ├───▶│  LAKEHOUSE       │    │  bronze (raw)    │   ┌──────────────┐    ├─▶ Finance / execs
+ 4 ranking-service ─┤   │  (WAL → Kafka)   │    │  Iceberg on S3   │───▶│  silver (clean,  │   │   SEMANTIC   │    │      (BI)
+ 5 trust-safety ───┘   │                  │    │                  │    │   conformed,SCD2)│──▶│   LAYER      │───▶├─▶ Supply ops
+                       │                  │    │  warehouse query │    │  gold (marts:    │   │  metrics +   │    │
+ 6 mkt-events ─────┐   ├─▶ Stream ingest ─┤───▶│  via Trino/Spark │    │  fct_*, dim_*)   │   │  dim defs,   │    ├─▶ Trust & safety
+                   ├───┤  (Kafka/Redpanda)│    └──────────────────┘    └──────────────────┘   │  one truth   │    │
+ 7 host-agent ⚡FIREHOSE│                  │                                    ▲               └──────┬───────┘    │
+   ~150M/day ══════╪═══╪══════════════════╪══════════╗                         │ rollups               │            └─▶ ML / DS
+                   │   │                  │          ║ raw telemetry           │ (per-GPU-hr)          │                  │
+ 8 payments ───┐   │   ├─▶ webhook+stream │          ▼                         │                  ┌────┴─────┐            │
+ 9 support ────┴───┘   └─▶ batch pull ────┘    ┌──────────────────┐   ─────────┘                  │ serving  │            │
+                                               │  CLICKHOUSE      │═══════════════════════════════╡ surfaces │            │
+                                               │  time-series     │  ops dashboards (real-time) ◀─┤          │            │
+                                               │  rollups+TTL     │                               │ • BI tool │           │
+                                               └──────────────────┘                               │ • reverse-│           │
+                                                                                                  │   ETL     │           │
+  GOVERNANCE & QUALITY (ch.10–11) ── catalog · contracts · tests · lineage · access · PII ──┐     │ • SQL API │           │
+  spans every layer ────────────────────────────────────────────────────────────────────  │     │ • feature │◀──────────┘
+                                                                                            ▼     │   store   │   offline
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐  │ • NL / AI │   features
+  │ ORCHESTRATION (Dagster): schedules CDC merges, dbt runs, rollup jobs, tests, freshness SLAs │  │   (ch.13) │──▶ online
+  └──────────────────────────────────────────────────────────────────────────────────────────┘  └──────────┘   serving</div>
+
+  <p>The layers, each in a sentence (the chapter that designs it in parentheses):</p>
+  <ul>
+    <li><strong>Sources (01).</strong> Nine systems in three shapes. The firehose is its own lane from the first inch.</li>
+    <li><strong>Ingest (04).</strong> Three patterns — Debezium CDC off Postgres WALs, Kafka streaming for events, batch/webhook pulls for third-party. The firehose streams but forks: a copy to the lake for history, the live path to ClickHouse for serving.</li>
+    <li><strong>Store (05).</strong> A <strong>dual store</strong>. An open lakehouse (Iceberg on S3) is the durable system of record for everything; ClickHouse is the purpose-built engine for the time-series firehose. The lake holds raw telemetry cheaply; ClickHouse holds queryable rollups.</li>
+    <li><strong>Transform (07).</strong> The medallion: <strong>bronze</strong> (raw, append-only landing), <strong>silver</strong> (deduped, conformed, SCD2 history merged from CDC), <strong>gold</strong> (the dimensional marts — <code>fct_rental_meter</code>, <code>dim_account</code>, <code>dim_machine</code>, …). dbt owns this tier.</li>
+    <li><strong>Semantic layer (08).</strong> The choke point of trust. Metrics like <code>gmv</code>, <code>take_rate_revenue</code>, and <code>fleet_utilization</code> are defined <em>once</em> over the gold marts so that BI, the SQL API, and the AI all compute the same number.</li>
+    <li><strong>Serve (08, 12, 13).</strong> One semantic definition fans out to five surfaces: the BI tool, reverse-ETL back into product systems, a governed SQL/metrics API, the feature store (offline + online), and the NL/AI analytics interface.</li>
+    <li><strong>Govern &amp; orchestrate (09–11).</strong> Catalog, contracts, tests, lineage, and access control are <em>cross-cutting</em> — they wrap every box. Dagster is the spine that runs and sequences it all.</li>
+  </ul>
+
+  <div class="callout insight">
+    <span class="callout-label">The whole design in one shape</span>
+    <p>If you remember one picture, remember the <strong>fork at ingest and the funnel at the semantic layer</strong>. The firehose forks early so the warehouse never drowns; everything funnels through the semantic layer so the company has one definition of every number. Those two decisions — divergence for cost, convergence for trust — are 80% of what makes this platform work.</p>
+  </div>
+</section>
+
+<section id="dataflow">
+  <h2>One rental, end to end</h2>
+  <p>Architecture diagrams hide the dynamics. So let's follow a <em>single</em> rental — call it <code>rental_99c1</code>, customer <code>acct_7a</code> renting machine <code>m_8f21a</code>'s GPU index 3 — as its data threads through every layer twice: once down the <strong>analytics path</strong> to a GMV number on the CFO's dashboard, once down the <strong>ML path</strong> to a churn feature. Same source events, two destinations. This trace <em>is</em> the platform working.</p>
+
+  <div class="flow">  T0  PRODUCT EVENT                       T0+10s  TELEMETRY (firehose)
+  ┌─────────────────────────────┐         ┌─────────────────────────────┐
+  │ instance-orchestrator emits │         │ host-agent emits, every 10s:│
+  │  rental.started             │         │  {m_8f21a, gpu 3,           │
+  │  {rental_99c1, acct_7a,     │         │   util 97%, power 402W,     │
+  │   offer_o5, instance i_4471}│         │   instance_id i_4471}       │
+  └──────────────┬──────────────┘         └──────────────┬──────────────┘
+                 │ Debezium CDC / Kafka                  │ Kafka stream
+                 ▼                                       ▼  (forks)
+  ┌─────────────────────────────┐         ┌──────────────────────┬──────────────────────┐
+  │ BRONZE  raw_rental (append) │         │ BRONZE raw_telemetry  │  CLICKHOUSE (live)   │
+  │  every status transition    │         │  to lake (history)    │  →rollup per-GPU-hr   │
+  └──────────────┬──────────────┘         └──────────┬───────────┴──────────────────────┘
+                 │ dbt: dedupe + SCD2 merge          │ dbt: aggregate util→delivered_gpu_hr
+                 ▼                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ SILVER   stg_rental (one row, current+history)  +  stg_gpu_hour       │
+  │          joins instance ↔ telemetry on instance_id + event_time window│
+  └──────────────────────────────────┬────────────────────────────────────┘
+                                      │ dbt: build the billing atom
+                                      ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ GOLD     fct_rental_meter   grain = one rental-hour                   │
+  │  rental_99c1 │ hour 14:00 │ gpu_hours 1.0 │ rate 1.80 │ amt_usd 1.80  │
+  └──────────────────────────────────┬────────────────────────────────────┘
+                                      │
+            ┌─────────────────────────┴──────────────────────────┐
+            ▼  ANALYTICS PATH                                     ▼  ML PATH
+  ┌───────────────────────────────┐              ┌─────────────────────────────────┐
+  │ SEMANTIC LAYER                │              │ FEATURE STORE (ch.12)            │
+  │  gmv = SUM(fct_rental_meter   │              │  acct_7a feature:                │
+  │        .amt_usd)              │              │   spend_7d, gpu_hrs_7d,          │
+  │  defined ONCE                 │              │   days_since_last_rental         │
+  └──────────────┬────────────────┘              │  computed from SAME fct table    │
+                 ▼                                └──────────────┬──────────────────┘
+  ┌───────────────────────────────┐                 offline (train) │ online (serve)
+  │ EXEC DASHBOARD (BI)           │                                ▼
+  │  "GMV today: $1.42M"          │              ┌─────────────────────────────────┐
+  │  rental_99c1 adds $1.80       │              │ CHURN MODEL  scores acct_7a daily│
+  │  reconciles to the ledger     │              │  parity: same feature offline=on │
+  └───────────────────────────────┘              └─────────────────────────────────┘</div>
+
+  <p>Three things this trace makes concrete:</p>
+  <ul>
+    <li><strong>The join is the product.</strong> Attributing physical telemetry (was the GPU actually delivering?) to a paying rental happens in silver, on <code>instance_id</code> within an event-time window. Get the lifecycle timestamps wrong (ch. 01) and the meter, utilization, and churn feature all drift together.</li>
+    <li><strong>One fact, two consumers.</strong> <code>fct_rental_meter</code> feeds <em>both</em> the GMV metric and the churn feature. They share a definition, which is why the dashboard and the model never disagree about how much <code>acct_7a</code> spent. This is offline/online <strong>parity</strong> in practice.</li>
+    <li><strong>Reconciliation closes the loop.</strong> The GMV number traces back through the semantic layer, the gold fact, silver, bronze, and CDC to a <code>ledger_entry</code> — the penny-tie Finance demanded in ch. 01 and ch. 11. Lineage isn't documentation; it's the audit trail that lets the CFO trust the $1.42M.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">Why trace a single row</span>
+    <p>When you onboard a new DPE, hand them this exercise: pick one rental and follow its bytes to a dashboard and a model. The moment they can narrate every hop — CDC, dedupe, SCD2 merge, the telemetry join, the meter, the metric definition, the feature — they understand the platform better than any architecture diagram could teach them. A platform you can't trace end-to-end is a platform you can't debug.</p>
+  </div>
+</section>
+
+<section id="stack-choice">
+  <h2>The stack we'd actually pick</h2>
+  <p>The guide carried <a href="00-START-HERE.html#stacks">three reference stacks</a> so we could reason about trade-offs without dogma. But this is the capstone, so we'll commit. For a company at VastDP's shape — a marketplace with a punishing telemetry firehose, a lean-but-real platform team, financial-grade correctness needs, and a strong allergy to vendor lock-in on its largest dataset — we'd build a <strong>pragmatic hybrid</strong>: an open lakehouse core (lean <strong>Stack A</strong>, Iceberg) for the durable system of record, <strong>ClickHouse</strong> for the firehose, a semantic layer over the top, and a feature store on the side. If the team were SQL-heavy and small with little platform headcount, we'd swap the core to <strong>Stack C</strong> (Snowflake) for time-to-value — the firehose still goes to ClickHouse either way. This is opinionated; reasonable teams choose differently.</p>
+
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>Our pick</th><th>Why this, here</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Streaming bus</td><td>Kafka (or Redpanda)</td><td>The firehose plus all event sources need a durable, partitioned, replayable log. Redpanda if we want to cut ops overhead and JVM tuning.</td></tr>
+      <tr><td>CDC</td><td>Debezium</td><td>Log-based capture off the Postgres WAL is the only way to get full history without hammering the OLTP DBs. Open, battle-tested.</td></tr>
+      <tr><td>Table format</td><td>Apache Iceberg on S3</td><td><strong>The keystone choice.</strong> Our largest asset (telemetry history) stays in an open format on cheap object storage — no engine can hold it hostage. Multiple engines (Trino, Spark, ClickHouse) read the same tables.</td></tr>
+      <tr><td>Time-series engine</td><td>ClickHouse</td><td>Non-negotiable for the firehose. Serves "metric X for GPU Y over window W" 10–100× cheaper than a warehouse, with TTL'd rollups. The whole reason the warehouse survives.</td></tr>
+      <tr><td>Transform</td><td>dbt-core + Spark SQL</td><td>dbt is the lingua franca of the medallion; analysts can contribute. Spark SQL handles the heavy silver merges and rollups.</td></tr>
+      <tr><td>Query engine</td><td>Trino</td><td>Federated SQL over Iceberg <em>and</em> ClickHouse from one endpoint — analysts join business data to telemetry rollups without caring where each lives.</td></tr>
+      <tr><td>Orchestration</td><td>Dagster</td><td>Asset-aware orchestration models the lineage natively (CDC→silver→gold→metric), with freshness SLAs and backfills first-class. Airflow if the team already lives there.</td></tr>
+      <tr><td>Catalog / governance</td><td>Polaris/Nessie + DataHub</td><td>Polaris (or Nessie) is the Iceberg REST catalog; DataHub layers search, lineage, contracts, and PII tagging across both stores.</td></tr>
+      <tr><td>Semantic layer</td><td>dbt MetricFlow / Cube</td><td>One definition of every metric, queryable by BI, the API, and the LLM. Without it, NL-to-SQL hallucinates revenue. Cube if we need a caching API tier.</td></tr>
+      <tr><td>Feature store</td><td>Feast + MLflow</td><td>Offline features from the gold marts, online serving with parity, registry in MLflow. Reuses the lake — no separate feature pipeline.</td></tr>
+      <tr><td>BI</td><td>A semantic-aware tool (e.g. Lightdash/Superset on the metrics layer)</td><td>BI must query the semantic layer, never raw tables — that's how "one number" is enforced at the tool boundary.</td></tr>
+      <tr><td>NL / AI analytics</td><td>LLM grounded on the semantic layer + catalog</td><td>The LLM writes metric queries, not raw SQL; accuracy comes entirely from the curated metric and dimension definitions (ch. 13).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Where opinions legitimately diverge</span>
+    <p>The Iceberg-vs-Snowflake core is the real fork, and it's a <em>capital and headcount</em> decision, not a technical one (ch. 03). Open lakehouse: lower cloud bill, higher engineering payroll, zero lock-in on your biggest dataset. Snowflake core: faster to value, smaller team, a bill that grows with the firehose's rollups unless you're disciplined about keeping raw telemetry <em>out</em>. The one thing that does <em>not</em> diverge: the firehose goes to a specialist engine in every version. That's the load-bearing invariant.</p>
+  </div>
+</section>
+
+<section id="org">
+  <h2>Team &amp; org shape</h2>
+  <p>A platform is also an org design. The pattern that scales VastDP past tribal knowledge is a small <strong>central platform team</strong> that builds <em>paved roads</em> — the ingestion framework, the dbt project skeleton, the semantic layer, the catalog, the CI checks — and <strong>embedded analysts/data scientists</strong> who live in the business domains and ride those roads. The platform team owns the <em>system</em>; the domains own their <em>data products</em> and contracts.</p>
+
+  <div class="flow">                          ┌─────────────────────────────────┐
+                          │   Head of Data Platform         │
+                          └──────────────┬──────────────────┘
+              ┌──────────────────────────┼──────────────────────────┐
+              ▼                           ▼                          ▼
+  ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐
+  │  PLATFORM TEAM (DPEs)  │  │  EMBEDDED ANALYSTS     │  │  ML / DS               │
+  │  ─ paved roads ─       │  │  (in domains)          │  │  (in domains)          │
+  │  • ingest framework    │  │  • Product/growth      │  │  • ranking, fraud,     │
+  │  • lakehouse+ClickHouse│  │  • Finance/execs       │  │    churn, pricing      │
+  │  • dbt skeleton + CI   │  │  • Supply ops          │  │  • own features + models│
+  │  • semantic layer      │  │  • Trust & safety      │  │  consume feature store  │
+  │  • catalog/governance  │  │  own gold marts +      │  │  + gold marts           │
+  │  • orchestration       │  │  metric defs in domain │  │                         │
+  └───────────┬───────────┘  └───────────┬───────────┘  └───────────┬───────────┘
+              │                          │                          │
+              └──────────────────────────┴──────────────────────────┘
+                   data contracts (ch.09) are the interface between them
+                   PLATFORM = roads & guardrails   ·   DOMAINS = the data products</div>
+
+  <p>Who owns what, RACI-style: the <strong>platform team</strong> is <em>Accountable</em> for ingestion, storage, the semantic layer's machinery, governance tooling, and uptime. <strong>Source-producing product teams</strong> are <em>Accountable</em> for their data contracts and schema stability (ch. 01, 09). <strong>Embedded analysts</strong> are <em>Responsible</em> for the gold marts and metric definitions in their domain; the platform team <em>Consults</em> on modeling and reviews PRs. <strong>ML teams</strong> are <em>Responsible</em> for features and models, with the platform team <em>Accountable</em> for the feature store's offline/online parity. Finance and execs are <em>Informed</em> consumers who sign off on metric definitions.</p>
+
+  <table>
+    <thead>
+      <tr><th>Stage</th><th>Platform (DPE)</th><th>Embedded analysts</th><th>ML / DS</th><th>Total data org</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Crawl (0–3 mo)</td><td>2–3</td><td>1–2</td><td>0–1</td><td>~3–6</td></tr>
+      <tr><td>Walk (3–9 mo)</td><td>3–5</td><td>3–5</td><td>2–3</td><td>~8–13</td></tr>
+      <tr><td>Run (9–18 mo)</td><td>5–7</td><td>5–8</td><td>4–6</td><td>~15–20</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">The platform team's real product is leverage</span>
+    <p>A DPE's output is not dashboards — it's the <em>paved road</em> that lets twenty analysts and scientists ship without filing tickets. If the platform team becomes a request queue ("can you add this column?"), it has failed at org design no matter how good the tech is. Measure the platform team by how much self-serve work happens <em>without</em> them (ch. 09), not by their own ticket throughput.</p>
+  </div>
+</section>
+
+<section id="roadmap">
+  <h2>The crawl → walk → run roadmap</h2>
+  <p>You do not build the architecture diagram in one quarter. You build the spine first — CDC into a lake into a warehouse into a handful of marts and a BI tool — prove value, then layer on the semantic tier, governance, the firehose specialist, and finally the AI and optimization work. Sequencing by <em>value unlocked</em>, not by architectural elegance, is what keeps the project funded.</p>
+
+  <table>
+    <thead>
+      <tr><th>Phase</th><th>What you build</th><th>Why now</th><th>What it unlocks</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Crawl</strong><br>0–3 mo</td>
+        <td>Debezium CDC off the core Postgres DBs; Iceberg lake on S3; a query engine; first dbt project with bronze→silver→a few gold marts (<code>fct_rental_meter</code>, <code>dim_account</code>); one BI tool.</td>
+        <td>The business needs <em>some</em> trustworthy number now. Start with the small, high-question relational domains — billing, marketplace — not the firehose.</td>
+        <td>First reconciled GMV/revenue dashboard. Proof the platform pays for itself. The spine everything else hangs on.</td>
+      </tr>
+      <tr>
+        <td><strong>Walk</strong><br>3–9 mo</td>
+        <td>Semantic layer over the marts; data catalog + contracts; data-quality tests in CI; self-serve onboarding; <strong>feature store</strong>; route the <strong>firehose to ClickHouse</strong> with rollups into the lake.</td>
+        <td>Now that the spine works, the cost is duplicated metric logic, broken pipelines, and the firehose threatening the warehouse bill. Fix trust and tame the firehose.</td>
+        <td>One definition of every metric; analysts self-serve; first ML features with parity; fleet/utilization dashboards at firehose scale without warehouse blowup.</td>
+      </tr>
+      <tr>
+        <td><strong>Run</strong><br>9–18 mo</td>
+        <td>NL/AI analytics grounded on the semantic layer; advanced governance (PII tokenization, audited access, lineage-based impact analysis); full observability (freshness, volume, schema drift); cost optimization (tiering, rollup tuning, autoscaling).</td>
+        <td>The platform is load-bearing for the company; now optimize for breadth of access, compliance, and unit economics.</td>
+        <td>Anyone asks questions in plain English; compliance-grade access; the platform is observable and cost-optimized at scale.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="flow">  MONTH:  0───────3────────────────────9──────────────────────18
+          │ CRAWL  │        WALK          │          RUN          │
+          ●────────●─────────────────────●───────────────────────●
+          │        │                     │                       │
+  spine ──┤ CDC    │ semantic layer      │ NL/AI analytics       │
+          │ lake   │ catalog + contracts │ advanced governance   │
+          │ dbt    │ data quality / CI   │ full observability    │
+          │ BI     │ feature store       │ cost optimization     │
+          │ 1st    │ firehose→ClickHouse │ tiering + autoscale    │
+          │ GMV    │ self-serve          │                        │
+          └────────┴─────────────────────┴────────────────────────┘
+           value:   one number   →   trusted self-serve   →   AI + scale + thrift</div>
+</section>
+
+<section id="capacity-cost">
+  <h2>Capacity &amp; cost math</h2>
+  <p>Design without magnitudes is fiction. Using the <a href="00-START-HERE.html#scale">scale fixtures</a> — ~17,000 GPUs, a sample every 10s, ~150 M telemetry samples/day, ~150–250 GB/day landed — here is roughly where the bytes and the dollars go. The numbers are order-of-magnitude teaching fixtures, but the <em>shape</em> is the lesson.</p>
+
+  <table>
+    <thead>
+      <tr><th>Quantity</th><th>Math</th><th>Result</th><th>Design consequence</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Telemetry rate</td><td>17,000 × 6 / min</td><td>~1,700 rows/s, ~150 M/day</td><td>The firehose. Sets everything below.</td></tr>
+      <tr><td>Raw landed growth</td><td>~150–250 GB/day compressed</td><td>~55–90 TB/yr</td><td>Object storage is cheap (~$23/TB-mo on S3); the lake absorbs this. Tier cold partitions to colder classes.</td></tr>
+      <tr><td>Telemetry rollup ratio</td><td>per-10s → per-GPU-hour</td><td>~360× reduction</td><td>150 M raw rows/day collapse to ~408 k rollup rows/day (17k × 24). <strong>This single step is what saves the warehouse.</strong></td></tr>
+      <tr><td>Rollup in the warehouse</td><td>~408 k rows/day × 365</td><td>~150 M rows/yr — trivial</td><td>The warehouse only ever sees rollups + business data — gigabytes, not petabytes.</td></tr>
+      <tr><td>ClickHouse footprint</td><td>raw at high compression + TTL</td><td>weeks of raw hot, then rolled + expired</td><td>TTL evicts raw detail after the ops window; the lake keeps the durable history.</td></tr>
+      <tr><td>Business data (CDC + events)</td><td>~30–55 M changes/day</td><td>small vs. telemetry</td><td>~80% of <em>questions</em>, ~1% of bytes. Cheap to model richly.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Now the rough monthly cost <em>shape</em> (illustrative, mid-size cloud spend):</p>
+
+  <table>
+    <thead>
+      <tr><th>Cost center</th><th>Driver</th><th>Rough share</th><th>Lever</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Firehose ingest + ClickHouse compute</td><td>1,700 rows/s, continuous</td><td><strong>~40–55%</strong></td><td>Rollup aggressively; TTL raw; right-size CH nodes.</td></tr>
+      <tr><td>Lake storage (raw telemetry history)</td><td>~55–90 TB/yr growing</td><td>~10–15%</td><td>Tiering (hot→cold→archive); compression; partition pruning.</td></tr>
+      <tr><td>Warehouse / query compute (Trino + dbt)</td><td>marts + rollups + ad-hoc</td><td>~20–30%</td><td>Keep firehose out; incremental models; autoscale.</td></tr>
+      <tr><td>Streaming bus (Kafka)</td><td>firehose + event throughput</td><td>~10%</td><td>Retention tuning; tiered storage.</td></tr>
+      <tr><td>Catalog, BI, feature store, AI</td><td>seats + serving</td><td>~5–10%</td><td>Mostly fixed; scales with users not bytes.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-label">Almost all the money is the firehose — and rollups slash it</span>
+    <p>Half the platform's bill traces to one source: the telemetry firehose. The reason the other half stays small is the <strong>~360× rollup</strong> — collapsing per-10-second samples to per-GPU-hour before anything touches the warehouse. The signature failure mode (ch. 01, 05, 14) is skipping that step and piping raw telemetry into a columnar warehouse: the bill grows linearly with the fleet and the dashboards get slow. Spend your optimization energy where the money is — the firehose path — not on the cheap relational marts.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The platform is <strong>one machine</strong>: sources → ingest → dual store → medallion transform → semantic layer → five serving surfaces, wrapped in governance and run by an orchestrator. Two decisions carry it — <em>fork the firehose early</em> for cost, <em>funnel everything through the semantic layer</em> for trust.</li>
+    <li>You can <strong>trace a single rental</strong> from a lifecycle event and a telemetry sample, through bronze/silver/gold, to both a reconciled GMV number and a churn feature with offline/online parity. If you can narrate that trace, you understand the platform.</li>
+    <li>The stack we'd actually build is a <strong>pragmatic hybrid</strong>: open Iceberg lakehouse core (or Snowflake if SQL-heavy and lean) + ClickHouse for the firehose + a semantic layer + a feature store. The firehose-to-specialist invariant never bends.</li>
+    <li>Org and roadmap matter as much as tech: a small platform team building <strong>paved roads</strong> for embedded domain analysts, sequenced <strong>crawl → walk → run</strong> by value unlocked, funded by the math that says ~half the cost is the firehose and rollups are the lever.</li>
+  </ul>
+  <p>One chapter remains. Having assembled the whole system, we step back to ask what's durable versus fashionable, where the field is heading, and what a DPE should bet on next. → <a href="16-synthesis-and-outlook.html">Synthesis &amp; Outlook</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

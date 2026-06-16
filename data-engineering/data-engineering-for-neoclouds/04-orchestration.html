@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orchestration — Data Engineering for Neoclouds</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#orchestrators">Orchestrator landscape</a>
+    <a href="#patterns">Multi-provider patterns</a>
+    <a href="#provisioning">Provisioning ephemeral GPU clusters</a>
+    <a href="#idempotency">Idempotency &amp; retries</a>
+    <a href="#spot">Spot &amp; preemption</a>
+    <a href="#observability">Observability</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-training-data-pipelines.html">← Previous</a>
+    <a href="05-cost-engineering.html">Next: Cost Engineering →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · DE using neoclouds</span>
+  <h1>Orchestration Across Providers</h1>
+  <p class="subtitle">How DE pipelines coordinate data work and GPU jobs across multiple providers. Orchestrator choice, multi-provider patterns, retry semantics on spot, and the operational discipline that keeps everything coherent.</p>
+</header>
+
+<section id="orchestrators">
+  <h2>Orchestrator landscape</h2>
+  <p>The orchestrators most commonly used in AI / GPU-cloud DE work:</p>
+
+  <h3>Airflow</h3>
+  <p>The veteran. Mature, broadly known, extensive operator ecosystem. Limitations: weaker data-asset abstractions; mixed support for streaming and ML-specific patterns. Strong fit for traditional ETL with periodic ML training jobs as one node.</p>
+
+  <h3>Dagster</h3>
+  <p>Asset-oriented. Treats datasets, models, and downstream artifacts as first-class assets. Strong fit for ML / DE workflows where lineage matters. Growing rapidly through 2024-2026.</p>
+
+  <h3>Prefect</h3>
+  <p>Pythonic, dynamic workflow definition. Good developer experience. Adoption strongest in mid-market.</p>
+
+  <h3>Argo Workflows</h3>
+  <p>Kubernetes-native. Often paired with Kubeflow for ML pipelines. Strong fit when your stack is already K8s-heavy.</p>
+
+  <h3>Flyte</h3>
+  <p>Kubernetes-native and ML-pipeline-oriented. Strong type system; reproducibility features; growing adoption.</p>
+
+  <h3>Custom job submission</h3>
+  <p>Many AI organizations build a thin job-submission layer over their primary orchestrator. The orchestrator schedules and tracks; the custom layer translates a job request into provider-specific API calls.</p>
+</section>
+
+<section id="patterns">
+  <h2>Multi-provider patterns</h2>
+  <p>Common patterns for handling multiple GPU providers from one orchestrator:</p>
+
+  <h3>Provider as parameter</h3>
+  <p>The DAG / workflow takes a "provider" parameter. Branching logic submits the actual GPU job to the chosen provider. Simple; works for small numbers of providers; brittle as providers' surfaces diverge.</p>
+
+  <h3>Provider abstraction layer</h3>
+  <p>A thin internal library that abstracts "submit GPU job" across providers. The orchestrator only calls the abstraction; the library handles provider-specific API translation. More maintenance but cleaner.</p>
+
+  <h3>Kubernetes federation</h3>
+  <p>Run K8s clusters at each provider; treat them as labeled targets. Orchestrator submits to a federated control plane that routes to clusters. Adds operational complexity; powerful for heavy users.</p>
+
+  <h3>External scheduling service</h3>
+  <p>A service that takes job specs, looks at current provider availability and pricing, and chooses where to submit. The orchestrator submits to the service; the service handles the routing decision.</p>
+
+  <p>Most shops start with parameter-based or abstraction-layer and graduate to more sophisticated patterns as they grow.</p>
+</section>
+
+<section id="provisioning">
+  <h2>Provisioning ephemeral GPU clusters</h2>
+  <p>For training jobs, you often need to spin up a multi-node GPU cluster, run the job, tear it down. The DE-relevant aspects:</p>
+  <ul>
+    <li><strong>Cluster startup time.</strong> 5-30 minutes from request to ready, depending on provider and configuration. Plan for it.</li>
+    <li><strong>Image / environment management.</strong> Container image with CUDA, drivers, frameworks pre-baked saves boot time.</li>
+    <li><strong>Storage mounts.</strong> Get the storage attached at boot; don't fall back to copying data after.</li>
+    <li><strong>Network setup.</strong> InfiniBand or other fast interconnect configured.</li>
+    <li><strong>Job submission inside cluster.</strong> Slurm, Ray, or custom; some providers manage this.</li>
+    <li><strong>Teardown discipline.</strong> Tear down promptly when done; idle GPU clusters burn money fast.</li>
+  </ul>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency &amp; retries</h2>
+  <p>Failure handling is a first-class concern. Retries that aren't idempotent cause duplicate billing, duplicate training, corrupted outputs.</p>
+
+  <ul>
+    <li><strong>Job-level retries.</strong> The orchestrator retries the job. Job submission should be idempotent — same inputs → same output, no side effects from duplicate runs.</li>
+    <li><strong>Step-level retries.</strong> Within a job, individual data loading or training steps may retry. Checkpointing is essential.</li>
+    <li><strong>Run identifiers.</strong> Every job gets a deterministic ID derived from inputs. Duplicate submissions de-dupe to the same logical run.</li>
+    <li><strong>Output staging.</strong> Write to staging locations, then atomic rename / publish. Avoids partial outputs being mistaken for complete.</li>
+  </ul>
+
+  <p>The classic DE idempotency mantra applies, just at higher stakes because each retry costs real GPU money.</p>
+</section>
+
+<section id="spot">
+  <h2>Spot &amp; preemption</h2>
+  <p>Spot / interruptible / preemptible GPU instances offer significant cost savings (often 50% off on-demand) at the cost of being killable.</p>
+
+  <p>To use them well:</p>
+  <ul>
+    <li>Frequent checkpointing — at least every N minutes, where N is acceptable rework on preemption.</li>
+    <li>Quick restart — the orchestrator should resubmit on a different instance promptly.</li>
+    <li>Preemption-aware code — training code that handles SIGTERM gracefully.</li>
+    <li>Budget for some wasted compute — preemption mid-step means losing the partial step.</li>
+    <li>Don't use spot for time-critical jobs — like a job blocking a model release.</li>
+  </ul>
+</section>
+
+<section id="observability">
+  <h2>Observability</h2>
+  <p>DE pipelines on neoclouds need observability across:</p>
+  <ul>
+    <li>Orchestrator runs (success/fail, durations).</li>
+    <li>GPU job-level metrics (utilization, memory, throughput).</li>
+    <li>Storage I/O.</li>
+    <li>Network bandwidth.</li>
+    <li>Cost per run.</li>
+    <li>Output quality (does the resulting model / dataset pass eval).</li>
+  </ul>
+
+  <p>This data ends up in the warehouse via the orchestrator's tracking tables, GPU metrics agents, and the provider's billing exports. Stitching it together for cost attribution (see next chapter) is itself a DE pipeline.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <p>Orchestration is where the DE work crosses the boundary into operations. Multi-provider abstraction, idempotency discipline, and graceful preemption handling separate teams that operate efficiently from teams that bleed GPU money. The next chapter goes deep on cost engineering — the discipline that makes the difference visible.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
