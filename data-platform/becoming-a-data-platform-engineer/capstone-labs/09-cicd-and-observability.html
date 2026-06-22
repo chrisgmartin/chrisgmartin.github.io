@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 09 — CI/CD &amp; Observability — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal</a>
+    <a href="#ci">A CI workflow on every PR</a>
+    <a href="#demo">Watch CI go red, then green</a>
+    <a href="#logging">Structured logs &amp; run metrics</a>
+    <a href="#monitoring">The observability surface</a>
+    <a href="#commit">Commit Lab 09</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-serve-bi-dashboard.html">← Previous</a>
+    <a href="10-ship-and-document.html">Next: Lab 10 — Ship &amp; Document →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 09 — CI/CD &amp; Observability</h1>
+  <p class="subtitle">A platform that only you can run, only on your laptop, only when you remember to, isn't production-grade. In this lab you make mini-GridDP defensible: every pull request gets its tests run automatically, and every pipeline run leaves a trail you can read. This is the difference between "it works on my machine" and "it works, and I can prove it, and I'll know the second it stops."</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need your <code>mini-griddp</code> repo pushed to <strong>GitHub</strong> (you've been committing since Lab 01 — if it's still local-only, create a repo with <code>gh repo create mini-griddp --source=. --private --push</code>). You also need the <strong>dbt project</strong> from Labs 03/06 building cleanly with <code>dbt build</code> locally, and the <strong>ingest/rollup scripts</strong> from Labs 02/04. Have your local stack runnable too, since you'll exercise the Dagster UI at the end. Everything in this lab is done from the repo root.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal</h2>
+  <p>So far mini-GridDP is correct <em>when you run it</em>. Two gaps separate it from a real platform:</p>
+  <ul>
+    <li><strong>Nobody checks your changes before they land.</strong> You could merge a broken model at midnight and not find out until the dashboard is wrong. We fix this with <strong>CI</strong> — Continuous Integration — that runs your dbt tests automatically on every pull request and <em>blocks the merge</em> if anything fails.</li>
+    <li><strong>You can't see what your pipelines did.</strong> When a run is slow or empty, you have no record of how many rows moved or how long it took. We fix this with <strong>observability</strong> — structured logs, run metrics, and freshness checks surfaced in the Dagster UI.</li>
+  </ul>
+  <p>This lab adds the last two boxes from the architecture diagram — the <code>QUALITY</code> and <code>OBSERVABILITY</code> rows at the bottom:</p>
+  <div class="flow">  YOU                 GITHUB                              YOUR LAPTOP
+  ┌──────────┐        ┌──────────────────────────┐        ┌─────────────────────┐
+  │ git push │───────▶│ Pull Request             │        │ Dagster UI          │
+  │ a branch │        │   └─▶ CI (Actions)        │        │  ├─ run timeline    │
+  └──────────┘        │        dbt build + test  │        │  ├─ asset checks    │
+                      │        on throwaway DuckDB│        │  ├─ freshness check │
+                      │   RED ✗  → merge blocked  │        │  └─ structured logs │
+                      │   GREEN ✓ → safe to merge │        │     rows + duration │
+                      └──────────────────────────┘        └─────────────────────┘</div>
+  <div class="callout insight">
+    <span class="callout-label">CI/CD, in one breath</span>
+    <p><strong>CI</strong> = on every change, automatically build it and run the tests. <strong>CD</strong> = automatically deploy what passes. For a data platform, "deploy" is usually "run dbt against production," which Dagster already does on a schedule (Lab 05). So we focus on the high-value half: a CI gate that stops bad data models from ever reaching <code>main</code>.</p>
+  </div>
+</section>
+
+<section id="ci">
+  <h2>A CI workflow on every PR</h2>
+  <p>GitHub Actions runs a <strong>workflow</strong> — a YAML file describing steps to execute on an event. Our event is <code>pull_request</code>. The steps: check out the code, set up Python with <a href="https://docs.astral.sh/uv/">uv</a> (the same tool from Course 5 ch.05), install dbt, seed a tiny throwaway DuckDB, then run <code>dbt build</code> and <code>dbt test</code>. If any test fails, the step exits non-zero and the whole check goes red.</p>
+  <p>The key idea: CI runs against a <strong>throwaway database seeded with a tiny sample</strong>, not your real warehouse. That makes the run fast, deterministic, and safe — it never touches production data. dbt's <a href="https://docs.getdbt.com/reference/commands/seed">seeds</a> are perfect for this: CSVs that dbt loads as tables.</p>
+
+  <p>First, give CI a sample to chew on. Create a couple of small seed files (real values, just a handful of rows):</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/seeds/sample_customers.csv</span></div><pre><code class="language-text">customer_id,name,region,signed_up_at
+1,Acme GPU Co,us-east,2026-01-04
+2,Northwind AI,eu-west,2026-02-11
+3,Globex Render,us-west,2026-03-02</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>dbt/seeds/sample_rentals.csv</span></div><pre><code class="language-text">rental_id,customer_id,gpu_id,started_at,ended_at,hourly_price
+1001,1,h100-01,2026-04-01T10:00:00,2026-04-01T14:00:00,2.50
+1002,2,a100-07,2026-04-01T11:30:00,2026-04-01T12:30:00,1.80
+1003,1,h100-02,2026-04-02T09:00:00,,2.50</code></pre></div>
+
+  <p>Point your staging models at these seeds <em>when running in CI</em>. The simplest pattern is a dbt var that swaps the source — but to keep this lab focused, we just build everything seeds-first: <code>dbt seed</code> loads the CSVs, then <code>dbt build</code> runs models + tests on top of them. Now the workflow:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>.github/workflows/ci.yml</span></div><pre><code class="language-yaml">name: CI
+
+# Run on every PR targeting main, and on pushes to main itself.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  dbt-build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbt        # all steps run inside the dbt project
+    env:
+      # dbt reads the profile from the repo, not ~/.dbt, so CI is self-contained.
+      DBT_PROFILES_DIR: .
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up uv (Python toolchain)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dbt + the DuckDB adapter
+        run: uv pip install --system dbt-core dbt-duckdb
+
+      - name: Show dbt can see the project
+        run: dbt debug
+
+      - name: Load the tiny sample (throwaway DuckDB)
+        run: dbt seed --full-refresh
+
+      - name: Build models and run ALL tests
+        # dbt build runs models, snapshots, seeds, AND tests in dependency order.
+        # If any test fails, dbt exits non-zero and this step (and the PR) goes red.
+        run: dbt build</code></pre></div>
+
+  <p>That <code>DBT_PROFILES_DIR: .</code> line means dbt looks for <code>profiles.yml</code> inside the <code>dbt/</code> folder. Commit a CI-only profile that writes to a local file — the runner throws it away when the job ends:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>dbt/profiles.yml</span></div><pre><code class="language-yaml">mini_griddp:
+  target: ci
+  outputs:
+    ci:
+      type: duckdb
+      path: ci_warehouse.duckdb    # created fresh on the runner, discarded after
+      threads: 4</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Push this branch and open a PR. On the PR's <strong>Checks</strong> tab, a job named <code>dbt-build-and-test</code> appears, runs for ~1–2 minutes, and finishes with a green check. Click into it and you'll see dbt's familiar output: <code>PASS seed ...</code>, <code>PASS model ...</code>, and a summary like <code>Done. PASS=9 WARN=0 ERROR=0</code>. That green check is the promise: nothing broken got merged.</p>
+  </div>
+
+  <table>
+    <thead><tr><th>Workflow piece</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>on: pull_request</code></td><td>Triggers the run when a PR opens or updates</td><td>Every change is checked <em>before</em> it can merge</td></tr>
+      <tr><td><code>runs-on: ubuntu-latest</code></td><td>A fresh, disposable Linux VM</td><td>Clean room — no "works on my machine" state</td></tr>
+      <tr><td><code>dbt seed</code></td><td>Loads the tiny sample CSVs</td><td>Fast, deterministic data; never touches prod</td></tr>
+      <tr><td><code>dbt build</code></td><td>Runs models + tests in DAG order</td><td>A failing test exits non-zero → red check</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">Make it a real gate</span>
+    <p>A red check is only advisory until you enforce it. In your repo on GitHub: <strong>Settings → Branches → Add branch protection rule</strong> for <code>main</code>, tick <em>Require status checks to pass before merging</em>, and select <code>dbt-build-and-test</code>. Now GitHub physically refuses to merge a PR whose CI is red.</p>
+  </div>
+</section>
+
+<section id="demo">
+  <h2>Watch CI go red, then green</h2>
+  <p>Tests you never see fail are tests you don't trust. Let's break something on purpose and watch the gate catch it. Pick a model with a <code>not_null</code> or <code>unique</code> test (your <code>fct_rentals</code> from Lab 06 has these on <code>rental_id</code>). On a new branch, introduce a duplicate:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git checkout -b break-ci-on-purpose
+
+# Add a duplicate rental_id to the seed so the unique test must fail.
+printf '1003,2,a100-09,2026-04-02T09:00:00,,1.80\n' >> dbt/seeds/sample_rentals.csv
+
+git add -A
+git commit -m "TEMP: duplicate rental_id to prove CI catches it"
+git push -u origin break-ci-on-purpose
+gh pr create --fill        # opens the PR</code></pre></div>
+
+  <div class="callout danger">
+    <span class="callout-label">✓ You should see — RED</span>
+    <p>Within a minute the PR's check turns into a red ✗. Click it: the <code>Build models and run ALL tests</code> step shows <code>FAIL 1 unique_fct_rentals_rental_id</code> with <code>Got 2 results, configured to fail if != 0</code>, and <code>dbt build</code> exits non-zero. The PR banner reads <strong>"Merging is blocked — Required statuses must pass."</strong> The bad data <em>cannot</em> reach <code>main</code>. This is the whole point.</p>
+  </div>
+
+  <p>Now fix it. Remove the duplicate row, commit, and push to the same branch — CI re-runs automatically:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># Drop the last (duplicate) line we appended.
+sed -i.bak '$ d' dbt/seeds/sample_rentals.csv &amp;&amp; rm dbt/seeds/sample_rentals.csv.bak
+
+git add -A
+git commit -m "Fix: remove duplicate rental_id"
+git push                   # same branch → CI runs again on the PR</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see — GREEN</span>
+    <p>The check flips to a green ✓, the "Merging is blocked" banner disappears, and the PR is now mergeable. You just experienced the full loop a teammate's PR goes through: propose → CI judges → fix → CI approves → merge. Since this PR only existed to demonstrate the gate, close it without merging (<code>gh pr close break-ci-on-purpose</code>) and delete the branch.</p>
+  </div>
+</section>
+
+<section id="logging">
+  <h2>Structured logs &amp; run metrics</h2>
+  <p>CI guards your <em>code</em>. Logging tells you what your <em>runs</em> actually did. Right now your ingest and rollup scripts probably <code>print()</code> a few things, which is invisible the moment you're not watching. Replace prints with <strong>structured logging</strong>: one JSON object per event, so a human can read it and a machine can parse it.</p>
+
+  <p>Create a tiny shared helper so every script logs the same way:</p>
+  <div class="code-wrap"><div class="code-header"><span>ingest/obs.py</span></div><pre><code class="language-python">"""Shared structured-logging helper for mini-GridDP scripts."""
+import json
+import logging
+import sys
+import time
+from contextlib import contextmanager
+
+
+class JsonFormatter(logging.Formatter):
+    """Render each log record as a single line of JSON."""
+    def format(self, record):
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        # Anything passed via logger.info("...", extra={"fields": {...}})
+        if hasattr(record, "fields"):
+            payload.update(record.fields)
+        return json.dumps(payload)
+
+
+def get_logger(name):
+    logger = logging.getLogger(name)
+    if not logger.handlers:            # avoid duplicate handlers on re-import
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JsonFormatter())
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+
+@contextmanager
+def timed_run(logger, step):
+    """Log start/finish of a step and emit duration + whatever metrics you set."""
+    metrics = {}                       # mutate this inside the `with` block
+    start = time.perf_counter()
+    logger.info(f"{step} started", extra={"fields": {"step": step, "event": "start"}})
+    try:
+        yield metrics
+    except Exception:
+        logger.exception(f"{step} FAILED", extra={"fields": {"step": step, "event": "error"}})
+        raise
+    else:
+        metrics["duration_s"] = round(time.perf_counter() - start, 3)
+        metrics["step"] = step
+        metrics["event"] = "finish"
+        logger.info(f"{step} finished", extra={"fields": metrics})</code></pre></div>
+
+  <p>Now wire it into the Postgres extractor from Lab 02. The pattern: open a <code>timed_run</code>, do the work, and record <code>rows</code> into the metrics dict — duration is captured for you.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>ingest/extract_postgres.py (excerpt)</span></div><pre><code class="language-python">from obs import get_logger, timed_run
+
+log = get_logger("ingest.postgres")
+
+def extract_table(con, table):
+    with timed_run(log, f"extract:{table}") as m:
+        rows = con.execute(f"SELECT * FROM {table}").fetchall()
+        write_to_bronze(table, rows)   # your existing landing logic
+        m["rows"] = len(rows)          # <-- the run metric we care about
+        m["table"] = table
+    return rows
+
+
+if __name__ == "__main__":
+    con = connect_postgres()
+    for table in ("customers", "gpus", "rentals", "prices"):
+        extract_table(con, table)</code></pre></div>
+
+  <p>Run it and watch the output. Every line is parseable JSON:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python ingest/extract_postgres.py
+
+# Want only the finished-step metrics? Pipe through jq:
+python ingest/extract_postgres.py | jq 'select(.event == "finish") | {step, rows, duration_s}'</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>JSON lines like
+    <code>{"ts":"2026-06-21T10:02:11","level":"INFO","logger":"ingest.postgres","msg":"extract:rentals finished","step":"extract:rentals","event":"finish","duration_s":0.214,"rows":1483}</code>.
+    The <code>jq</code> filter trims it to <code>{"step":"extract:rentals","rows":1483,"duration_s":0.214}</code>. You now have <strong>rows processed</strong> and <strong>duration</strong> for every step — the two numbers you'll watch to catch an empty source or a sudden slowdown. Apply the same <code>timed_run</code> wrapper to your telemetry rollup so it reports rows-rolled-up per hour.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Why JSON, not plain text</span>
+    <p>Plain logs are fine until you have thousands of lines. JSON logs are <em>queryable</em>: <code>jq</code>, a log platform, or Dagster's event log can filter on <code>rows == 0</code> or <code>duration_s &gt; 60</code> instantly. Structured-from-the-start is a habit that pays off the first time you have to debug a 2 a.m. run.</p>
+  </div>
+</section>
+
+<section id="monitoring">
+  <h2>The observability surface</h2>
+  <p>Logs are the raw material; you still need a <strong>surface</strong> to see them on. For mini-GridDP that surface is the <strong>Dagster UI</strong> you stood up in Lab 05 (and the orchestration ideas from Course 5 ch.07). Every asset materialization shows up as a run with a timeline, the captured logs, and — once we add them — checks.</p>
+
+  <p>Dagster <a href="https://docs.dagster.io/concepts/assets/asset-checks">asset checks</a> let an asset assert things about itself <em>after</em> it materializes. Add a <strong>freshness check</strong> that flags stale telemetry — if the newest row in <code>fct_telemetry_hourly</code> is older than two hours, the data has gone stale and the check fails loudly in the UI:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/checks.py</span></div><pre><code class="language-python">import datetime as dt
+from dagster import asset_check, AssetCheckResult, AssetKey
+
+
+@asset_check(asset=AssetKey("fct_telemetry_hourly"))
+def telemetry_is_fresh(duckdb) -> AssetCheckResult:
+    """Fail if the newest telemetry hour is more than 2 hours old."""
+    with duckdb.get_connection() as con:
+        newest = con.execute(
+            "SELECT max(hour) FROM fct_telemetry_hourly"
+        ).fetchone()[0]
+
+    if newest is None:
+        return AssetCheckResult(passed=False, metadata={"reason": "table is empty"})
+
+    age_hours = (dt.datetime.utcnow() - newest).total_seconds() / 3600
+    return AssetCheckResult(
+        passed=age_hours &lt;= 2,
+        metadata={
+            "newest_hour": str(newest),
+            "age_hours": round(age_hours, 2),
+            "threshold_hours": 2,
+        },
+    )</code></pre></div>
+
+  <p>Reload your code location and run the pipeline:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dagster dev    # open http://localhost:3000</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>In the Dagster UI, open the <code>fct_telemetry_hourly</code> asset. Under <strong>Checks</strong> you'll see <code>telemetry_is_fresh</code> with a green ✓ right after a fresh run, and its metadata (<code>age_hours: 0.3</code>, <code>newest_hour: ...</code>). Stop the generator, wait, re-run the check, and it flips to a red ✗ with <code>age_hours</code> above the threshold — the platform is now <em>telling you</em> the data is stale instead of you finding out from a confused dashboard.</p>
+  </div>
+
+  <p>What you'd actually alert on, in priority order:</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Where it comes from</th><th>Why you'd page someone</th></tr></thead>
+    <tbody>
+      <tr><td>A scheduled run <strong>failed</strong></td><td>Dagster run status</td><td>The pipeline is down; data is not updating at all</td></tr>
+      <tr><td><strong>Freshness</strong> check red</td><td>The asset check above</td><td>Data is stale — dashboards silently show old numbers</td></tr>
+      <tr><td><strong>rows == 0</strong> on an ingest step</td><td>Your structured log metric</td><td>A source went empty; a downstream model will be wrong</td></tr>
+      <tr><td><strong>Duration</strong> 3× the norm</td><td>Your <code>duration_s</code> metric</td><td>Something's degrading before it fully breaks</td></tr>
+      <tr><td>A <strong>dbt test</strong> failed in prod</td><td>Dagster's dbt integration</td><td>An assumption about the data broke (nulls, dupes)</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Alert on symptoms, not noise</span>
+    <p>Wire failures to a Dagster <a href="https://docs.dagster.io/concepts/ops-jobs-graphs/job-execution#sensors">sensor</a> that posts to Slack or email. The rule of thumb: alert on things a human must act on (run failed, data stale), and merely <em>log</em> the rest. An alert that fires for nothing trains everyone to ignore it — the worst possible outcome for observability.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit Lab 09</h2>
+  <p>You've added the CI workflow, sample seeds, a CI profile, the logging helper, and asset checks. Land it all on <code>main</code> through a clean PR — and this time, let your own green check approve the merge:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git checkout -b lab-09-cicd-observability
+git add .github/workflows/ci.yml dbt/seeds dbt/profiles.yml \
+        ingest/obs.py ingest/extract_postgres.py dagster_app/checks.py
+git commit -m "Lab 09: CI on every PR + structured logs + freshness checks"
+git push -u origin lab-09-cicd-observability
+gh pr create --fill
+# wait for the green check, then:
+gh pr merge --squash --delete-branch</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The PR opens, CI runs <code>dbt build</code> on the sample, the check goes green, and the merge succeeds. Your commit history now shows mini-GridDP gaining a safety net — exactly the kind of progression a hiring manager loves to scroll through.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain, step by step, what happens between <code>git push</code> on a branch and a green check on the PR?</li>
+    <li>Why does CI build against a seeded throwaway DuckDB instead of your real warehouse?</li>
+    <li>What two run metrics does <code>timed_run</code> emit, and what would each one warn you about?</li>
+    <li>Which signals deserve an alert, and which should merely be logged?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add a freshness step to CI, or one more instrumented script</strong></summary>
+    <div class="collapse-card-body">
+      <p>Pick one. <strong>(A)</strong> Add a CI step that also runs <code>dbt source freshness</code> so the PR checks source-data freshness, not just tests. <strong>(B)</strong> Wrap your telemetry rollup script in <code>timed_run</code> so it emits a <code>rows</code> metric like the extractor does.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution A — .github/workflows/ci.yml (add a step)</span></div><pre><code class="language-yaml">      - name: Check source freshness
+        # Runs against the freshness rules defined on your dbt sources.
+        # --no-error-on-runtime so a stale sample doesn't red the PR;
+        # drop that flag once you want freshness to actually gate merges.
+        run: dbt source freshness --no-error-on-runtime</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>solution B — ingest/rollup_telemetry.py (excerpt)</span></div><pre><code class="language-python">from obs import get_logger, timed_run
+
+log = get_logger("rollup.telemetry")
+
+def rollup_hourly(con):
+    with timed_run(log, "rollup:telemetry_hourly") as m:
+        con.execute(BUILD_HOURLY_SQL)          # your existing rollup SQL
+        m["rows"] = con.execute(
+            "SELECT count(*) FROM fct_telemetry_hourly"
+        ).fetchone()[0]
+
+
+if __name__ == "__main__":
+    rollup_hourly(connect_duckdb())</code></pre></div>
+      <p>For A, you should see a new <code>Check source freshness</code> step in the PR's check log, printing each source's freshness state. For B, running the rollup prints a JSON finish line with <code>"step":"rollup:telemetry_hourly"</code>, a <code>rows</code> count, and <code>duration_s</code> — now <em>both</em> ends of your firehose are observable.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your platform is built, tested in CI, and observable — time to package it so anyone can run it and understand it. → <a href="10-ship-and-document.html">Lab 10 — Ship &amp; Document</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

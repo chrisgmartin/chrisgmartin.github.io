@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Your First Pipeline — Orientation &amp; Setup</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">What you'll build</a>
+    <a href="#seed">Seed the source</a>
+    <a href="#extract">Extract</a>
+    <a href="#transform">Transform</a>
+    <a href="#load">Load</a>
+    <a href="#run">Run end to end</a>
+    <a href="#idempotent">Make it re-runnable</a>
+    <a href="#reflect">Reflect</a>
+    <a href="#commit">Commit your work</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-docker-and-databases.html">← Previous</a>
+    <a href="../foundations/index.html">Next course: Foundations →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 2 · Hands-on</span>
+  <h1>Your First Pipeline</h1>
+  <p class="subtitle">This is the capstone. You'll wire everything from this course — the shell, Python, Postgres, DuckDB — into one real <strong>extract → transform → load</strong> pipeline that moves rental data out of a source database, reshapes it, and lands an analytics table in a warehouse. It's the entire curriculum in miniature. Type it all; by the end you'll have run a genuine data pipeline with your own hands.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need two things from earlier chapters running and ready:</p>
+  <ul>
+    <li><strong>Postgres up</strong> (Chapter 05) — your Docker Compose stack running, reachable at <code>localhost:5432</code> with the <code>griddp</code> database, user <code>griddp</code>, password <code>griddp</code>. Confirm with <code>docker compose ps</code> in your <code>mini-griddp</code> folder.</li>
+    <li><strong>Your uv project</strong> (Chapter 04) — the <code>mini-griddp</code> project with <code>uv</code> initialized. We'll add a couple of packages to it.</li>
+  </ul>
+  <p>From inside <code>mini-griddp</code>, add the libraries this lab uses:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv add duckdb psycopg[binary] pandas</code></pre></div>
+  <p><code>duckdb</code> is our warehouse, <code>psycopg</code> talks to Postgres, and <code>pandas</code> gives us a dataframe to move data through. If <code>uv add</code> succeeds you're ready.</p>
+</div>
+
+<section id="goal">
+  <h2>What you'll build</h2>
+  <p>Real data platforms all do the same fundamental thing: take data out of the systems that <em>produce</em> it, reshape it into something useful, and put it where people can <em>analyze</em> it. That three-step move has a name — <strong>ETL</strong> (extract, transform, load), sometimes ordered <strong>ELT</strong>. You're going to build a tiny but genuine one.</p>
+  <p>Our story: a GPU-rental marketplace records every rental in Postgres (the operational source). We want a business question answered — <em>how much revenue did each GPU model earn?</em> — so we'll pull the rentals into DuckDB (our analytics warehouse), compute revenue, aggregate by model, and save the answer as a clean table.</p>
+
+  <div class="flow">  ┌── Postgres ──┐      ┌── Python ──┐      ┌──── DuckDB ────┐
+  │  rentals     │      │            │      │                │
+  │  (source DB) │─────▶│ EXTRACT    │─────▶│  raw rows in   │
+  │              │ read │ pull rows  │      │  a dataframe   │
+  └──────────────┘      └────────────┘      └───────┬────────┘
+                                                    │
+                              TRANSFORM             ▼
+                        revenue = hours × rate   ┌────────────────────┐
+                        sum revenue per model    │  gpu_model_revenue │
+                                                 │  (analytics table) │  ◀── LOAD
+                                                 └────────────────────┘
+   ─────────────────────────────────────────────────────────────────────▶
+   extract             transform                load            data flows left to right</div>
+
+  <div class="callout insight">
+    <span class="callout-label">The whole curriculum in miniature</span>
+    <p>Everything you'll learn over the next courses — orchestration, scale, testing, infrastructure — is in service of running this shape <em>reliably, repeatedly, and big</em>. Once the small version clicks, the rest is amplification.</p>
+  </div>
+</section>
+
+<section id="seed">
+  <h2>Seed the source</h2>
+  <p>Before we can extract anything, the source needs data. Let's create a <code>rentals</code> table in Postgres and drop in eight sample rentals. Connect to your running Postgres with <code>psql</code> (the client is bundled in the Postgres container):</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker compose exec postgres psql -U griddp -d griddp</code></pre></div>
+
+  <p>At the <code>griddp=#</code> prompt, paste this SQL:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>seed.sql — paste into psql</span></div><pre><code class="language-sql">DROP TABLE IF EXISTS rentals;
+
+CREATE TABLE rentals (
+    rental_id      INTEGER PRIMARY KEY,
+    customer_id    INTEGER NOT NULL,
+    gpu_model      TEXT    NOT NULL,
+    hours          NUMERIC NOT NULL,
+    price_per_hour NUMERIC NOT NULL,
+    created_at     TIMESTAMP DEFAULT now()
+);
+
+INSERT INTO rentals (rental_id, customer_id, gpu_model, hours, price_per_hour) VALUES
+    (1, 101, 'A100', 10.0, 2.50),
+    (2, 102, 'H100', 5.0,  4.00),
+    (3, 101, 'A100', 3.5,  2.50),
+    (4, 103, 'L4',   20.0, 0.80),
+    (5, 102, 'H100', 8.0,  4.00),
+    (6, 104, 'A100', 1.5,  2.50),
+    (7, 103, 'L4',   12.0, 0.80),
+    (8, 101, 'H100', 6.0,  4.00);
+
+SELECT * FROM rentals ORDER BY rental_id;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A table of <strong>8 rows</strong> printed back, with columns <code>rental_id, customer_id, gpu_model, hours, price_per_hour, created_at</code> — a mix of <code>A100</code>, <code>H100</code>, and <code>L4</code> rentals. Type <code>\q</code> to leave <code>psql</code>. Your source system now has data, just like a production app would.</p>
+  </div>
+</section>
+
+<section id="extract">
+  <h2>Extract — read from the source</h2>
+  <p>Extraction means: connect to the source and pull the rows we need. We'll use <code>psycopg</code> to query Postgres and load the result straight into a pandas dataframe. In your <code>mini-griddp</code> folder, create <code>extract.py</code>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>extract.py</span></div><pre><code class="language-python">import psycopg
+import pandas as pd
+
+PG_CONN = "host=localhost port=5432 dbname=griddp user=griddp password=griddp"
+
+def extract_rentals() -&gt; pd.DataFrame:
+    """Connect to Postgres and read the rentals table into a dataframe."""
+    with psycopg.connect(PG_CONN) as conn:
+        df = pd.read_sql("SELECT * FROM rentals", conn)
+    return df
+
+if __name__ == "__main__":
+    rentals = extract_rentals()
+    print(f"Extracted {len(rentals)} rows")
+    print(rentals.head())</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python extract.py</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p><code>Extracted 8 rows</code> followed by a printed dataframe — the first five rentals with all their columns. You just pulled live data out of a database with code. (If you get a connection error, your Postgres container isn't running — revisit the Setup box and <code>docker compose up -d</code>.)</p>
+  </div>
+</section>
+
+<section id="transform">
+  <h2>Transform — reshape the data</h2>
+  <p>Now the interesting part: turn raw rows into an <em>answer</em>. We need two steps — compute <code>revenue = hours × price_per_hour</code> for each rental, then sum that revenue grouped by <code>gpu_model</code>.</p>
+  <p>We have a choice of <em>where</em> to do this. Two common options:</p>
+  <table>
+    <thead><tr><th>Approach</th><th>What it looks like</th><th>When you'd pick it</th></tr></thead>
+    <tbody>
+      <tr><td><strong>In pandas (Python)</strong></td><td>Add a column, then <code>.groupby()</code></td><td>Small data, Python-heavy logic</td></tr>
+      <tr><td><strong>In DuckDB (SQL)</strong></td><td>One <code>SELECT … GROUP BY</code> over the dataframe</td><td>Pushes work to the engine; scales far better; reads like the question</td></tr>
+    </tbody>
+  </table>
+  <p>We'll use <strong>DuckDB SQL</strong>. DuckDB can query a pandas dataframe directly as if it were a table, the transform reads almost exactly like the business question, and this is the pattern real warehouses use — let the analytics engine do the heavy lifting. Create <code>transform.py</code>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>transform.py</span></div><pre><code class="language-python">import duckdb
+import pandas as pd
+
+def transform(rentals: pd.DataFrame) -&gt; pd.DataFrame:
+    """Compute revenue per rental, then aggregate to revenue per GPU model."""
+    result = duckdb.sql("""
+        SELECT
+            gpu_model,
+            COUNT(*)                        AS rental_count,
+            SUM(hours * price_per_hour)     AS total_revenue
+        FROM rentals
+        GROUP BY gpu_model
+        ORDER BY total_revenue DESC
+    """).df()
+    return result
+
+if __name__ == "__main__":
+    from extract import extract_rentals
+    summary = transform(extract_rentals())
+    print(summary)</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python transform.py</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A small table with one row per GPU model. <code>H100</code> leads at <code>76.0</code> total revenue (3 rentals), then <code>A100</code> at <code>40.0</code> (3 rentals), then <code>L4</code> at <code>25.6</code> (2 rentals). Notice DuckDB read the <code>rentals</code> dataframe by name straight out of your Python scope — no import, no copy. That's the in-process magic that makes it a great local warehouse.</p>
+  </div>
+</section>
+
+<section id="load">
+  <h2>Load — land it in the warehouse</h2>
+  <p>The answer exists, but only in memory — when the script ends it's gone. <strong>Loading</strong> means persisting the result somewhere durable. We'll write it into a DuckDB database file as a table called <code>gpu_model_revenue</code>, and also drop a Parquet file (the standard columnar format you'll meet everywhere later). Create <code>load.py</code>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>load.py</span></div><pre><code class="language-python">import duckdb
+import pandas as pd
+
+WAREHOUSE = "warehouse.duckdb"
+
+def load(summary: pd.DataFrame) -&gt; None:
+    """Persist the summary into the DuckDB warehouse and to Parquet."""
+    con = duckdb.connect(WAREHOUSE)
+    con.register("summary_df", summary)
+    con.sql("CREATE OR REPLACE TABLE gpu_model_revenue AS SELECT * FROM summary_df")
+    con.sql("COPY gpu_model_revenue TO 'gpu_model_revenue.parquet' (FORMAT parquet)")
+    con.close()
+
+if __name__ == "__main__":
+    con = duckdb.connect(WAREHOUSE)
+    print(con.sql("SELECT * FROM gpu_model_revenue").df())
+    con.close()</code></pre></div>
+
+  <p>That <code>__main__</code> block lets you <em>query the warehouse back</em> after the pipeline has run — proving the data is really on disk:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python load.py   # (run this after the full pipeline below)</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Once the pipeline has populated it, <code>load.py</code> prints the <code>gpu_model_revenue</code> table read straight from <code>warehouse.duckdb</code> — your data survived the program ending. A <code>gpu_model_revenue.parquet</code> file now sits in the folder too. That's a warehouse: query it any time without re-running the whole pipeline.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Run end to end</h2>
+  <p>Three functions, one flow. Let's assemble them into a single <code>pipeline.py</code> that runs the whole extract → transform → load in one command:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>pipeline.py</span></div><pre><code class="language-python">from extract import extract_rentals
+from transform import transform
+from load import load
+
+def run() -&gt; None:
+    print("→ Extracting from Postgres…")
+    rentals = extract_rentals()
+    print(f"  got {len(rentals)} rows")
+
+    print("→ Transforming…")
+    summary = transform(rentals)
+
+    print("→ Loading into DuckDB warehouse…")
+    load(summary)
+
+    print("✓ Pipeline complete. Result:")
+    print(summary)
+
+if __name__ == "__main__":
+    run()</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python pipeline.py</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Three progress lines, then <code>✓ Pipeline complete.</code> and the final revenue-per-model table — <code>H100</code> at <code>76.0</code>, <code>A100</code> at <code>40.0</code>, <code>L4</code> at <code>25.6</code>. <strong>You just ran a complete data pipeline.</strong> Data left Postgres, got reshaped, and landed in a queryable warehouse — all from one command.</p>
+  </div>
+</section>
+
+<section id="idempotent">
+  <h2>A first big idea: make it re-runnable</h2>
+  <p>Run <code>uv run python pipeline.py</code> a second time. Notice the result is <em>exactly the same</em> — not doubled. That's not luck; it's by design, and it's one of the most important properties a pipeline can have.</p>
+  <p>The magic word is <strong>idempotent</strong>: <em>running the operation twice leaves the system in the same state as running it once.</em> Press an elevator button twice — same result. Our load uses <code>CREATE OR REPLACE TABLE</code>, which <em>rebuilds</em> the table from scratch every run instead of appending to it. So a re-run can't produce duplicates.</p>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ The trap we avoided</span>
+    <p>If <code>load.py</code> had used <code>INSERT INTO gpu_model_revenue …</code> instead, every run would <em>stack</em> another copy of the rows on top — run it three times, get triple the data. That class of bug is everywhere in real pipelines. The fixes: <code>CREATE OR REPLACE</code>, drop-then-load, or "upsert" (update existing rows, insert new ones). We used the simplest.</p>
+  </div>
+
+  <div class="flow">  run pipeline.py  ──▶  ┌──────────────────────┐
+                        │  gpu_model_revenue   │  3 rows
+                        └──────────────────────┘
+  run pipeline.py AGAIN ──▶  table is REPLACED, not appended
+                        ┌──────────────────────┐
+                        │  gpu_model_revenue   │  3 rows  ← same state
+                        └──────────────────────┘
+   idempotent: run once or run ten times → identical result</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why this matters later</span>
+    <p>Pipelines fail halfway and get retried. Schedulers run them on overlapping triggers. A teammate kicks one off by hand to debug. If a re-run can corrupt or double your data, every one of those is a disaster. Idempotency makes "just run it again" a safe instinct — and you'll meet this idea again in every course ahead.</p>
+  </div>
+</section>
+
+<section id="reflect">
+  <h2>Reflect — map it to the mental model</h2>
+  <p>Remember the data-platform layers from Chapter 01? You just built one of each:</p>
+  <table>
+    <thead><tr><th>Mental-model layer</th><th>What you built</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Source</strong></td><td>The Postgres <code>rentals</code> table — the operational system producing data</td></tr>
+      <tr><td><strong>Ingestion</strong></td><td><code>extract_rentals()</code> — code that pulls data out of the source</td></tr>
+      <tr><td><strong>Storage</strong></td><td>The DuckDB warehouse (<code>warehouse.duckdb</code>) + the Parquet file</td></tr>
+      <tr><td><strong>Transformation</strong></td><td>The SQL aggregation — revenue computed and rolled up per model</td></tr>
+      <tr><td><strong>Serving</strong></td><td>The <code>gpu_model_revenue</code> table — the answer, ready for anyone to query</td></tr>
+    </tbody>
+  </table>
+  <p>That's a real platform's spine. But it's a <em>toy</em>, and the gap between this and production is exactly what the rest of the curriculum fills. Here's what's still missing:</p>
+  <table>
+    <thead><tr><th>You did (toy)</th><th>Real platforms do (and where you'll learn it)</th></tr></thead>
+    <tbody>
+      <tr><td>Ran the pipeline by hand</td><td><strong>Schedule &amp; orchestrate</strong> it — run on a timer, in order, with retries and alerts on failure (Courses 4–6)</td></tr>
+      <tr><td>Trusted the output by eyeballing it</td><td><strong>Test &amp; check quality</strong> — automated assertions that the data is correct before anyone trusts it (later courses)</td></tr>
+      <tr><td>Moved 8 rows in memory</td><td><strong>Scale</strong> — handle millions/billions of rows, partitioned and distributed (Course 3 explains how this is even possible)</td></tr>
+      <tr><td>Read one table from one database</td><td><strong>Integrate many sources</strong> — APIs, files, streams, multiple databases</td></tr>
+      <tr><td>Hard-coded a password in the script</td><td><strong>Manage secrets &amp; config</strong> safely, and define infra as code</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The shape never changes</span>
+    <p>Every item above makes the <em>same</em> extract → transform → load more reliable, bigger, or more automated. You now own the core. Everything ahead is amplification.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit your work</h2>
+  <p>You built something real — get it into version control so it's tracked and part of your portfolio. From inside <code>mini-griddp</code>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># don't commit the generated warehouse/parquet — they're rebuildable
+echo "warehouse.duckdb" &gt;&gt; .gitignore
+echo "*.parquet"        &gt;&gt; .gitignore
+
+git add extract.py transform.py load.py pipeline.py .gitignore pyproject.toml uv.lock
+git commit -m "Add first ETL pipeline: Postgres rentals -> DuckDB revenue"
+git push</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A commit recording your four pipeline files, then a successful <code>push</code> to GitHub. Notice we <em>git-ignored</em> the warehouse and Parquet outputs — they're generated artifacts, rebuildable any time by running the pipeline. That's the reproducibility principle in action: commit the <em>code that makes the data</em>, not the data itself. Your portfolio just grew by one working pipeline.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you name the three stages of the pipeline and what each one does?</li>
+    <li>Can you explain, in one sentence, what <strong>idempotent</strong> means and why it matters?</li>
+    <li>Do you know why we committed the code but git-ignored <code>warehouse.duckdb</code>?</li>
+    <li>Could you map your pipeline onto the source → ingestion → storage → transformation → serving layers?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add a second metric, and keep it idempotent</strong></summary>
+    <div class="collapse-card-body">
+      <p>Add a second analytics table, <code>customer_hours</code>, holding <strong>total hours per customer</strong>, loaded into the same warehouse alongside <code>gpu_model_revenue</code>. The whole script must stay idempotent — running it twice produces identical tables, no duplicates.</p>
+      <p>One clean way: add a second transform, and load both summaries with <code>CREATE OR REPLACE</code> so each run rebuilds its table.</p>
+      <div class="code-wrap"><div class="code-header"><span>transform.py — add alongside transform()</span></div><pre><code class="language-python">def transform_customer_hours(rentals):
+    import duckdb
+    return duckdb.sql("""
+        SELECT customer_id, SUM(hours) AS total_hours
+        FROM rentals
+        GROUP BY customer_id
+        ORDER BY total_hours DESC
+    """).df()</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>load.py — generalize load()</span></div><pre><code class="language-python">def load_table(summary, table_name):
+    con = duckdb.connect(WAREHOUSE)
+    con.register("df", summary)
+    # CREATE OR REPLACE = idempotent: rebuilds, never appends
+    con.sql(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+    con.close()</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>pipeline.py — wire in the second table</span></div><pre><code class="language-python">from extract import extract_rentals
+from transform import transform, transform_customer_hours
+from load import load_table
+
+def run():
+    rentals = extract_rentals()
+    load_table(transform(rentals), "gpu_model_revenue")
+    load_table(transform_customer_hours(rentals), "customer_hours")
+    print("✓ Loaded gpu_model_revenue and customer_hours")
+
+if __name__ == "__main__":
+    run()</code></pre></div>
+      <p>Run <code>uv run python pipeline.py</code> twice, then query both tables — same results each time. Because every load uses <code>CREATE OR REPLACE</code>, the whole pipeline is idempotent end to end. If you got two tables that don't grow on re-runs, you've nailed the core skill of this course.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>That's a wrap on <strong>Course 2</strong>. Stop and appreciate what you can now do: you have a real data-engineering workstation, and you've built and committed a working pipeline that extracts from a source database, transforms data with SQL, and loads it into a warehouse — idempotently. That is the actual job, in miniature.</p>
+  <p>You built the <em>what</em>. <strong>Course 3 — Foundations</strong> explains the <em>why</em>: how databases really store and find data, how files and storage formats work under the hood, and how distributed systems let a pipeline like yours scale from 8 rows to billions. Once you understand the machinery beneath the tools, you stop following recipes and start engineering.</p>
+  <p>Course 3 — <a href="../foundations/index.html">Foundations</a> — is ready, and it's where you go next: it explains the machinery beneath everything you just built. Congratulations on finishing Course 2.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

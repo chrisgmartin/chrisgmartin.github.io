@@ -8,6 +8,11 @@
   // renders only the topics (flat list); the `guides` array is also used
   // to drive auto-injected breadcrumbs on chapter pages and to mark a
   // topic active when the user is inside one of its guides.
+  // A guide may belong to a named sub-collection (a folder grouping several
+  // guides under a topic, e.g. a multi-course curriculum). Guides carry an
+  // optional `group: { name, folder }` so breadcrumbs/paths reflect the nesting.
+  const DPE_CURRICULUM = { name: 'Becoming a Data Platform Engineer', folder: 'becoming-a-data-platform-engineer' };
+
   const SITE_NAV = [
     {
       name: 'AI Engineering',
@@ -38,22 +43,27 @@
       ]
     },
     {
+      name: 'Data Platform',
+      folder: 'data-platform',
+      guides: [
+        { name: 'Start Here & Roadmap', folder: 'start-here-roadmap', group: DPE_CURRICULUM },
+        { name: 'Orientation & Setup', folder: 'orientation-setup', group: DPE_CURRICULUM },
+        { name: 'Foundations', folder: 'foundations', group: DPE_CURRICULUM },
+        { name: 'The DE Craft', folder: 'the-de-craft', group: DPE_CURRICULUM },
+        { name: 'Tooling & the Modern Stack', folder: 'tooling-stack', group: DPE_CURRICULUM },
+        { name: 'Capstone Labs', folder: 'capstone-labs', group: DPE_CURRICULUM },
+        { name: 'Career & Getting the Job', folder: 'career', group: DPE_CURRICULUM },
+        { name: 'Glossary & Cheat Sheets', folder: 'glossary', group: DPE_CURRICULUM },
+        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
+      ]
+    },
+    {
       name: 'Data Science',
       folder: 'data-science',
       guides: [
         { name: 'Product & Analytics Data Science', folder: 'product-analytics-ds' },
         { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' },
         { name: 'Data Science for Neoclouds', folder: 'data-science-for-neoclouds' }
-      ]
-    },
-    {
-      name: 'Product Management',
-      folder: 'product-management',
-      guides: [
-        { name: 'Senior PM — Platform (Onboarding & KYC)', folder: 'senior-pm-platform' },
-        { name: 'Senior PM — Payments (Emerging Markets)', folder: 'senior-pm-payments' },
-        { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
-        { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
     },
     {
@@ -84,18 +94,13 @@
       ]
     },
     {
-      name: 'Data Platform',
-      folder: 'data-platform',
+      name: 'Product Management',
+      folder: 'product-management',
       guides: [
-        { name: 'Start Here & Roadmap', folder: 'start-here-roadmap' },
-        { name: 'Orientation & Setup', folder: 'orientation-setup' },
-        { name: 'Foundations', folder: 'foundations' },
-        { name: 'The DE Craft', folder: 'the-de-craft' },
-        { name: 'Tooling & the Modern Stack', folder: 'tooling-stack' },
-        { name: 'Capstone Labs', folder: 'capstone-labs' },
-        { name: 'Career & Getting the Job', folder: 'career' },
-        { name: 'Glossary & Cheat Sheets', folder: 'glossary' },
-        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
+        { name: 'Senior PM — Platform (Onboarding & KYC)', folder: 'senior-pm-platform' },
+        { name: 'Senior PM — Payments (Emerging Markets)', folder: 'senior-pm-payments' },
+        { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
+        { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
     }
   ];
@@ -171,7 +176,7 @@
       a.href = root + topic.folder + '/index.html';
       a.className = 'site-nav-guide';
       a.textContent = topic.name;
-      const inGuide = topic.guides.some(g => g.folder === currentFolder);
+      const inGuide = topic.guides.some(g => g.folder === currentFolder || (g.group && g.group.folder === currentFolder));
       if (topic.folder === currentFolder || inGuide) {
         a.classList.add('active');
       }
@@ -245,7 +250,13 @@
     crumbs.appendChild(sep('·'));
     crumbs.appendChild(link(root + ctx.topic.folder + '/index.html', ctx.topic.name));
     crumbs.appendChild(sep('›'));
-    crumbs.appendChild(link(root + ctx.topic.folder + '/' + ctx.guide.folder + '/index.html', ctx.guide.name));
+    // Guides may live inside a named group folder (e.g. a curriculum); reflect it.
+    const groupPrefix = ctx.guide.group ? ctx.guide.group.folder + '/' : '';
+    if (ctx.guide.group) {
+      crumbs.appendChild(link(root + ctx.topic.folder + '/' + ctx.guide.group.folder + '/index.html', ctx.guide.group.name));
+      crumbs.appendChild(sep('›'));
+    }
+    crumbs.appendChild(link(root + ctx.topic.folder + '/' + groupPrefix + ctx.guide.folder + '/index.html', ctx.guide.name));
     crumbs.appendChild(sep('›'));
     const current = document.createElement('span');
     current.setAttribute('aria-current', 'page');

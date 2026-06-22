@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Modeling II — Dimensional Modeling — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why analytics needs a different model</a>
+    <a href="#star">The star schema</a>
+    <a href="#facts">Fact tables</a>
+    <a href="#dims">Dimension tables</a>
+    <a href="#grain">Declaring the grain</a>
+    <a href="#hands-on">Hands-on: build a star in DuckDB</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-data-modeling-relational.html">← Previous</a>
+    <a href="03-slowly-changing-dimensions.html">Next: Slowly-Changing Dimensions →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Data Modeling II — Dimensional Modeling</h1>
+  <p class="subtitle">In Chapter 01 you normalized the marketplace into a clean transactional schema — great for recording rentals, awkward for answering "how much revenue did each GPU model make last month?" This lab teaches the other half of modeling: the star schema, a shape built not for writing data but for asking questions of it. By the end you'll have built one in DuckDB and queried it.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need the normalized source from Chapter 01 and DuckDB. We'll work entirely inside one DuckDB session — no Postgres required this time, since we'll recreate a small normalized source in DuckDB to model from. Open a terminal in your <code>mini-griddp</code> repo and launch DuckDB with <code>duckdb marketplace.duckdb</code> (or <code>python -c "import duckdb; duckdb.connect('marketplace.duckdb')"</code> if you prefer Python). Keep this page beside it and run each block as you read.</p>
+</div>
+
+<section id="why">
+  <h2>Why analytics needs a different model</h2>
+  <p>The schema you built in Chapter 01 was <strong>normalized</strong>: every fact lives in exactly one place, foreign keys stitch the tables together, and nothing is duplicated. That's exactly what a transactional system (an <strong>OLTP</strong> system — online <em>transaction</em> processing) wants. When a customer rents a GPU, you insert one row, update one balance, and trust that there's no contradictory copy anywhere. Normalization protects correctness when data is constantly changing.</p>
+  <p>But analysts don't insert rows one at a time — they ask sweeping questions across millions of them: revenue by region by month, average rental length by GPU tier, the top ten customers this quarter. To answer those against a normalized schema, every query has to <strong>re-join</strong> the same five or six tables, every time. That's painful in two ways:</p>
+  <ul>
+    <li><strong>It's slow.</strong> Joining many tables over large volumes is expensive, and the engine redoes that work for every report.</li>
+    <li><strong>It's hard to understand.</strong> An analyst has to know which of fifteen tables holds the customer's region, and how to navigate the key chain to reach it. The model fights the question instead of serving it.</li>
+  </ul>
+  <p>So for analytics we use a different shape — one deliberately <em>denormalized</em> and optimized for reading. This is <strong>OLAP</strong>: online <em>analytical</em> processing. The most common and most durable design is the <strong>star schema</strong>.</p>
+  <div class="callout insight">
+    <span class="callout-label">Two models, one truth</span>
+    <p>This isn't "normalized is wrong." Both models describe the same business — they're tuned for opposite jobs. OLTP optimizes for fast, safe <em>writes</em> with no duplication. OLAP optimizes for fast, understandable <em>reads</em>, accepting some duplication as the price. A real platform keeps both: the normalized source of record, and dimensional tables built <em>from</em> it for analysis. The pipeline between them is most of what this course builds.</p>
+  </div>
+</section>
+
+<section id="star">
+  <h2>The star schema</h2>
+  <p>A star schema has one central <strong>fact table</strong> surrounded by several <strong>dimension tables</strong>. The fact table records the events you measure; the dimensions hold the descriptive context you slice by. Draw it and it looks like a star — the fact in the middle, dimensions as points radiating out, each connected by a single key.</p>
+  <p>Here's the marketplace as a star. The fact is <code>fct_rentals</code> (one row per rental); the points are who rented (<code>dim_customer</code>), what they rented (<code>dim_gpu</code>), and when (<code>dim_date</code>):</p>
+  <div class="flow">                 ┌─────────────────┐
+                 │   dim_date      │
+                 │  date_key (PK)  │
+                 │  year, month    │
+                 │  day, weekday   │
+                 └────────┬────────┘
+                          │ date_key
+                          │
+  ┌───────────────┐   ┌───┴───────────────────┐   ┌──────────────────┐
+  │ dim_customer  │   │     fct_rentals       │   │     dim_gpu      │
+  │ customer_key  ├───┤  (one row per rental) ├───┤  gpu_key (PK)    │
+  │ (PK)          │   │  customer_key  (FK)   │   │  gpu_model       │
+  │ name, tier    │   │  gpu_key       (FK)   │   │  vram_gb, tier   │
+  │ country       │   │  date_key      (FK)   │   └──────────────────┘
+  └───────────────┘   │  hours    (measure)   │
+                      │  revenue  (measure)   │
+                      └───────────────────────┘
+            ◀── dimensions: the context you GROUP BY / filter on ──▶
+                  facts: the numbers you SUM / AVG / COUNT</div>
+  <p>The whole point of this shape: an analyst's question maps onto it almost word-for-word. "Revenue (a measure on the fact) by GPU model (a column on <code>dim_gpu</code>) by month (a column on <code>dim_date</code>)" becomes one join from the fact to two dimensions and a <code>GROUP BY</code>. No long key chains, no guessing which table holds what.</p>
+</section>
+
+<section id="facts">
+  <h2>Fact tables</h2>
+  <p>A fact table records <strong>events or measurements</strong> — things that happened, with numbers attached. Each row is one occurrence of the business process you're modeling: a rental, an order, a payment, a shipment. Fact tables are tall and narrow: they hold the foreign keys to the dimensions, plus the numeric <strong>measures</strong> you'll aggregate.</p>
+  <p>The most important property of a measure is its <strong>additivity</strong> — whether you can meaningfully add it up across <em>any</em> dimension. Get this wrong and your dashboards lie.</p>
+  <table>
+    <thead><tr><th>Additivity</th><th>Means</th><th>Marketplace example</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Additive</strong></td><td>Can be summed across <em>every</em> dimension (customer, GPU, date…).</td><td><code>revenue</code>, <code>hours</code> — total revenue across any combination of customers, GPUs, and days is just a <code>SUM</code>.</td></tr>
+      <tr><td><strong>Semi-additive</strong></td><td>Summable across some dimensions but <em>not</em> over time — usually a balance or snapshot.</td><td>An end-of-day <code>gpus_available</code> count: you can add it across regions, but summing it across 30 days is nonsense. Average it over time instead.</td></tr>
+      <tr><td><strong>Non-additive</strong></td><td>Can't be summed across <em>any</em> dimension — usually a ratio or percentage.</td><td><code>utilization_pct</code> (a fraction). Summing percentages is meaningless; you must recompute it from its additive parts (busy hours ÷ total hours).</td></tr>
+    </tbody>
+  </table>
+  <div class="callout danger">
+    <span class="callout-label">⚠ Never store ratios as measures you'll sum</span>
+    <p>It is tempting to precompute a tidy <code>utilization_pct</code> column. But the moment someone <code>SUM</code>s it — or even averages a column of pre-averaged values — the number is wrong. The rule: <strong>store the additive ingredients</strong> (busy_hours, total_hours) and let the query compute the ratio at the level it's grouping to. Additive measures compose; ratios don't.</p>
+  </div>
+</section>
+
+<section id="dims">
+  <h2>Dimension tables</h2>
+  <p>Dimensions hold the <strong>descriptive context</strong> — the adjectives and labels you filter and group by. <code>dim_customer</code> knows a customer's name, tier, and country; <code>dim_gpu</code> knows a model's VRAM and tier. Where fact tables are tall and narrow, dimensions are <strong>wide and short</strong>: many descriptive columns, relatively few rows.</p>
+  <p>Crucially, dimensions are <strong>deliberately denormalized</strong>. In Chapter 01 you might have split a GPU's brand, tier, and spec across three normalized tables. In the dimension you flatten all of that into <em>one wide table</em>, even though it duplicates "NVIDIA" across many rows. That duplication is the trade we accept on purpose: it means a query touches one dimension instead of joining a little snowflake of sub-tables. Fewer joins, simpler SQL, faster reads.</p>
+  <div class="callout insight">
+    <span class="callout-label">Conformed dimensions</span>
+    <p>When the <em>same</em> dimension is shared by multiple fact tables — the same <code>dim_customer</code> joined to <code>fct_rentals</code>, <code>fct_payments</code>, and <code>fct_support_tickets</code> — it's a <strong>conformed dimension</strong>. This is what lets you compare across business processes ("revenue vs. support load per customer tier") and have the labels mean exactly the same thing everywhere. Conformed dimensions are how a warehouse stays coherent as it grows from one star to many.</p>
+  </div>
+</section>
+
+<section id="grain">
+  <h2>Declaring the grain</h2>
+  <p>Before you write a single <code>CREATE TABLE</code>, you must answer one question: <strong>what does one row of the fact table represent?</strong> That answer is the <strong>grain</strong>, and it is the most important decision in the entire model. Declare it as a sentence that starts with "one row per…":</p>
+  <ul>
+    <li><em>"One row per <strong>rental</strong>"</em> — the finest, most flexible grain. Every individual rental is a row.</li>
+    <li><em>"One row per <strong>customer per GPU model per day</strong>"</em> — a pre-aggregated grain. Smaller and faster, but you've thrown away per-rental detail forever.</li>
+    <li><em>"One row per <strong>customer per month</strong>"</em> — coarser still; good for a tidy monthly summary, useless for "how long was that one rental?"</li>
+  </ul>
+  <p>Why does this dominate everything? Because <strong>every measure and every dimension key on the fact must be true at that grain</strong>. If you declare "one row per rental" but accidentally join in a row per <em>rental-hour</em>, your revenue <code>SUM</code> double-counts — multiplied by the number of hours — and no one notices until the finance number is off by 10x. A wrong grain doesn't fail loudly; it quietly inflates totals.</p>
+  <div class="callout tip">
+    <span class="callout-label">The discipline</span>
+    <p>Write the grain sentence at the top of your model file as a comment. Then check every column against it: <em>is this measure additive at exactly one row per rental? Does this dimension key point to exactly one customer per rental?</em> If a column needs a different grain, it belongs in a <em>different</em> fact table. One fact table, one grain — no exceptions.</p>
+  </div>
+  <p>For the rest of this chapter we choose the finest grain — <strong>one row per rental</strong> — because you can always roll a fine grain up to a coarse summary, but you can never recover detail you didn't keep.</p>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: build a star in DuckDB</h2>
+  <p>Let's build it for real. First, recreate a small <strong>normalized source</strong> — the kind of thing Chapter 01 left you with: a <code>rentals</code> table that references customers and GPUs by id. Run this in your DuckDB session:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>DuckDB</span></div><pre><code class="language-sql">-- the normalized OLTP-style source (what ch.01 produced)
+CREATE OR REPLACE TABLE src_customers (
+  customer_id INTEGER, name VARCHAR, tier VARCHAR, country VARCHAR
+);
+INSERT INTO src_customers VALUES
+  (1,'Acme Labs','pro','US'),
+  (2,'Beta AI','free','DE'),
+  (3,'Gamma Co','pro','US');
+
+CREATE OR REPLACE TABLE src_gpus (
+  gpu_id INTEGER, model VARCHAR, vram_gb INTEGER, tier VARCHAR
+);
+INSERT INTO src_gpus VALUES
+  (10,'A100',80,'datacenter'),
+  (11,'H100',80,'datacenter'),
+  (12,'RTX4090',24,'consumer');
+
+CREATE OR REPLACE TABLE src_rentals (
+  rental_id INTEGER, customer_id INTEGER, gpu_id INTEGER,
+  started_at TIMESTAMP, hours DOUBLE, hourly_rate DECIMAL(8,2)
+);
+INSERT INTO src_rentals VALUES
+  (1001,1,10,'2026-05-03 09:00',5.0,2.50),
+  (1002,2,12,'2026-05-03 14:00',2.0,0.80),
+  (1003,1,11,'2026-05-20 10:00',8.0,3.00),
+  (1004,3,10,'2026-06-02 11:00',4.0,2.50),
+  (1005,3,11,'2026-06-18 16:00',6.0,3.00),
+  (1006,1,12,'2026-06-18 16:00',1.5,0.80);</code></pre></div>
+
+  <p>Now build the <strong>dimensions</strong>. Notice each gets its own surrogate key (<code>*_key</code>) — a clean integer the warehouse owns, independent of the source ids. We flatten descriptive columns straight in:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>DuckDB</span></div><pre><code class="language-sql">-- dim_customer: wide, denormalized, one row per customer
+CREATE OR REPLACE TABLE dim_customer AS
+SELECT
+  customer_id              AS customer_key,
+  name                     AS customer_name,
+  tier                     AS customer_tier,
+  country
+FROM src_customers;
+
+-- dim_gpu: descriptive context about each GPU model
+CREATE OR REPLACE TABLE dim_gpu AS
+SELECT
+  gpu_id                   AS gpu_key,
+  model                    AS gpu_model,
+  vram_gb,
+  tier                     AS gpu_tier
+FROM src_gpus;
+
+-- dim_date: one row per calendar day the business cares about.
+-- A date dimension lets you GROUP BY month/weekday without date math everywhere.
+CREATE OR REPLACE TABLE dim_date AS
+SELECT
+  CAST(d AS DATE)                          AS date_key,
+  EXTRACT(year  FROM d)                    AS year,
+  EXTRACT(month FROM d)                    AS month,
+  STRFTIME(d, '%Y-%m')                     AS year_month,
+  EXTRACT(day   FROM d)                    AS day,
+  DAYNAME(d)                               AS weekday
+FROM generate_series(DATE '2026-05-01', DATE '2026-06-30', INTERVAL 1 DAY) AS t(d);</code></pre></div>
+
+  <p>Finally the <strong>fact table</strong>. Grain: <em>one row per rental</em>. We carry the dimension keys plus the additive measures (<code>hours</code>, <code>revenue</code>), computing revenue once at load time:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>DuckDB</span></div><pre><code class="language-sql">-- fct_rentals — GRAIN: one row per rental
+CREATE OR REPLACE TABLE fct_rentals AS
+SELECT
+  r.rental_id                         AS rental_key,
+  r.customer_id                       AS customer_key,   -- FK -> dim_customer
+  r.gpu_id                            AS gpu_key,         -- FK -> dim_gpu
+  CAST(r.started_at AS DATE)          AS date_key,        -- FK -> dim_date
+  r.hours                             AS hours,           -- additive measure
+  r.hours * r.hourly_rate             AS revenue          -- additive measure
+FROM src_rentals r;
+
+-- sanity check: row count must equal the number of rentals (grain check!)
+SELECT count(*) AS rows, count(DISTINCT rental_key) AS distinct_rentals
+FROM fct_rentals;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The grain check returns <code>rows = 6</code> and <code>distinct_rentals = 6</code> — equal, confirming exactly one row per rental with no accidental fan-out. If those two numbers ever differ, a join multiplied your facts and your measures are now wrong. This one query is the cheapest insurance in dimensional modeling.</p>
+  </div>
+
+  <p>Now the payoff — the analytical question that was painful against the normalized source becomes a clean star query: <strong>revenue by GPU model by month</strong>.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>DuckDB</span></div><pre><code class="language-sql">SELECT
+  d.year_month,
+  g.gpu_model,
+  SUM(f.revenue)  AS revenue,
+  SUM(f.hours)    AS hours
+FROM fct_rentals f
+JOIN dim_gpu  g ON f.gpu_key  = g.gpu_key
+JOIN dim_date d ON f.date_key = d.date_key
+GROUP BY d.year_month, g.gpu_model
+ORDER BY d.year_month, revenue DESC;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Six rows — one per (month, GPU model) combination that had rentals. For <code>2026-05</code> you'll see <code>H100</code> at <code>24.00</code> (8h × $3.00), <code>A100</code> at <code>12.50</code> (5h × $2.50), and <code>RTX4090</code> at <code>1.60</code>. For <code>2026-06</code>: <code>H100</code> at <code>18.00</code>, <code>A100</code> at <code>10.00</code>, <code>RTX4090</code> at <code>1.20</code>. Notice how readable the query is — the dimensions named exactly the things you wanted to slice by, and the additive <code>revenue</code> summed cleanly across both.</p>
+  </div>
+
+  <p>That's a complete star schema: a fact at a declared grain, three conformed-ready dimensions, and an analytical query that reads almost like the English question that prompted it. This is the shape your warehouse tables will take for the rest of the course.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you state, in one "one row per…" sentence, the grain of <code>fct_rentals</code>?</li>
+    <li>Can you classify <code>revenue</code>, an end-of-day <code>active_rentals</code> count, and <code>utilization_pct</code> as additive, semi-additive, or non-additive — and say why?</li>
+    <li>Why are dimensions deliberately denormalized when Chapter 01 worked so hard to normalize?</li>
+    <li>What does the <code>rows = distinct_rentals</code> check protect you from?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Design a star for support tickets</strong></summary>
+    <div class="collapse-card-body">
+      <p>The marketplace also runs a support desk. Customers open tickets; each ticket has a priority, gets assigned to an agent, opens on one day and resolves on another, and accrues a handling time in minutes. <strong>Declare the grain</strong> in one sentence, then design the star: name the fact table, its measures (and their additivity), and the dimensions. Reuse a conformed dimension where you can.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution sketch</span></div><pre><code class="language-sql">-- GRAIN: one row per support ticket.
+
+-- fct_support_tickets
+--   ticket_key                       (degenerate key: the ticket id itself)
+--   customer_key   FK -> dim_customer   <-- CONFORMED, shared with fct_rentals!
+--   agent_key      FK -> dim_agent
+--   priority_key   FK -> dim_priority
+--   opened_date_key   FK -> dim_date     <-- dim_date is also conformed
+--   resolved_date_key FK -> dim_date     (a "role-playing" dimension: dim_date
+--                                          joined twice in different roles)
+--   handling_minutes   measure  -> ADDITIVE   (sum across anything)
+--   ticket_count = 1   measure  -> ADDITIVE   (lets you COUNT by summing)
+--   was_resolved (0/1) measure  -> ADDITIVE   (sum = # resolved)
+--   -- resolution_rate is NON-ADDITIVE: compute it as
+--   --   SUM(was_resolved) / SUM(ticket_count) at query time, never store it.
+
+-- dimensions:
+--   dim_customer  (CONFORMED with the rentals star)
+--   dim_date      (CONFORMED; role-plays as opened & resolved)
+--   dim_agent     (agent name, team)
+--   dim_priority  (low / medium / high / urgent)</code></pre></div>
+      <p>The two ideas to land: (1) the grain sentence ("one row per ticket") fixes everything else, and (2) reusing <code>dim_customer</code> and <code>dim_date</code> as <strong>conformed</strong> dimensions means you can now compare rental revenue and support load for the same customer tier — because "tier" means exactly the same thing in both stars.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your dimensions are clean and wide — but customers change tiers and GPUs change prices over time, and right now overwriting them would silently rewrite history. Next we fix that. → <a href="03-slowly-changing-dimensions.html">Slowly-Changing Dimensions &amp; History</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

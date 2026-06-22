@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streaming Fundamentals — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#batch-vs-stream">Batch vs streaming</a>
+    <a href="#log">The log abstraction</a>
+    <a href="#producers-consumers">Producers, consumers &amp; offsets</a>
+    <a href="#event-time">Event-time &amp; windows</a>
+    <a href="#hands-on">Hands-on: a live stream</a>
+    <a href="#when">When streaming is worth it</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-the-lakehouse.html">← Previous</a>
+    <a href="10-orchestration-with-dagster.html">Next: Orchestration with Dagster →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Streaming Fundamentals</h1>
+  <p class="subtitle">Everything you've built so far runs on a schedule: a job wakes up, processes a batch, goes back to sleep. Streaming flips that — data is processed <em>as it arrives</em>, event by event. This lab demystifies the core ideas (the log, topics, offsets, event-time windows) and has you stand up a real streaming bus on your laptop, push events into it, and read them back live.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You'll run <strong>Redpanda</strong> — a Kafka-API-compatible streaming engine that's a single binary, far lighter than Kafka for local work — via Docker Compose, and talk to it from Python. From your <code>mini-griddp</code> repo:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># a Python Kafka client (works against Redpanda's Kafka API)
+pip install confluent-kafka
+
+# Docker must be running; we'll bring up Redpanda in the hands-on section
+docker --version</code></pre></div>
+  <p>That's it — no Java, no ZooKeeper, no cluster. Keep this page beside your terminal and run each block as you read.</p>
+</div>
+
+<section id="batch-vs-stream">
+  <h2>Batch vs streaming</h2>
+  <p>There are two fundamental shapes for moving data through a pipeline, and almost everything else is a detail on top of one of them.</p>
+  <ul>
+    <li><strong>Batch</strong> — process data <em>on a schedule</em>. Every hour (or night, or 15 minutes) a job runs, reads everything that piled up since last time, transforms it, writes results, and stops. This is what your dbt models and ingestion jobs do.</li>
+    <li><strong>Streaming</strong> — process data <em>as it arrives</em>. There's no "run"; a long-lived program sits there reacting to each event within milliseconds of it happening.</li>
+  </ul>
+  <p>The trade is <strong>latency versus simplicity</strong>. Batch is dramatically simpler: a job either ran or it didn't, you can re-run it, you can inspect its input and output as files or tables. Streaming buys you freshness — seconds instead of hours — but you pay with always-on infrastructure, harder debugging, and a whole vocabulary of new failure modes.</p>
+  <table>
+    <thead><tr><th></th><th>Batch</th><th>Streaming</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Trigger</strong></td><td>A schedule (cron, orchestrator)</td><td>Each event, as it lands</td></tr>
+      <tr><td><strong>Latency</strong></td><td>Minutes to hours</td><td>Milliseconds to seconds</td></tr>
+      <tr><td><strong>Unit of work</strong></td><td>A bounded set of rows</td><td>An unbounded, never-ending sequence</td></tr>
+      <tr><td><strong>Debugging</strong></td><td>Re-run, inspect files/tables</td><td>Replay from a log, watch live</td></tr>
+      <tr><td><strong>Operational load</strong></td><td>Low — runs then exits</td><td>High — must stay up 24/7</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Most pipelines are batch — and that's correct</span>
+    <p>It's tempting to think streaming is the "advanced" choice. It isn't more advanced; it's a different tool for a different need. The vast majority of analytics runs perfectly well on batch, and reaching for streaming when you don't need low latency just buys you operational pain. Streaming earns its keep when freshness is the <em>product</em> — fraud alerts, live dashboards, real-time GPU autoscaling — not when a nightly table would do.</p>
+  </div>
+</section>
+
+<section id="log">
+  <h2>The log abstraction</h2>
+  <p>Strip away the branding and Kafka, Redpanda, Kinesis, and Pulsar are all the same idea: a <strong>log</strong>. Not "log" as in application logging — log as in an <em>append-only, ordered sequence of events</em>. New events are only ever added to the end; existing events are never modified. Each event gets a position number as it lands, and those numbers only go up.</p>
+  <div class="flow">  A TOPIC is a named log, split into PARTITIONS for parallelism
+  ──────────────────────────────────────────────────────────────
+
+  topic: gpu-usage
+  ┌──────────────────────────────────────────────────────────┐
+  │ partition 0 │ [0] [1] [2] [3] [4] [5] ─── append here ──▶ │
+  │ partition 1 │ [0] [1] [2] [3] ───────────── append here ──▶ │
+  │ partition 2 │ [0] [1] [2] [3] [4] [5] [6] ─ append here ──▶ │
+  └──────────────────────────────────────────────────────────┘
+                  ▲                                  ▲
+            old events                          new events
+       (still here — durable)              (just arrived)
+
+  • Ordering is guaranteed WITHIN a partition, not across them.
+  • Events stay on disk (durable) until a retention limit, not until "read".</div>
+  <p>Two terms carry all the weight here:</p>
+  <ul>
+    <li>A <strong>topic</strong> is a named stream — <code>gpu-usage</code>, <code>payments</code>, <code>clicks</code>. It's the logical channel producers write to and consumers read from.</li>
+    <li>A <strong>partition</strong> is a slice of a topic's log. A topic is split into N partitions so the work can be spread across machines and readers. The catch: <strong>ordering is only guaranteed within a single partition</strong>. Events in partition 0 are strictly ordered; an event in partition 0 and an event in partition 1 have no defined order relative to each other.</li>
+  </ul>
+  <p>That last point drives a key design choice: if you need all events for one GPU to stay in order, you give them the same <strong>key</strong> (the GPU id), and the log routes same-key events to the same partition. Different GPUs can spread across partitions for parallelism while each individual GPU's history stays ordered.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why "durable log" matters</span>
+    <p>Unlike a queue, reading an event does <em>not</em> remove it. Events sit on disk until a retention policy (say, 7 days) ages them out. That single property — the log remembers — is what makes replay, multiple independent readers, and recovery-after-a-crash possible. Hold onto it; the next section depends entirely on it.</p>
+  </div>
+</section>
+
+<section id="producers-consumers">
+  <h2>Producers, consumers &amp; offsets</h2>
+  <p>Two roles sit on either side of the log.</p>
+  <div class="flow">  PRODUCER ──writes──▶  [ topic: gpu-usage ]  ──reads──▶ CONSUMER
+                              partition log
+                         [0][1][2][3][4][5]
+                                     ▲
+                                     └── consumer's OFFSET = 4
+                                         "I've read through #3;
+                                          read #4 next."</div>
+  <ul>
+    <li>A <strong>producer</strong> writes events to a topic. It's fire-and-(mostly)-forget: append to the end, move on.</li>
+    <li>A <strong>consumer</strong> reads events from a topic, in order, one partition at a time.</li>
+  </ul>
+  <p>The single most important concept on the consumer side is the <strong>offset</strong>. An offset is just a consumer's bookmark — the position number of the next event it intends to read. The log doesn't track who has read what; <em>each consumer remembers its own offset</em>. This is the whole trick, and it has two huge consequences:</p>
+  <ul>
+    <li><strong>Replay.</strong> Because the events are still on disk and your position is just a number, you can move your bookmark backward — set the offset to 0 and re-read the entire history. Reprocessing a bug-fixed transformation over last week's events is as simple as rewinding. (You felt the value of this idempotent re-run mindset in <a href="08-the-lakehouse.html">the lakehouse</a>; the log makes it native.)</li>
+    <li><strong>At-least-once delivery.</strong> A consumer reads an event, processes it, and then <em>commits</em> its new offset. If it crashes after processing but before committing, on restart it re-reads that event — so you might see an event more than once, but never lose one. This is the <strong>at-least-once</strong> guarantee, and it's why downstream logic must be idempotent — exactly the delivery-semantics idea from <a href="../foundations/index.html">Foundations ch.11</a>.</li>
+  </ul>
+  <p>When one consumer can't keep up, you run several in a <strong>consumer group</strong>. The log hands each partition to exactly one member of the group, so three consumers can split a three-partition topic and process in parallel — while the group as a whole still reads every event exactly once between them.</p>
+  <table>
+    <thead><tr><th>Concept</th><th>One-line definition</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Offset</strong></td><td>A consumer's bookmark — the position of the next event to read.</td></tr>
+      <tr><td><strong>Commit</strong></td><td>Saving your offset so a restart resumes where you left off.</td></tr>
+      <tr><td><strong>Consumer group</strong></td><td>A team of consumers that splits a topic's partitions for parallel reads.</td></tr>
+      <tr><td><strong>Replay</strong></td><td>Rewinding the offset to re-read past events.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="event-time">
+  <h2>Event-time &amp; windows</h2>
+  <p>When you aggregate a stream — "GPU-hours used per minute" — you have to bucket events into time windows. The subtle, important question is: <em>which clock</em>?</p>
+  <ul>
+    <li><strong>Event-time</strong> — when the event actually <em>happened</em> (the timestamp the producer stamped on it).</li>
+    <li><strong>Processing-time</strong> — when your consumer happened to <em>read</em> it.</li>
+  </ul>
+  <p>These differ because the network is messy. An event generated at 12:00:59 might not reach your consumer until 12:01:03 — a phone was offline, a queue backed up, a retry fired. If you bucket by processing-time, that event lands in the 12:01 window even though it belongs to 12:00. Your "usage at 12:00" number is now wrong, and worse, it's wrong in a way that changes depending on how busy your system was. <strong>You almost always want to window by event-time</strong>, so the same events always produce the same answer no matter when you process them.</p>
+  <div class="flow">  event-time window  [12:00:00 ─────────────── 12:00:59]
+                          ▲          ▲              ▲    ▲
+   events happened:    12:00:03   12:00:30      12:00:55 │
+                                                          └─ 12:00:59 event
+                                                             ARRIVES at 12:01:03
+                                                             → it's LATE, but it
+                                                               still belongs to the
+                                                               12:00 window</div>
+  <p>Which raises the hard part: <strong>late data</strong>. If an event for the 12:00 window can show up at 12:01:03, when is the 12:00 window safe to close and emit? Close too early and you drop late events; wait forever and you never emit a result. Streaming engines solve this with a <strong>watermark</strong> — a moving marker that asserts "I believe I've now seen all events up to time T." When the watermark passes the end of a window, the engine finalizes it; events arriving after the watermark are flagged as late and handled by an explicit policy (drop, or re-open and correct). You met windows conceptually in Foundations; here you can see exactly why event-time is the honest clock to bucket by.</p>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: a live stream end to end</h2>
+  <p>Time to make it real. We'll bring up Redpanda, write a producer that emits GPU-usage events to a topic, and a consumer that reads and counts them live.</p>
+
+  <p><strong>1. Bring up Redpanda.</strong> Save this as <code>docker-compose.streaming.yml</code> in your repo:</p>
+  <div class="code-wrap"><div class="code-header"><span>docker-compose.streaming.yml</span></div><pre><code class="language-yaml">services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    command:
+      - redpanda start
+      - --smp 1                       # 1 CPU core — plenty for local
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"                   # the Kafka API your Python client talks to</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker compose -f docker-compose.streaming.yml up -d
+docker compose -f docker-compose.streaming.yml ps   # redpanda should be "Up"</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The <code>ps</code> command lists the <code>redpanda</code> container with state <strong>Up</strong> and port <code>9092</code> published. If it's restarting, check <code>docker compose -f docker-compose.streaming.yml logs redpanda</code> — usually it's a port already in use.</p>
+  </div>
+
+  <p><strong>2. The producer.</strong> Save as <code>producer.py</code>. It emits one GPU-usage event per second, keyed by GPU id so each GPU's events stay ordered:</p>
+  <div class="code-wrap"><div class="code-header"><span>producer.py</span></div><pre><code class="language-python">import json, time, random
+from datetime import datetime, timezone
+from confluent_kafka import Producer
+
+producer = Producer({"bootstrap.servers": "localhost:9092"})
+TOPIC = "gpu-usage"
+GPUS = ["gpu-a100-01", "gpu-a100-02", "gpu-h100-01"]
+
+def delivered(err, msg):
+    if err:
+        print("delivery failed:", err)
+    else:
+        print(f"  -> partition {msg.partition()} offset {msg.offset()}")
+
+print("producing events to 'gpu-usage' (Ctrl-C to stop)...")
+while True:
+    gpu = random.choice(GPUS)
+    event = {
+        "gpu_id": gpu,
+        "utilization_pct": random.randint(10, 100),
+        # event-time: when the usage was measured, stamped by the source
+        "event_time": datetime.now(timezone.utc).isoformat(),
+    }
+    producer.produce(
+        TOPIC,
+        key=gpu,                       # same key -> same partition -> ordered
+        value=json.dumps(event),
+        callback=delivered,
+    )
+    producer.poll(0)                   # let delivery callbacks fire
+    print("sent:", event)
+    time.sleep(1)</code></pre></div>
+
+  <p><strong>3. The consumer.</strong> Save as <code>consumer.py</code>. It joins a consumer group, reads events, and keeps a running count per GPU:</p>
+  <div class="code-wrap"><div class="code-header"><span>consumer.py</span></div><pre><code class="language-python">import json
+from collections import Counter
+from confluent_kafka import Consumer
+
+consumer = Consumer({
+    "bootstrap.servers": "localhost:9092",
+    "group.id": "usage-counter",       # the consumer GROUP id
+    "auto.offset.reset": "earliest",   # if no saved offset, start from the beginning
+})
+consumer.subscribe(["gpu-usage"])
+
+counts = Counter()
+print("consuming from 'gpu-usage' (Ctrl-C to stop)...")
+try:
+    while True:
+        msg = consumer.poll(1.0)       # wait up to 1s for an event
+        if msg is None:
+            continue
+        if msg.error():
+            print("error:", msg.error())
+            continue
+        event = json.loads(msg.value())
+        counts[event["gpu_id"]] += 1
+        print(f"offset {msg.offset():>4} | {event['gpu_id']} "
+              f"{event['utilization_pct']}%  | totals: {dict(counts)}")
+finally:
+    consumer.close()                   # leaves the group cleanly, commits offsets</code></pre></div>
+
+  <p><strong>4. Run them together.</strong> Open two terminals. Start the consumer first, then the producer:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># terminal 1
+python consumer.py
+
+# terminal 2
+python producer.py</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>In terminal 2, a line per second: <code>sent: {'gpu_id': 'gpu-h100-01', ...}</code> followed by its <code>partition / offset</code>. In terminal 1, those same events appearing live, each with an increasing <code>offset</code> and a growing per-GPU <code>totals</code> dict. Events are flowing through the log end to end. Stop the producer with Ctrl-C; the consumer simply waits for more. That patience is the streaming mindset — the program never "finishes."</p>
+  </div>
+</section>
+
+<section id="when">
+  <h2>When streaming is worth it</h2>
+  <p>You've now felt how clean the happy path is — so here's the honest counterweight. Streaming's real cost isn't writing the producer and consumer; it's <em>operating</em> them.</p>
+  <ul>
+    <li><strong>It's always on.</strong> A batch job that fails at 2 a.m. waits for you. A streaming consumer that crashes is silently falling behind every second it's down — lag is a metric you must watch.</li>
+    <li><strong>Debugging is harder.</strong> There's no tidy input file to inspect. You reason about offsets, lag, partition assignment, and "which event triggered this bad output" across an unbounded stream.</li>
+    <li><strong>Correctness is subtler.</strong> At-least-once means duplicates; out-of-order arrival means late data and watermark tuning. None of this exists in a batch job over a static table.</li>
+  </ul>
+  <div class="callout danger">
+    <span class="callout-label">⚠ Default to batch</span>
+    <p>Reach for streaming only when you genuinely need low latency — when a result that's an hour old is worthless. If a nightly or hourly batch table answers the question, build that. It will be simpler, cheaper, easier to test, and easier to trust. "We might need it real-time someday" is not a reason to pay the streaming tax today.</p>
+  </div>
+  <p>A common, sane middle ground: stream the <em>ingestion</em> (so events land durably in the log within seconds), then run <em>batch</em> jobs that read from the log on a schedule. You get a buffered, replayable front door without the burden of real-time processing everywhere downstream.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain the difference between batch and streaming in one sentence each — and say which one most pipelines should use?</li>
+    <li>Why is ordering only guaranteed <em>within</em> a partition, not across a topic?</li>
+    <li>What does an offset bookmark let you do that a delete-on-read queue cannot?</li>
+    <li>Why bucket aggregations by event-time instead of processing-time?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Produce 5 events, consume from the start, and explain offsets</strong></summary>
+    <div class="collapse-card-body">
+      <p>Produce exactly five events to a fresh topic, then consume them from the very beginning using a consumer group — proving you can replay. Finally, in your own words, explain what an offset is.</p>
+      <div class="code-wrap"><div class="code-header"><span>produce_five.py</span></div><pre><code class="language-python">import json
+from confluent_kafka import Producer
+
+p = Producer({"bootstrap.servers": "localhost:9092"})
+for i in range(5):
+    p.produce("demo", key="g1", value=json.dumps({"n": i}))
+p.flush()                              # block until all 5 are delivered
+print("produced 5 events")</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>consume_all.py</span></div><pre><code class="language-python">from confluent_kafka import Consumer
+
+c = Consumer({
+    "bootstrap.servers": "localhost:9092",
+    "group.id": "demo-reader",
+    "auto.offset.reset": "earliest",   # no saved offset -> start at offset 0
+})
+c.subscribe(["demo"])
+
+seen = 0
+while seen < 5:
+    msg = c.poll(1.0)
+    if msg is None or msg.error():
+        continue
+    print(f"offset {msg.offset()} -> {msg.value().decode()}")
+    seen += 1
+c.close()</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python produce_five.py
+python consume_all.py        # prints offsets 0,1,2,3,4</code></pre></div>
+      <p><strong>You should see</strong> the consumer print offsets <code>0</code> through <code>4</code> with values <code>{"n": 0}</code>…<code>{"n": 4}</code>. Because the group <code>demo-reader</code> had no committed offset, <code>auto.offset.reset: earliest</code> started it at the head of the log — that's a replay of the full history.</p>
+      <p><strong>What an offset is:</strong> an offset is a consumer's bookmark into a partition — the integer position of the next event it will read. The log itself doesn't track readers; each consumer (or group) remembers its own offset and commits it as it progresses. Because events stay on disk and the offset is just a number, you can move it backward to re-read past events (replay), or, after a crash, resume from your last committed position — re-reading the in-flight event, which is exactly what gives you at-least-once delivery.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can move data event-by-event — but most of your pipeline still runs as scheduled jobs that depend on each other, and something has to run them in the right order and recover when they fail. → <a href="10-orchestration-with-dagster.html">Orchestration with Dagster</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

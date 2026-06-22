@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Networking &amp; APIs — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#model">The client/server model</a>
+    <a href="#tcp-ip">The network stack</a>
+    <a href="#http">HTTP up close</a>
+    <a href="#rest">REST APIs</a>
+    <a href="#auth">Authentication &amp; secrets</a>
+    <a href="#reliability">When the network fails</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-operating-systems.html">← Previous</a>
+    <a href="10-distributed-systems-scaling.html">Next: Distributed Systems I →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Networking &amp; APIs</h1>
+  <p class="subtitle">Almost no data starts on your machine. It lives on a database across the room, a vendor's API across the country, a service across the world — and getting it to you means sending bytes over a network you don't control. This chapter explains how two machines actually talk, how HTTP and REST APIs work up close, where your secrets should live, and the single most important fact about networks: they always fail eventually, so your code has to expect it.</p>
+</header>
+
+<section id="model">
+  <h2>The client/server model</h2>
+  <p>Strip away every buzzword and networking is two programs exchanging messages. One side asks; the other answers. The asker is the <strong>client</strong> (your script, your browser, your pipeline). The answerer is the <strong>server</strong> (an API, a database, a web service). A <strong>request</strong> goes out, a <strong>response</strong> comes back. That's the whole shape, and everything in this chapter is a detail hung on it.</p>
+
+  <div class="flow">   CLIENT                                                      SERVER
+   (your pipeline)                                            (an API)
+
+      │   ──────────── request ───────────▶                     │
+      │   "GET /v1/orders?page=2"                               │
+      │                                              looks up data,
+      │                                              builds a reply
+      │   ◀─────────── response ───────────                     │
+      │   "200 OK  { orders: [ … ] }"                           │
+      │                                                         │
+   parse JSON,                                            waits for the
+   do the work                                            next request
+   ───────────────────────────────────────────────────────────────────▶ one round trip</div>
+
+  <p>A few things to notice now, because they shape everything later. The client always starts the conversation — the server can't push to you out of nowhere; it answers when asked. Each request is a round <em>trip</em>: out and back, with the network's delay paid <em>both</em> ways. And the same server happily talks to thousands of clients at once, which is exactly why a server you depend on might be slow or unavailable through no fault of yours.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Where you've seen this</span>
+    <p>When you ran <code>psql</code> against Postgres in Course 2, <code>psql</code> was the client and the database was the server — same model, different protocol. A web browser fetching a page is a client; the website is a server. Once you see "request out, response back" everywhere, networking stops feeling mysterious.</p>
+  </div>
+</section>
+
+<section id="tcp-ip">
+  <h2>The network stack, in plain language</h2>
+  <p>For a request to find the right machine and arrive intact, several layers each do one job. You rarely touch them directly, but knowing what they do explains a lot of slowness and a lot of errors.</p>
+
+  <p><strong>IP addresses &amp; ports.</strong> Every machine on a network has an <strong>IP address</strong> — a number like <code>93.184.216.34</code> that says <em>which machine</em>. A <strong>port</strong> (like <code>443</code> or <code>5432</code>) says <em>which program</em> on that machine, since one server runs many. Address + port together name an exact endpoint to talk to.</p>
+
+  <p><strong>DNS — names to addresses.</strong> Humans can't remember IP numbers, so we use names like <code>api.example.com</code>. The <strong>Domain Name System</strong> is the network's phone book: before any request, your machine asks DNS to turn the name into an IP address. (This lookup is itself a tiny network round trip — and a surprisingly common source of "why is the first request slow?")</p>
+
+  <p><strong>TCP vs UDP.</strong> Once you have an address and port, you need a way to move bytes. <strong>TCP</strong> is the reliable, ordered channel: it guarantees every byte arrives, in order, retransmitting anything lost — and almost everything you'll touch (HTTP, Postgres, Kafka) rides on it. <strong>UDP</strong> trades those guarantees for speed: it just fires packets and doesn't care if some are lost (think live video) — you'll meet it rarely.</p>
+
+  <div class="flow">  What happens to "api.example.com/orders"
+  ──────────────────────────────────────────────────────────────────────▶
+
+   1. DNS      "api.example.com"  ──▶  93.184.216.34     (name → address)
+   2. TCP      open a reliable connection to 93.184.216.34 : 443
+   3. TLS      encrypt it (the 's' in https)
+   4. HTTP     send "GET /orders" over that connection      ◀── this layer is yours
+   5. ◀────    bytes come back, reassembled in order, decrypted, parsed</div>
+
+  <div class="callout insight">
+    <span class="callout-label">Latency vs bandwidth — the one to internalize</span>
+    <p><strong>Bandwidth</strong> is how much data fits through the pipe per second (a wide road). <strong>Latency</strong> is how long one round trip takes (the length of the road). They're independent — a fat pipe across the world can still have high latency. For data work the killer is latency on <em>many small requests</em>: if each round trip costs 50&nbsp;ms and you make 10,000 of them one at a time, that's <strong>500 seconds of pure waiting</strong>, no matter how fat your pipe is. The fix is almost never "more bandwidth" — it's "fewer round trips": batch, paginate in bigger pages, or fetch in parallel. Keep this in your pocket; it explains half the slow pipelines you'll ever debug.</p>
+  </div>
+</section>
+
+<section id="http">
+  <h2>HTTP up close</h2>
+  <p><strong>HTTP</strong> is the language clients and servers speak on the web — and the language nearly every API you'll pull from speaks. It's just structured text. A request has four parts, and so does a response. Here's a request:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>an HTTP request</span></div><pre><code class="language-http">GET /v1/orders?page=2 HTTP/1.1            ← method · URL/path · version
+Host: api.example.com                     ← headers (metadata, key: value)
+Authorization: Bearer abc123
+Accept: application/json
+
+(no body for a GET — a POST would put JSON here)</code></pre></div>
+
+  <p>And the response that comes back:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>an HTTP response</span></div><pre><code class="language-http">HTTP/1.1 200 OK                           ← status line (code + reason)
+Content-Type: application/json            ← headers
+Content-Length: 1843
+
+{ "orders": [ … ], "next_page": 3 }       ← body (the actual data)</code></pre></div>
+
+  <p>The <strong>method</strong> states your intent — what you want done. There are a handful you'll use constantly:</p>
+
+  <table>
+    <thead><tr><th>Method</th><th>Means</th><th>Changes data?</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td>Read / fetch a resource. Your bread and butter for pulling data.</td><td>No (safe)</td></tr>
+      <tr><td><code>POST</code></td><td>Create something new, or submit a request that does work.</td><td>Yes</td></tr>
+      <tr><td><code>PUT</code></td><td>Replace a resource at a known location (set it to this).</td><td>Yes</td></tr>
+      <tr><td><code>DELETE</code></td><td>Remove a resource.</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+
+  <p>The <strong>status code</strong> in the response tells you, at a glance, how it went. You don't need all of them — you need the families and a few specifics:</p>
+
+  <table>
+    <thead><tr><th>Code</th><th>Family — meaning</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td><code>200</code> / <code>201</code></td><td><strong>2xx Success</strong> — it worked (201 = created).</td><td>Proceed; parse the body.</td></tr>
+      <tr><td><code>400</code></td><td><strong>4xx — you</strong> sent a bad request.</td><td>Fix your request; retrying won't help.</td></tr>
+      <tr><td><code>401</code> / <code>403</code></td><td>Not authenticated / not allowed.</td><td>Check your key/token &amp; permissions.</td></tr>
+      <tr><td><code>404</code></td><td>That resource doesn't exist.</td><td>Check the URL.</td></tr>
+      <tr><td><code>429</code></td><td>Too many requests — you're rate-limited.</td><td>Slow down; back off and retry later.</td></tr>
+      <tr><td><code>500</code> / <code>503</code></td><td><strong>5xx — the server</strong> broke or is overloaded.</td><td>Not your fault; retry with backoff.</td></tr>
+    </tbody>
+  </table>
+
+  <p>The single rule worth memorizing: <strong>4xx is your problem, 5xx is theirs.</strong> Retrying a 4xx (you sent something wrong) just repeats the mistake; retrying a 5xx or 429 (their side) often succeeds once they recover. We'll lean on that in the reliability section.</p>
+
+  <p><strong>Headers</strong> are the metadata around the message: who you are (<code>Authorization</code>), what format you'll accept (<code>Accept</code>), what format the body is (<code>Content-Type</code>), and often rate-limit counters telling you how many requests you have left. They're easy to overlook and frequently hold the clue when something behaves oddly.</p>
+</section>
+
+<section id="rest">
+  <h2>REST APIs — your most common external source</h2>
+  <p>Most third-party data you'll ever pull — payment records, weather, CRM contacts, GitHub stats — arrives through a <strong>REST API</strong>: a set of HTTP endpoints, each a URL representing a kind of resource, that you <code>GET</code> to read and usually get back as <strong>JSON</strong>. A vendor publishes one, hands you a key, and your pipeline becomes a client politely asking for pages of data. Two patterns dominate, and you must handle both.</p>
+
+  <p><strong>Pagination.</strong> No sane API returns a million rows in one response. Instead it returns a <em>page</em> — say 100 records — plus a hint for getting the next one (a <code>next_page</code> number, a cursor token, or a <code>Link</code> header). You loop: fetch a page, process it, ask for the next, and stop when the hint runs out. Forgetting to paginate is the classic rookie bug — you grab page 1 and quietly miss 99% of the data.</p>
+
+  <p><strong>Rate limits.</strong> APIs cap how fast you may call them (e.g. 60 requests/minute). Exceed it and you get a <code>429 Too Many Requests</code>, often with a <code>Retry-After</code> header saying how long to wait. The right response is to slow down and back off — not to hammer harder. We'll do exactly that below.</p>
+
+  <p>Let's pull real data. This calls a free public API that needs no key, parses the JSON, and walks a few pages.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>python — fetch &amp; parse JSON</span></div><pre><code class="language-python">import requests
+
+# A public, no-auth API. Each "post" is a small JSON object.
+resp = requests.get(
+    "https://jsonplaceholder.typicode.com/posts",
+    params={"_page": 1, "_limit": 5},   # ask for page 1, 5 items
+    timeout=10,                          # never wait forever (see below)
+)
+
+resp.raise_for_status()                  # turn a 4xx/5xx into an error
+data = resp.json()                       # parse the JSON body into Python
+
+print("status:", resp.status_code)
+print("items on this page:", len(data))
+print("first title:", data[0]["title"][:40])</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p><code>status: 200</code>, then <code>items on this page: 5</code>, then the first post's title (truncated). If you get a <code>requests.exceptions.ConnectionError</code>, check your internet; if <code>raise_for_status</code> throws, the status line in the message tells you whether it was your fault (4xx) or theirs (5xx). You just did the core loop of every API pull: request, check status, parse JSON.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Read the docs first, always</span>
+    <p>Every API differs in how it paginates, names its parameters, and limits you. The vendor's API docs are not optional reading — they tell you the page size, the rate limit, the auth scheme, and the shape of the JSON. Five minutes there saves an hour of guessing.</p>
+  </div>
+</section>
+
+<section id="auth">
+  <h2>Authentication &amp; where secrets go</h2>
+  <p>Most real APIs need to know who you are before they hand over data. That proof travels in a header (or sometimes a query parameter), and it comes in a few common flavors:</p>
+
+  <table>
+    <thead><tr><th>Type</th><th>How it works</th><th>Looks like</th></tr></thead>
+    <tbody>
+      <tr><td><strong>API key</strong></td><td>A single long secret string identifying your account.</td><td><code>?api_key=…</code> or a header</td></tr>
+      <tr><td><strong>Bearer token</strong></td><td>A token you send on every request to prove identity.</td><td><code>Authorization: Bearer …</code></td></tr>
+      <tr><td><strong>OAuth 2.0</strong></td><td>You exchange credentials for a short-lived access token, then send that. Common for user-account access; the token expires and is refreshed.</td><td>a flow that yields a bearer token</td></tr>
+      <tr><td><strong>Basic auth</strong></td><td>A username:password pair, encoded (not encrypted — only safe over HTTPS).</td><td><code>Authorization: Basic …</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>The mechanics matter less than the discipline around the secret itself. A key or token is a password — anyone who has it can act as you, run up your bill, or read your data. So the iron rule:</p>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ Never hard-code secrets, never commit them</span>
+    <p>Do <strong>not</strong> paste a key as a string in your code, because the moment you <code>git commit</code> it, it lives in history forever — even if you delete the line later. Keys leak this way constantly and get scraped from public repos within minutes. Put secrets in <strong>environment variables</strong> (or a secrets manager) and read them at runtime. And make sure the file holding them is in <code>.gitignore</code> (recall Course 2) so it's never tracked.</p>
+  </div>
+
+  <div class="code-wrap"><div class="code-header"><span>python — read the secret from the environment</span></div><pre><code class="language-python">import os
+import requests
+
+# Set this in your shell first, e.g.:  export API_TOKEN="abc123"
+token = os.environ["API_TOKEN"]          # read at runtime, never written in code
+
+resp = requests.get(
+    "https://api.example.com/v1/orders",
+    headers={"Authorization": f"Bearer {token}"},
+    timeout=10,
+)</code></pre></div>
+
+  <p>The token now lives in your shell or your deployment's secret store, not in the file you push to GitHub. Same code runs everywhere; each environment supplies its own value. That separation — config and secrets <em>outside</em> the code — is a habit that will keep you out of real trouble.</p>
+</section>
+
+<section id="reliability">
+  <h2>When the network fails — and it will</h2>
+  <p>Here is the truth that separates a script from a pipeline: <strong>the network always fails eventually.</strong> A request hangs, a server returns 503, a connection drops mid-stream, DNS hiccups. Not <em>if</em> — when, and at scale, often. Robust code treats failure as normal and plans for it with three tools.</p>
+
+  <p><strong>Timeouts.</strong> Never wait forever. A request with no timeout can hang indefinitely if the server stops responding, freezing your whole pipeline. Always set one (you saw <code>timeout=10</code> above). A request that takes too long is itself a failure — treat it as one and move on.</p>
+
+  <p><strong>Retries with exponential backoff.</strong> Many failures are transient — a blip, a momentary overload. The cure is to try again, but <em>not</em> instantly and not forever: wait a moment, retry, and if it fails again wait <em>longer</em> (1s, then 2s, then 4s — doubling). This <strong>exponential backoff</strong> gives a struggling server room to recover instead of a thundering herd of clients hammering it the instant it wobbles. Cap the number of attempts so you don't loop forever, and only retry the failures worth retrying — 5xx and 429, not 4xx.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>python — retry with exponential backoff</span></div><pre><code class="language-python">import time
+import requests
+
+def get_with_retry(url, max_attempts=4, **kwargs):
+    """GET a URL, retrying transient failures with exponential backoff."""
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.get(url, timeout=10, **kwargs)
+            if resp.status_code < 500 and resp.status_code != 429:
+                return resp          # success OR a 4xx — retrying won't help
+        except requests.exceptions.RequestException:
+            pass                     # connection error / timeout: fall through to retry
+
+        if attempt < max_attempts - 1:
+            wait = 2 ** attempt      # 1s, 2s, 4s, …  (exponential backoff)
+            time.sleep(wait)
+
+    raise RuntimeError(f"{url} failed after {max_attempts} attempts")</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why retried requests must be idempotent</span>
+    <p>Retrying has a trap. Suppose you <code>POST</code> "create order," the server creates it, but the response is lost on the way back. Your client thinks it failed and retries — and now you have <strong>two orders</strong>. A request is <strong>idempotent</strong> when doing it twice has the same effect as doing it once. <code>GET</code> and <code>DELETE</code> usually are; a naive <code>POST</code> usually isn't. So only auto-retry operations that are safe to repeat, or make them safe (e.g. with a unique request ID the server de-duplicates on). This idea — exactly-once is hard, duplicates are the enemy — comes back in full force in <a href="11-distributed-systems-consistency.html">Chapter 11</a>; for now, just retry reads freely and writes carefully.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain "request out, response back" and which side starts the conversation?</li>
+    <li>Why does latency — not bandwidth — dominate a workload of many small requests?</li>
+    <li>What's the difference between a 4xx and a 5xx, and which is worth retrying?</li>
+    <li>Where should an API key live, and why is committing one dangerous even after you delete the line?</li>
+    <li>Why must a request be idempotent before you auto-retry it?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Fetch every page from a paginated API (with a timeout and one retry)</strong></summary>
+    <div class="collapse-card-body">
+      <p>Write <code>fetch_all_pages(url)</code> that pulls every page from the public posts API, stopping when a page comes back empty. Each request must use a <strong>timeout</strong> and get <strong>one retry</strong> on failure. Return the combined list of all items.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-python">import time
+import requests
+
+def get_once_with_retry(url, params):
+    """One GET, with a timeout and a single retry on a transient failure."""
+    for attempt in range(2):                 # original try + 1 retry
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code < 500 and resp.status_code != 429:
+                resp.raise_for_status()      # raise on a real 4xx
+                return resp.json()
+        except requests.exceptions.RequestException:
+            pass
+        if attempt == 0:
+            time.sleep(1)                    # brief backoff before the retry
+    raise RuntimeError(f"failed to fetch {url} {params}")
+
+def fetch_all_pages(url, page_size=20):
+    items, page = [], 1
+    while True:
+        batch = get_once_with_retry(url, {"_page": page, "_limit": page_size})
+        if not batch:                        # empty page → we're done
+            break
+        items.extend(batch)
+        page += 1
+    return items
+
+all_posts = fetch_all_pages("https://jsonplaceholder.typicode.com/posts")
+print("total items fetched:", len(all_posts))   # -> 100</code></pre></div>
+      <p>Notice the three lessons folded in: a <code>timeout</code> so it can't hang, a single retry that skips un-retryable 4xx errors, and a loop that keeps paging until the data runs out instead of grabbing page 1 and stopping. That's a real, if small, API extractor — the backbone of countless ingestion jobs.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can now make one machine talk to another reliably — so let's ask what happens when one machine isn't enough and you have to spread the work across many. → <a href="10-distributed-systems-scaling.html">Distributed Systems I — Scaling Out</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
