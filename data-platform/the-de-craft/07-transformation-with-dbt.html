@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transformation with dbt — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why dbt changed analytics</a>
+    <a href="#models">Models are just SELECTs</a>
+    <a href="#layering">Layering: staging → marts</a>
+    <a href="#tests">Tests in schema.yml</a>
+    <a href="#incremental">Incremental models</a>
+    <a href="#docs">Docs &amp; lineage</a>
+    <a href="#hands-on">Hands-on: a dbt project on DuckDB</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-change-data-capture.html">← Previous</a>
+    <a href="08-the-lakehouse.html">Next: The Lakehouse →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Transformation with dbt</h1>
+  <p class="subtitle">You've modeled the data and moved it in. Now comes the "T" in ELT: turning raw, awkward source tables into clean, business-ready ones. dbt is the tool that made this feel like real software engineering — SQL transformations that are version-controlled, tested, documented, and wired into a dependency graph that builds itself. This is the chapter where your warehouse starts to feel trustworthy.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>From your <code>mini-griddp</code> repo, install dbt with the DuckDB adapter. With <a href="https://docs.astral.sh/uv/">uv</a>:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv add dbt-core dbt-duckdb        # or: pip install dbt-core dbt-duckdb
+dbt --version                     # confirm it's installed</code></pre></div>
+  <p>That's all the software you need — no server, no cloud account. dbt will read and write a local DuckDB file (<code>griddp.duckdb</code>) sitting right in your repo. We'll create the actual project in the <a href="#hands-on">hands-on</a> section; read the concepts first so the files make sense when you type them.</p>
+</div>
+
+<section id="why">
+  <h2>Why dbt changed analytics engineering</h2>
+  <p>For years, the "transform" step of a data pipeline was a graveyard of brittle practices: hand-run SQL scripts, stored procedures nobody could find, a 2,000-line query in a BI tool that one analyst understood. The logic worked, but it wasn't <em>software</em> — you couldn't review it, version it, test it, or trust that re-running it gave the same answer.</p>
+  <p>dbt (data build tool) made one deceptively simple bet: <strong>your transformations are just SELECT statements, so treat them like code.</strong> Put each one in a <code>.sql</code> file in a git repo. From there, everything good follows:</p>
+  <table>
+    <thead><tr><th>Before dbt</th><th>With dbt</th></tr></thead>
+    <tbody>
+      <tr><td>SQL pasted in a BI tool or run by hand</td><td>SQL in <code>.sql</code> files, reviewed in pull requests</td></tr>
+      <tr><td>"Does this number look right?" (a vibe)</td><td>Automated tests that <em>fail the build</em> when data is wrong</td></tr>
+      <tr><td>You manually run scripts in the right order</td><td>dbt reads your references and builds the order for you</td></tr>
+      <tr><td>Tribal knowledge of what feeds what</td><td>An auto-generated lineage graph + docs</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The "T" done right</span>
+    <p>In ELT (Extract, Load, <em>Transform</em>) you load raw data into the warehouse first, then transform it <em>inside</em> the warehouse with SQL. dbt owns that last step. It doesn't move data and it doesn't have its own compute — it compiles your SQL and hands it to the warehouse (here, DuckDB) to run. dbt is the conductor, not the orchestra.</p>
+  </div>
+</section>
+
+<section id="models">
+  <h2>Models are just SELECT statements</h2>
+  <p>A <strong>model</strong> is a single <code>.sql</code> file containing one <code>SELECT</code>. The file's name becomes the model's name. When you run dbt, it wraps your SELECT in <code>CREATE VIEW</code> or <code>CREATE TABLE</code> and materializes it in the warehouse. Here is a complete model — the whole file:</p>
+  <div class="code-wrap"><div class="code-header"><span>models/staging/stg_rentals.sql</span></div><pre><code class="language-sql">select
+    rental_id,
+    customer_id,
+    gpu_model,
+    hours_used,
+    price_per_hour,
+    hours_used * price_per_hour as revenue,
+    rented_at::date            as rental_date
+from {{ source('griddp', 'rentals') }}
+where hours_used &gt; 0</code></pre></div>
+  <p>Two things in that file are pure dbt magic, and they're the whole point of the tool:</p>
+  <ul>
+    <li><strong><code>{{ source('griddp', 'rentals') }}</code></strong> — instead of hard-coding the raw table name, you declare it as a <em>source</em>: data that arrives from outside dbt (here, the <code>rentals</code> table loaded from Postgres). dbt now knows this model depends on that raw input.</li>
+    <li><strong><code>{{ ref('other_model') }}</code></strong> — when one model reads from another, you reference it by name with <code>ref()</code> instead of writing the table name. This is how the DAG gets built.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">ref() builds the graph for free</span>
+    <p>Every time you write <code>{{ ref('stg_rentals') }}</code> in a downstream model, you've told dbt "this depends on that." dbt reads every <code>ref()</code> and <code>source()</code> across your project and assembles a <strong>DAG</strong> — a directed acyclic graph of what must build before what. You never write the run order by hand; you just say what each model reads, and the order falls out. Change a column in <code>stg_rentals</code> and dbt knows exactly which downstream models are affected.</p>
+  </div>
+  <p>Each model has a <strong>materialization</strong> — how dbt persists it. The two you'll use most:</p>
+  <table>
+    <thead><tr><th>Materialization</th><th>dbt creates</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>view</code> (default)</td><td>A SQL <code>VIEW</code> — re-computed on every query</td><td>Light staging logic; always-fresh; cheap to store</td></tr>
+      <tr><td><code>table</code></td><td>A physical <code>TABLE</code>, rebuilt each run</td><td>Heavier marts queried often; you want fast reads</td></tr>
+      <tr><td><code>incremental</code></td><td>A table that only appends new rows</td><td>Large fact tables where rebuilding all of it is wasteful</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="layering">
+  <h2>Layering: staging → intermediate → marts</h2>
+  <p>You don't dump all your SQL into one giant model. dbt projects follow a layered structure, and it maps cleanly onto the <strong>medallion layers</strong> you built in <a href="04-medallion-architecture.html">Chapter 04</a>:</p>
+  <div class="flow">  RAW (bronze)        STAGING (silver)        INTERMEDIATE        MARTS (gold)
+  ──────────────────────────────────────────────────────────────────────────▶
+
+  source('griddp',    stg_rentals             int_rentals_        fct_revenue_
+    'rentals')   ───▶  · rename columns  ───▶   enriched      ───▶  by_gpu
+                       · cast types            · join refs          · business
+  source('griddp',    stg_customers           · reusable           metrics
+    'customers') ───▶  · 1 model per           middle steps        dim_customers
+                         source                                    · ready for BI
+       │                    │                      │                   │
+   land raw,          clean &amp; conform        combine, the        the tables
+   untouched          (one model per         "messy middle"      analysts query
+                       source table)         (often skipped)</div>
+  <p>The three layers each have a job:</p>
+  <ul>
+    <li><strong>Staging</strong> (≈ silver cleanup) — one model per source table. Rename cryptic columns, cast types, trim whitespace, drop obvious garbage. No joins, no business logic. The goal is a clean, predictable version of each raw input. Convention: prefix with <code>stg_</code>.</li>
+    <li><strong>Intermediate</strong> — optional "messy middle" models that join and reshape staging models into reusable building blocks. Prefix <code>int_</code>. Small projects often skip this layer entirely.</li>
+    <li><strong>Marts</strong> (= gold) — the business-facing tables analysts and dashboards actually query. Facts (<code>fct_</code>) and dimensions (<code>dim_</code>) from your <a href="02-dimensional-modeling.html">dimensional modeling</a>. This is where revenue, KPIs, and reportable numbers live.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Why bother with layers?</span>
+    <p>Layering keeps each model small and single-purpose, so a change to how you clean a column happens in exactly one place (the staging model) and flows everywhere downstream. It's the same instinct as the medallion architecture — never let raw and business logic mix in one query.</p>
+  </div>
+</section>
+
+<section id="tests">
+  <h2>Tests: catching bad data before anyone sees it</h2>
+  <p>This is dbt's quietly revolutionary feature. You declare expectations about your data in a YAML file, and dbt turns each one into a query that <em>should return zero rows</em>. If a test query returns rows, the assumption is violated and the build fails. Four tests ship built-in:</p>
+  <table>
+    <thead><tr><th>Test</th><th>Passes when…</th><th>Catches</th></tr></thead>
+    <tbody>
+      <tr><td><code>not_null</code></td><td>No NULLs in the column</td><td>Missing keys, dropped joins, broken loads</td></tr>
+      <tr><td><code>unique</code></td><td>No duplicate values</td><td>Fan-out joins, double-loaded rows</td></tr>
+      <tr><td><code>accepted_values</code></td><td>Every value is in an allowed list</td><td>Typos, unexpected new categories</td></tr>
+      <tr><td><code>relationships</code></td><td>Every value exists in a parent table</td><td>Orphan rows / referential breaks</td></tr>
+    </tbody>
+  </table>
+  <p>You attach tests to models and columns in a <code>schema.yml</code> file that lives beside the models:</p>
+  <div class="code-wrap"><div class="code-header"><span>models/staging/schema.yml</span></div><pre><code class="language-yaml">version: 2
+
+models:
+  - name: stg_rentals
+    description: "One cleaned row per GPU rental."
+    columns:
+      - name: rental_id
+        description: "Primary key for a rental."
+        tests:
+          - not_null
+          - unique
+      - name: gpu_model
+        tests:
+          - accepted_values:
+              values: ['A100', 'H100', 'L40S', 'RTX4090']
+      - name: customer_id
+        tests:
+          - not_null</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">Why this matters more than it looks</span>
+    <p>A test that fails the build is the difference between "the dashboard quietly shows wrong revenue for a week" and "the pipeline stopped and paged you the moment a duplicate rental_id appeared." Tests turn assumptions you'd otherwise hold in your head into executable contracts. They are the cheapest data quality you will ever buy — we go much deeper in <a href="11-data-quality-and-testing.html">Chapter 11</a>.</p>
+  </div>
+</section>
+
+<section id="incremental">
+  <h2>Incremental models for large tables</h2>
+  <p>Rebuilding a marts table from scratch every run is fine for thousands of rows. It is wasteful for billions. <strong>Incremental models</strong> let dbt process only the <em>new</em> rows since the last run — a direct payoff of the change-data-capture thinking from <a href="06-change-data-capture.html">Chapter 06</a>.</p>
+  <div class="code-wrap"><div class="code-header"><span>models/marts/fct_rentals.sql</span></div><pre><code class="language-sql">{{ config(materialized='incremental', unique_key='rental_id') }}
+
+select *
+from {{ ref('stg_rentals') }}
+
+{% if is_incremental() %}
+  -- only rows newer than what we've already loaded
+  where rental_date &gt; (select max(rental_date) from {{ this }})
+{% endif %}</code></pre></div>
+  <p>The mechanics: <code>materialized='incremental'</code> tells dbt to build the table once, then <em>append</em> on later runs. The <code>{% if is_incremental() %}</code> block only kicks in on those later runs (on the first build, and on a <code>--full-refresh</code>, it's skipped and the whole table is built). Inside it, <code>{{ this }}</code> refers to the model's own existing table, so <code>max(rental_date)</code> is the high-water mark of what you already have. You append only what's past it.</p>
+  <div class="callout tip">
+    <span class="callout-label">Keep it boring</span>
+    <p>Incremental models add real complexity — late-arriving data and updates can slip through a naive high-water-mark filter. Reach for them only when full rebuilds genuinely hurt. Until then, a plain <code>table</code> that rebuilds each run is simpler and always correct.</p>
+  </div>
+</section>
+
+<section id="docs">
+  <h2>Docs &amp; lineage — for free</h2>
+  <p>Because dbt already knows every dependency (from your <code>ref()</code> and <code>source()</code> calls) and every description (from your <code>schema.yml</code>), it can generate a documentation site and a visual lineage graph with two commands:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt docs generate     # build docs from your models, refs, and descriptions
+dbt docs serve        # open a local site with searchable docs + a DAG viewer</code></pre></div>
+  <p>The result is a browsable site where every model lists its columns, descriptions, tests, and the exact SQL — plus an interactive <strong>lineage graph</strong> showing how data flows from sources through staging into marts. Click any node to see what feeds it and what it feeds. When an analyst asks "where does <code>fct_revenue_by_gpu</code> come from?", you point them at the graph instead of explaining it. The documentation can't drift from reality, because it's generated from the same code that runs.</p>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: build a dbt project on DuckDB</h2>
+  <p>Time to make it real. We'll declare the <code>rentals</code> source, build one staging model and one marts model, add tests, and run the whole thing with a single command. Work inside your <code>mini-griddp</code> repo.</p>
+
+  <p><strong>1. Scaffold the project.</strong> Create a folder and the four files we need. First, the project config:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/dbt_project.yml</span></div><pre><code class="language-yaml">name: 'griddp'
+version: '1.0.0'
+profile: 'griddp'
+
+model-paths: ["models"]
+
+models:
+  griddp:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table</code></pre></div>
+
+  <p><strong>2. Tell dbt how to connect.</strong> The <code>profiles.yml</code> holds connection details. Point it at a local DuckDB file:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/profiles.yml</span></div><pre><code class="language-yaml">griddp:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: griddp.duckdb     # a local file, created on first run
+      threads: 4</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Where profiles.yml lives</span>
+    <p>By default dbt looks for <code>profiles.yml</code> in <code>~/.dbt/</code>. To keep everything in one repo, place it in the project folder and run dbt with <code>--profiles-dir .</code> (shown below). For real projects, secrets go in environment variables, never committed — but a local DuckDB file has no secrets, so this is fine.</p>
+  </div>
+
+  <p><strong>3. Seed some raw data.</strong> So the project has something to read, create the <code>rentals</code> table in DuckDB. (In your real pipeline this is loaded from Postgres; here we fake it so the chapter is self-contained.)</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python -c "
+import duckdb
+con = duckdb.connect('griddp_dbt/griddp.duckdb')
+con.execute('''
+  CREATE OR REPLACE TABLE rentals AS
+  SELECT * FROM (VALUES
+    (1, 101, 'A100',  10, 2.50, TIMESTAMP '2026-06-01 09:00'),
+    (2, 102, 'H100',   5, 4.00, TIMESTAMP '2026-06-01 11:00'),
+    (3, 101, 'A100',   8, 2.50, TIMESTAMP '2026-06-02 09:00'),
+    (4, 103, 'L40S',  20, 1.25, TIMESTAMP '2026-06-02 14:00'),
+    (5, 102, 'H100',   3, 4.00, TIMESTAMP '2026-06-03 08:00')
+  ) AS t(rental_id, customer_id, gpu_model, hours_used, price_per_hour, rented_at)
+''')
+print('rows:', con.execute('SELECT count(*) FROM rentals').fetchone()[0])
+"</code></pre></div>
+
+  <p><strong>4. Declare the source.</strong> Tell dbt the raw <code>rentals</code> table exists:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/models/staging/sources.yml</span></div><pre><code class="language-yaml">version: 2
+
+sources:
+  - name: griddp
+    description: "Raw tables loaded into the warehouse."
+    tables:
+      - name: rentals</code></pre></div>
+
+  <p><strong>5. The staging model</strong> — clean one row per rental:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/models/staging/stg_rentals.sql</span></div><pre><code class="language-sql">select
+    rental_id,
+    customer_id,
+    gpu_model,
+    hours_used,
+    price_per_hour,
+    hours_used * price_per_hour as revenue,
+    rented_at::date            as rental_date
+from {{ source('griddp', 'rentals') }}
+where hours_used &gt; 0</code></pre></div>
+
+  <p><strong>6. The marts model</strong> — revenue rolled up per GPU, reading the staging model via <code>ref()</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/models/marts/fct_revenue_by_gpu.sql</span></div><pre><code class="language-sql">select
+    gpu_model,
+    count(*)        as rental_count,
+    sum(hours_used) as total_hours,
+    sum(revenue)    as total_revenue
+from {{ ref('stg_rentals') }}
+group by gpu_model
+order by total_revenue desc</code></pre></div>
+
+  <p><strong>7. Add tests</strong> in a schema file beside the models:</p>
+  <div class="code-wrap"><div class="code-header"><span>griddp_dbt/models/staging/schema.yml</span></div><pre><code class="language-yaml">version: 2
+
+models:
+  - name: stg_rentals
+    description: "One cleaned row per GPU rental, with revenue computed."
+    columns:
+      - name: rental_id
+        description: "Primary key."
+        tests:
+          - not_null
+          - unique
+      - name: gpu_model
+        tests:
+          - accepted_values:
+              values: ['A100', 'H100', 'L40S', 'RTX4090']</code></pre></div>
+
+  <p><strong>8. Build it.</strong> The <code>dbt build</code> command runs your models <em>and</em> their tests in DAG order — one command for the whole project:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd griddp_dbt
+dbt build --profiles-dir .</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>dbt finds your models, builds them in dependency order (<code>stg_rentals</code> before <code>fct_revenue_by_gpu</code>), and runs the three tests — all green:</p>
+    <div class="code-wrap"><div class="code-header"><span>output</span></div><pre><code class="language-bash">Found 2 models, 3 data tests, 1 source
+
+1 of 5 START sql view model main.stg_rentals ............ [RUN]
+1 of 5 OK created sql view model main.stg_rentals ....... [OK in 0.04s]
+2 of 5 START test accepted_values_stg_rentals_gpu_model . [RUN]
+2 of 5 PASS accepted_values_stg_rentals_gpu_model ....... [PASS in 0.02s]
+3 of 5 START test not_null_stg_rentals_rental_id ........ [RUN]
+3 of 5 PASS not_null_stg_rentals_rental_id .............. [PASS in 0.02s]
+4 of 5 START test unique_stg_rentals_rental_id .......... [RUN]
+4 of 5 PASS unique_stg_rentals_rental_id ................ [PASS in 0.02s]
+5 of 5 START sql table model main.fct_revenue_by_gpu .... [RUN]
+5 of 5 OK created sql table model main.fct_revenue_by_gpu [OK in 0.05s]
+
+Finished running 1 view model, 3 data tests, 1 table model in 0.31s
+
+Completed successfully
+
+Done. PASS=5 WARN=0 ERROR=0 SKIP=0 TOTAL=5</code></pre></div>
+    <p><code>PASS=5 ERROR=0</code> means every model built and every test held. Query the result to see it: <code>duckdb griddp.duckdb "SELECT * FROM fct_revenue_by_gpu"</code> — H100 should top the revenue list. If a test had failed, dbt would print <code>ERROR</code> and a count of the offending rows, and the run would not be "successful." That's the safety net working.</p>
+  </div>
+  <p>You now have a real dbt project: a declared source, a layered staging→marts DAG, tests that gate the build, and a reproducible <code>dbt build</code>. Commit <code>griddp_dbt/</code> to <code>mini-griddp</code> — this is a centerpiece of your portfolio.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>What does <code>ref()</code> do that hard-coding a table name doesn't — and why does dbt need it?</li>
+    <li>Which medallion layer does a <code>stg_</code> model correspond to? A <code>fct_</code> model?</li>
+    <li>What does a dbt test actually run, and what makes it "pass"?</li>
+    <li>When would you reach for an <code>incremental</code> materialization instead of <code>table</code>?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add tests to the marts model and build a revenue-per-customer mart</strong></summary>
+    <div class="collapse-card-body">
+      <p>Two tasks. (1) Add a <code>not_null</code> + <code>unique</code> test to a column on your marts model — <code>gpu_model</code> is unique in <code>fct_revenue_by_gpu</code> (one row per GPU). (2) Create a new marts model <code>fct_revenue_by_customer.sql</code> that rolls revenue up per customer, and re-run <code>dbt build</code>.</p>
+      <p>First, the tests. Add a <code>schema.yml</code> in the marts folder:</p>
+      <div class="code-wrap"><div class="code-header"><span>models/marts/schema.yml</span></div><pre><code class="language-yaml">version: 2
+
+models:
+  - name: fct_revenue_by_gpu
+    description: "Revenue and usage rolled up per GPU model."
+    columns:
+      - name: gpu_model
+        tests:
+          - not_null
+          - unique</code></pre></div>
+      <p>Now the new model — same shape as the GPU mart, grouped by customer:</p>
+      <div class="code-wrap"><div class="code-header"><span>models/marts/fct_revenue_by_customer.sql</span></div><pre><code class="language-sql">select
+    customer_id,
+    count(*)     as rental_count,
+    sum(revenue) as total_revenue
+from {{ ref('stg_rentals') }}
+group by customer_id
+order by total_revenue desc</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt build --profiles-dir .</code></pre></div>
+      <p><strong>You should see</strong> the count climb to three models and five tests, all <code>PASS</code>, with <code>fct_revenue_by_customer</code> built. Customer 102 (two H100 rentals) should land near the top. Notice you never told dbt the run order — it derived it from your <code>ref()</code> calls. That's the whole promise of the tool in one command.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your transformations are clean, tested, and version-controlled — but where do the tables physically live? Next we give them a home that combines the cheapness of a data lake with the reliability of a warehouse. → <a href="08-the-lakehouse.html">The Lakehouse</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

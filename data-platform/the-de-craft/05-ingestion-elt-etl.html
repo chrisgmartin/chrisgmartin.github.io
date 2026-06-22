@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ingestion &amp; ELT/ETL — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#shapes">The three source shapes</a>
+    <a href="#extract">Full vs incremental extraction</a>
+    <a href="#elt-etl">ELT vs ETL</a>
+    <a href="#idempotent">Idempotent loads</a>
+    <a href="#hands-on">Hands-on: an incremental extractor</a>
+    <a href="#patterns">Batch, micro-batch &amp; streaming</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-medallion-architecture.html">← Previous</a>
+    <a href="06-change-data-capture.html">Next: Change Data Capture →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Ingestion &amp; ELT/ETL</h1>
+  <p class="subtitle">Modeling gave your data a good shape. Now we move it: pulling rows out of a source system and landing them in your warehouse, reliably, without re-pulling everything or creating duplicates. This is the "get it in" stage of the pipeline — and the patterns here (incremental extraction, idempotent loads, load-then-transform) are the ones you'll reach for in almost every job you ever build.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>From your <code>mini-griddp</code> repo, bring up Postgres and confirm the <code>rentals</code> table from Course 2 has rows. You'll also use DuckDB as the destination warehouse. Install the Postgres driver if you haven't: <code>pip install psycopg2-binary duckdb</code>. Keep this page beside your terminal and type each block.</p>
+</div>
+
+<section id="shapes">
+  <h2>The three source shapes</h2>
+  <p>In <a href="../foundations/index.html">Foundations</a> you met the idea that data arrives in three fundamentally different shapes, and that each one needs a different way of getting at it. Before we move anything, let's recap — because <em>how you extract</em> is decided entirely by <em>what the source is</em>.</p>
+  <table>
+    <thead><tr><th>Source shape</th><th>Examples</th><th>How you extract</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Databases</strong></td><td>Postgres, MySQL, an app's OLTP store</td><td>Run a <code>SELECT</code> over a connection; filter to new rows with a <code>WHERE</code> clause. (Our <code>rentals</code> table.)</td></tr>
+      <tr><td><strong>Files</strong></td><td>CSV / Parquet / JSON in a folder or object store (S3, GCS)</td><td>List the bucket, read new files; track which filenames you've already loaded.</td></tr>
+      <tr><td><strong>APIs &amp; events</strong></td><td>REST/GraphQL endpoints, webhooks, Kafka topics</td><td>Page through results with a cursor/token, or subscribe to a stream and consume messages.</td></tr>
+    </tbody>
+  </table>
+  <p>The mental model is the same in all three: <strong>find what's new, pull it, land it.</strong> Only the "how do I ask for new things" mechanic changes. This chapter works the database case end to end (it's the most common and the clearest), but the patterns transfer directly — the next chapter, <a href="06-change-data-capture.html">Change Data Capture</a>, sharpens the database case even further.</p>
+</section>
+
+<section id="extract">
+  <h2>Full vs incremental extraction</h2>
+  <p>There are exactly two ways to get rows out of a source, and choosing between them is the first real decision of any ingestion job.</p>
+  <ul>
+    <li><strong>Full extract</strong> — pull <em>every</em> row, every run. Simple and always correct, but it re-reads data you already have. Fine for a 500-row reference table; ruinous for a 50-million-row events table you run hourly.</li>
+    <li><strong>Incremental extract</strong> — pull only the rows that are <em>new or changed</em> since last time. The workhorse of real pipelines.</li>
+  </ul>
+  <p>The standard way to do an incremental extract is the <strong>high-watermark pattern</strong>. You keep a single value — the maximum <code>id</code> or <code>updated_at</code> you saw on the last run — and each new run asks the source for only rows <em>above</em> that mark. Then you save the new maximum for next time.</p>
+  <div class="flow">  HIGH-WATERMARK INCREMENTAL EXTRACT
+
+  last run saved:  watermark = 2026-06-20 09:00
+                          │
+                          ▼
+  SELECT * FROM rentals WHERE updated_at > '2026-06-20 09:00'
+                          │
+            ┌─────────────┴─────────────┐
+            ▼                           ▼
+     pull only NEW rows          compute new max(updated_at)
+            │                           │
+            ▼                           ▼
+     land in bronze            save watermark = 2026-06-21 09:00
+                                        │
+                                        └──▶ used by the NEXT run</div>
+  <p>Why this matters so much:</p>
+  <ul>
+    <li><strong>Cost &amp; speed</strong> — you move kilobytes instead of gigabytes. A run that took an hour now takes seconds.</li>
+    <li><strong>You don't hammer the source</strong> — that Postgres is also serving the live application. A full table scan every 15 minutes competes with real customer traffic. A tight indexed range query barely registers.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Pick a good watermark column</span>
+    <p>A watermark column must be <strong>monotonic</strong> for the rows you care about — it only ever goes up. An auto-incrementing <code>id</code> is perfect for append-only data (new rentals). An <code>updated_at</code> timestamp is better when rows can <em>change</em> after insert, because it moves every time the row is touched. The watermark only captures what its column captures — that's exactly the gap CDC closes in the next chapter.</p>
+  </div>
+</section>
+
+<section id="elt-etl">
+  <h2>ELT vs ETL</h2>
+  <p>Both acronyms have the same three letters — Extract, Load, Transform — and differ only in the <em>order</em>. That order is the whole story.</p>
+  <div class="flow">  ETL  (older)                          ELT  (modern)
+
+  Extract ─▶ Transform ─▶ Load          Extract ─▶ Load ─▶ Transform
+     │          │           │              │        │         │
+   source   reshape on    write          source   dump raw   reshape
+            a separate    clean                    into the  INSIDE the
+            box first     data                     warehouse warehouse
+                                                              (with SQL)</div>
+  <p><strong>ETL</strong> was born when storage was expensive and warehouses were weak. You couldn't afford to keep raw data, so you transformed it on a dedicated machine <em>first</em> and only loaded the polished result. The cost: every change to your logic meant re-extracting from the source, and your raw data was gone forever.</p>
+  <p><strong>ELT</strong> flips the last two steps, and it won the industry for three concrete reasons:</p>
+  <table>
+    <thead><tr><th>What changed</th><th>Why it makes ELT possible</th></tr></thead>
+    <tbody>
+      <tr><td>Storage got cheap</td><td>Keeping every raw row forever costs almost nothing, so you load first and never lose the original.</td></tr>
+      <tr><td>Warehouses got powerful</td><td>DuckDB, BigQuery, Snowflake can transform huge volumes <em>in place</em> — no separate transform box needed.</td></tr>
+      <tr><td>SQL is everywhere</td><td>Transformations become version-controlled SQL (you'll do this with dbt in ch. 07), readable by the whole team.</td></tr>
+    </tbody>
+  </table>
+  <p>This maps cleanly onto the <a href="04-medallion-architecture.html">medallion architecture</a> you just built. Ingestion is the <strong>Load</strong> step: get raw rows into <strong>bronze</strong>, faithfully, with no cleaning. The <strong>Transform</strong> then happens later, in the warehouse, promoting bronze → <strong>silver</strong> → <strong>gold</strong>. Keeping load and transform separate is exactly what lets you re-run your cleaning logic against untouched raw data whenever you fix a bug. So: this chapter is the "EL" of ELT; chapter 07 is the "T".</p>
+</section>
+
+<section id="idempotent">
+  <h2>Idempotent loads</h2>
+  <p>Pipelines fail and get re-run — a network blip, a retry from your scheduler, a manual re-trigger after you fixed something. So a load step must be <strong>idempotent</strong>: running it twice with the same input leaves the destination in the same state as running it once. No duplicates. You met idempotency in <a href="../foundations/index.html">Foundations</a> and again in Course 2; here it becomes a daily habit.</p>
+  <p>The naive <code>INSERT</code> is <em>not</em> idempotent — re-run it and you get two copies of every row. There are two standard ways to fix that:</p>
+  <p><strong>Pattern A — UPSERT / MERGE on a key.</strong> Insert new rows; for rows whose key already exists, update them instead of inserting again. Use this when rows arrive incrementally and may be updates.</p>
+  <div class="code-wrap"><div class="code-header"><span>SQL · upsert on a primary key</span></div><pre><code class="language-sql">-- DuckDB: requires a PRIMARY KEY or UNIQUE constraint on the key column
+INSERT INTO bronze_rentals
+SELECT * FROM staging_rentals
+ON CONFLICT (rental_id) DO UPDATE SET
+    customer_id = excluded.customer_id,
+    gpu_model   = excluded.gpu_model,
+    updated_at  = excluded.updated_at;
+-- re-running with the same rows updates them in place -> no duplicates</code></pre></div>
+  <p><strong>Pattern B — replace by partition.</strong> Delete the slice you're about to load, then insert it fresh. Use this when you reload a whole day/hour at a time and want that window to be exactly the source.</p>
+  <div class="code-wrap"><div class="code-header"><span>SQL · replace-by-partition</span></div><pre><code class="language-sql">BEGIN;
+DELETE FROM bronze_rentals WHERE load_date = DATE '2026-06-21';
+INSERT INTO bronze_rentals
+SELECT * FROM staging_rentals WHERE load_date = DATE '2026-06-21';
+COMMIT;
+-- re-running replaces the same partition -> the result is identical</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Idempotency and the watermark work together</span>
+    <p>The watermark stops you from <em>fetching</em> rows you already have; the idempotent write stops a <em>re-run</em> from duplicating the rows you do fetch. You want both — they guard different failure modes. The hands-on below wires them together.</p>
+  </div>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: an incremental extractor</h2>
+  <p>Let's build a real one: pull only <em>new</em> rentals from Postgres into a bronze table in DuckDB, using a high-watermark, idempotently. Then we'll run it twice and prove there are no duplicates.</p>
+  <p>Save this as <code>extract_rentals.py</code> in your <code>mini-griddp</code> repo:</p>
+  <div class="code-wrap"><div class="code-header"><span>extract_rentals.py</span></div><pre><code class="language-python">import duckdb
+import psycopg2
+
+WAREHOUSE = "griddp.duckdb"           # local DuckDB file = our warehouse
+PG = dict(host="localhost", port=5432, dbname="postgres",
+          user="postgres", password="postgres")
+
+def get_watermark(con):
+    """The highest rental_id we've already loaded (0 if the table is empty)."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bronze_rentals (
+            rental_id   BIGINT PRIMARY KEY,
+            customer_id BIGINT,
+            gpu_model   VARCHAR,
+            updated_at  TIMESTAMP
+        )""")
+    row = con.execute("SELECT max(rental_id) FROM bronze_rentals").fetchone()
+    return row[0] or 0
+
+def extract_new_rows(watermark):
+    """Pull ONLY rentals newer than the watermark from Postgres."""
+    pg = psycopg2.connect(**PG)
+    cur = pg.cursor()
+    cur.execute(
+        "SELECT rental_id, customer_id, gpu_model, updated_at "
+        "FROM rentals WHERE rental_id > %s ORDER BY rental_id",
+        (watermark,),
+    )
+    rows = cur.fetchall()
+    pg.close()
+    return rows
+
+def load_idempotent(con, rows):
+    """UPSERT on rental_id so a re-run can never duplicate."""
+    con.executemany("""
+        INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)
+        ON CONFLICT (rental_id) DO UPDATE SET
+            customer_id = excluded.customer_id,
+            gpu_model   = excluded.gpu_model,
+            updated_at  = excluded.updated_at
+    """, rows)
+
+def main():
+    con = duckdb.connect(WAREHOUSE)
+    watermark = get_watermark(con)
+    print(f"watermark (last rental_id loaded) = {watermark}")
+
+    rows = extract_new_rows(watermark)
+    print(f"pulled {len(rows)} new row(s) from Postgres")
+
+    load_idempotent(con, rows)
+    total = con.execute("SELECT count(*) FROM bronze_rentals").fetchone()[0]
+    print(f"bronze_rentals now has {total} row(s)")
+    con.close()
+
+if __name__ == "__main__":
+    main()</code></pre></div>
+  <p>Now run it <strong>twice in a row</strong>, without changing the source in between:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python extract_rentals.py     # first run: loads everything
+python extract_rentals.py     # second run: should load NOTHING new</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The <strong>first</strong> run prints <code>watermark ... = 0</code>, pulls all your rentals (say 200), and ends with <code>bronze_rentals now has 200 row(s)</code>. The <strong>second</strong> run prints the watermark as the highest id (e.g. <code>200</code>), reports <code>pulled 0 new row(s)</code>, and still ends with <code>200 row(s)</code> — <strong>not 400</strong>. The watermark skipped re-fetching; the upsert guaranteed no duplicates even if rows <em>had</em> come back. That's a correct incremental, idempotent load.</p>
+  </div>
+  <p>To see the increment actually work, insert a couple of fresh rentals into Postgres and run the script a third time — it will report exactly those new rows and nothing else.</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal · add new source rows, then re-run</span></div><pre><code class="language-bash">docker compose exec -T postgres psql -U postgres -c \
+  "INSERT INTO rentals (customer_id, gpu_model, updated_at)
+   VALUES (7, 'H100', now()), (7, 'A100', now());"
+python extract_rentals.py     # -> pulled 2 new row(s); total grows by exactly 2</code></pre></div>
+</section>
+
+<section id="patterns">
+  <h2>Batch, micro-batch &amp; streaming</h2>
+  <p>Our extractor runs, finishes, and exits — that's <strong>batch</strong> ingestion: move a chunk of data on a schedule (every hour, every night). It's by far the most common pattern, and for good reason — it's simple, cheap, and easy to reason about. <strong>Micro-batch</strong> is the same idea on a tight loop (every few seconds to minutes), trading a bit more cost for fresher data. <strong>Streaming</strong> processes each event the moment it arrives, continuously, with no "run" boundary at all — the right tool when seconds of latency genuinely matter. We build a real streaming pipeline in <a href="09-streaming-fundamentals.html">chapter 09</a>; for now, just know that most of the ingestion you'll write is batch, and reaching for streaming before you need it is a classic over-engineering trap.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you name the three source shapes and how extraction differs for each?</li>
+    <li>Can you explain the high-watermark pattern — what you store and how it filters the next pull?</li>
+    <li>Why did ELT beat ETL? Can you tie its "L" and "T" to bronze and silver/gold?</li>
+    <li>What makes a load idempotent, and what are the two ways to achieve it?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Make a naive full-reload extractor incremental and idempotent</strong></summary>
+    <div class="collapse-card-body">
+      <p>Here is a deliberately bad extractor. It pulls the <em>entire</em> table every run and plain-<code>INSERT</code>s it — so every run re-reads all of Postgres and doubles the bronze table. Fix it: add a high-watermark so it only pulls new rows, and make the load idempotent so a re-run never duplicates.</p>
+      <div class="code-wrap"><div class="code-header"><span>bad_extractor.py · starting point</span></div><pre><code class="language-python">import duckdb, psycopg2
+
+con = duckdb.connect("griddp.duckdb")
+con.execute("""CREATE TABLE IF NOT EXISTS bronze_rentals
+    (rental_id BIGINT, customer_id BIGINT, gpu_model VARCHAR, updated_at TIMESTAMP)""")
+
+pg = psycopg2.connect(host="localhost", dbname="postgres",
+                      user="postgres", password="postgres")
+cur = pg.cursor()
+cur.execute("SELECT rental_id, customer_id, gpu_model, updated_at FROM rentals")  # FULL pull
+con.executemany("INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)", cur.fetchall())  # plain INSERT
+print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre></div>
+      <p>Two changes do it: (1) read the current max <code>rental_id</code> from bronze and add a <code>WHERE rental_id &gt; %s</code> to the source query; (2) make the table's key a <code>PRIMARY KEY</code> and switch the <code>INSERT</code> to an <code>ON CONFLICT</code> upsert.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-python">import duckdb, psycopg2
+
+con = duckdb.connect("griddp.duckdb")
+con.execute("""CREATE TABLE IF NOT EXISTS bronze_rentals
+    (rental_id BIGINT PRIMARY KEY, customer_id BIGINT,
+     gpu_model VARCHAR, updated_at TIMESTAMP)""")            # 1a. key for upsert
+
+# 1b. high-watermark: highest id we already have (0 if empty)
+watermark = con.execute("SELECT max(rental_id) FROM bronze_rentals").fetchone()[0] or 0
+
+pg = psycopg2.connect(host="localhost", dbname="postgres",
+                      user="postgres", password="postgres")
+cur = pg.cursor()
+cur.execute("SELECT rental_id, customer_id, gpu_model, updated_at "
+            "FROM rentals WHERE rental_id > %s ORDER BY rental_id", (watermark,))  # 1c. incremental
+
+con.executemany("""INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)
+    ON CONFLICT (rental_id) DO UPDATE SET
+        customer_id = excluded.customer_id,
+        gpu_model   = excluded.gpu_model,
+        updated_at  = excluded.updated_at""", cur.fetchall())  # 2. idempotent
+print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre></div>
+      <p>Run it twice: the count holds steady instead of doubling. If you instinctively reached for "store the max, filter above it, upsert on the key," the core skill of ingestion has landed — it's the same shape for files (track loaded filenames) and APIs (track the cursor token).</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>The watermark only catches what its column reveals — it can miss deletes and silent updates. To capture <em>every</em> change a source makes, we go to the database's own change log. → <a href="06-change-data-capture.html">Change Data Capture</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 01 — Project Setup &amp; the Data Generator — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal</a>
+    <a href="#compose">The Compose stack</a>
+    <a href="#schema">The source schema</a>
+    <a href="#generator">The data generator</a>
+    <a href="#run">Run it &amp; verify</a>
+    <a href="#commit">Commit</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-ingestion-bronze.html">Next: Lab 02 — Ingestion →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 01 — Project Setup &amp; the Data Generator</h1>
+  <p class="subtitle">A platform is useless without a business to serve. In this first lab you stand up the running stack — Postgres, Redpanda, Dagster, and Metabase — in one Compose file, design the operational database that our fictional GPU marketplace writes to, and build a generator that fills it with realistic data. By the end you have a live source system that the next nine labs will pull from.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need the full local stack from <a href="../orientation-setup/index.html">Course 2</a> and <a href="../tooling-stack/index.html">Course 5</a> already installed: <strong>Docker Desktop</strong> (running), <strong>uv</strong> for Python, and the <strong>psql</strong> client. You also need the empty <code>mini-griddp</code> skeleton from <a href="00-START-HERE.html">chapter 00</a> — the folders <code>generator/</code>, <code>ingest/</code>, <code>dbt/</code>, etc., committed to git. Open a terminal in the repo root and keep this page beside it.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal — give the platform a source to read from</h2>
+  <p>Every lab adds one piece to the architecture from chapter 00. This lab builds the leftmost column — the <strong>sources</strong> — plus the running infrastructure everything else depends on. Three things ship here: the Compose stack, an operational Postgres schema, and a generator that simulates the marketplace.</p>
+  <div class="flow">  THIS LAB ADDS ▼                INGEST           STORE / MODEL          SERVE
+  ┌─────────────────────┐
+  │ docker-compose.yml  │   (Postgres · Redpanda · Dagster · Metabase — all running)
+  ├─────────────────────┤
+  │ Postgres SOURCE     │        ┌──────────┐      ┌─────────────┐      ┌──────────┐
+  │  customers          │  ····▶ │  ingest  │ ···▶ │  bronze →   │ ···▶ │ Metabase │
+  │  gpus · gpu_prices  │        │ (Lab 02) │      │  gold       │      │ (Lab 08) │
+  │  rentals            │        └──────────┘      └─────────────┘      └──────────┘
+  ├─────────────────────┤
+  │ generator/          │   inserts ~50 customers, ~10 GPUs + prices,
+  │  generate.py        │   a few hundred rentals spread across time
+  └─────────────────────┘
+  ─────────────────────────────────────────────────────────────────────────────────
+  Dotted boxes are future labs. After today, the source on the left is LIVE and full.</div>
+  <p>Think of Postgres here as the marketplace's own application database — the system of record that the live product would write to as customers sign up and rent GPUs. Our generator plays the role of those customers. The rest of the platform is a read-only consumer of this database; it never writes back.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why a real Postgres, not a CSV</span>
+    <p>Real source systems are live transactional databases with constraints, types, and rows that change over time. Building against one now means Lab 02's ingestion learns to extract from a database — incrementally and idempotently — exactly as it would in production. A folder of static CSVs would teach you the wrong reflexes.</p>
+  </div>
+</section>
+
+<section id="compose">
+  <h2>The Compose stack</h2>
+  <p>Everything runs in containers so the whole platform comes up with one command and tears down cleanly. We reuse the wiring you wrote in <a href="../tooling-stack/index.html">Course 5, chapter 03</a> and assemble all four services into one file at the repo root. Create <code>docker-compose.yml</code>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>mini-griddp/docker-compose.yml</span></div><pre><code class="language-yaml">services:
+  postgres:
+    image: postgres:16
+    container_name: griddp-postgres
+    environment:
+      POSTGRES_USER: griddp
+      POSTGRES_PASSWORD: griddp
+      POSTGRES_DB: marketplace
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U griddp -d marketplace"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redpanda:
+    image: redpandadata/redpanda:v24.1.7
+    container_name: griddp-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  dagster:
+    image: dagster/dagster-celery-k8s:latest
+    container_name: griddp-dagster
+    # We run Dagster locally with `dagster dev` in later labs; this service
+    # is a placeholder webserver so the UI port is reserved and documented.
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  metabase:
+    image: metabase/metabase:v0.49.6
+    container_name: griddp-metabase
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:</code></pre></div>
+
+  <div class="callout tip">
+    <span class="callout-label">Why these choices</span>
+    <p>The named volume <code>pgdata</code> keeps your data when containers restart, so you don't regenerate on every reboot. Health checks let downstream services wait until Postgres is genuinely ready, not just started. Metabase maps to host port <strong>3001</strong> so it doesn't collide with Dagster on 3000. We'll wire up Dagster and Metabase properly in Labs 05 and 08 — for now they just need to be reachable.</p>
+  </div>
+
+  <p>Bring the stack up. The first run pulls images and may take a few minutes:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker compose up -d        # -d = detached, runs in the background
+docker compose ps           # show the status of each service</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p><code>docker compose ps</code> lists four containers. <code>griddp-postgres</code> and <code>griddp-redpanda</code> show status <code>healthy</code> (give them ~15 seconds). Visiting <code>http://localhost:3001</code> shows the Metabase setup screen, and <code>http://localhost:3000</code> shows the Dagster UI. If Postgres isn't healthy, run <code>docker compose logs postgres</code> and check that port 5432 isn't already in use by a local install.</p>
+  </div>
+</section>
+
+<section id="schema">
+  <h2>The source schema</h2>
+  <p>Now design the database the marketplace application writes to. Four tables capture the core business: who the customers are, what GPUs exist, what those GPUs cost, and who rented what. This is a normalized <strong>operational</strong> schema — built for fast inserts and updates, not analytics. (Turning it into an analytics-friendly star schema is exactly the job of Lab 03.)</p>
+
+  <table>
+    <thead><tr><th>Table</th><th>Represents</th><th>Grows when…</th></tr></thead>
+    <tbody>
+      <tr><td><code>customers</code></td><td>Accounts on the marketplace</td><td>someone signs up</td></tr>
+      <tr><td><code>gpus</code></td><td>The catalog of GPU models we rent</td><td>we add a model (rarely)</td></tr>
+      <tr><td><code>gpu_prices</code></td><td>Hourly price per GPU, over time</td><td>a price changes</td></tr>
+      <tr><td><code>rentals</code></td><td>Each individual rental transaction</td><td>a customer rents a GPU</td></tr>
+    </tbody>
+  </table>
+
+  <p>Save the DDL as <code>generator/schema.sql</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>mini-griddp/generator/schema.sql</span></div><pre><code class="language-sql">-- Operational source schema for the GPU marketplace.
+-- Safe to re-run: drops and recreates from scratch.
+
+DROP TABLE IF EXISTS rentals;
+DROP TABLE IF EXISTS gpu_prices;
+DROP TABLE IF EXISTS gpus;
+DROP TABLE IF EXISTS customers;
+
+CREATE TABLE customers (
+    customer_id  SERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    tier         TEXT NOT NULL CHECK (tier IN ('free', 'pro', 'enterprise')),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE gpus (
+    gpu_id   SERIAL PRIMARY KEY,
+    model    TEXT NOT NULL UNIQUE,
+    vram_gb  INTEGER NOT NULL
+);
+
+-- Prices change over time; each row is valid from a moment onward.
+-- The "current" price for a GPU is the row with the latest valid_from.
+CREATE TABLE gpu_prices (
+    gpu_id          INTEGER NOT NULL REFERENCES gpus(gpu_id),
+    price_per_hour  NUMERIC(6, 2) NOT NULL,
+    valid_from      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (gpu_id, valid_from)
+);
+
+CREATE TABLE rentals (
+    rental_id    SERIAL PRIMARY KEY,
+    customer_id  INTEGER NOT NULL REFERENCES customers(customer_id),
+    gpu_id       INTEGER NOT NULL REFERENCES gpus(gpu_id),
+    hours        NUMERIC(8, 2) NOT NULL CHECK (hours > 0),
+    started_at   TIMESTAMPTZ NOT NULL
+);
+
+-- Indexes that an ingestion job will lean on (incremental reads by time).
+CREATE INDEX idx_rentals_started_at ON rentals(started_at);
+CREATE INDEX idx_customers_created_at ON customers(created_at);</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why <code>gpu_prices</code> is its own table</span>
+    <p>Prices move. Putting price on the <code>gpus</code> row would lose history — you couldn't answer "what did this GPU cost last March?". A separate table with a <code>valid_from</code> column keeps every price ever charged. This is your first taste of <strong>temporal data</strong>, and in Lab 03 it becomes a slowly-changing dimension. The marketplace world rewards you for modeling time honestly.</p>
+  </div>
+</section>
+
+<section id="generator">
+  <h2>The data generator</h2>
+  <p>The generator is the marketplace's heartbeat — it plays thousands of customers signing up and renting GPUs. We'll write it in Python using <code>psycopg</code> (the modern Postgres driver) and <code>Faker</code> for realistic names. Set up an isolated environment in the <code>generator/</code> folder with <strong>uv</strong>:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd generator
+uv init --no-workspace          # creates pyproject.toml if you don't have one
+uv add "psycopg[binary]" faker  # the Postgres driver + fake-data library</code></pre></div>
+
+  <p>Now write <code>generator/generate.py</code>. It loads the schema, then inserts customers, GPUs with a price history, and a few hundred rentals spread across the last 90 days:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>mini-griddp/generator/generate.py</span></div><pre><code class="language-python">"""Populate the marketplace source database with realistic data.
+
+Run after `docker compose up`:   uv run python generate.py
+Re-running rebuilds the schema and regenerates from scratch.
+"""
+import os
+import random
+from datetime import datetime, timedelta, timezone
+
+import psycopg
+from faker import Faker
+
+fake = Faker()
+random.seed(42)        # deterministic runs — same data every time
+Faker.seed(42)
+
+DSN = os.environ.get(
+    "GRIDDP_DSN",
+    "postgresql://griddp:griddp@localhost:5432/marketplace",
+)
+
+# The GPU catalog: model name, VRAM, and a base hourly price.
+GPU_CATALOG = [
+    ("NVIDIA A100 40GB", 40, 1.80),
+    ("NVIDIA A100 80GB", 80, 2.40),
+    ("NVIDIA H100 80GB", 80, 4.20),
+    ("NVIDIA L4 24GB", 24, 0.65),
+    ("NVIDIA L40S 48GB", 48, 1.10),
+    ("NVIDIA T4 16GB", 16, 0.35),
+    ("NVIDIA V100 32GB", 32, 0.95),
+    ("AMD MI300X 192GB", 192, 3.90),
+    ("AMD MI250 128GB", 128, 2.10),
+    ("NVIDIA RTX 4090 24GB", 24, 0.55),
+]
+TIERS = ["free", "pro", "enterprise"]
+TIER_WEIGHTS = [0.5, 0.4, 0.1]   # most users are free, few are enterprise
+NOW = datetime.now(timezone.utc)
+
+
+def run():
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        # 1. (Re)create the schema from the DDL file next to this script.
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "schema.sql")) as f:
+            conn.execute(f.read())
+        print("schema created")
+
+        # 2. Customers — ~50, each created at some point in the last year.
+        customer_ids = []
+        for _ in range(50):
+            created = NOW - timedelta(days=random.randint(0, 365))
+            tier = random.choices(TIERS, weights=TIER_WEIGHTS)[0]
+            row = conn.execute(
+                "INSERT INTO customers (name, tier, created_at) "
+                "VALUES (%s, %s, %s) RETURNING customer_id",
+                (fake.company(), tier, created),
+            ).fetchone()
+            customer_ids.append(row[0])
+        print(f"inserted {len(customer_ids)} customers")
+
+        # 3. GPUs + a price history (1–3 price points each).
+        gpu_ids = []
+        for model, vram, base_price in GPU_CATALOG:
+            gid = conn.execute(
+                "INSERT INTO gpus (model, vram_gb) VALUES (%s, %s) "
+                "RETURNING gpu_id",
+                (model, vram),
+            ).fetchone()[0]
+            gpu_ids.append(gid)
+
+            price = base_price
+            valid_from = NOW - timedelta(days=365)
+            for _ in range(random.randint(1, 3)):
+                conn.execute(
+                    "INSERT INTO gpu_prices (gpu_id, price_per_hour, valid_from) "
+                    "VALUES (%s, %s, %s)",
+                    (gid, round(price, 2), valid_from),
+                )
+                # next price point: drift +/- 15%, later in time
+                price *= random.uniform(0.85, 1.15)
+                valid_from += timedelta(days=random.randint(60, 150))
+        print(f"inserted {len(gpu_ids)} GPUs with price history")
+
+        # 4. Rentals — a few hundred, spread over the last 90 days.
+        rental_count = 0
+        for _ in range(400):
+            started = NOW - timedelta(
+                days=random.randint(0, 90),
+                hours=random.randint(0, 23),
+            )
+            conn.execute(
+                "INSERT INTO rentals (customer_id, gpu_id, hours, started_at) "
+                "VALUES (%s, %s, %s, %s)",
+                (
+                    random.choice(customer_ids),
+                    random.choice(gpu_ids),
+                    round(random.uniform(0.5, 72.0), 2),
+                    started,
+                ),
+            )
+            rental_count += 1
+        print(f"inserted {rental_count} rentals")
+
+    print("done — marketplace populated")
+
+
+if __name__ == "__main__":
+    run()</code></pre></div>
+
+  <div class="callout tip">
+    <span class="callout-label">Telemetry comes later</span>
+    <p>A real GPU also emits a firehose of telemetry — utilization, temperature, power — many readings per second. That high-volume stream is the star of <strong>Lab 04</strong>, where it flows through Redpanda (which is why it's already in our Compose stack). For now we deliberately keep the source small and relational: four tables, hundreds of rows, easy to reason about.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Run it &amp; verify</h2>
+  <p>With the stack up and Postgres healthy, run the generator from inside the <code>generator/</code> folder:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generate.py</code></pre></div>
+
+  <p>It prints its progress: schema created, customers, GPUs, rentals. Now confirm the data is really in Postgres by querying it directly with <code>psql</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># connect to the running container's database
+docker compose exec postgres psql -U griddp -d marketplace</code></pre></div>
+
+  <p>At the <code>marketplace=#</code> prompt, run a few counts and a peek at the data:</p>
+  <div class="code-wrap"><div class="code-header"><span>marketplace=# (SQL)</span></div><pre><code class="language-sql">SELECT count(*) FROM customers;
+SELECT count(*) FROM gpus;
+SELECT count(*) FROM gpu_prices;
+SELECT count(*) FROM rentals;
+
+-- a realistic-looking join: revenue per GPU model
+SELECT g.model,
+       count(*)                AS rentals,
+       round(sum(r.hours), 1)  AS total_hours
+FROM rentals r
+JOIN gpus g ON g.gpu_id = r.gpu_id
+GROUP BY g.model
+ORDER BY total_hours DESC;
+
+\q   -- quit psql</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p><code>customers</code> → <strong>50</strong>, <code>gpus</code> → <strong>10</strong>, <code>gpu_prices</code> → somewhere between <strong>10 and 30</strong> (1–3 points each), and <code>rentals</code> → <strong>400</strong>. The grouped query returns all ten models with rental counts and total hours, ordered by usage. Because the generator is seeded, your counts will match exactly on every run. If a count is zero, the insert step failed silently — re-run and read the printed progress lines.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit</h2>
+  <p>You just gave the platform a beating heart. Lock it in. From the repo root:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd ..                    # back to mini-griddp/ root
+git add docker-compose.yml generator/
+git commit -m "Lab 01: Compose stack + Postgres source schema + data generator"</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Mind the secrets</span>
+    <p>Our credentials here (<code>griddp/griddp</code>) are fine to commit because this is a throwaway local database — but build the habit now: real connection strings and passwords belong in <code>.env</code> (gitignored), referenced from Compose. Check <code>git status</code> shows no stray <code>.venv</code> or <code>__pycache__</code> folders; if it does, add them to <code>.gitignore</code> before committing.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you bring the whole stack up and down with <code>docker compose up -d</code> / <code>down</code>, and tell which services are healthy?</li>
+    <li>Can you explain why <code>gpu_prices</code> is a separate table instead of a column on <code>gpus</code>?</li>
+    <li>Can you connect with <code>psql</code> and run a join across <code>rentals</code> and <code>gpus</code>?</li>
+    <li>Do you understand that this Postgres is a <em>source</em> — the rest of the platform only reads from it?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add a <code>regions</code> table and give each rental a region</strong></summary>
+    <div class="collapse-card-body">
+      <p>Real marketplaces run GPUs in multiple data-center regions, and that dimension drives a lot of analysis ("revenue by region"). Add a <code>regions</code> lookup table, then add a <code>region_id</code> foreign key to <code>rentals</code> and have the generator assign each rental a random region. Verify with a grouped count.</p>
+      <p><strong>1. Extend the schema</strong> — in <code>schema.sql</code>, add the table near the top (before <code>rentals</code>, since rentals will reference it) and add the column + drop line:</p>
+      <div class="code-wrap"><div class="code-header"><span>schema.sql (additions)</span></div><pre><code class="language-sql">-- add to the DROP block at the top (drop rentals first — it references regions)
+DROP TABLE IF EXISTS rentals;
+DROP TABLE IF EXISTS regions;
+-- ... existing drops ...
+
+-- new lookup table
+CREATE TABLE regions (
+    region_id  SERIAL PRIMARY KEY,
+    code       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL
+);
+
+-- add this column to the rentals table definition:
+--   region_id INTEGER NOT NULL REFERENCES regions(region_id),</code></pre></div>
+      <p><strong>2. Seed regions and assign them</strong> — in <code>generate.py</code>, insert a handful of regions before the rentals loop, then include a region in each rental insert:</p>
+      <div class="code-wrap"><div class="code-header"><span>generate.py (additions)</span></div><pre><code class="language-python"># after creating GPUs, before the rentals loop:
+REGIONS = [
+    ("us-east", "US East (Virginia)"),
+    ("us-west", "US West (Oregon)"),
+    ("eu-central", "EU Central (Frankfurt)"),
+    ("ap-south", "AP South (Mumbai)"),
+]
+region_ids = []
+for code, name in REGIONS:
+    rid = conn.execute(
+        "INSERT INTO regions (code, name) VALUES (%s, %s) "
+        "RETURNING region_id",
+        (code, name),
+    ).fetchone()[0]
+    region_ids.append(rid)
+print(f"inserted {len(region_ids)} regions")
+
+# update the rentals INSERT to include region_id:
+conn.execute(
+    "INSERT INTO rentals (customer_id, gpu_id, region_id, hours, started_at) "
+    "VALUES (%s, %s, %s, %s, %s)",
+    (
+        random.choice(customer_ids),
+        random.choice(gpu_ids),
+        random.choice(region_ids),
+        round(random.uniform(0.5, 72.0), 2),
+        started,
+    ),
+)</code></pre></div>
+      <p><strong>3. Re-run and verify:</strong></p>
+      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generate.py
+docker compose exec postgres psql -U griddp -d marketplace \
+  -c "SELECT rg.code, count(*) AS rentals
+      FROM rentals r JOIN regions rg ON rg.region_id = r.region_id
+      GROUP BY rg.code ORDER BY rentals DESC;"</code></pre></div>
+      <p><strong>You should see</strong> four region codes, each with roughly 100 rentals (400 spread across 4 regions). You just added a dimension to the source — and you'll be glad you did when Lab 08's dashboard slices revenue by region. Notice how a clean operational schema made the change a two-file edit: that's the payoff of modeling carefully.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>The source is live and full. Now let's pull from it — landing raw rows into the bronze layer, incrementally and idempotently. → <a href="02-ingestion-bronze.html">Lab 02 — Ingestion — Land Raw to Bronze</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

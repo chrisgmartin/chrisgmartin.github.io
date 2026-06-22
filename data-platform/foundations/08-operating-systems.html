@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Operating Systems &amp; Resources — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-os">Why a data engineer needs OS basics</a>
+    <a href="#processes">Processes, threads &amp; the GIL</a>
+    <a href="#memory">Memory &amp; out-of-memory</a>
+    <a href="#disk-io">Disk &amp; I/O</a>
+    <a href="#cpu">CPU &amp; parallelism</a>
+    <a href="#observing">Observing resources in practice</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-files-and-serialization.html">← Previous</a>
+    <a href="09-networking-and-apis.html">Next: Networking &amp; APIs →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Operating Systems &amp; Resources</h1>
+  <p class="subtitle">Your pipelines don't run in the cloud, in dbt, or in Spark — they run on a machine with a fixed amount of CPU, memory, and disk, refereed by an operating system. Once you can picture those three finite resources and watch a job consume them, most "mysterious" pipeline failures stop being mysterious. They were resource failures all along.</p>
+</header>
+
+<section id="why-os">
+  <h2>Why a data engineer needs OS basics</h2>
+  <p>You will spend a surprising amount of this career staring at a job that died for no obvious reason. The logs say <code>Killed</code>, or <code>OOMKilled</code>, or the run just hangs at 100% and never finishes. The instinct is to blame the tool — "Spark is flaky," "pandas is slow." It almost never is. What's actually happening is that your program, like every program, is competing for three physical resources that a referee called the <strong>operating system</strong> (OS) hands out: <strong>CPU</strong> (the chips that do the computing), <strong>memory / RAM</strong> (fast scratch space), and <strong>disk</strong> (slow permanent storage). When you run out of one, the OS does something abrupt, and your pipeline dies.</p>
+
+  <p>A <strong>program</strong> is a file of instructions; a <strong>process</strong> is that program actually running, with its own slice of memory the OS grants it. Your pipeline is just a process (or a few). The OS's whole job is to share one machine's resources across many processes — yours, the database's, the browser you forgot to close — and to lie to each of them that it has the machine to itself. Knowing where that lie breaks down is the difference between guessing and diagnosing.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The reframe that pays off</span>
+    <p>Stop reading pipeline failures as "bugs in the tool" and start reading them as "I asked for more of a resource than the machine has." Out of memory, disk full, CPU pegged at 100%, all cores idle while one crawls — these are the four flavors of resource failure, and this chapter teaches you to recognize each on sight.</p>
+  </div>
+</section>
+
+<section id="processes">
+  <h2>Processes, threads &amp; the GIL</h2>
+  <p>A <strong>process</strong> is an isolated running program with its own private memory. A <strong>thread</strong> is a stream of execution <em>inside</em> a process; one process can have many threads that share its memory. Roughly: processes are separate houses, threads are people in the same house sharing a kitchen.</p>
+
+  <div class="flow">  PROCESS  (own private memory, isolated from others)
+  ┌───────────────────────────────────────────────┐
+  │   thread 1 ──▶ runs instructions                │
+  │   thread 2 ──▶ runs instructions   } share the  │
+  │   thread 3 ──▶ runs instructions   } same memory│
+  └───────────────────────────────────────────────┘
+       ▲ crash one process → others survive
+       ▲ crash via shared memory → can corrupt the whole process</div>
+
+  <p>Two words people use loosely but that matter here. <strong>Concurrency</strong> means juggling several tasks so they all make progress — like one cook starting the pasta, then chopping veg while it boils. <strong>Parallelism</strong> means literally doing several tasks at the same instant — several cooks, several stoves. You can have concurrency on a single CPU core (it switches between tasks fast); you only get true parallelism with multiple cores.</p>
+
+  <p>This brings us to a famous Python wrinkle. CPython (the standard Python) has a <strong>Global Interpreter Lock (GIL)</strong>: a lock that lets only <em>one</em> thread run Python bytecode at a time, even on a machine with many cores. So spinning up ten threads to do ten heavy calculations does <em>not</em> give you ten-way parallelism — they take turns holding the GIL.</p>
+
+  <p>That's why data engineers usually don't reach for threads to speed up CPU-bound work. Instead they reach for <strong>multiprocessing</strong> (separate processes, each with its own interpreter and its own GIL, so they genuinely run in parallel) or for a <strong>distributed/columnar engine</strong> (DuckDB, Spark, Polars) that does its heavy number-crunching in compiled C/C++/Rust code which releases the GIL and uses all your cores for you.</p>
+
+  <table>
+    <thead><tr><th>Approach</th><th>True parallelism?</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td>Python threads</td><td>No (GIL) for CPU work; yes for waiting on I/O</td><td>Many concurrent network/disk waits (API calls, downloads)</td></tr>
+      <tr><td>Python multiprocessing</td><td>Yes — one process per core</td><td>CPU-heavy work you wrote in pure Python</td></tr>
+      <tr><td>DuckDB / Spark / Polars</td><td>Yes — engine uses all cores in compiled code</td><td>Almost all real DE crunching: joins, group-bys, scans</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-label">The GIL in two sentences</span>
+    <p>Only one thread runs Python code at a time, so threads won't speed up CPU-bound Python. For real parallelism, use multiple processes — or, far more often, push the work into an engine like DuckDB or Spark that already does it.</p>
+  </div>
+</section>
+
+<section id="memory">
+  <h2>Memory &amp; out-of-memory</h2>
+  <p>Not all storage is equal. There's a <strong>memory hierarchy</strong>: a few tiers, each one dramatically faster but smaller and pricier than the one below it. Every byte your code touches lives somewhere on this ladder, and where it lives decides how fast your job runs.</p>
+
+  <div class="flow">  FASTEST / TINIEST                                  SLOWEST / BIGGEST
+  ──────────────────────────────────────────────────────────────────▶
+
+  CPU registers   →   CPU cache   →   RAM        →   SSD / disk
+  ~1 ns               ~1–10 ns        ~100 ns        ~100,000+ ns
+  bytes               a few MB        GBs            TBs
+  │                   │               │              │
+  the CPU's           recently        your "working  permanent storage;
+  hands               used data       set" lives     survives reboot
+                                      here
+
+  Each step down ≈ orders of magnitude slower. Disk is roughly
+  ~1000× slower than RAM. RAM is the scarce, fast resource you fight over.</div>
+
+  <p>The key takeaway: <strong>RAM is fast but small.</strong> A laptop might have 16 GB of RAM and 1 TB of disk — so RAM is ~60× scarcer. Yet RAM is where data has to be for the CPU to actually work on it. Anything you want to compute on must first be loaded from slow disk into fast RAM. That loading is exactly where pipelines die.</p>
+
+  <p><strong>Out of memory (OOM)</strong> is what happens when a process tries to use more RAM than is available. The OS can't grant it, so it kills the process (on Linux, the "OOM killer" picks a victim and terminates it — your log shows <code>Killed</code>). There's no graceful warning; the process just vanishes.</p>
+
+  <p>Why do data jobs trigger this so reliably? Because so many operations <strong>materialize</strong> data — pull the whole thing into RAM at once:</p>
+  <ul>
+    <li><code>pandas.read_csv("huge.csv")</code> loads the <em>entire</em> file into RAM as a DataFrame — and the in-memory form is often 2–10× larger than the file on disk (Python objects, indexes, type overhead). A 10 GB CSV can need 30–80 GB of RAM.</li>
+    <li>A big <strong>JOIN</strong> may build a hash table of one whole side in RAM before matching rows; a wide one can explode row counts.</li>
+    <li>A <strong>GROUP BY</strong> or a sort may need every group, or the whole dataset, held in memory at once.</li>
+  </ul>
+
+  <p>The fixes are patterns you've already met. <strong>Stream / chunk</strong> the data (Chapter 06) so you only ever hold a slice in RAM at a time — process and discard, never materialize the whole file. Or <strong>push the work down to the database/engine</strong> (DuckDB, Postgres, Spark), which is built to spill to disk and process more-than-RAM datasets without falling over. The rule of thumb: <em>if the data doesn't fit in RAM, don't load it all into RAM — let a tool that streams or spills do the heavy lifting.</em></p>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ "It worked on the sample"</span>
+    <p>A script that loads a file with pandas works beautifully on the 100 MB sample and gets <code>Killed</code> on the 40 GB production file — same code, no code bug. The sample fit in RAM; production didn't. Always ask "how big is this in RAM?" not "how big is this on disk?" before you load.</p>
+  </div>
+</section>
+
+<section id="disk-io">
+  <h2>Disk &amp; I/O</h2>
+  <p><strong>I/O</strong> ("input/output") is the work of moving bytes to and from disk (or the network). It's slow compared to CPU and RAM, so how you read matters enormously.</p>
+
+  <p>Two access patterns: a <strong>sequential read</strong> grabs bytes in order, in one continuous sweep (like playing a record start to finish); a <strong>random read</strong> jumps all over the disk to fetch scattered bytes (like skipping to track 7, then 2, then 19). Sequential is far faster — the disk (and the OS's read-ahead) is optimized for it. On old spinning <strong>HDDs</strong>, random reads meant physically moving a head and waiting for the platter to spin, which is glacial; <strong>SSDs</strong> have no moving parts and are much better at random access, but sequential still wins because it reads big contiguous blocks.</p>
+
+  <p>This is exactly why the <strong>columnar formats</strong> from Chapter 07 (Parquet) are fast: storing each column together lets a query read just the columns it needs, in long sequential scans, skipping the rest. Row formats force you to read everything to get one column.</p>
+
+  <p>The most useful diagnostic question you can ask about any slow job: <strong>is it I/O-bound or CPU-bound?</strong> An <strong>I/O-bound</strong> job spends most of its time waiting for bytes (reading a huge file, calling a slow API) — the CPU sits mostly idle. A <strong>CPU-bound</strong> job spends most of its time computing (heavy math, parsing, compression) — the CPU is pegged near 100%. The cure is different for each, so naming it first saves you from optimizing the wrong thing.</p>
+
+  <table>
+    <thead><tr><th>&nbsp;</th><th>I/O-bound</th><th>CPU-bound</th></tr></thead>
+    <tbody>
+      <tr><td>Bottleneck</td><td>Reading/writing disk or network</td><td>The processor doing work</td></tr>
+      <tr><td>What you'd see in <code>top</code></td><td>Low CPU %, high wait; disk busy</td><td>CPU near 100% on one or more cores</td></tr>
+      <tr><td>Typical example</td><td>Downloading files, scanning a giant log</td><td>Parsing JSON, decompressing, big joins</td></tr>
+      <tr><td>How to speed it up</td><td>Read less (columnar, filters), concurrency, faster storage</td><td>More cores / parallelism, a vectorized engine, less work</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="cpu">
+  <h2>CPU &amp; parallelism</h2>
+  <p>A modern CPU has multiple <strong>cores</strong> — independent units that can each run instructions at the same time. A 4-core laptop can genuinely do four things at once; an 8-core, eight. Many tools, left alone, use only one core, which means a job can crawl while seven cores sit idle.</p>
+
+  <p>This is where <strong>columnar, vectorized engines</strong> shine. DuckDB, Spark, and Polars process data in batches (vectors) of column values using compiled code, and they automatically split that work across all your cores. So the same group-by that pins a single-threaded pandas script to one core can run several times faster on DuckDB just by using the whole CPU — parallelism within one machine, for free, without you writing any threading code. (Spark extends the same idea across many machines, which is Chapters 10–11.)</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Let the engine use your machine</span>
+    <p>Before reaching for clever Python parallelism, ask whether a columnar engine can do the job. It will usually use every core and spill to disk when memory runs low — solving the CPU <em>and</em> the OOM problem at once. "Push it to DuckDB" is the single highest-leverage move in this chapter.</p>
+  </div>
+</section>
+
+<section id="observing">
+  <h2>Observing resources in practice</h2>
+  <p>You don't have to guess which resource is the problem — you can watch. <code>top</code> is built into every Unix system; <code>htop</code> is a friendlier, colorful version (install with <code>brew install htop</code> on macOS or <code>sudo apt install htop</code> on Linux). Both show, live, which processes are eating CPU and memory.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">top            # live process list; press q to quit
+# or, nicer:
+htop           # arrow keys to scroll, F10 or q to quit</code></pre></div>
+
+  <p>The columns that matter:</p>
+  <table>
+    <thead><tr><th>Column</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td><code>%CPU</code></td><td>Share of a core this process is using. <strong>Can exceed 100%</strong> — 400% means it's using four cores fully.</td></tr>
+      <tr><td><code>%MEM</code> / <code>RES</code></td><td>Share of RAM / actual RAM in use. Watch <code>RES</code> climb toward your total — that's an OOM building.</td></tr>
+      <tr><td><code>COMMAND</code></td><td>Which program it is (e.g. <code>python</code>, <code>duckdb</code>, <code>postgres</code>).</td></tr>
+      <tr><td>Load average</td><td>Roughly how many cores' worth of work is queued. Above your core count = saturated.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Now let's <em>create</em> a job to watch, so you can see memory grow with your own eyes. Open two terminals: run <code>htop</code> (or <code>top</code>) in one, and this Python in the other.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>memory_demo.py</span></div><pre><code class="language-python">import time
+
+# Allocate ~100 MB chunks and hold onto them, so RAM keeps climbing.
+chunks = []
+for i in range(1, 21):
+    # a list of 100 million small ints ≈ ~100 MB+ in RAM
+    chunks.append([0] * 12_000_000)
+    print(f"allocated chunk {i} (~{i * 100} MB held)")
+    time.sleep(1)          # pause so you can watch it in top/htop
+
+print("done holding memory; sleeping 10s before releasing")
+time.sleep(10)</code></pre></div>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python3 memory_demo.py</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>In <code>top</code>/<code>htop</code>, the <code>python3</code> row's <code>%MEM</code> and <code>RES</code> climb step by step, once per second, as each chunk is allocated — a staircase going up. Its <code>%CPU</code> stays low (this job is barely computing, just allocating and sleeping — it's <em>not</em> CPU-bound). When the script ends, that memory is freed and the row disappears. Push the loop range high enough on a small machine and you'll watch the process get <code>Killed</code> — that's an OOM, live.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Reading the two failure shapes</span>
+    <p>One process at a steady ~100% CPU on a single core while others idle = <strong>CPU-bound and single-threaded</strong> (a job that should probably move to DuckDB). A process whose <code>RES</code> marches toward your total RAM, then vanishes from the list = <strong>OOM</strong>. You can now diagnose both from across the room.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you name the four tiers of the memory hierarchy, fastest to slowest?</li>
+    <li>Can you explain in one sentence why <code>pandas.read_csv</code> on a huge file causes OOM?</li>
+    <li>Can you tell whether a slow job is I/O-bound or CPU-bound by looking at <code>top</code>?</li>
+    <li>Can you say, in two sentences, what the GIL is and why DE uses multiprocessing or DuckDB instead of threads for heavy work?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Will a 50 GB CSV load on a 16 GB laptop?</strong></summary>
+    <div class="collapse-card-body">
+      <p>You're handed a 50 GB CSV and asked to run <code>pandas.read_csv("data.csv")</code> on your 16 GB laptop, then do a group-by. Predict whether it works, explain why, and name two ways to fix it. Decide before reading on.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-text">Prediction: No — it will fail with an out-of-memory error
+(the process gets Killed).
+
+Why: read_csv MATERIALIZES the whole file in RAM as a DataFrame.
+The in-memory form is typically larger than the 50 GB on disk
+(Python object + type overhead), so it needs well over 50 GB —
+but the laptop only has 16 GB. The OS can't grant it and kills
+the process. Disk size (50 GB) is fine; RAM (16 GB) is the wall.
+
+Two fixes (any two):
+  1. STREAM/CHUNK it: read_csv(..., chunksize=...) and process a
+     piece at a time, never holding the whole file in RAM.
+  2. PUSH IT DOWN to an engine that spills to disk:
+       import duckdb
+       duckdb.sql("SELECT region, sum(amount) FROM 'data.csv'
+                   GROUP BY region").df()
+     DuckDB scans the file without materializing it all and uses
+     all your cores.
+  3. (Bonus) Convert to Parquet first and read only needed columns,
+     turning random work into fast sequential column scans.</code></pre></div>
+      <p>If your prediction was "no, because it doesn't fit in RAM," you've internalized the most important idea in this chapter: disk is big, RAM is small, and computation happens in RAM.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can now reason about one machine's resources. Real pipelines also pull data across the wire — so next we look at what happens between machines. → <a href="09-networking-and-apis.html">Networking &amp; APIs</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Docker Deeper — Tooling &amp; the Modern Stack</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#recap">Image vs container, recap</a>
+    <a href="#dockerfile">Writing a Dockerfile</a>
+    <a href="#layers">Layers &amp; the build cache</a>
+    <a href="#multistage">Multi-stage builds</a>
+    <a href="#compose-deep">Compose, deeper</a>
+    <a href="#registry">Image registries</a>
+    <a href="#hands-on">Hands-on: a 2-service stack</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-professional-git.html">← Previous</a>
+    <a href="03-wiring-the-mini-platform.html">Next: Wiring the Mini-Platform →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 5 · Tooling</span>
+  <h1>Docker Deeper</h1>
+  <p class="subtitle">In Course 2 you <em>ran</em> someone else's container. Now you'll <em>build your own</em> image for a small data pipeline, understand why rebuilds are sometimes instant and sometimes slow, and wire two services together with Compose so a Python script can talk to a Postgres database by name. This is the leap from "I can use Docker" to "I package and ship software with Docker."</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need Docker installed and running — the same Docker you set up in <strong>Course 2</strong>. Open a terminal and run <code>docker --version</code> and <code>docker compose version</code>; both should print a version. If Docker Desktop isn't running, start it (the whale icon should be steady, not animating). Make a fresh working folder to follow along: <code>mkdir -p ~/docker-deeper &amp;&amp; cd ~/docker-deeper</code>. Type every command — the fluency lives in your fingers.</p>
+</div>
+
+<section id="recap">
+  <h2>Image vs container, in one breath</h2>
+  <p>One distinction underpins everything in this chapter, so let's nail it. An <strong>image</strong> is a frozen, read-only template — a packaged filesystem plus the metadata that says "run this command when you start." A <strong>container</strong> is a running (or stopped) instance of that image — a live process with its own isolated filesystem layered on top.</p>
+  <table>
+    <thead><tr><th>Image</th><th>Container</th></tr></thead>
+    <tbody>
+      <tr><td>A template / blueprint</td><td>A running instance of that template</td></tr>
+      <tr><td>Read-only, built once</td><td>Has a writable layer; starts &amp; stops</td></tr>
+      <tr><td>Like a class in code</td><td>Like an object you created from the class</td></tr>
+      <tr><td>You <code>build</code> or <code>pull</code> it</td><td>You <code>run</code> it (one image → many containers)</td></tr>
+    </tbody>
+  </table>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker run --rm python:3.12-slim python -c "print('hello from a container')"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Docker pulls the <code>python:3.12-slim</code> image if you don't have it, starts a container, prints <code>hello from a container</code>, and removes the container (<code>--rm</code>) when it exits. The <em>image</em> stays cached on your machine; only the <em>container</em> was disposable. That image-stays / container-goes split is the whole mental model.</p>
+  </div>
+</section>
+
+<section id="dockerfile">
+  <h2>Writing a Dockerfile — building your own image</h2>
+  <p>A <strong>Dockerfile</strong> is a plain-text recipe: a list of instructions Docker follows, top to bottom, to assemble an image. Let's build one for a tiny Python "pipeline." First, the two files our image will contain.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal — create the app files</span></div><pre><code class="language-bash">cat > requirements.txt <<'EOF'
+requests==2.32.3
+EOF
+
+cat > pipeline.py <<'EOF'
+print("[pipeline] starting")
+nums = [120, 80, 200, 95]
+total = sum(nums)
+print(f"[pipeline] processed {len(nums)} records, total = {total}")
+print("[pipeline] done")
+EOF</code></pre></div>
+
+  <p>Now the Dockerfile. Each instruction is purposeful — read the comments:</p>
+  <div class="code-wrap"><div class="code-header"><span>Dockerfile</span></div><pre><code class="language-dockerfile"># FROM: the base image we build on top of. "slim" = small Debian + Python.
+FROM python:3.12-slim
+
+# WORKDIR: set (and create) the working directory inside the image.
+# Every later COPY/RUN/CMD runs relative to here.
+WORKDIR /app
+
+# COPY dependencies FIRST (before the app code) — see the next section for why.
+COPY requirements.txt .
+
+# RUN: execute a command at BUILD time and bake the result into the image.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Now copy the rest of the application code.
+COPY pipeline.py .
+
+# CMD: the default command run when a container STARTS (at run time).
+CMD ["python", "pipeline.py"]</code></pre></div>
+
+  <p>Build the image (the <code>-t</code> gives it a name/tag), then run a container from it:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker build -t mypipeline:v1 .     # the trailing "." = build context (this folder)
+docker run --rm mypipeline:v1</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The build streams steps like <code>[1/4] FROM</code>, <code>[3/4] RUN pip install</code>, and ends with <code>naming to docker.io/library/mypipeline:v1</code>. The <code>run</code> then prints <code>[pipeline] starting</code> … <code>processed 4 records, total = 495</code> … <code>done</code>. You just built and ran software that will behave <em>identically</em> on any machine with Docker — laptop, teammate's laptop, or a server.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">CMD vs ENTRYPOINT</span>
+    <p><code>CMD</code> sets the default command, and anything you append after <code>docker run image …</code> <em>replaces</em> it. <code>ENTRYPOINT</code> sets a fixed command that always runs, and <code>CMD</code> becomes its default arguments. Rule of thumb: use <code>CMD</code> for "here's what to run by default" (our case); use <code>ENTRYPOINT</code> when the image <em>is</em> a specific tool and run-time args should be passed to it.</p>
+  </div>
+</section>
+
+<section id="layers">
+  <h2>Layers &amp; the build cache</h2>
+  <p>Here's the idea that makes Docker fast once you understand it: <strong>every instruction in a Dockerfile creates a layer</strong>, and Docker <em>caches</em> each layer. On a rebuild, Docker reuses a cached layer as long as nothing it depends on changed. The moment one instruction's inputs change, that layer <em>and every layer after it</em> are rebuilt.</p>
+
+  <div class="flow">  Dockerfile instruction          →  cached layer
+  ──────────────────────────────────────────────────────────
+  FROM python:3.12-slim           →  [ base OS + Python ]      ← rarely changes
+  WORKDIR /app                    →  [ + workdir set      ]
+  COPY requirements.txt .         →  [ + deps manifest    ]    ← changes when deps change
+  RUN pip install ...             →  [ + installed packages ]  ← the SLOW layer
+  COPY pipeline.py .              →  [ + your code        ]    ← changes constantly
+  CMD ["python","pipeline.py"]    →  [ + start command    ]
+
+  Edit ONLY pipeline.py  →  Docker reuses everything down to the last COPY,
+                            skips the slow pip install, rebuilds in a blink.</div>
+
+  <p>This is why we copied <code>requirements.txt</code> and ran <code>pip install</code> <em>before</em> copying the app code. Your code changes dozens of times a day; your dependencies rarely do. By ordering the cheap-but-frequent change (code) <em>after</em> the expensive-but-rare one (installing packages), most rebuilds skip the slow <code>pip install</code> entirely. Prove it to yourself:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># Change only the app code, not the dependencies
+echo 'print("[pipeline] v2 — extra line")' >> pipeline.py
+
+docker build -t mypipeline:v2 .</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The <code>FROM</code>, <code>WORKDIR</code>, <code>COPY requirements.txt</code>, and <code>RUN pip install</code> steps all show <code>CACHED</code>. Only the final <code>COPY pipeline.py</code> and <code>CMD</code> actually rerun. The build finishes in well under a second instead of re-downloading packages. If you'd put <code>COPY pipeline.py</code> <em>before</em> the install, every code edit would re-run pip — the classic beginner mistake.</p>
+  </div>
+
+  <p>Two more habits keep images small and builds clean:</p>
+  <table>
+    <thead><tr><th>Technique</th><th>Why it helps</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Slim / alpine base images</strong></td><td><code>python:3.12-slim</code> is a fraction of the full <code>python:3.12</code>. Smaller images push, pull, and start faster.</td></tr>
+      <tr><td><strong><code>.dockerignore</code> file</strong></td><td>Excludes junk (<code>.git</code>, <code>__pycache__</code>, local data) from the build context, so it isn't sent to the builder or baked into layers.</td></tr>
+      <tr><td><strong><code>--no-cache-dir</code> on pip</strong></td><td>Stops pip from caching wheels <em>inside</em> the image — bytes you'd ship forever for no benefit.</td></tr>
+      <tr><td><strong>Combine RUN steps</strong></td><td>Each <code>RUN</code> is a layer; chaining with <code>&amp;&amp;</code> and cleaning up in the same line avoids leftover cruft in earlier layers.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrap"><div class="code-header"><span>.dockerignore</span></div><pre><code class="language-text">.git
+__pycache__/
+*.pyc
+.env
+data/
+*.md</code></pre></div>
+</section>
+
+<section id="multistage">
+  <h2>Multi-stage builds — ship a lean runtime</h2>
+  <p>Sometimes building your app needs heavy tools (compilers, build dependencies) that the <em>running</em> app doesn't. Shipping those tools bloats the image and widens its attack surface. A <strong>multi-stage build</strong> uses one stage to build and a second, clean stage to run — copying only the finished artifacts across.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>Dockerfile (multi-stage)</span></div><pre><code class="language-dockerfile"># ---- Stage 1: builder — has the tools to install dependencies ----
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+# Install packages into a self-contained folder we can copy out
+RUN pip install --no-cache-dir --target=/deps -r requirements.txt
+
+# ---- Stage 2: runtime — lean image, only what's needed to RUN ----
+FROM python:3.12-slim
+WORKDIR /app
+# Copy ONLY the installed packages from the builder stage
+COPY --from=builder /deps /usr/local/lib/python3.12/site-packages
+COPY pipeline.py .
+CMD ["python", "pipeline.py"]</code></pre></div>
+
+  <p>The final image contains your code and your dependencies — but none of the build-time scratch work. For a Python script the savings are modest; for compiled languages or apps with build toolchains, multi-stage can shrink an image from gigabytes to tens of megabytes. The pattern is the same everywhere: <em>build fat, ship thin</em>.</p>
+</section>
+
+<section id="compose-deep">
+  <h2>Compose, deeper — wiring services together</h2>
+  <p>A single container is rarely a whole system. A real data stack is several containers — a database, a script, maybe a scheduler — that must find and talk to each other. <strong>Docker Compose</strong> describes that whole stack in one YAML file and brings it up with one command. You met Compose in Course 2; now we use its connective tissue.</p>
+
+  <table>
+    <thead><tr><th>Compose concept</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><strong>services</strong></td><td>Each container in the stack. Service name becomes its hostname.</td></tr>
+      <tr><td><strong>networks</strong></td><td>Compose puts all services on a shared network; they reach each other by <em>service name</em> (no IPs).</td></tr>
+      <tr><td><strong>volumes</strong> (named)</td><td>Docker-managed storage that <em>survives</em> container removal — for databases.</td></tr>
+      <tr><td><strong>bind mounts</strong></td><td>Map a host folder into the container (<code>./code:/app</code>) — for live-editing code in dev.</td></tr>
+      <tr><td><strong>environment / env_file</strong></td><td>Pass config (passwords, hosts) into containers as env vars.</td></tr>
+      <tr><td><strong>depends_on + healthcheck</strong></td><td>Control start order and wait until a dependency is actually <em>ready</em>, not just started.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">Service name = hostname (the key idea)</span>
+    <p>By default Compose creates one network for your stack and joins every service to it. Inside that network, a container reaches another by its <strong>service name</strong> as if it were a DNS hostname. So a service named <code>db</code> is reachable at the host <code>db</code> on its port — no IP addresses, no manual networking. This is exactly how the next section's script will connect to Postgres.</p>
+  </div>
+
+  <p><strong>Named volume vs bind mount</strong> trips people up, so hold both in mind:</p>
+  <table>
+    <thead><tr><th>Named volume</th><th>Bind mount</th></tr></thead>
+    <tbody>
+      <tr><td><code>pgdata:/var/lib/postgresql/data</code></td><td><code>./pipeline.py:/app/pipeline.py</code></td></tr>
+      <tr><td>Docker manages where it lives</td><td>You point at a specific host path</td></tr>
+      <tr><td>Best for <strong>persistent data</strong> (databases)</td><td>Best for <strong>live code</strong> in development</td></tr>
+      <tr><td>Survives <code>docker compose down</code></td><td>Just a window into your host folder</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="registry">
+  <h2>Image registries — push &amp; pull</h2>
+  <p>You built <code>mypipeline:v1</code> locally — but how does a teammate or a production server get it? Through a <strong>registry</strong>: a server that stores and serves images. <strong>Docker Hub</strong> is the default public one; <strong>GHCR</strong> (GitHub Container Registry) is popular because it sits next to your code. <code>docker pull python:3.12-slim</code> already used a registry — you were pulling from Docker Hub.</p>
+
+  <p>You <em>publish</em> an image so the exact bytes you tested run unchanged elsewhere — no rebuilding, no "works on my machine." The flow is tag → log in → push:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal — illustrative (needs a real account)</span></div><pre><code class="language-bash"># Tag the local image with a registry path: registry/namespace/name:tag
+docker tag mypipeline:v1 ghcr.io/yourname/mypipeline:v1
+
+docker login ghcr.io                       # authenticate once
+docker push ghcr.io/yourname/mypipeline:v1 # upload it
+
+# Anyone (with access) can now run the very same image:
+docker pull ghcr.io/yourname/mypipeline:v1</code></pre></div>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ Tags are mutable — pin what matters</span>
+    <p>A tag like <code>:latest</code> is just a moving label; whoever pushes last owns it. For anything reproducible, use explicit version tags (<code>:v1</code>, <code>:2026-06-21</code>) so a deploy can't silently change underneath you. "It worked yesterday and nothing changed" is often a <code>:latest</code> that quietly moved.</p>
+  </div>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: a script that talks to Postgres</h2>
+  <p>Now the payoff. We'll run a two-service stack — our Python pipeline and a Postgres database — on a shared network, and have the pipeline connect to Postgres <em>by service name</em>. This is a miniature of every data platform you'll build.</p>
+
+  <p>First, update the pipeline to actually connect to a database. Replace <code>pipeline.py</code> and add the Postgres driver:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal — rewrite the app</span></div><pre><code class="language-bash">cat > requirements.txt <<'EOF'
+psycopg[binary]==3.2.1
+EOF
+
+cat > pipeline.py <<'EOF'
+import os, time, psycopg
+
+# "db" is the Compose SERVICE NAME — that's the hostname we connect to.
+dsn = (
+    f"host={os.environ['DB_HOST']} "
+    f"dbname={os.environ['POSTGRES_DB']} "
+    f"user={os.environ['POSTGRES_USER']} "
+    f"password={os.environ['POSTGRES_PASSWORD']}"
+)
+
+print("[pipeline] connecting to Postgres...")
+with psycopg.connect(dsn) as conn:
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS sales (region TEXT, amount INT);")
+        cur.execute("INSERT INTO sales VALUES ('us', 120), ('eu', 80), ('us', 200);")
+        cur.execute("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region;")
+        for region, total in cur.fetchall():
+            print(f"[pipeline] {region} total = {total}")
+print("[pipeline] done")
+EOF</code></pre></div>
+
+  <p>Now the Compose file. Note how <code>depends_on</code> waits for Postgres to be <em>healthy</em>, and how the pipeline reaches the database at host <code>db</code> — the service name:</p>
+  <div class="code-wrap"><div class="code-header"><span>compose.yaml</span></div><pre><code class="language-yaml">services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: warehouse
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # named volume → data persists
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d warehouse"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  pipeline:
+    build: .                              # build from our Dockerfile
+    environment:
+      DB_HOST: db                         # ← the service name above
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: warehouse
+    depends_on:
+      db:
+        condition: service_healthy        # wait until Postgres is READY
+
+volumes:
+  pgdata:                                 # declare the named volume</code></pre></div>
+
+  <p>Bring up the stack. <code>--build</code> rebuilds the pipeline image first:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">docker compose up --build
+
+# In another terminal (or after it exits), tidy up.
+# down       = stop &amp; remove containers/network (named volume survives)
+# down -v    = also delete the named volume (wipes the database)
+docker compose down</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Postgres logs start up, then report <code>database system is ready to accept connections</code>. Compose waits for the healthcheck to pass, <em>then</em> starts the pipeline, which prints <code>connecting to Postgres...</code>, then <code>eu total = 80</code> and <code>us total = 320</code>, then <code>done</code> and exits. The two containers found each other purely by the name <code>db</code> — no IPs anywhere. Run <code>docker compose up</code> again and the totals double, because the named volume kept the table; run <code>down -v</code> first to start clean.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Why the healthcheck matters</span>
+    <p>A Postgres container is "started" within milliseconds but isn't <em>ready</em> to accept connections for a second or two. Without <code>condition: service_healthy</code>, your pipeline races ahead and crashes with "connection refused." The healthcheck turns "is it running?" into "is it actually usable?" — a distinction that saves you from flaky, intermittent startup failures.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain, in one sentence, the difference between an image and a container?</li>
+    <li>Why do we <code>COPY requirements.txt</code> and install deps <em>before</em> copying the app code?</li>
+    <li>How does one container reach another in a Compose stack — by IP, or by something else?</li>
+    <li>What's the difference between a named volume and a bind mount, and which one would you use for a database?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Containerize a script and compose it with Postgres</strong></summary>
+    <div class="collapse-card-body">
+      <p>From scratch in an empty folder: write a <code>Dockerfile</code> that installs dependencies from <code>requirements.txt</code> and runs <code>app.py</code>; then write a <code>compose.yaml</code> that builds it as a service alongside a <code>postgres:16</code> service named <code>db</code>, on the default shared network, with the app waiting for the database to be healthy. The app should connect to host <code>db</code> and print one row.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — Dockerfile</span></div><pre><code class="language-dockerfile">FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+CMD ["python", "app.py"]</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>solution — compose.yaml</span></div><pre><code class="language-yaml">services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: warehouse
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d warehouse"]
+      interval: 3s
+      retries: 10
+
+  app:
+    build: .
+    environment:
+      DB_HOST: db
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: warehouse
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>solution — app.py &amp; requirements.txt</span></div><pre><code class="language-python"># requirements.txt -> psycopg[binary]==3.2.1
+import os, psycopg
+dsn = (f"host={os.environ['DB_HOST']} dbname={os.environ['POSTGRES_DB']} "
+       f"user={os.environ['POSTGRES_USER']} password={os.environ['POSTGRES_PASSWORD']}")
+with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    cur.execute("SELECT 'connected to ' || current_database();")
+    print(cur.fetchone()[0])</code></pre></div>
+      <p>Run <code>docker compose up --build</code>. If you see <code>connected to warehouse</code> after Postgres reports ready, you've built and composed a real two-service stack — the same shape as the platform you'll wire up next, just bigger.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can build images and compose services that find each other by name — now let's scale that up into a real local data platform with several cooperating services. → <a href="03-wiring-the-mini-platform.html">Wiring the Mini-Platform</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

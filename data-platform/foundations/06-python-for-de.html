@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Python for Data Engineering — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#beyond-scripts">Beyond one-off scripts</a>
+    <a href="#types">Type hints</a>
+    <a href="#errors">Error handling</a>
+    <a href="#iterators">Iterators &amp; generators</a>
+    <a href="#data-libs">The data libraries</a>
+    <a href="#testing">Testing with pytest</a>
+    <a href="#structure">Structuring a pipeline</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-sql-in-depth.html">← Previous</a>
+    <a href="07-files-and-serialization.html">Next: Files &amp; Serialization at Scale →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Python for Data Engineering</h1>
+  <p class="subtitle">You already know enough Python to write a script. This chapter is about the gap between "a script that works once on your laptop" and code that runs in production every night, on data that's bigger than memory, that someone else can trust and change. We'll cover the handful of Python features that close that gap — type hints, error handling, generators, the data libraries, and tests — and end by structuring a real little pipeline.</p>
+</header>
+
+<section id="beyond-scripts">
+  <h2>Beyond notebooks and one-off scripts</h2>
+  <p>Most people learn Python in a notebook: cells you run top to bottom, variables floating in memory, a chart at the end. That's a wonderful way to <em>explore</em> data. It's a terrible way to <em>ship</em> it. A notebook hides state (you ran cell 7 before cell 4, who knows), can't be tested, and is painful to schedule or review. Production data code looks different: it lives in <strong>modules</strong> (plain <code>.py</code> files), it's organized into <strong>functions</strong>, and it's versioned in git so every change is reviewable and reversible.</p>
+
+  <p>Recall the <code>uv</code> project you set up in <a href="../orientation-setup/index.html">Course 2</a>. That layout is the starting point for everything here:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>project layout</span></div><pre><code class="language-text">my-pipeline/
+├── pyproject.toml        # dependencies + project metadata (uv manages this)
+├── uv.lock               # exact pinned versions, committed to git
+├── src/
+│   └── my_pipeline/
+│       ├── __init__.py   # marks this folder as an importable package
+│       ├── extract.py    # one module per stage
+│       ├── transform.py
+│       └── load.py
+└── tests/
+    └── test_transform.py # tests live next door, not inside the code</code></pre></div>
+
+  <p>A <strong>module</strong> is just a file. An <strong>import</strong> pulls names from one file into another (<code>from my_pipeline.transform import clean_rows</code>). A <strong>package</strong> is a folder with an <code>__init__.py</code>. None of this is exotic — it's how you turn a wall of cells into named, reusable pieces. The payoff: each function can be tested in isolation, imported by the scheduler, and reviewed in a pull request line by line.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why structure &amp; version</span>
+    <p>The difference between "data scientist code" and "data engineer code" is rarely cleverness — it's <em>operability</em>. Structured, versioned code can be run unattended at 3am, debugged from a stack trace, rolled back when it breaks, and changed safely by a teammate six months later. That reliability is the job.</p>
+  </div>
+</section>
+
+<section id="types">
+  <h2>Type hints: catching shape drift early</h2>
+  <p>Python doesn't force you to declare types, but you can <em>annotate</em> them. A type hint is a note to readers and to tools about what a function expects and returns. It changes nothing at runtime — Python won't stop you passing the wrong type — but a <strong>type checker</strong> reads the hints and flags mismatches <em>before</em> you run anything.</p>
+
+  <p>This matters enormously in data code, where the bugs are almost always <strong>shape and type drift</strong>: a column that was an <code>int</code> yesterday arrives as a <code>str</code> today, a function that promised a list quietly returns <code>None</code>, a dict is missing a key. Types make those promises explicit.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>typed_transform.py</span></div><pre><code class="language-python">from datetime import date
+
+def daily_total(rows: list[dict[str, float]], day: date) -> float:
+    """Sum the 'amount' field across all rows for one day."""
+    total = 0.0
+    for row in rows:
+        total += row["amount"]      # type checker knows this is a float
+    return total</code></pre></div>
+
+  <p>Read the signature like a contract: "give me a list of dicts whose values are floats, plus a date; I'll give you back a float." If somewhere else you call <code>daily_total(df, "2026-06-21")</code> — passing a DataFrame and a string — a type checker catches it instantly, instead of you discovering it via a confusing error in production.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">One line to run it</span>
+    <p>Install a checker and point it at your code: <code>uv run mypy src/</code> (or <code>uv run pyright</code>). It reads the hints, reports mismatches, and never executes your pipeline. Run it in CI and shape bugs get caught at review time, not 3am.</p>
+  </div>
+</section>
+
+<section id="errors">
+  <h2>Error handling: fail loudly, not silently</h2>
+  <p>When something goes wrong, Python raises an <strong>exception</strong> — an object describing the failure that travels up the call stack until something catches it or the program stops. You catch exceptions with <code>try</code>/<code>except</code>, and clean up with <code>finally</code> (which runs no matter what):</p>
+
+  <div class="code-wrap"><div class="code-header"><span>errors.py</span></div><pre><code class="language-python">def parse_amount(raw: str) -> float:
+    try:
+        return float(raw)
+    except ValueError:
+        # the WRONG thing to do is `return 0.0` and move on — that
+        # silently corrupts your data. Re-raise with context instead.
+        raise ValueError(f"could not parse amount from {raw!r}")
+    finally:
+        pass  # e.g. close a file or connection here, always</code></pre></div>
+
+  <p>The cardinal sin in data engineering is the <strong>silent swallow</strong>: <code>except: pass</code>. It turns a loud, debuggable crash into a quiet wrong number that nobody notices for weeks. A pipeline that <em>fails</em> is annoying; a pipeline that succeeds with corrupt output is a disaster, because everyone downstream trusts it. <strong>Fail loudly.</strong> Let bad data stop the line.</p>
+
+  <p>For pipelines, define <strong>custom exceptions</strong> per stage so failures are self-labeling:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>exceptions.py</span></div><pre><code class="language-python">class PipelineError(Exception):
+    """Base class for everything our pipeline raises."""
+
+class ExtractError(PipelineError): ...
+class TransformError(PipelineError): ...
+class LoadError(PipelineError): ...</code></pre></div>
+
+  <p>Now a stack trace that ends in <code>TransformError</code> tells you <em>where</em> in the flow it broke before you read a single line. Here's how to decide what to do when something fails:</p>
+
+  <table>
+    <thead><tr><th>Situation</th><th>Pattern</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Network blip, API timeout, rate limit</td><td><strong>Retry</strong> with backoff (then give up)</td><td>Transient — likely works on the next try; don't fail on a hiccup.</td></tr>
+      <tr><td>Malformed row, bad schema, missing column</td><td><strong>Fail loudly</strong> (raise)</td><td>The data is wrong; running on means corrupt output downstream.</td></tr>
+      <tr><td>A few junk rows in a million-row file</td><td><strong>Quarantine</strong> — route bad rows aside, count them, continue</td><td>Don't lose 999,999 good rows over a handful; but record the rejects.</td></tr>
+      <tr><td>Bug in your own logic (e.g. <code>KeyError</code>)</td><td><strong>Let it crash</strong>; fix the code</td><td>Catching your own bugs hides them. Crash, read the trace, fix.</td></tr>
+      <tr><td>Cleanup (close file, release lock)</td><td><code>finally</code> or a <code>with</code> block</td><td>Must happen on both success and failure.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ Never bare-except-pass</span>
+    <p><code>try: ... except: pass</code> catches <em>everything</em> — including typos, <kbd>Ctrl-C</kbd>, and out-of-memory — and throws the evidence away. If you must catch, catch the <em>specific</em> exception you expect, and at minimum log it. Swallowed errors are the number-one cause of "the numbers look weird and nobody knows why."</p>
+  </div>
+</section>
+
+<section id="iterators">
+  <h2>Iterators &amp; generators: data bigger than memory</h2>
+  <p>Here's a scenario you'll hit constantly: a 50 GB CSV and a laptop with 16 GB of RAM. <code>rows = open("huge.csv").readlines()</code> tries to load all 50 GB into memory at once and crashes (that OOM from the <a href="00-START-HERE.html">Start Here</a> table). The fix is <strong>laziness</strong>: process one row at a time, holding only that row in memory, and let the rest stay on disk until you reach it.</p>
+
+  <p>Python's tool for this is the <strong>generator</strong> — a function that uses <code>yield</code> instead of <code>return</code>. Each <code>yield</code> hands back one value and <em>pauses</em>, resuming where it left off when you ask for the next. It produces values one at a time, on demand, never building the whole list.</p>
+
+  <div class="flow">  huge.csv on disk          generator (lazy)              consumer
+  ┌───────────────┐         ┌──────────────┐            ┌──────────┐
+  │ row 1         │ ──────▶ │ yield row →  │ ─────────▶ │ process  │
+  │ row 2         │  one    │   pause...   │   one      │  row,    │
+  │ row 3         │  at a   │   resume →   │   at a     │  forget  │
+  │ ... 50 GB ... │  time   │   yield row  │   time     │  it      │
+  └───────────────┘         └──────────────┘            └──────────┘
+   stays on disk      only ONE row in memory at a time    constant memory ▲</div>
+
+  <p>Let's prove the memory stays flat. This generator yields squares forever; we consume a billion of them and watch memory <em>not</em> grow:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>generator_demo.py</span></div><pre><code class="language-python">import tracemalloc
+
+def squares(n: int):
+    """A generator: yields one value at a time, never builds a list."""
+    for i in range(n):
+        yield i * i
+
+tracemalloc.start()
+total = 0
+for sq in squares(1_000_000_000):   # a BILLION values
+    total += sq
+    if total > 10_000_000:          # stop early; the point is memory, not the sum
+        break
+current, peak = tracemalloc.get_traced_memory()
+print(f"peak memory: {peak / 1024:.1f} KB")
+print(f"summed up to: {total}")</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Peak memory in the <strong>single-digit KB</strong> range — even though we iterated over a billion-element sequence. Constant memory, regardless of <code>n</code>. Compare the eager version, <code>sum(i*i for i in range(1_000_000_000))</code> built as a <em>list</em> <code>[i*i for i in range(...)]</code> — that would try to allocate tens of gigabytes and die. The generator never holds more than one value at a time.</p>
+  </div>
+
+  <p>This is why generators are <em>core</em> to data engineering, not a nice-to-have. Streaming a file row by row, paging through an API, transforming records as they flow — all of it is generators. The pattern below reads any file lazily; it works the same on a 1 KB file and a 1 TB file:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>stream_file.py</span></div><pre><code class="language-python">def read_rows(path: str):
+    """Yield one line at a time. Memory stays flat for any file size."""
+    with open(path) as f:
+        for line in f:          # iterating a file object is ALREADY lazy
+            yield line.rstrip("\n")
+
+# Count non-empty rows in a huge file without ever loading it:
+count = sum(1 for row in read_rows("huge.csv") if row)
+print(count)</code></pre></div>
+</section>
+
+<section id="data-libs">
+  <h2>The data libraries: which one, when</h2>
+  <p>Plain Python (loops, dicts, generators) is perfect for glue, streaming, and oddly-shaped data. But for tabular work — filtering, joining, grouping millions of rows — you want a library that does the heavy lifting in fast compiled code. Three dominate, and they're good at different things:</p>
+
+  <table>
+    <thead><tr><th>Tool</th><th>Ease</th><th>Speed</th><th>Memory</th><th>Best at</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Plain Python</strong></td><td>★★★★★</td><td>★☆☆☆☆</td><td>Flexible (lazy if you stream)</td><td>Glue, streaming, weird/nested shapes, small data</td></tr>
+      <tr><td><strong>pandas</strong></td><td>★★★★☆</td><td>★★☆☆☆</td><td>Eager — loads it all</td><td>Exploration, small/medium tables, huge ecosystem</td></tr>
+      <tr><td><strong>polars</strong></td><td>★★★★☆</td><td>★★★★★</td><td>Efficient; can stream lazily</td><td>Fast in-process transforms, multi-core, bigger tables</td></tr>
+      <tr><td><strong>DuckDB</strong></td><td>★★★★☆</td><td>★★★★★</td><td>Spills to disk; out-of-core</td><td>SQL-shaped work, joins/aggregations over files, Parquet</td></tr>
+    </tbody>
+  </table>
+
+  <p>Notice the family resemblance: pandas and polars give you a Python <em>DataFrame</em> API; DuckDB gives you <em>SQL</em> (everything you learned in <a href="05-sql-in-depth.html">Chapter 05</a>) that runs straight over CSV and Parquet files. They overlap heavily, and you'll mix them — read with DuckDB, refine with polars, hand a small result to pandas for a chart.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">Rule of thumb</span>
+    <p><strong>Small data or glue?</strong> Plain Python, or pandas/polars if it's tabular. <strong>SQL-shaped (joins, GROUP BY, scanning files)?</strong> Reach for DuckDB — it's a database engine in a library, no server needed. <strong>Genuinely huge (won't fit one machine)?</strong> That's distributed processing (Spark and friends), which we get to later. Don't reach for the heavy tool until the light one actually hurts.</p>
+  </div>
+</section>
+
+<section id="testing">
+  <h2>Testing with pytest</h2>
+  <p>"It ran without errors" is not the same as "it produced the right numbers." Data engineers test <strong>transform logic</strong> — the functions that clean, reshape, and compute — because that's where silent correctness bugs hide. A test pins down the expected output for a known input, so when you change the code later, you find out immediately if you broke the meaning.</p>
+
+  <p>The standard tool is <strong>pytest</strong>. The convention: put functions named <code>test_*</code> in files named <code>test_*.py</code>, and assert what should be true. Here's a transform and its test:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>tests/test_transform.py</span></div><pre><code class="language-python">def normalize_region(region: str) -> str:
+    """Lowercase and strip a region code. The thing we want to trust."""
+    return region.strip().lower()
+
+def test_normalize_region():
+    assert normalize_region("  US ") == "us"
+    assert normalize_region("Eu") == "eu"
+    assert normalize_region("apac") == "apac"</code></pre></div>
+
+  <p>Run the whole suite from your project root:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run pytest</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Output ending in something like <code>1 passed in 0.01s</code>, with a green dot or <code>.</code> per test. Now break the function on purpose (return <code>region</code> unchanged) and re-run — pytest prints a clear diff: <code>assert ' US ' == 'us'</code>, pointing at the exact failing line. That fast feedback loop is the whole value.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Fixtures, in one line</span>
+    <p>A <strong>fixture</strong> is reusable test setup — define a function decorated with <code>@pytest.fixture</code> (say, a sample DataFrame or a temp database), name it as an argument in your test, and pytest builds it fresh for each test that asks for it. Great for sharing a known sample dataset across many tests.</p>
+  </div>
+</section>
+
+<section id="structure">
+  <h2>Structuring a pipeline: extract, transform, load</h2>
+  <p>Pull the threads together. A pipeline is three jobs — <strong>extract</strong> (get the data), <strong>transform</strong> (clean and reshape it), <strong>load</strong> (write it somewhere) — and the trick is to make each one a separate <strong>pure function</strong>. A pure function depends only on its inputs and returns a value with no hidden side effects. Pure functions are <em>testable</em> (same input → same output, every time) and they compose cleanly.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>pipeline.py</span></div><pre><code class="language-python">def extract(path: str):
+    """Yield raw rows lazily — memory stays flat (see #iterators)."""
+    with open(path) as f:
+        header = f.readline().rstrip("\n").split(",")
+        for line in f:
+            yield dict(zip(header, line.rstrip("\n").split(",")))
+
+def transform(rows):
+    """Pure: clean each row. No I/O, no surprises — easy to test."""
+    for row in rows:
+        yield {
+            "region": row["region"].strip().lower(),
+            "amount": float(row["amount"]),
+        }
+
+def load(rows, conn) -> int:
+    """The ONLY function with a side effect: writing out."""
+    n = 0
+    for row in rows:
+        conn.execute("INSERT INTO sales VALUES (?, ?)",
+                     (row["region"], row["amount"]))
+        n += 1
+    return n
+
+# Wire them together — data streams through, one row at a time:
+# load(transform(extract("sales.csv")), conn)</code></pre></div>
+
+  <p>Two things are happening here. First, it's a <strong>stream</strong>: <code>extract</code> and <code>transform</code> are generators, so a row flows extract → transform → load and is forgotten before the next one starts — constant memory, any file size. Second, the messy stuff (file I/O, the database) is isolated in <code>extract</code> and <code>load</code>, leaving <code>transform</code> a pure function you can test with a plain list of dicts and no database at all.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Idempotency, recalled from Course 2</span>
+    <p>An <strong>idempotent</strong> step produces the same end state whether you run it once or five times — re-running after a crash doesn't duplicate data. Pure transforms are naturally idempotent (same input → same output). The <code>load</code> step is where you must engineer it deliberately: use an upsert (<code>INSERT ... ON CONFLICT</code>) or delete-then-insert for the partition, so a retried run heals rather than double-writes. We'll lean on this hard when we build real pipelines.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Why is a notebook a poor home for production data code — name two concrete reasons?</li>
+    <li>What's the danger of <code>except: pass</code>, and what should you do instead?</li>
+    <li>How does a generator keep memory flat on a file bigger than RAM?</li>
+    <li>Which would you reach for: a 200-row CSV needing a quick chart vs. a join across three 5 GB Parquet files?</li>
+    <li>Why are pure functions easier to test, and how does that connect to idempotency?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — A cleaning generator and a test for it</strong></summary>
+    <div class="collapse-card-body">
+      <p>Write a generator <code>clean_rows</code> that takes a list of raw dicts and yields cleaned rows: region lowercased/stripped, amount converted to <code>float</code>, and rows with an empty region <em>skipped</em>. Then write a pytest test that feeds it a small list and asserts the result.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — clean.py</span></div><pre><code class="language-python">def clean_rows(rows: list[dict]):
+    """Yield cleaned rows; drop rows with a missing region."""
+    for row in rows:
+        region = row.get("region", "").strip().lower()
+        if not region:
+            continue                      # skip junk, don't crash on it
+        yield {"region": region, "amount": float(row["amount"])}</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>solution — tests/test_clean.py</span></div><pre><code class="language-python">from clean import clean_rows
+
+def test_clean_rows():
+    raw = [
+        {"region": "  US ", "amount": "120"},
+        {"region": "eu",    "amount": "80.5"},
+        {"region": "",      "amount": "999"},   # should be dropped
+    ]
+    out = list(clean_rows(raw))               # materialize the generator
+    assert out == [
+        {"region": "us", "amount": 120.0},
+        {"region": "eu", "amount": 80.5},
+    ]
+    assert len(out) == 2                       # the empty-region row was skipped</code></pre></div>
+      <p>Run <code>uv run pytest</code>. You should see <code>1 passed</code>. Note how we call <code>list(...)</code> to pull every value out of the generator so we can compare the whole result — in production you'd iterate it lazily instead, one row at a time. You've now written the three pillars of this chapter in one place: a generator (lazy, memory-flat), a pure transform (skips bad data loudly-but-gracefully), and a test that pins down its behavior.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can write structured, tested, memory-aware Python — now let's make the <em>files</em> it reads and writes fast and compact, from CSV's pitfalls to columnar Parquet. → <a href="07-files-and-serialization.html">Files &amp; Serialization at Scale</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

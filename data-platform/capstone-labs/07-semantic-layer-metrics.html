@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 07 — The Semantic Layer &amp; Metrics — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal</a>
+    <a href="#problem">The five-definitions problem</a>
+    <a href="#metrics">The metric catalog</a>
+    <a href="#implement">Implementing one source of truth</a>
+    <a href="#consume">Two consumers, one number</a>
+    <a href="#run">Build &amp; query</a>
+    <a href="#commit">Commit Lab 07</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-data-quality-tests.html">← Previous</a>
+    <a href="08-serve-bi-dashboard.html">Next: Lab 08 — Serve It →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 07 — The Semantic Layer &amp; Metrics</h1>
+  <p class="subtitle">Your gold marts hold clean facts and dimensions — but a fact is not a metric. "Revenue" isn't a column; it's a <em>definition</em>. In this lab you'll define mini-GridDP's business metrics exactly once, in one place, so that every consumer — the dashboard, an analyst's ad-hoc query, an AI assistant — gets the identical number. This is the semantic layer, and it's where a warehouse becomes a source of truth.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need the <strong>gold marts from Lab 03</strong> built and queryable in DuckDB: <code>dim_customer</code>, <code>dim_gpu</code>, <code>dim_date</code>, <code>fct_rentals</code>, and <code>fct_telemetry_hourly</code>. Confirm with <code>cd mini-griddp/dbt &amp;&amp; dbt run --select marts</code> and a quick <code>SELECT count(*) FROM fct_rentals;</code> in <code>duckdb ../warehouse.duckdb</code>. If those tables are missing, go back and finish Lab 03 — this lab builds directly on them.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal</h2>
+  <p>So far the platform can <em>store</em> facts. Now it needs to <em>mean</em> something. A "metric" is a number with a fixed business definition — Gross Merchandise Value, take-rate revenue, utilization. The job of the semantic layer is to capture each definition <strong>once</strong> and hand the same answer to everyone who asks.</p>
+  <div class="flow">  GOLD MARTS                 SEMANTIC LAYER              CONSUMERS
+  ┌──────────────┐          ┌──────────────────┐
+  │ fct_rentals  │          │  metric_gmv      │        ┌───────────────┐
+  │ dim_customer │────────▶ │  metric_revenue  │ ─────▶ │ BI dashboard  │
+  │ dim_gpu      │  facts   │  metric_utilization│      │ ad-hoc SQL    │
+  │ dim_date     │          │  fill_rate, ARPU │ ─────▶ │ AI assistant  │
+  │ fct_tel…     │          │  …ONE definition │        └───────────────┘
+  └──────────────┘          └──────────────────┘         every one gets
+                                                          the SAME number
+  ──────────────────────────────────────────────────────────────────────
+  The definition lives HERE, not in each dashboard's hand-written SQL.</div>
+  <p>This realizes chapter <strong>08 — Serving &amp; the Semantic Layer</strong> of the <a href="../data-platform-systems-design/index.html">Systems Design</a> reference, at laptop scale. The principle is identical whether your warehouse serves five people or five thousand.</p>
+</section>
+
+<section id="problem">
+  <h2>The five-definitions problem</h2>
+  <p>Here's the failure mode the semantic layer exists to prevent. Imagine mini-GridDP has no shared metric definitions. The CEO asks five people for "monthly revenue," and each one writes their own SQL against <code>fct_rentals</code>:</p>
+  <table>
+    <thead><tr><th>Who</th><th>Their "revenue" SQL</th><th>Quietly assumes…</th></tr></thead>
+    <tbody>
+      <tr><td>Analyst A</td><td><code>sum(rental_amount)</code></td><td>gross GMV = revenue (wrong — that's the customer's spend)</td></tr>
+      <tr><td>Analyst B</td><td><code>sum(rental_amount * 0.20)</code></td><td>20% take rate, hard-coded</td></tr>
+      <tr><td>Finance</td><td><code>sum(rental_amount * take_rate)</code></td><td>per-row take rate, only <em>completed</em> rentals</td></tr>
+      <tr><td>Dashboard</td><td><code>sum(rental_amount * take_rate)</code> incl. cancelled</td><td>forgot the status filter</td></tr>
+      <tr><td>AI assistant</td><td>whatever the prompt guessed</td><td>nobody knows</td></tr>
+    </tbody>
+  </table>
+  <p>Five numbers. They disagree, sometimes by 5×. Now every meeting starts with "whose number is right?" instead of "what should we do?" — and once people stop trusting the dashboard, they go back to spreadsheets and the platform's whole value evaporates.</p>
+  <div class="callout insight">
+    <span class="callout-label">The core idea</span>
+    <p>A metric is a <strong>contract</strong>, not a query. The contract — "take-rate revenue = sum of <code>rental_amount × take_rate</code> over rentals where <code>status = 'completed'</code>" — must live in <em>one</em> place that everyone reads from. Write it twice and it <em>will</em> drift. The semantic layer is just the place where that contract lives, version-controlled, beside the rest of your dbt project.</p>
+  </div>
+  <p>This is the same lesson as systems-design chapter 08: serving isn't about making data <em>available</em>, it's about making one <em>agreed</em> definition available. Trust is the product.</p>
+</section>
+
+<section id="metrics">
+  <h2>The metric catalog</h2>
+  <p>Before writing a line of code, write the catalog. For each metric: a precise English definition and the gold fact it's computed from. This table <em>is</em> the spec — the SQL that follows just encodes it.</p>
+  <table>
+    <thead><tr><th>Metric</th><th>Precise definition</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td><strong>GMV</strong></td><td>Gross Merchandise Value — total customer spend. <code>sum(rental_amount)</code> over completed rentals.</td><td><code>fct_rentals</code></td></tr>
+      <tr><td><strong>Take-rate revenue</strong></td><td>What the marketplace keeps. <code>sum(rental_amount × take_rate)</code> over completed rentals.</td><td><code>fct_rentals</code></td></tr>
+      <tr><td><strong>Utilization %</strong></td><td>Share of available GPU-hours that were actually rented. <code>rented_hours / available_hours × 100</code>.</td><td><code>fct_rentals</code>, <code>fct_telemetry_hourly</code></td></tr>
+      <tr><td><strong>Fill rate</strong></td><td>Of all rental <em>requests</em>, the fraction that became a completed rental. <code>completed / requested</code>.</td><td><code>fct_rentals</code></td></tr>
+      <tr><td><strong>ARPU</strong></td><td>Average Revenue Per User. <code>take-rate revenue / count(distinct customer)</code> over the period.</td><td><code>fct_rentals</code>, <code>dim_customer</code></td></tr>
+      <tr><td><strong>Revenue per gpu_model</strong></td><td>Take-rate revenue sliced by <code>dim_gpu.gpu_model</code> (A100, H100, …).</td><td><code>fct_rentals</code>, <code>dim_gpu</code></td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Definitions carry their grain</span>
+    <p>Notice every definition names a <em>filter</em> (completed rentals) and a <em>grain</em> (per period, per model). Most "the number is wrong" bugs are really a forgotten filter or a wrong grain. Writing them down here, in plain English, is half the battle.</p>
+  </div>
+</section>
+
+<section id="implement">
+  <h2>Implementing one source of truth</h2>
+  <p>There are two ways to build a semantic layer in dbt. The <strong>fancy</strong> way is dbt's MetricFlow / semantic models — you declare metrics in YAML and dbt generates the SQL on demand. It's powerful, but it needs dbt Cloud or the MetricFlow CLI and adds moving parts. We'll use the <strong>pragmatic</strong> way that's fully local and just as principled: <strong>metric models</strong>. Each metric is a small, heavily documented dbt model in <code>models/metrics/</code> that every consumer queries. The definition lives in the SQL; nobody re-derives it.</p>
+  <p>Create the folder and tell dbt to materialize these as views (cheap, always fresh):</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp/dbt
+mkdir -p models/metrics</code></pre></div>
+  <p>First, the headline metrics — GMV and take-rate revenue — at a daily grain, so any consumer can roll them up to month, quarter, or year:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/metrics/metric_revenue.sql</span></div><pre><code class="language-sql">-- METRIC: GMV and take-rate revenue, per day.
+-- Definition (the contract — do NOT redefine elsewhere):
+--   gmv     = sum(rental_amount)               over completed rentals
+--   revenue = sum(rental_amount * take_rate)   over completed rentals
+-- Grain: one row per rental_date. Roll up by summing.
+{{ config(materialized='view') }}
+
+select
+    d.date_day                              as rental_date,
+    d.year_month,
+    sum(r.rental_amount)                    as gmv,
+    sum(r.rental_amount * r.take_rate)      as revenue
+from {{ ref('fct_rentals') }} r
+join {{ ref('dim_date') }} d on r.date_key = d.date_key
+where r.status = 'completed'
+group by 1, 2</code></pre></div>
+  <p>Next, ARPU — note it <em>reuses</em> the revenue definition by referencing the same filtered facts, so it can never disagree with <code>metric_revenue</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/metrics/metric_arpu.sql</span></div><pre><code class="language-sql">-- METRIC: ARPU — average take-rate revenue per active customer, per month.
+-- Definition:
+--   arpu = sum(rental_amount * take_rate) / count(distinct customer_key)
+--          over completed rentals, per year_month.
+{{ config(materialized='view') }}
+
+select
+    d.year_month,
+    count(distinct r.customer_key)                      as active_customers,
+    sum(r.rental_amount * r.take_rate)                  as revenue,
+    sum(r.rental_amount * r.take_rate)
+        / nullif(count(distinct r.customer_key), 0)     as arpu
+from {{ ref('fct_rentals') }} r
+join {{ ref('dim_date') }} d on r.date_key = d.date_key
+where r.status = 'completed'
+group by 1</code></pre></div>
+  <p>And revenue per GPU model, the same contract sliced by a dimension:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/metrics/metric_revenue_by_model.sql</span></div><pre><code class="language-sql">-- METRIC: take-rate revenue by GPU model.
+-- Same revenue definition as metric_revenue, grouped by gpu_model.
+{{ config(materialized='view') }}
+
+select
+    g.gpu_model,
+    sum(r.rental_amount * r.take_rate)      as revenue,
+    count(*)                                as completed_rentals
+from {{ ref('fct_rentals') }} r
+join {{ ref('dim_gpu') }} g on r.gpu_key = g.gpu_key
+where r.status = 'completed'
+group by 1
+order by revenue desc</code></pre></div>
+  <p>Finally, document the catalog so it shows up in <code>dbt docs</code> and anyone browsing knows these are the blessed definitions:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/metrics/_metrics.yml</span></div><pre><code class="language-yaml">version: 2
+
+models:
+  - name: metric_revenue
+    description: >
+      SOURCE OF TRUTH for GMV and take-rate revenue, per day.
+      gmv = sum(rental_amount); revenue = sum(rental_amount * take_rate);
+      both over completed rentals only. Roll up by summing across rental_date.
+    columns:
+      - name: revenue
+        description: Take-rate revenue (what the marketplace keeps).
+        tests: [not_null]
+      - name: gmv
+        description: Gross Merchandise Value (total customer spend).
+        tests: [not_null]
+
+  - name: metric_arpu
+    description: Average take-rate revenue per active customer, per month.
+
+  - name: metric_revenue_by_model
+    description: Take-rate revenue sliced by GPU model. Same revenue definition.</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">Why this counts as a real semantic layer</span>
+    <p>The point of a semantic layer isn't a particular tool — it's that <em>every</em> consumer reads the metric from one governed definition instead of re-deriving it. Metric models give you exactly that: versioned, tested, documented, and queryable with plain SQL. When you later outgrow it, MetricFlow is a drop-in upgrade of the same idea.</p>
+  </div>
+</section>
+
+<section id="consume">
+  <h2>Two consumers, one number</h2>
+  <p>Here's the whole payoff. Two different "consumers" ask for June revenue. Neither one knows or cares how revenue is defined — they just read the metric model. Watch them land on the <em>same</em> number.</p>
+  <p><strong>Consumer 1 — the BI dashboard</strong> wants monthly revenue, so it rolls the daily metric up to a month:</p>
+  <div class="code-wrap"><div class="code-header"><span>consumer 1: dashboard query</span></div><pre><code class="language-sql">-- "June take-rate revenue" as the dashboard would ask it
+select sum(revenue) as june_revenue
+from metric_revenue
+where year_month = '2026-06';</code></pre></div>
+  <p><strong>Consumer 2 — an analyst (or AI assistant)</strong> comes in through ARPU but only wants the revenue piece. Because ARPU is built on the same filtered facts, its <code>revenue</code> column must match:</p>
+  <div class="code-wrap"><div class="code-header"><span>consumer 2: ad-hoc / AI query</span></div><pre><code class="language-sql">-- Different consumer, different entry point, SAME definition underneath
+select revenue as june_revenue
+from metric_arpu
+where year_month = '2026-06';</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">The test that matters</span>
+    <p>If these two queries ever return different numbers, your semantic layer has a leak — two models are computing revenue two different ways. They should be <strong>byte-for-byte identical</strong> because both ultimately apply the one contract: <code>sum(rental_amount * take_rate)</code> over completed rentals. That equality <em>is</em> the semantic layer working.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Build &amp; query</h2>
+  <p>Build the new metric models, then run both consumer queries and compare:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp/dbt
+dbt run --select metrics          # build the 4 metric views
+dbt test --select metrics         # the not_null contracts pass
+
+# now query as the two consumers (DuckDB CLI)
+duckdb ../warehouse.duckdb "
+  select 'dashboard' as consumer, sum(revenue) as june_revenue
+  from metric_revenue where year_month = '2026-06'
+  union all
+  select 'ad-hoc/AI', revenue
+  from metric_arpu where year_month = '2026-06';
+"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p><code>dbt run</code> builds 4 views (revenue, arpu, revenue_by_model — plus whatever you add) with <code>PASS</code> on the tests. The final query prints two rows — <code>dashboard</code> and <code>ad-hoc/AI</code> — with the <strong>exact same</strong> <code>june_revenue</code> value (e.g. both <code>18423.50</code>). Two consumers, two entry points, one number. If they differ, one of your metric models isn't using the canonical filter or expression — fix it until they match.</p>
+  </div>
+  <p>For a sanity sweep, peek at the model breakdown too — it should tell a coherent business story:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">duckdb ../warehouse.duckdb "select * from metric_revenue_by_model;"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>One row per GPU model (H100, A100, …), ordered by revenue descending, with the high-end models earning the most. The model revenues should sum to the GMV-adjacent total you saw above — another quick consistency check.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit Lab 07</h2>
+  <p>The semantic layer is now part of the repo's story — commit it.</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp
+git add dbt/models/metrics
+git commit -m "Lab 07: semantic layer — metric models (GMV, revenue, ARPU, by-model)"</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Why this commit matters</span>
+    <p>This is the commit where your warehouse stops being a pile of tables and becomes a <em>source of truth</em>. A hiring manager reading your history sees you understand that metrics are governed contracts, not ad-hoc SQL — a senior instinct.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain the "five definitions" problem and why it destroys trust in a dashboard?</li>
+    <li>Why does a metric live in <em>one</em> model instead of being written into each consumer's query?</li>
+    <li>Why must the two consumer queries above return the identical number — and what does it mean if they don't?</li>
+    <li>What does each metric definition pin down besides the arithmetic (hint: filter and grain)?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add an "avg rental hours" metric to the catalog and implement it</strong></summary>
+    <div class="collapse-card-body">
+      <p>Extend the semantic layer with one new metric: <strong>average rental hours</strong> — the mean duration of a completed rental, per month. First add it to the catalog table in your head (definition: <code>avg(rental_hours)</code> over completed rentals, grain: per <code>year_month</code>, source: <code>fct_rentals</code>). Then implement it as a metric model and confirm it builds.</p>
+      <div class="code-wrap"><div class="code-header"><span>dbt/models/metrics/metric_avg_rental_hours.sql</span></div><pre><code class="language-sql">-- METRIC: average duration of a completed rental, per month.
+-- Definition: avg(rental_hours) over completed rentals, per year_month.
+{{ config(materialized='view') }}
+
+select
+    d.year_month,
+    avg(r.rental_hours)     as avg_rental_hours,
+    count(*)                as completed_rentals
+from {{ ref('fct_rentals') }} r
+join {{ ref('dim_date') }} d on r.date_key = d.date_key
+where r.status = 'completed'
+group by 1
+order by d.year_month;</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp/dbt
+dbt run --select metric_avg_rental_hours
+duckdb ../warehouse.duckdb "select * from metric_avg_rental_hours;"</code></pre></div>
+      <p><strong>You should see</strong> one row per month with a sensible average (e.g. <code>6.4</code> hours) and the matching completed-rental count. Notice you reused the <em>same</em> two patterns — the <code>status = 'completed'</code> filter and the <code>dim_date</code> join — that every metric here shares. That repetition is the contract holding: a churned-customers or utilization metric would follow the identical shape. (Stretch goal: if your <code>fct_rentals</code> lacks a <code>rental_hours</code> column, derive it from start/end timestamps in <code>silver</code> first, then this metric is trivial.)</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your metrics are defined once and proven consistent. Now let's put them in front of a human — a real, clickable dashboard wired straight to the semantic layer. → <a href="08-serve-bi-dashboard.html">Lab 08 — Serve It — BI Dashboard</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

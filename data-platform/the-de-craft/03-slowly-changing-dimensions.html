@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slowly-Changing Dimensions &amp; History — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#problem">The problem: attributes change</a>
+    <a href="#scd1">Type 1: overwrite</a>
+    <a href="#scd2">Type 2: a row per version</a>
+    <a href="#scd3">Type 3: a previous-value column</a>
+    <a href="#temporal">Point-in-time correctness</a>
+    <a href="#hands-on">Hands-on: SCD2 for GPU prices</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-dimensional-modeling.html">← Previous</a>
+    <a href="04-medallion-architecture.html">Next: The Medallion Architecture →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Slowly-Changing Dimensions &amp; History</h1>
+  <p class="subtitle">A dimension's attributes don't stay still — a GPU's hourly price changes, a customer moves up a tier. If you overwrite the old value, you quietly destroy the answer to a vital question: <em>what was true at the time the event happened?</em> This chapter teaches the patterns that keep history intact, with Type 2 — the one you'll reach for again and again — at the centre.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You only need DuckDB for this chapter — every query below runs in the DuckDB shell with no external data. Open it from your <code>mini-griddp</code> repo with <code>duckdb</code> (or <code>python -c "import duckdb; duckdb.sql('...')"</code>). Type each statement as you read; the muscle memory of building an SCD2 table by hand is the whole point.</p>
+</div>
+
+<section id="problem">
+  <h2>The problem: dimension attributes change over time</h2>
+  <p>In the last chapter you built a star schema: a <code>fact_rentals</code> table surrounded by dimensions like <code>dim_gpu</code> and <code>dim_customer</code>. Dimensions described <em>who</em> and <em>what</em>. The unspoken assumption was that a dimension row is a stable fact about the world. It isn't.</p>
+  <p>Consider one column: the hourly price of an <strong>A100</strong> GPU. In January it rents for <code>$2.00/hr</code>. In March you raise it to <code>$2.50</code>. In May a price war drops it to <code>$1.80</code>. The GPU is the same physical card — same <code>gpu_id</code> — but one of its attributes has a <em>history</em>.</p>
+  <p>Now suppose your <code>dim_gpu</code> table holds a single <code>price_per_hour</code> column and you simply <strong>overwrite</strong> it each time the price changes. Today it says <code>$1.80</code>. Someone asks an entirely reasonable question:</p>
+  <blockquote>"How much revenue did we earn from A100 rentals in February?"</blockquote>
+  <p>If your report multiplies February's rental hours by the <em>current</em> price, you get a number computed at <code>$1.80</code> — but in February the price was <code>$2.00</code>. The report is wrong, and worse, it's <em>silently</em> wrong: nothing errors, the query runs, a confident-looking number appears. Last month the same query returned a different answer. Trust evaporates.</p>
+  <div class="callout danger">
+    <span class="callout-label">⚠ The silent-corruption trap</span>
+    <p>Overwriting a dimension value doesn't just lose history — it <strong>rewrites the past</strong>. Every historical report that joins to that dimension now uses today's value as if it had always been true. Numbers that were correct last week change with no code change and no warning. This is one of the most common ways a data team loses the business's confidence.</p>
+  </div>
+  <p>The fix is to stop treating a dimension as "the current state" and start treating it as "the state over time." How much machinery you add to do that is exactly what the SCD <em>types</em> describe.</p>
+</section>
+
+<section id="scd1">
+  <h2>Type 1: overwrite the value</h2>
+  <p>Type 1 is the no-history approach: when an attribute changes, you <code>UPDATE</code> the row in place. The old value is gone forever.</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb · SCD Type 1</span></div><pre><code class="language-sql">-- A Type 1 update: the old price simply disappears
+UPDATE dim_gpu
+SET    price_per_hour = 2.50
+WHERE  gpu_id = 'A100';</code></pre></div>
+  <p>This is simple, cheap, and sometimes exactly right. Type 1 is acceptable when the attribute is a <strong>correction</strong> rather than a real change, or when nobody will ever need the prior value:</p>
+  <ul>
+    <li>Fixing a typo in a customer's name (<code>"Jhon" → "John"</code>) — the old spelling was never meaningfully true.</li>
+    <li>A field nobody reports on historically (an internal note, a display colour).</li>
+    <li>Late-binding reference data where only "now" matters.</li>
+  </ul>
+  <p>The test is a single question: <em>"Would anyone ever ask what this value was at some past moment?"</em> If yes, Type 1 is the wrong choice — and for a <em>price</em>, the answer is emphatically yes.</p>
+</section>
+
+<section id="scd2">
+  <h2>Type 2: add a new row for each version</h2>
+  <p>Type 2 is the workhorse, and the one worth truly understanding. Instead of overwriting, you <strong>add a new row</strong> every time an attribute changes, and you stamp each row with the window of time during which it was the truth. The business key (<code>gpu_id</code>) now appears on several rows — one per version — so you introduce a <strong>surrogate key</strong> that is unique per version.</p>
+  <p>The standard columns are:</p>
+  <table>
+    <thead><tr><th>Column</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>gpu_sk</code> (surrogate key)</td><td>Unique per <em>version</em>. The fact table joins to this.</td></tr>
+      <tr><td><code>gpu_id</code> (business key)</td><td>The real-world identity. Repeats across versions.</td></tr>
+      <tr><td><code>price_per_hour</code></td><td>The attribute value for this version.</td></tr>
+      <tr><td><code>valid_from</code></td><td>Timestamp this version became active.</td></tr>
+      <tr><td><code>valid_to</code></td><td>Timestamp it stopped being active (open-ended for the live one).</td></tr>
+      <tr><td><code>is_current</code></td><td>Boolean flag — <code>true</code> for the one live version.</td></tr>
+    </tbody>
+  </table>
+  <p>Here is the A100's price history as a Type 2 dimension. The same <code>gpu_id</code> spans three rows; each owns a slice of time:</p>
+  <div class="flow">  A100 price over time (SCD Type 2)
+
+  sk   gpu_id  price   valid_from    valid_to       is_current
+  ───  ──────  ─────   ──────────    ──────────     ──────────
+  101  A100    $2.00   2026-01-01    2026-03-01      false
+  102  A100    $2.50   2026-03-01    2026-05-01      false
+  103  A100    $1.80   2026-05-01    9999-12-31      true   ◄─ live
+
+   Jan ──────────── Mar ──────────── May ──────────────────▶
+   │   $2.00 (sk 101) │  $2.50 (sk 102) │   $1.80 (sk 103)
+   └─────────────────┴─────────────────┴──────────────────
+   a Feb rental falls here → joins to sk 101 → priced at $2.00</div>
+  <p>Notice how the windows abut: each <code>valid_to</code> equals the next row's <code>valid_from</code>. The live row's <code>valid_to</code> is a sentinel far in the future (<code>9999-12-31</code>) so range checks work without special-casing <code>NULL</code>. The <code>is_current</code> flag is redundant with that sentinel, but it makes "give me today's price" a trivial filter.</p>
+  <p>Now the crucial part: <strong>a fact joins to the version that was current at the event's timestamp</strong>, not to the latest version. A rental that started on <code>2026-02-14</code> falls inside row 101's window, so it joins to surrogate key <code>101</code> and is priced at <code>$2.00</code> — correct, forever, no matter how many future price changes happen.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why a surrogate key, really</span>
+    <p>The fact stores the <em>surrogate</em> key (<code>gpu_sk = 101</code>), not the business key. That single integer pins the rental to one exact version of the GPU's attributes. The fact becomes immutable: it captured the truth at load time and never needs revisiting when prices change later. This is the heart of why Type 2 dimensions and surrogate keys travel together.</p>
+  </div>
+</section>
+
+<section id="scd3">
+  <h2>Type 3: keep a "previous value" column</h2>
+  <p>Type 3 is a middle ground you'll rarely use. Instead of new rows, you add a second column to hold the <em>prior</em> value:</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb · SCD Type 3</span></div><pre><code class="language-sql">-- One extra column remembers exactly one previous value
+UPDATE dim_gpu
+SET    previous_price = price_per_hour,   -- shuffle current → previous
+       price_per_hour = 2.50              -- set the new current
+WHERE  gpu_id = 'A100';</code></pre></div>
+  <p>This keeps history exactly one step deep. After a second change, the original <code>$2.00</code> is lost — <code>previous_price</code> only ever holds the most recent former value. It's occasionally handy for "show this quarter vs. last quarter's territory assignment" where only the immediately prior value matters and you want it on the same row. For anything needing full history — which is almost everything in analytics — Type 2 is the answer. Here is the comparison at a glance:</p>
+  <table>
+    <thead><tr><th>Type</th><th>Mechanism</th><th>History kept</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Type 1</strong></td><td>Overwrite in place</td><td>None</td><td>Corrections; no one queries the past value</td></tr>
+      <tr><td><strong>Type 2</strong></td><td>New row per version + valid range</td><td><strong>Full</strong></td><td>Anything where "what was true then" matters (prices, tiers, status)</td></tr>
+      <tr><td><strong>Type 3</strong></td><td>Extra "previous" column</td><td>One step</td><td>Rare; only the single prior value matters, on the same row</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="temporal">
+  <h2>Point-in-time correctness: the "as-of" join</h2>
+  <p>Everything above converges on one technique. To price a fact correctly you join it to the dimension version that was valid <em>as of</em> the fact's own timestamp. That's the <strong>as-of join</strong>, and it's the backbone of trustworthy history:</p>
+  <div class="code-wrap"><div class="code-header"><span>the shape of an as-of join</span></div><pre><code class="language-sql">SELECT r.rental_id, r.hours, g.price_per_hour
+FROM   fact_rentals r
+JOIN   dim_gpu g
+  ON   g.gpu_id = r.gpu_id
+ AND   r.started_at &gt;= g.valid_from     -- the event happened after this
+ AND   r.started_at &lt;  g.valid_to;      -- version began, and before it ended</code></pre></div>
+  <p>The two range conditions are the magic. For any given <code>started_at</code>, exactly one version satisfies both — because the validity windows partition the timeline with no gaps or overlaps. Join on the business key for identity, then on the time range for the right version. (The <code>&gt;=</code>/<code>&lt;</code> asymmetry matters: it makes the boundary timestamp belong to exactly one window, never both.)</p>
+  <div class="callout insight">
+    <span class="callout-label">This idea outlives this chapter</span>
+    <p>"Use the value that was valid at event time, never the latest value" is <strong>point-in-time correctness</strong>, and it reappears far beyond dimensions. When you build features for a machine-learning model later in the curriculum, the single deadliest bug is <em>leakage</em> — letting a feature peek at information from after the prediction moment. The cure is the very same as-of discipline you're learning now. Master it on GPU prices and you've learned a pattern you'll use for the rest of your career.</p>
+  </div>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: an SCD2 dimension for GPU prices</h2>
+  <p>Let's build it for real in DuckDB. We'll create a Type 2 price dimension, apply a price change with proper merge logic, record some rentals, and then compute revenue using the price that was active at each rental's moment.</p>
+
+  <p><strong>Step 1 — create the dimension and seed two versions.</strong> The A100 starts at <code>$2.00</code>, then rises to <code>$2.50</code> on March 1st.</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">CREATE TABLE dim_gpu (
+  gpu_sk         INTEGER,
+  gpu_id         VARCHAR,
+  price_per_hour DECIMAL(6,2),
+  valid_from     DATE,
+  valid_to       DATE,
+  is_current     BOOLEAN
+);
+
+INSERT INTO dim_gpu VALUES
+  (101, 'A100', 2.00, DATE '2026-01-01', DATE '2026-03-01', false),
+  (102, 'A100', 2.50, DATE '2026-03-01', DATE '9999-12-31', true );</code></pre></div>
+
+  <p><strong>Step 2 — a new price arrives.</strong> On May 1st the price drops to <code>$1.80</code>. An SCD2 update is two moves: <em>close</em> the currently-live row, then <em>insert</em> the new live row. Never overwrite.</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb · the SCD2 merge</span></div><pre><code class="language-sql">-- (a) close the old current version: set its valid_to and unflag it
+UPDATE dim_gpu
+SET    valid_to   = DATE '2026-05-01',
+       is_current = false
+WHERE  gpu_id = 'A100'
+  AND  is_current = true;
+
+-- (b) insert the new current version, open-ended into the future
+INSERT INTO dim_gpu VALUES
+  (103, 'A100', 1.80, DATE '2026-05-01', DATE '9999-12-31', true);
+
+-- inspect the full history
+SELECT * FROM dim_gpu ORDER BY valid_from;</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Three rows for <code>A100</code>: sk <code>101</code> (<code>$2.00</code>, Jan→Mar, <code>false</code>), sk <code>102</code> (<code>$2.50</code>, Mar→May, <code>false</code>), and sk <code>103</code> (<code>$1.80</code>, May→<code>9999-12-31</code>, <code>true</code>). Exactly one row has <code>is_current = true</code>, and each <code>valid_to</code> meets the next <code>valid_from</code> — no gaps, no overlaps. That contiguity is the invariant that makes as-of joins return exactly one match.</p>
+  </div>
+
+  <p><strong>Step 3 — record some rentals</strong> at different times, then price them with an as-of join. Two rentals land in February (price <code>$2.00</code>), one in April (<code>$2.50</code>), one in June (<code>$1.80</code>).</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">CREATE TABLE fact_rentals (
+  rental_id  INTEGER,
+  gpu_id     VARCHAR,
+  started_at DATE,
+  hours      INTEGER
+);
+
+INSERT INTO fact_rentals VALUES
+  (1, 'A100', DATE '2026-02-10', 5),   -- price era: $2.00
+  (2, 'A100', DATE '2026-02-20', 3),   -- price era: $2.00
+  (3, 'A100', DATE '2026-04-15', 4),   -- price era: $2.50
+  (4, 'A100', DATE '2026-06-05', 2);   -- price era: $1.80
+
+-- revenue using the price that was ACTIVE at each rental's time
+SELECT  r.rental_id,
+        r.started_at,
+        r.hours,
+        g.price_per_hour                 AS price_at_rental_time,
+        r.hours * g.price_per_hour       AS revenue
+FROM    fact_rentals r
+JOIN    dim_gpu g
+  ON    g.gpu_id = r.gpu_id
+ AND    r.started_at &gt;= g.valid_from
+ AND    r.started_at &lt;  g.valid_to
+ORDER BY r.started_at;</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Each rental priced by its own era: rental 1 → <code>5 × $2.00 = $10.00</code>, rental 2 → <code>3 × $2.00 = $6.00</code>, rental 3 → <code>4 × $2.50 = $10.00</code>, rental 4 → <code>2 × $1.80 = $3.60</code>. Total revenue <code>$29.60</code>. Compare that to the naive answer — multiplying every rental by the <em>current</em> <code>$1.80</code> — which would total <code>$25.20</code> and quietly misstate every pre-May rental. The as-of join is the difference between right and confidently-wrong.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">In the real world you don't hand-write surrogate keys</span>
+    <p>We assigned <code>101, 102, 103</code> by hand to keep the mechanics visible. In production a sequence or hash generates them, and a tool — dbt snapshots (Chapter 07) or your warehouse's <code>MERGE</code> — performs the close-old-row / insert-new-row dance for you, every run, idempotently. The pattern is identical; you're just learning what the tool does under the hood so you can trust and debug it.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Why does overwriting a dimension value make <em>past</em> reports wrong, not just lose history?</li>
+    <li>In an SCD2 table, what does the fact table store — the business key or the surrogate key — and why does that make the fact immutable?</li>
+    <li>Write the two range conditions of an as-of join from memory. Why is one <code>&gt;=</code> and the other <code>&lt;</code>?</li>
+    <li>How does point-in-time correctness here connect to feature leakage in machine learning?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — A customer upgrades tiers mid-month: SCD1 vs SCD2</strong></summary>
+    <div class="collapse-card-body">
+      <p>Customer <code>C7</code> is on the <code>silver</code> tier. On <strong>2026-06-15</strong> they upgrade to <code>gold</code>. They placed rentals on June 3rd (still silver) and June 20th (now gold). Show what <code>dim_customer</code> looks like under SCD1 versus SCD2, and explain which one lets you correctly report "how many rentals happened while the customer was <em>silver</em>?"</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-sql">-- ── SCD1: overwrite. One row, history destroyed. ──
+-- dim_customer after the upgrade:
+--   customer_id | tier
+--   C7          | gold     ◄─ the 'silver' period is GONE
+--
+-- Asking "rentals while silver?" is now impossible — every C7
+-- rental, including the June 3rd one, looks like it was 'gold'.
+
+-- ── SCD2: a new row per version. Full history. ──
+CREATE TABLE dim_customer (
+  cust_sk INTEGER, customer_id VARCHAR, tier VARCHAR,
+  valid_from DATE, valid_to DATE, is_current BOOLEAN
+);
+INSERT INTO dim_customer VALUES
+  (1, 'C7', 'silver', DATE '2026-01-01', DATE '2026-06-15', false),
+  (2, 'C7', 'gold',   DATE '2026-06-15', DATE '9999-12-31', true );
+
+CREATE TABLE rentals (rental_id INT, customer_id VARCHAR, started_at DATE);
+INSERT INTO rentals VALUES
+  (10, 'C7', DATE '2026-06-03'),   -- silver era
+  (11, 'C7', DATE '2026-06-20');   -- gold era
+
+-- as-of join attaches the tier that was true AT rental time
+SELECT  d.tier, count(*) AS rentals
+FROM    rentals r
+JOIN    dim_customer d
+  ON    d.customer_id = r.customer_id
+ AND    r.started_at &gt;= d.valid_from
+ AND    r.started_at &lt;  d.valid_to
+GROUP BY d.tier;
+-- → silver | 1   (the June 3rd rental)
+--   gold   | 1   (the June 20th rental)</code></pre></div>
+      <p>Under SCD1 both rentals would be attributed to <code>gold</code> and the question "how many while silver?" can't be answered at all — the silver period no longer exists in the table. Under SCD2 each rental joins to the tier that was valid at its own timestamp, so the split is exactly right: one silver, one gold. That's the whole reason Type 2 exists.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can now keep history honest in a single dimension. Next we organise <em>all</em> your tables — raw, cleaned, and business-ready — into disciplined layers that make a whole platform legible. → <a href="04-medallion-architecture.html">The Medallion Architecture</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

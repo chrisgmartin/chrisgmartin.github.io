@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Distributed Systems II — Consistency &amp; Delivery — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#problem">The core problem: agreement over a flaky network</a>
+    <a href="#cap">The CAP theorem, in plain language</a>
+    <a href="#consistency-models">Strong vs eventual consistency</a>
+    <a href="#consensus">Consensus: agreeing on one truth</a>
+    <a href="#delivery">Delivery semantics</a>
+    <a href="#idempotency">Idempotency — the superpower</a>
+    <a href="#wrap">Wrapping up Foundations</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="10-distributed-systems-scaling.html">← Previous</a>
+    <a href="../the-de-craft/index.html">Next course: The DE Craft →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Distributed Systems II — Consistency &amp; Delivery</h1>
+  <p class="subtitle">Once data lives on many machines connected by a network that can drop and delay messages, a hard question appears: how do the machines agree on what's true? This is the chapter behind "two services disagree" and "we're seeing duplicate events." It closes Foundations with the ideas that protect your pipelines from a network that refuses to be reliable — and gives you idempotency, the single most useful trick in the whole course.</p>
+</header>
+
+<section id="problem">
+  <h2>The core problem: agreement over a flaky network</h2>
+  <p>In <a href="10-distributed-systems-scaling.html">Chapter 10</a> we scaled <em>out</em> — splitting work across many machines and copying (<strong>replicating</strong>) the same data to several nodes so reads are fast and a dead machine doesn't lose your data. "Just copy the data everywhere" sounds simple, and on a good day it is. The trouble is the network in between.</p>
+  <p>A network is not a reliable wire. Messages get <strong>dropped</strong>, <strong>delayed</strong>, <strong>reordered</strong>, and sometimes a whole group of machines gets cut off from another group — a <strong>network partition</strong>. Crucially, when a node sends a message and hears nothing back, it <em>cannot tell</em> whether the other node crashed, is just slow, or the reply got lost. The silence looks identical in all three cases.</p>
+
+  <div class="flow">     WRITE arrives at node A          ...meanwhile the link to node B breaks
+
+       ┌─────────┐    replicate?   ╳    ┌─────────┐
+       │ node A  │ ─────────────── ╳ ──▶│ node B  │
+       │ x = 9   │      (lost)     ╳    │ x = 5   │   ← still has the OLD value
+       └─────────┘                 ╳    └─────────┘
+            │                    PARTITION
+            ▼
+   A read hitting A sees x = 9.   A read hitting B sees x = 5.
+   Two nodes, two "truths." Who is right? Neither can ask the other.</div>
+
+  <p>That single picture is the whole chapter. The moment a partition happens, the copies can disagree, and each node has to decide — alone — how to behave. Everything that follows (CAP, consistency models, consensus, delivery, idempotency) is a different angle on this one problem: <strong>how do independent machines stay in agreement when the network won't cooperate?</strong></p>
+
+  <div class="callout insight">
+    <span class="callout-label">Why a DE cares</span>
+    <p>You won't write a database from scratch. But you will <em>choose</em> and <em>operate</em> systems that made these trade-offs for you — and when a dashboard shows a stale number or a queue delivers the same event twice, you'll need to know which trade-off you're standing on. These ideas turn "the system is being weird" into "ah, that's eventual consistency / an at-least-once retry."</p>
+  </div>
+</section>
+
+<section id="cap">
+  <h2>The CAP theorem, in plain language</h2>
+  <p>The <strong>CAP theorem</strong> is the most famous (and most misquoted) result in distributed systems. The three letters stand for:</p>
+  <ul>
+    <li><strong>C — Consistency:</strong> every read sees the most recent write. All nodes show the same value at the same time.</li>
+    <li><strong>A — Availability:</strong> every request gets an answer (not an error or a hang), even if some nodes are unreachable.</li>
+    <li><strong>P — Partition tolerance:</strong> the system keeps working even when the network splits into groups that can't talk.</li>
+  </ul>
+  <p>The popular phrasing — "pick 2 of 3" — is misleading. Across real networks, partitions <em>will</em> happen; <strong>P is not optional</strong>. So the honest reading is narrower and far more useful:</p>
+
+  <div class="callout tip">
+    <span class="callout-label">The real CAP, in one line</span>
+    <p><strong>When a partition is happening, you must choose: stay Consistent (refuse some requests) <em>or</em> stay Available (answer, but maybe with stale or conflicting data). You cannot have both during the partition.</strong> When the network is healthy, you get both — CAP only forces the choice during the split.</p>
+  </div>
+
+  <div class="flow">                    PARTITION in progress — a node can't reach its peers
+                                         │
+                 ┌───────────────────────┴───────────────────────┐
+                 ▼                                                ▼
+         choose CONSISTENCY (CP)                         choose AVAILABILITY (AP)
+         "I can't confirm I'm current,                   "I'll answer with what I have,
+          so I'll refuse / error out."                    even if it might be stale."
+                 │                                                │
+                 ▼                                                ▼
+         No wrong answers,                               Always responsive,
+         but some requests fail.                         but reads can be stale/conflicting.</div>
+
+  <table>
+    <thead><tr><th>System / situation</th><th>Leans toward</th><th>Why that's the right call</th></tr></thead>
+    <tbody>
+      <tr><td>Bank account balance, money transfer</td><td><strong>C</strong> (CP)</td><td>Showing a wrong balance or double-spending is unacceptable — better to reject the request and retry than to lie.</td></tr>
+      <tr><td>Shopping cart, social feed, "likes"</td><td><strong>A</strong> (AP)</td><td>A briefly stale cart or like-count is fine; a site that won't load loses money. Reconcile later.</td></tr>
+      <tr><td>Leader-based SQL database (e.g. Postgres primary)</td><td><strong>C</strong></td><td>Writes go to one leader; if it's unreachable, writes pause rather than diverge.</td></tr>
+      <tr><td>Multi-region key-value store (e.g. Dynamo-style)</td><td><strong>A</strong></td><td>Built to keep serving from any region during a split, accepting that copies converge afterward.</td></tr>
+    </tbody>
+  </table>
+  <p>There's no universally "right" answer — only the right answer <em>for this data</em>. Part of reading a system's docs is spotting which way it leans, because that decision shows up in your data on the worst day.</p>
+</section>
+
+<section id="consistency-models">
+  <h2>Strong vs eventual consistency</h2>
+  <p>"Consistency" isn't all-or-nothing; it's a spectrum of <strong>guarantees</strong> a system makes about what a read can see. Two anchor points matter most to a data engineer:</p>
+
+  <table>
+    <thead><tr><th></th><th>Strong consistency</th><th>Eventual consistency</th></tr></thead>
+    <tbody>
+      <tr><td>The promise</td><td>A read always returns the latest write. Once you write <code>x = 9</code>, everyone sees 9.</td><td>If writes stop, all copies <em>eventually</em> agree — but for a while, a read may return an older value.</td></tr>
+      <tr><td>What you might see</td><td>Always the current truth.</td><td>Slightly <strong>stale</strong> data — last second's value, not this second's.</td></tr>
+      <tr><td>Cost</td><td>Coordination on every write (slower, can stall during partitions).</td><td>Cheap, fast, stays available — at the price of temporary disagreement.</td></tr>
+      <tr><td>Where you'll meet it</td><td>The primary of your transactional database; a leader-elected store.</td><td>A <strong>read replica</strong>; a CDN; a cross-region cache; many cloud object stores.</td></tr>
+    </tbody>
+  </table>
+
+  <p>The phrase that trips people up is <em>"eventually"</em>. It does <strong>not</strong> mean "broken" — it means "correct, after a short catch-up window." A classic example: you write a row to your database's primary, then immediately read it back from a <strong>read replica</strong>. The replica hasn't received the change yet, so your read returns the <em>old</em> row. Nothing is malfunctioning; the replica is eventually consistent and you read it a half-second too soon. This is the mechanism behind "I just updated it but the dashboard still shows the old number."</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Know which copy you're reading</span>
+    <p>The practical takeaway for a DE: <strong>always know whether you're reading a primary (strong) or a replica (eventual).</strong> Pointing a "did the order go through?" check at a read replica will give you flaky, intermittently-wrong answers — and you'll waste a day blaming your code. Pointing analytics at a replica, on the other hand, is exactly right: you don't need this-millisecond freshness, and you take load off the primary.</p>
+  </div>
+</section>
+
+<section id="consensus">
+  <h2>Consensus: how a cluster agrees on one truth</h2>
+  <p>If nodes can disagree, how does a cluster ever decide a single value — like "node 3 is now the leader," or "this is record #847 in the log"? That's the <strong>consensus</strong> problem: getting a group of machines to agree on one thing despite some of them being slow, crashed, or briefly unreachable. The famous algorithms are <strong>Paxos</strong> and <strong>Raft</strong>. We'll skip the math entirely and keep just the intuition, because that's all you need to operate these systems.</p>
+
+  <div class="flow">       Proposal: "the new value is 9"  —  ask the cluster of 5 nodes
+                                  │
+         ┌──────────┬────────────┼────────────┬──────────┐
+         ▼          ▼            ▼            ▼          ▼
+      node1      node2        node3        node4      node5
+       ✓ ok       ✓ ok        ✓ ok          ╳          ╳   (down / unreachable)
+         └──────────┴────────────┘
+              3 of 5 = MAJORITY (a "quorum")  ──▶  value 9 is COMMITTED.
+       Because any future majority must overlap this one, no second,
+       conflicting value can ever be committed. The cluster stays in agreement.</div>
+
+  <p>Two ideas carry the whole thing:</p>
+  <ul>
+    <li><strong>A majority must agree (a quorum).</strong> A value is only "real" once more than half the nodes have accepted it. With 5 nodes you need 3; the cluster survives losing 2. The magic is that any two majorities of the same group always share at least one node — so they can't commit two conflicting values. That overlap is what prevents a "split brain" where each side thinks it won.</li>
+    <li><strong>A leader coordinates.</strong> Rather than everyone proposing at once (chaos), the cluster elects one <strong>leader</strong> to order writes. If the leader vanishes, the survivors hold an election and a majority picks a new one. Writes pause for that brief election, then resume — this is the system choosing <em>consistency</em> over momentary availability.</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>You'll find consensus inside…</th><th>Doing what</th></tr></thead>
+    <tbody>
+      <tr><td>Distributed databases (CockroachDB, Spanner, etcd, ZooKeeper)</td><td>Agreeing on each committed write and on cluster membership.</td></tr>
+      <tr><td>Kafka (its controller / metadata quorum)</td><td>Electing the controller and agreeing which broker leads each partition.</td></tr>
+      <tr><td>Schedulers &amp; orchestrators (Kubernetes, Nomad)</td><td>Electing one active leader so two schedulers don't fight over the same work.</td></tr>
+    </tbody>
+  </table>
+  <p>You rarely call a consensus algorithm directly. But "needs a majority to make progress" explains a lot of real behavior — like why a 3-node cluster goes read-only when 2 nodes die, or why people run clusters with an <em>odd</em> number of nodes (so a majority is always well-defined).</p>
+</section>
+
+<section id="delivery">
+  <h2>Delivery semantics — the practical heart</h2>
+  <p>Now the part you'll touch every single week. When one system sends a message to another over a flaky network — a producer to a queue, a queue to your pipeline — what guarantee do you get that the message arrives <em>exactly</em> as intended? There are three possible promises, and the differences are the source of a huge share of real pipeline bugs.</p>
+
+  <div class="flow">  AT-MOST-ONCE          AT-LEAST-ONCE  (the common default)   EXACTLY-ONCE
+  ───────────────       ─────────────────────────────────     ─────────────────
+  send, don't retry      send, retry until acknowledged         send, with extra
+                                                                machinery to dedup
+  fast, simple           safe — nothing is ever lost            no loss, no dups
+  may LOSE messages      may DUPLICATE messages                 hard &amp; expensive
+
+  message ─▶ (lost)      message ─▶ ✓                           message ─▶ ✓ (once,
+            ✗ gone                 message ─▶ ✓✓  (twice!)                 guaranteed)</div>
+
+  <table>
+    <thead><tr><th>Semantic</th><th>Guarantee</th><th>Failure mode</th><th>Use it when…</th></tr></thead>
+    <tbody>
+      <tr><td><strong>At-most-once</strong></td><td>Delivered zero or one time.</td><td>Can silently <strong>lose</strong> data.</td><td>Loss is acceptable — metrics, sampled logs, best-effort telemetry.</td></tr>
+      <tr><td><strong>At-least-once</strong></td><td>Delivered one or more times — never lost.</td><td>Can <strong>duplicate</strong> data.</td><td>Almost everything — the practical default for queues and pipelines.</td></tr>
+      <tr><td><strong>Exactly-once</strong></td><td>Effectively one time, no loss, no dups.</td><td>Complex, slower, and only within a system's boundaries.</td><td>You truly need it <em>and</em> can pay for it (financial ledgers, some stream processors).</td></tr>
+    </tbody>
+  </table>
+
+  <p>Why does at-least-once <em>duplicate</em>? Because of that same unreliable network and the silence problem from the start of the chapter. The sender delivers a message and waits for an <strong>acknowledgement</strong> ("got it"). If the work succeeded but the <em>ack</em> got lost on the way back, the sender hears nothing, assumes failure, and <strong>retries</strong> — delivering the same message a second time.</p>
+
+  <div class="flow">   producer                    queue / consumer
+      │   send event E   ───────────▶  │  processes E ✓   (work done!)
+      │                                │
+      │   ◀── ack (LOST on the way) ─╳ │
+      │   ...silence... timeout                       producer can't tell
+      │   send event E again ───────▶  │  processes E ✓✓  ← DUPLICATE
+                                                       "we're seeing duplicate events"</div>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ "Exactly-once" is mostly a lie you shouldn't buy</span>
+    <p>True end-to-end exactly-once delivery across independent systems is, in the general case, impossible — the ack problem above can't be wished away. What systems advertise as "exactly-once" is usually <strong>at-least-once delivery plus deduplication</strong>, working only inside their own boundary. The robust, portable answer isn't to chase magical delivery; it's to make your processing safe to repeat. That's idempotency, next — and it's how real pipelines achieve <em>effectively</em> exactly-once.</p>
+  </div>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency — the superpower that tames at-least-once</h2>
+  <p>Here's the key insight that makes peace with a duplicating world: <strong>if running an operation twice has the same effect as running it once, then duplicates stop mattering.</strong> An operation with that property is called <strong>idempotent</strong>. You met this in <a href="../orientation-setup/index.html">Course 2</a> when you built a pipeline you could safely re-run after a crash without doubling your data — that re-runnability <em>was</em> idempotency. Now you know the name and the why.</p>
+
+  <p>Compare two ways to load a payment event:</p>
+  <table>
+    <thead><tr><th>Not idempotent (dangerous)</th><th>Idempotent (safe to retry)</th></tr></thead>
+    <tbody>
+      <tr><td><code>balance = balance + 100</code><br>Run twice → balance grows by 200. A duplicate corrupts the data.</td><td><code>INSERT … ON CONFLICT (event_id) DO NOTHING</code><br>Run twice → the second insert is a no-op. Same result either way.</td></tr>
+      <tr><td>"Append this row" (blind insert)</td><td>"Set this row to this value" (upsert keyed by id)</td></tr>
+    </tbody>
+  </table>
+
+  <p>The three workhorse techniques — you'll reach for these constantly:</p>
+  <ul>
+    <li><strong>Idempotency key.</strong> Give every event a stable unique id (an <code>event_id</code>, an order number, a hash of the payload). Carry it through the pipeline so a retry is recognizable as the <em>same</em> event, not a new one.</li>
+    <li><strong>Upsert instead of insert.</strong> "Insert-or-update by key" (<code>MERGE</code> / <code>ON CONFLICT</code>) makes a write land in the same final state no matter how many times it runs.</li>
+    <li><strong>Dedup on the key.</strong> Keep a record of ids you've already processed (a table, a set, a unique constraint) and drop anything you've seen before.</li>
+  </ul>
+
+  <div class="flow">   at-least-once queue delivers E (id=abc) ... then RETRIES E (id=abc)
+
+      first delivery                          retry (duplicate)
+            │                                       │
+            ▼                                       ▼
+      seen id "abc"?  ── no ──▶ process &amp;      seen id "abc"?  ── YES ──▶ skip.
+                               record "abc"                              (no-op)
+            │                                       │
+            ▼                                       ▼
+      data written ONCE  ◀───────── same final state ─────────▶  data still written ONCE
+
+           result: AT-LEAST-ONCE delivery + idempotent load = "effectively exactly-once"</div>
+
+  <div class="callout tip">
+    <span class="callout-label">The mental shift</span>
+    <p>Stop trying to guarantee a message arrives exactly once — you usually can't. Instead, <strong>assume duplicates will happen and make them harmless.</strong> Design every load step so re-running it is a non-event. Do that, and a retry-happy queue, a crashed-and-restarted job, and a replayed backfill all become safe by construction. This one habit prevents more data-quality incidents than almost anything else in the craft.</p>
+  </div>
+</section>
+
+<section id="wrap">
+  <h2>Wrapping up Foundations</h2>
+  <p>Take a breath — you just finished the longest, deepest course in the curriculum. Look at the distance you've covered. You can now narrate the entire journey of data, end to end:</p>
+
+  <div class="flow">  bits ─▶ algorithms ─▶ databases ─▶ files ─▶ one machine ─▶ many machines ─▶ AGREEMENT
+   01       02          03–04       07        08              09–10            11
+
+   "what data    "what it      "how it's    "how it's   "what really    "how machines   "how they stay
+    physically    costs to      stored &amp;     packed for   happens on      talk, scale, &amp;   in agreement
+    is"           process"      queried"     scale"       one box"        replicate"       despite failure"</div>
+
+  <p>When you write <code>SELECT … JOIN … GROUP BY</code> now, you don't see magic — you see bytes moving from disk into memory, hashed and sorted by real algorithms (Ch. 2–4), maybe spilling when memory runs out (Ch. 8), possibly fanned across a cluster that had to <em>agree</em> on the result (Ch. 10–11). That narration — knowing what physically happens — is exactly the senior engineer's superpower the <a href="00-START-HERE.html">first chapter</a> promised you'd build. It's the thing that turns "the system is being weird" into a specific, answerable question.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">What's next: Course 4 — The DE Craft</span>
+    <p>Foundations told you how the machines work. <strong>Course 4 puts it to work.</strong> You'll build real pipelines — ingestion, transformation with dbt, orchestration, testing, and the day-to-day craft of moving data reliably — and every chapter will lean on what you just learned. That "design it to be safe to retry" instinct from idempotency? You'll use it on day one. Foundations was the theory; the Craft is where it earns its keep.</p>
+  </div>
+  <p>If any chapter here felt shaky, that's expected — Foundations is a reference you return to, not a wall you clear once. Distributed systems especially will click harder after you've built a pipeline that hits a duplicate event for real. Coming back is part of the plan.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>During a network partition, what does a system give up if it chooses Consistency? What if it chooses Availability?</li>
+    <li>Why might reading from a read replica return stale data — and is that a bug?</li>
+    <li>In one sentence: why does <em>at-least-once</em> delivery cause duplicates?</li>
+    <li>What does it mean for an operation to be <strong>idempotent</strong>, and why does that make duplicates harmless?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Make a duplicating load idempotent</strong></summary>
+    <div class="collapse-card-body">
+      <p>Your pipeline reads order events from an <strong>at-least-once</strong> queue and writes them to a table. Because the queue sometimes redelivers, you occasionally process the same <code>order_id</code> twice and end up with duplicate rows (and, worse, a downstream revenue total that's too high). <strong>Describe two different ways to make the load idempotent</strong> so duplicates become harmless.</p>
+      <p>Try to write both before expanding.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — two approaches</span></div><pre><code class="language-sql">-- WAY 1: Upsert keyed by the event's unique id.
+-- A redelivery overwrites the same row instead of adding a new one,
+-- so the final state is identical no matter how many times it runs.
+INSERT INTO orders (order_id, customer, amount, ordered_at)
+VALUES (:order_id, :customer, :amount, :ordered_at)
+ON CONFLICT (order_id) DO UPDATE
+  SET customer = EXCLUDED.customer,
+      amount   = EXCLUDED.amount,
+      ordered_at = EXCLUDED.ordered_at;
+-- (Requires a UNIQUE / PRIMARY KEY on order_id.)
+
+-- WAY 2: Dedup — record processed ids and skip ones you've seen.
+-- The blind insert simply does nothing on a repeat.
+INSERT INTO orders (order_id, customer, amount, ordered_at)
+VALUES (:order_id, :customer, :amount, :ordered_at)
+ON CONFLICT (order_id) DO NOTHING;
+-- Equivalently: keep a `processed_ids` table (or set) and check membership
+-- before doing the work, inserting the id in the same transaction.</code></pre></div>
+      <p>Other valid answers: a <code>MERGE</code> statement (same idea as the upsert); deduping in a staging step before the final load; or, if the data is naturally a "current state," <code>DELETE</code>-then-insert keyed by id within one transaction. The common thread is always the same — <strong>a stable id plus a write that lands in the same final state every time.</strong> That's idempotency, and it's the standard way real pipelines turn an at-least-once source into an effectively exactly-once result.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>That's it — you've finished the longest and most demanding course in the curriculum. Bits to agreement, you can now narrate the whole journey of data through a machine and across a cluster. Be a little proud of that; most people who use these systems never learn how they actually work.</p>
+  <p>From here, the theory goes to work. <strong>Course 4 — <a href="../the-de-craft/index.html">The DE Craft</a></strong> is where you build real pipelines on top of everything you just learned — and it's ready now. That's your next stop.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 05 — Orchestrate with Dagster — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal</a>
+    <a href="#assets">Define the assets</a>
+    <a href="#graph">Run the graph</a>
+    <a href="#schedule">Add a schedule</a>
+    <a href="#why">Why this beats cron</a>
+    <a href="#run">Materialize end to end</a>
+    <a href="#commit">Commit Lab 05</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-telemetry-firehose.html">← Previous</a>
+    <a href="06-data-quality-tests.html">Next: Lab 06 — Data Quality →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 05 — Orchestrate with Dagster</h1>
+  <p class="subtitle">So far you've been running three scripts by hand, in your head, in the right order: extract from Postgres, consume the telemetry stream, build dbt. In this lab you hand that whole sequence to Dagster. You'll declare each step as an <strong>asset</strong>, wire up the dependencies, watch Dagster figure out the order for you, and put the whole pipeline on a daily schedule. This is the moment your collection of scripts becomes a <em>platform</em>.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need <strong>Dagster installed</strong> in your project's virtual environment (from Course 5) and the scripts from <strong>Labs 02–04 working</strong>: <code>ingest/extract_postgres.py</code> populates bronze from Postgres, <code>ingest/consume_stream.py</code> lands telemetry, and your <code>dbt/</code> project builds silver + gold. Have the Compose stack up (<code>docker compose up -d</code>) so Postgres and Redpanda are reachable. Run each script once by hand first to confirm they still work — Dagster only orchestrates what already runs.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal</h2>
+  <p>Right now your pipeline lives in your memory. You know that <code>extract_postgres.py</code> has to run before dbt, and that the telemetry consumer has to land data before the hourly rollup can summarize it. Forget that order — or run dbt before the extract finishes — and you get stale or empty tables. That's fine for one person on one laptop. It is a disaster for anything real.</p>
+  <p>An <strong>orchestrator</strong> takes the ordering out of your head and puts it in code. Dagster's model is <strong>assets</strong>: each asset is a thing that exists in your warehouse (a table, a view, a rollup), and you describe what each asset <em>depends on</em>. Dagster reads those dependencies, builds a graph, and runs everything in the only correct order — every time, with logs, retries, and a UI.</p>
+  <p>By the end of this lab, these four manual steps become one dependency-aware graph:</p>
+  <div class="flow">  POSTGRES                    STREAM                         dbt                       ROLLUP
+  ┌───────────────┐          ┌────────────────┐          ┌──────────────┐          ┌──────────────────────┐
+  │ bronze_       │          │ telemetry_     │          │ dbt_build    │          │ fct_telemetry_hourly │
+  │ business      │          │ bronze         │          │ (silver+gold)│          │ (hourly rollup)      │
+  └──────┬────────┘          └───────┬────────┘          └──────┬───────┘          └──────────┬───────────┘
+         │                           │                          ▲                             ▲
+         │  extract from Postgres    │  consume Redpanda        │                             │
+         │                           │                          │                             │
+         └───────────────────────────┴──────────────────────────┘                             │
+                       both bronze layers must land BEFORE dbt runs                            │
+                                                                                               │
+         dbt produces dim/fct tables ──────────────────────────────────────────────────────────┘
+                       the hourly rollup reads the telemetry that dbt staged
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────
+  Dagster reads these arrows and runs:  bronze_business + telemetry_bronze  →  dbt_build  →  fct_telemetry_hourly</div>
+  <p>You declare the boxes and the arrows. Dagster does the scheduling.</p>
+</section>
+
+<section id="assets">
+  <h2>Define the assets</h2>
+  <p>An asset is just a Python function decorated with <code>@asset</code>. The function name becomes the asset's name; its return is metadata about what it produced; and its function <em>arguments</em> name the assets it depends on. That argument-equals-dependency trick is the whole magic — Dagster reads the signature and builds the graph.</p>
+  <p>Create <code>dagster_app/assets.py</code>. We'll reuse the exact scripts you already wrote, calling them as subprocesses so there's a single source of truth for each step. (You could also import and call the functions directly — both are common; subprocess keeps the lab honest about what's actually running.)</p>
+
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/assets.py</span></div><pre><code class="language-python">import subprocess
+from pathlib import Path
+
+from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
+import duckdb
+
+# Project paths — adjust if your repo root differs.
+REPO = Path(__file__).resolve().parents[1]
+INGEST = REPO / "ingest"
+DBT_DIR = REPO / "dbt"
+WAREHOUSE = REPO / "warehouse" / "griddp.duckdb"
+
+
+def _run(context: AssetExecutionContext, cmd: list[str], cwd: Path) -> str:
+    """Run a subprocess, stream its output into Dagster's logs, raise on failure."""
+    context.log.info(f"$ {' '.join(cmd)}  (cwd={cwd})")
+    result = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True
+    )
+    if result.stdout:
+        context.log.info(result.stdout.strip())
+    if result.returncode != 0:
+        context.log.error(result.stderr.strip())
+        raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
+    return result.stdout
+
+
+@asset(group_name="bronze")
+def bronze_business(context: AssetExecutionContext) -> MaterializeResult:
+    """Extract customers, gpus, rentals, prices from Postgres into the bronze layer.
+    Wraps ingest/extract_postgres.py from Lab 02."""
+    _run(context, ["python", "extract_postgres.py"], cwd=INGEST)
+    con = duckdb.connect(str(WAREHOUSE), read_only=True)
+    rows = con.execute("select count(*) from bronze.rentals").fetchone()[0]
+    con.close()
+    return MaterializeResult(metadata={"bronze_rental_rows": MetadataValue.int(rows)})
+
+
+@asset(group_name="bronze")
+def telemetry_bronze(context: AssetExecutionContext) -> MaterializeResult:
+    """Drain the Redpanda telemetry topic and land it into bronze.
+    Wraps ingest/consume_stream.py from Lab 04."""
+    _run(context, ["python", "consume_stream.py", "--drain"], cwd=INGEST)
+    con = duckdb.connect(str(WAREHOUSE), read_only=True)
+    rows = con.execute("select count(*) from bronze.telemetry").fetchone()[0]
+    con.close()
+    return MaterializeResult(metadata={"bronze_telemetry_rows": MetadataValue.int(rows)})
+
+
+@asset(group_name="gold", deps=[bronze_business, telemetry_bronze])
+def dbt_build(context: AssetExecutionContext) -> MaterializeResult:
+    """Run `dbt build` to produce silver staging + the gold star schema
+    (dim_customer, dim_gpu, dim_date, fct_rentals). From Lab 03.
+    Depends on BOTH bronze assets — dbt reads the tables they land."""
+    _run(context, ["dbt", "build", "--target", "dev"], cwd=DBT_DIR)
+    return MaterializeResult(metadata={"dbt": MetadataValue.text("silver + gold built")})
+
+
+@asset(group_name="gold", deps=[dbt_build])
+def fct_telemetry_hourly(context: AssetExecutionContext) -> MaterializeResult:
+    """Roll the raw telemetry firehose into an hourly fact.
+    Depends on dbt_build because it reads the staged silver telemetry. From Lab 04."""
+    con = duckdb.connect(str(WAREHOUSE))
+    con.execute("""
+        create or replace table gold.fct_telemetry_hourly as
+        select
+            gpu_id,
+            date_trunc('hour', event_ts)      as hour,
+            count(*)                           as reading_count,
+            avg(utilization_pct)               as avg_utilization,
+            max(temperature_c)                 as max_temp_c,
+            avg(power_watts)                   as avg_power_watts
+        from silver.stg_telemetry
+        group by 1, 2
+    """)
+    rows = con.execute("select count(*) from gold.fct_telemetry_hourly").fetchone()[0]
+    con.close()
+    return MaterializeResult(metadata={"hourly_rows": MetadataValue.int(rows)})
+</code></pre></div>
+
+  <p>Two ways to declare a dependency, both shown above:</p>
+  <table>
+    <thead><tr><th>Style</th><th>How</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Argument</strong></td><td>Add the upstream asset as a function parameter; Dagster passes its loaded value in.</td><td>When the downstream asset uses the upstream's <em>data</em> in-process.</td></tr>
+      <tr><td><strong><code>deps=[...]</code></strong></td><td>List upstream assets in the decorator; you get ordering but not the value.</td><td>When the dependency is "this must run first" — exactly our case, since data flows through DuckDB, not Python.</td></tr>
+    </tbody>
+  </table>
+  <p>We use <code>deps=[...]</code> everywhere because every step reads and writes the shared DuckDB file — the data never passes through Python variables, so we only need ordering. Notice <code>dbt_build</code> declares <code>deps=[bronze_business, telemetry_bronze]</code>: it will not start until <em>both</em> bronze assets are green.</p>
+
+  <p>Now make Dagster aware of the file. Create <code>dagster_app/definitions.py</code>, which is the entry point Dagster loads:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/definitions.py</span></div><pre><code class="language-python">from dagster import Definitions, load_assets_from_modules
+
+from dagster_app import assets
+
+all_assets = load_assets_from_modules([assets])
+
+defs = Definitions(
+    assets=all_assets,
+)
+</code></pre></div>
+
+  <p>And a tiny <code>pyproject.toml</code> stanza (or <code>dagster.yaml</code>) so <code>dagster dev</code> knows which module holds your definitions. The simplest path is a <code>pyproject.toml</code> at the repo root:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>pyproject.toml (add this)</span></div><pre><code class="language-toml">[tool.dagster]
+module_name = "dagster_app.definitions"
+code_location_name = "mini_griddp"
+</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>No errors yet — these are definitions, not runs. Sanity-check the wiring without launching the UI: <code>dagster asset list</code> should print four assets — <code>bronze_business</code>, <code>telemetry_bronze</code>, <code>dbt_build</code>, <code>fct_telemetry_hourly</code>. If it complains it can't find a module, you're likely running from the wrong directory or your package isn't importable — run from the repo root and make sure <code>dagster_app/</code> has an <code>__init__.py</code>.</p>
+  </div>
+</section>
+
+<section id="graph">
+  <h2>Run the graph</h2>
+  <p>Launch Dagster's local development server. It starts a web UI and watches your code for changes:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># from the repo root, with your venv active
+dagster dev
+
+# it prints something like:
+#   Serving dagster-webserver on http://127.0.0.1:3000
+</code></pre></div>
+
+  <p>Open <a href="http://127.0.0.1:3000">http://127.0.0.1:3000</a>. Click <strong>Assets</strong> in the top nav, then <strong>View global asset lineage</strong> (or open the <em>Asset graph</em>). You'll see your four boxes connected by arrows — exactly the dependency graph you declared, drawn for you:</p>
+
+  <div class="flow">  ┌────────────────┐     ┌──────────────────┐
+  │ bronze_business│     │ telemetry_bronze │       (group: bronze)
+  └───────┬────────┘     └────────┬─────────┘
+          │                       │
+          └──────────┬────────────┘
+                     ▼
+              ┌──────────────┐
+              │  dbt_build   │                       (group: gold)
+              └──────┬───────┘
+                     ▼
+          ┌──────────────────────┐
+          │ fct_telemetry_hourly │                   (group: gold)
+          └──────────────────────┘</div>
+
+  <p>Now run it. Click <strong>Materialize all</strong> (top-right of the asset graph). Dagster computes the order from the arrows and launches a run. Watch the assets turn from grey to <strong>blue (running)</strong> to <strong>green (materialized)</strong>, bottom-up the dependency chain.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The two bronze assets start <em>first and in parallel</em> (they have no dependency on each other). Only once both are green does <code>dbt_build</code> start. Then <code>fct_telemetry_hourly</code> runs last. Every box ends green, and clicking one shows the metadata you returned — <code>bronze_rental_rows</code>, <code>hourly_rows</code>, and so on — plus the streamed subprocess logs. If a box goes red, click it, read the logs (Dagster captured the script's stderr for you), fix, and click <strong>Materialize</strong> on just that asset.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Re-materialize one asset</span>
+    <p>You don't have to re-run everything. Click a single asset and hit <strong>Materialize</strong> to rebuild just it (and, optionally, everything downstream). This is already a huge upgrade over hand-running scripts.</p>
+  </div>
+</section>
+
+<section id="schedule">
+  <h2>Add a schedule</h2>
+  <p>A graph you click is nice. A graph that runs itself every morning is a platform. Dagster schedules target a <strong>job</strong> — a named selection of assets to materialize. We'll define a job that covers all four assets and a schedule that runs it daily at 06:00.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/definitions.py (updated)</span></div><pre><code class="language-python">from dagster import (
+    Definitions,
+    load_assets_from_modules,
+    define_asset_job,
+    ScheduleDefinition,
+    AssetSelection,
+)
+
+from dagster_app import assets
+
+all_assets = load_assets_from_modules([assets])
+
+# A job that materializes every asset in the pipeline.
+pipeline_job = define_asset_job(
+    name="full_pipeline",
+    selection=AssetSelection.all(),
+)
+
+# Run the whole pipeline daily at 06:00 (cron syntax: min hour dom mon dow).
+daily_schedule = ScheduleDefinition(
+    name="daily_pipeline",
+    job=pipeline_job,
+    cron_schedule="0 6 * * *",
+    execution_timezone="America/New_York",
+)
+
+defs = Definitions(
+    assets=all_assets,
+    jobs=[pipeline_job],
+    schedules=[daily_schedule],
+)
+</code></pre></div>
+
+  <p>Save the file. <code>dagster dev</code> auto-reloads. In the UI, go to <strong>Automation</strong> (or <strong>Schedules</strong>), find <code>daily_pipeline</code>, and flip its toggle to <strong>on</strong>. Schedules only fire while the Dagster daemon is running — and <code>dagster dev</code> runs the daemon for you locally.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The schedule listed with its cron expression <code>0 6 * * *</code> and a "Next tick" timestamp for tomorrow at 06:00. Don't want to wait until morning to test it? Use the schedule's <strong>⋯ → Preview / Test schedule</strong>, or just click <strong>Materialize all</strong> on the asset graph to trigger the same job by hand right now.</p>
+  </div>
+</section>
+
+<section id="why">
+  <h2>Why this beats cron-ing the scripts</h2>
+  <p>You might ask: I could just write four lines in <code>crontab</code> and call it a day. You could — and you'd lose almost everything that makes a pipeline operable. This is the practical payoff of <a href="../data-platform-systems-design/07-transformation-orchestration.html">Course 4, Chapter 10 (Transformation &amp; Orchestration)</a>, made concrete:</p>
+  <table>
+    <thead><tr><th>Concern</th><th>Four cron lines</th><th>Dagster asset graph</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Ordering</strong></td><td>You hard-code <code>sleep 300</code> and hope the extract finished. Fragile.</td><td>dbt literally cannot start until both bronze assets are green. Order is guaranteed by the graph.</td></tr>
+      <tr><td><strong>Failure handling</strong></td><td>Step 1 fails, steps 2–4 run anyway on stale data. Silent corruption.</td><td>A failed upstream asset blocks its downstreams; the run stops at the break, not after it.</td></tr>
+      <tr><td><strong>Retries</strong></td><td>None, unless you script them yourself.</td><td>Add <code>retry_policy=RetryPolicy(max_retries=2)</code> to an asset — transient blips self-heal.</td></tr>
+      <tr><td><strong>Visibility</strong></td><td><code>grep</code> through log files to learn what happened, if you logged at all.</td><td>A UI shows every run, every asset's status, metadata, and captured logs in one place.</td></tr>
+      <tr><td><strong>Backfills</strong></td><td>Re-run yesterday? Hand-edit dates and pray.</td><td>Select assets, pick a range, click <strong>Backfill</strong>. Dagster tracks each partition.</td></tr>
+      <tr><td><strong>Partial reruns</strong></td><td>All-or-nothing.</td><td>Re-materialize one asset and its downstreams; leave the rest untouched.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The mental shift</span>
+    <p>Cron schedules <em>tasks</em> ("run this command at this time"). Dagster manages <em>assets</em> ("this table should exist and be fresh; here's how to make it, and what it needs first"). When you think in assets, the orchestrator can reason about your data — what's stale, what failed, what to rebuild — instead of blindly firing commands into the dark.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Materialize end to end</h2>
+  <p>Let's prove the whole thing runs clean from a cold start. Stop the server (<kbd>Ctrl-C</kbd>), confirm the stack is up, and run a fresh materialization — this time from the command line, no UI clicking, the way the scheduler will:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># make sure Postgres + Redpanda are running
+docker compose up -d
+
+# materialize the entire pipeline as one job, headless
+dagster job execute -j full_pipeline -m dagster_app.definitions
+
+# ...then peek at the result in DuckDB
+duckdb warehouse/griddp.duckdb \
+  "select count(*) as hourly_rows from gold.fct_telemetry_hourly;"</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Dagster logs each asset starting and finishing in dependency order — <code>bronze_business</code> and <code>telemetry_bronze</code> first, then <code>dbt_build</code>, then <code>fct_telemetry_hourly</code> — and a final "RUN_SUCCESS". The DuckDB query returns a positive <code>hourly_rows</code> count. That single command just did what used to be four manual steps in the right order. That's the lab.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit Lab 05</h2>
+  <p>Your orchestration layer now exists in code. Commit it so your history keeps telling the story:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp
+git add dagster_app/ pyproject.toml
+git status                 # confirm only the orchestration files are staged
+git commit -m "Lab 05: Dagster asset graph + daily schedule (ingest → dbt → rollup)"</code></pre></div>
+  <div class="callout tip">
+    <span class="callout-label">Don't commit run state</span>
+    <p>When <code>dagster dev</code> runs, it writes a local <code>$DAGSTER_HOME</code> (or a <code>tmp</code> instance) full of run history and logs. Add it to <code>.gitignore</code> — it's machine state, not source. Your repo should contain the <em>definitions</em>, never the run database.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain, pointing at the asset graph, why <code>dbt_build</code> can't start until both bronze assets are green?</li>
+    <li>What's the difference between declaring a dependency as a function <em>argument</em> versus <code>deps=[...]</code> — and why did we use <code>deps</code> here?</li>
+    <li>Name two things Dagster gives you that four cron lines don't.</li>
+    <li>Where does the schedule's cron expression <code>0 6 * * *</code> fire, and what must be running for it to fire at all?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add an asset check (or a downstream asset) and re-materialize</strong></summary>
+    <div class="collapse-card-body">
+      <p>An <strong>asset check</strong> is a lightweight assertion that runs <em>with</em> an asset and reports pass/fail in the UI — a preview of the data-quality work in Lab 06. Add a check that fails if the hourly rollup came out empty, then re-materialize <code>fct_telemetry_hourly</code> and confirm the check shows up green.</p>
+      <div class="code-wrap"><div class="code-header"><span>dagster_app/assets.py (add to the bottom)</span></div><pre><code class="language-python">from dagster import asset_check, AssetCheckResult
+
+
+@asset_check(asset=fct_telemetry_hourly)
+def hourly_rollup_not_empty() -> AssetCheckResult:
+    """Fail the build if the hourly fact materialized with zero rows."""
+    con = duckdb.connect(str(WAREHOUSE), read_only=True)
+    rows = con.execute("select count(*) from gold.fct_telemetry_hourly").fetchone()[0]
+    con.close()
+    return AssetCheckResult(
+        passed=bool(rows > 0),
+        metadata={"row_count": MetadataValue.int(rows)},
+    )</code></pre></div>
+      <p>Save (the server auto-reloads), open <code>fct_telemetry_hourly</code> in the UI, and click <strong>Materialize</strong>. Under the asset you'll now see a <strong>Checks</strong> tab with <code>hourly_rollup_not_empty</code> reporting <strong>Passed</strong> and the <code>row_count</code> metadata.</p>
+      <p><strong>Prefer a downstream asset instead?</strong> Add one that depends on <code>fct_telemetry_hourly</code> — for example a <code>fleaderboard_top_gpus</code> asset that selects the ten busiest GPUs by total readings — declare <code>deps=[fct_telemetry_hourly]</code>, and watch it appear as a new box hanging off the bottom of the graph. Re-materialize all and confirm it runs dead last.</p>
+      <p>Either way, you've extended a live, orchestrated pipeline by adding one declaration — no scheduling logic, no ordering code. That's the power you just unlocked.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your pipeline runs in order, on a schedule — but nothing yet checks that the data it produces is <em>correct</em>. Let's add real tests and freshness checks. → <a href="06-data-quality-tests.html">Lab 06 — Data Quality &amp; Tests</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

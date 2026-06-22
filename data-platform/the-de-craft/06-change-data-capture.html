@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Change Data Capture — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#problem">The snapshot problem</a>
+    <a href="#cdc">What CDC is</a>
+    <a href="#log-based">Log-based CDC</a>
+    <a href="#handling">Handling the change stream</a>
+    <a href="#hands-on">Hands-on: apply a change feed</a>
+    <a href="#tradeoffs">Tradeoffs &amp; when to use it</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-ingestion-elt-etl.html">← Previous</a>
+    <a href="07-transformation-with-dbt.html">Next: Transformation with dbt →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Change Data Capture</h1>
+  <p class="subtitle">Last chapter you moved data in with extracts and loads. But a nightly extract only ever sees a source as it looks <em>right now</em> — it never sees what happened in between. Change Data Capture closes that gap: instead of re-reading the table, you capture every insert, update, and delete the moment it happens. This is how real platforms keep a warehouse in lock-step with a live database — with full fidelity and no history lost.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You'll need your <code>mini-griddp</code> repo with Postgres up (<code>docker compose up -d</code>) and DuckDB available, exactly as in <a href="05-ingestion-elt-etl.html">Chapter 05</a>. The hands-on section runs entirely in DuckDB by <em>simulating</em> a change feed, so it works on any laptop — no special Postgres configuration required. Keep a terminal beside this page.</p>
+</div>
+
+<section id="problem">
+  <h2>The snapshot problem</h2>
+  <p>In Chapter 05 you loaded data the simplest way: run a <code>SELECT *</code> against the source, dump the result into the warehouse. Maybe nightly, maybe with a high-water mark so you only grab new rows. That works — until you ask what it <em>misses</em>. A full nightly snapshot is a photograph taken once a day. Anything that happened between two photographs is simply gone.</p>
+  <p>Picture our GPU-rental marketplace. The source has a <code>rentals</code> table (who rented what, and at what status) and a <code>prices</code> table (the hourly rate per GPU type). Both change all day long. Now look at what a once-a-day <code>SELECT *</code> can and can't tell you:</p>
+
+  <div class="flow">  Source table, over one day            What the nightly snapshot sees
+  ────────────────────────────────      ──────────────────────────────
+  09:00  rental #501 INSERT (active)
+  11:00  rental #501 UPDATE → paused          ┐
+  14:00  rental #501 UPDATE → active          │  all three updates collapsed
+  18:00  rental #501 UPDATE → completed   ────┴─►  one row: "completed"
+  22:00  rental #502 INSERT, then DELETE  ────►  nothing at all — never seen
+
+  ── snapshot taken here, 23:59 ──────────────────────────────────────▶</div>
+
+  <p>Four distinct things went wrong, and each is a real failure mode:</p>
+  <table>
+    <thead><tr><th>What the snapshot misses</th><th>Why it hurts</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Intra-day changes</strong></td><td>Rental #501 was paused, resumed, then completed. The snapshot shows only the final state — you can't report "how long was it paused?"</td></tr>
+      <tr><td><strong>Deletes</strong></td><td>Rental #502 was created and deleted before midnight. A <code>SELECT *</code> can <em>never</em> show you a row that no longer exists. Your warehouse silently still thinks it's there (or never knew it).</td></tr>
+      <tr><td><strong>Lost history of in-place updates</strong></td><td>When a price changes from $2.10 to $2.40, the old value is overwritten in the source. Tomorrow's snapshot has $2.40; the $2.10 is gone forever — and so is the question "what did this cost last Tuesday?"</td></tr>
+      <tr><td><strong>Full-table scans</strong></td><td>To find what changed, you re-read the <em>entire</em> table — millions of rows — every run. That hammers the production OLTP database your customers depend on.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ The delete problem is the sharpest one</span>
+    <p>Incremental extraction with a high-water mark (<code>WHERE updated_at &gt; :last_run</code>) catches new and changed rows cheaply. But a deleted row has no <code>updated_at</code> to compare — it's <em>gone</em>. Query-based methods are structurally blind to deletes. If your source ever deletes rows and you care about correctness, this alone is a reason to reach for CDC.</p>
+  </div>
+</section>
+
+<section id="cdc">
+  <h2>What CDC is</h2>
+  <p><strong>Change Data Capture (CDC)</strong> flips the model. Instead of periodically asking the table "what do you look like now?", you capture <em>every individual change</em> — every insert, update, and delete — as a stream of discrete <strong>change events</strong>, in the exact order they happened.</p>
+  <p>Compare the two mental models directly:</p>
+
+  <div class="flow">  SNAPSHOT (query-based)                  CDC (event-based)
+  ──────────────────────                  ─────────────────
+
+   ┌──────────────┐                        INSERT #501 ─┐
+   │  full table  │  re-read everything     UPDATE #501  │
+   │  SELECT *    │  ──► one row per key     UPDATE #501  ├─► ordered stream
+   │  (a photo)   │      = latest state      UPDATE #501  │   of every change
+   └──────────────┘                          DELETE #502 ─┘   (a movie)
+        once a day                          continuous, as it happens</div>
+
+  <p>A snapshot is a photo; CDC is the movie. With the movie you can always reconstruct any photo (replay the changes up to a point in time), <em>and</em> answer questions a photo never could: how often did this row change, what was deleted, what was the value at 2pm last Tuesday. The cost is that you now have to capture and process a stream rather than run one tidy query — which is the rest of this chapter.</p>
+</section>
+
+<section id="log-based">
+  <h2>Log-based CDC</h2>
+  <p>How do you capture every change without re-querying the table? The clever answer: the database is <em>already</em> writing every change down for you. Every transactional database keeps a <strong>write-ahead log</strong> (the WAL in Postgres; the binlog in MySQL; the redo log in Oracle). Before any change touches the actual table files, the database appends a record of it to this log — that's how it guarantees durability and can recover after a crash.</p>
+  <p>That log is a perfect, ordered, complete record of every insert, update, and delete that ever happened. <strong>Log-based CDC</strong> simply <em>tails</em> that log. A connector — the best-known is <a href="https://debezium.io">Debezium</a> — reads the WAL, decodes each entry into a structured change event, and emits it to a stream (typically Kafka / Redpanda, which you'll meet in Chapter 09).</p>
+
+  <div class="flow">  Postgres                Debezium                  Stream            Consumers
+  ─────────               ─────────                 ──────            ─────────
+  ┌─────────────┐         ┌──────────────┐          ┌─────────┐       ┌──────────┐
+  │   tables    │         │  reads the   │  decode  │ topic:  │       │ warehouse│
+  │     ▼       │  WAL    │  replication ├─────────►│ rentals ├──────►│ lakehouse│
+  │  write-     ├────────►│  slot, tails │  events  │ (Kafka /│       │ search   │
+  │  ahead log  │  tail   │  the WAL     │          │ Redpanda)│      │ index    │
+  └─────────────┘         └──────────────┘          └─────────┘       └──────────┘
+   every change           one row in the WAL  ──►   one change event in the stream</div>
+
+  <p>Why is reading the log so much better than the obvious alternative — polling the table with a query on a timer?</p>
+  <table>
+    <thead><tr><th></th><th>Query-based (polling)</th><th>Log-based (WAL)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Load on source</strong></td><td>Every poll runs a real query against live tables</td><td>Reads the log the DB already writes — near-zero query load</td></tr>
+      <tr><td><strong>Deletes</strong></td><td>Invisible — a gone row has nothing to query</td><td>Captured: the WAL records the delete explicitly</td></tr>
+      <tr><td><strong>Ordering</strong></td><td>Approximate, inferred from timestamps</td><td>Exact — the log <em>is</em> the order of commits</td></tr>
+      <tr><td><strong>Intermediate states</strong></td><td>Missed between polls</td><td>Every change captured, even three updates a second apart</td></tr>
+      <tr><td><strong>Latency</strong></td><td>As slow as your poll interval (minutes)</td><td>Sub-second — events flow as commits land</td></tr>
+    </tbody>
+  </table>
+
+  <p>A single change in the WAL becomes one richly-structured event. Here is what a Debezium-style event for an <strong>update</strong> to a rental looks like — note that it carries both the <code>before</code> and the <code>after</code> image of the row, plus an <code>op</code> code telling you what kind of change it was:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>cdc-event.json</span></div><pre><code class="language-json">{
+  "op": "u",                       // c = create/insert, u = update, d = delete, r = snapshot read
+  "ts_ms": 1718900000000,          // when the change was captured
+  "source": {
+    "db": "griddp",
+    "table": "rentals",
+    "lsn": 24563120,               // log sequence number — the exact position in the WAL
+    "txId": 5512
+  },
+  "before": {                       // the row as it was (null for an insert)
+    "rental_id": 501,
+    "gpu_type": "A100",
+    "status": "paused"
+  },
+  "after": {                        // the row as it now is (null for a delete)
+    "rental_id": 501,
+    "gpu_type": "A100",
+    "status": "active"
+  }
+}</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">Read an event like a sentence</span>
+    <p>"At <code>ts_ms</code>, in <code>source.table</code>, operation <code>op</code> changed the row from <code>before</code> to <code>after</code>." For an insert, <code>before</code> is <code>null</code>; for a delete, <code>after</code> is <code>null</code>. The <code>lsn</code> is the row's exact position in the log — it gives you a total order and lets a connector resume from precisely where it left off after a restart.</p>
+  </div>
+</section>
+
+<section id="handling">
+  <h2>Handling the change stream</h2>
+  <p>Capturing the stream is half the job; the other half is <em>applying</em> it downstream so your warehouse reflects the source. There are two outputs you usually want from the same stream, and CDC can feed both:</p>
+  <ul>
+    <li><strong>Current state</strong> — a table that mirrors the source as it is right now. You get this by <strong>upserting</strong>: an insert or update writes the <code>after</code> row (merge on the key); a delete removes the key.</li>
+    <li><strong>Full history</strong> — a record of every version a row ever had. You get this by <strong>appending</strong> every event to a log table, never overwriting. This is exactly the slowly-changing dimension (SCD2) pattern from <a href="03-slowly-changing-dimensions.html">Chapter 03</a> — a CDC stream is the most natural raw material for SCD2 history.</li>
+  </ul>
+
+  <div class="flow">                      ┌──────────────────────────────► CURRENT STATE
+                      │   upsert: write `after`,        (one row per key,
+   change stream ─────┤   delete: remove key             mirrors the source)
+   (c / u / d events) │
+                      └──────────────────────────────► FULL HISTORY
+                          append every event             (every version ever,
+                          (never overwrite)               SCD2 from ch.03)</div>
+
+  <p>Two details matter when you apply the stream:</p>
+  <table>
+    <thead><tr><th>Concept</th><th>What it is &amp; why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Tombstone</strong></td><td>A delete event (and, in Kafka, a follow-up null-value record) marks a key as gone. Without it, your current-state table would keep a row the source has deleted. The tombstone is how a delete propagates.</td></tr>
+      <tr><td><strong>Idempotent apply</strong></td><td>Streams can redeliver an event after a restart. Applying by <strong>upsert on the key</strong> (merge), not blind insert, means replaying the same event twice yields the same result — safe to re-run.</td></tr>
+      <tr><td><strong>Order by LSN</strong></td><td>Apply events in log order. If two updates to the same key arrive out of order, the latest <code>lsn</code> must win, or current state ends up stale.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: apply a change feed</h2>
+  <p>Configuring Postgres logical decoding and Debezium is a real production setup, but it's heavy for a laptop. The <em>logic</em> of CDC — turning a stream of <code>c</code>/<code>u</code>/<code>d</code> events into current state and history — is the part worth your fingers. So we'll <strong>simulate the change feed</strong>: a small table of CDC events, exactly the shape Debezium would emit, and write the SQL that applies it. Run this in DuckDB.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- A simulated CDC feed for one rental key (501), in log order.
+-- op: c = insert, u = update, d = delete.  lsn = position in the WAL.
+CREATE OR REPLACE TABLE cdc_feed (
+  lsn      INTEGER,
+  op       VARCHAR,
+  rental_id INTEGER,
+  status   VARCHAR,     -- the value in `after` (NULL for a delete)
+  ts       TIMESTAMP
+);
+
+INSERT INTO cdc_feed VALUES
+  (10, 'c', 501, 'active',    TIMESTAMP '2026-06-21 09:00'),
+  (20, 'u', 501, 'paused',    TIMESTAMP '2026-06-21 11:00'),
+  (30, 'u', 501, 'active',    TIMESTAMP '2026-06-21 14:00'),
+  (40, 'u', 501, 'completed', TIMESTAMP '2026-06-21 18:00'),
+  (50, 'c', 502, 'active',    TIMESTAMP '2026-06-21 21:00'),
+  (60, 'd', 502, NULL,        TIMESTAMP '2026-06-21 22:00');</code></pre></div>
+
+  <p>First, build <strong>current state</strong>: for each key, take the latest event by <code>lsn</code>, and drop keys whose last event was a delete (the tombstone).</p>
+
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- latest event per key, then filter out deletes
+WITH latest AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY rental_id ORDER BY lsn DESC) AS rn
+  FROM cdc_feed
+)
+SELECT rental_id, status, ts AS as_of
+FROM latest
+WHERE rn = 1
+  AND op &lt;&gt; 'd'          -- tombstone: a key whose last op is a delete is gone
+ORDER BY rental_id;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Exactly <strong>one row</strong>: <code>501 | completed | 2026-06-21 18:00</code>. Key 502 is correctly <em>absent</em> — it was inserted then deleted, so its tombstone removes it from current state. This is the delete the nightly snapshot could never represent.</p>
+  </div>
+
+  <p>Now build <strong>full history</strong> — every version key 501 ever held, with a valid-from / valid-to window. This is SCD2, derived straight from the feed:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- each event opens a new version; the next event's ts closes it
+SELECT
+  rental_id,
+  status,
+  ts AS valid_from,
+  LEAD(ts) OVER (PARTITION BY rental_id ORDER BY lsn) AS valid_to,
+  (LEAD(lsn) OVER (PARTITION BY rental_id ORDER BY lsn) IS NULL) AS is_current
+FROM cdc_feed
+WHERE op &lt;&gt; 'd'          -- a delete closes the prior version but adds no new one
+  AND rental_id = 501
+ORDER BY lsn;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Four history rows for 501: <code>active</code> (09:00→11:00), <code>paused</code> (11:00→14:00), <code>active</code> (14:00→18:00), and <code>completed</code> (18:00→NULL, <code>is_current = true</code>). Every intra-day state the snapshot collapsed is now preserved — you can answer "how long was #501 paused?" (three hours) directly from this table.</p>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">From simulation to the real thing</span>
+    <p>In production the <code>cdc_feed</code> table is replaced by a stream from Debezium, and the current-state query becomes a <code>MERGE</code> / upsert that runs continuously. The <em>shape</em> of the logic — order by LSN, latest-wins, tombstones for deletes, append for history — is identical to what you just wrote. You've done the conceptual core of every CDC pipeline.</p>
+  </div>
+</section>
+
+<section id="tradeoffs">
+  <h2>Tradeoffs &amp; when to use it</h2>
+  <p>CDC is powerful, but it is not free, and it is not always the right tool. The honest comparison against the simple incremental extraction from Chapter 05:</p>
+  <table>
+    <thead><tr><th></th><th>Incremental extract (ch.05)</th><th>Change Data Capture</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Setup</strong></td><td>A query and a high-water mark — minutes</td><td>Logical decoding, a connector, a stream — real infrastructure</td></tr>
+      <tr><td><strong>Captures deletes</strong></td><td>No</td><td>Yes</td></tr>
+      <tr><td><strong>Captures every intermediate state</strong></td><td>No — only the latest between runs</td><td>Yes — every commit</td></tr>
+      <tr><td><strong>Latency</strong></td><td>Batch (minutes to a day)</td><td>Seconds — near real-time</td></tr>
+      <tr><td><strong>Load on source</strong></td><td>A query per run</td><td>Near-zero (tails the log)</td></tr>
+      <tr><td><strong>Operational complexity</strong></td><td>Low</td><td>Higher — connectors, slots, a stream to run</td></tr>
+      <tr><td><strong>Best when</strong></td><td>Append-mostly tables, daily reporting is fine</td><td>Deletes/edits matter, you need fresh data or full history</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">A rule of thumb</span>
+    <p>Reach for CDC when at least one of these is true: the source <strong>deletes or edits</strong> rows and you need correctness; you need <strong>low latency</strong> (dashboards that must be minutes-fresh); or you need <strong>full history</strong> for audit or SCD2. If your source is append-only and a daily batch is fine, the simple incremental extract from Chapter 05 is the right, cheaper choice. Don't pay for the movie when a photo will do.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Why can a query-based nightly snapshot never capture a deleted row?</li>
+    <li>What is the WAL, and why is tailing it cheaper than polling the table?</li>
+    <li>In a CDC event, what do <code>before</code> and <code>after</code> hold for an insert? For a delete?</li>
+    <li>How does the same change stream produce <em>both</em> current state and full history?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Apply three CDC events for one key</strong></summary>
+    <div class="collapse-card-body">
+      <p>You receive three CDC events for customer <code>id = 42</code>, in log order:</p>
+      <ol>
+        <li><code>lsn 100, op=c, tier="free"</code></li>
+        <li><code>lsn 200, op=u, tier="pro"</code></li>
+        <li><code>lsn 300, op=d</code> (delete)</li>
+      </ol>
+      <p>Show (a) the resulting <strong>current-state</strong> row(s) for key 42, and (b) the <strong>history</strong> rows.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-sql">CREATE OR REPLACE TABLE cust_cdc (lsn INT, op VARCHAR, id INT, tier VARCHAR);
+INSERT INTO cust_cdc VALUES
+  (100, 'c', 42, 'free'),
+  (200, 'u', 42, 'pro'),
+  (300, 'd', 42, NULL);
+
+-- (a) CURRENT STATE: latest event is a delete -> the key is GONE.
+WITH latest AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY lsn DESC) AS rn
+  FROM cust_cdc
+)
+SELECT id, tier FROM latest WHERE rn = 1 AND op &lt;&gt; 'd';
+--  -> zero rows. The delete tombstones key 42.
+
+-- (b) HISTORY: every version the key ever held (deletes add no new version).
+SELECT id, tier,
+       lsn AS valid_from_lsn,
+       LEAD(lsn) OVER (PARTITION BY id ORDER BY lsn) AS valid_to_lsn
+FROM cust_cdc
+WHERE op &lt;&gt; 'd'
+ORDER BY lsn;
+--  -> 42 | free | 100 | 200
+--     42 | pro  | 200 | 300   (closed at lsn 300 by the delete)</code></pre></div>
+      <p><strong>The key insight:</strong> current state shows <em>nothing</em> for key 42 (it was deleted), yet history still proves it existed — it was <code>free</code>, then <code>pro</code>, then gone. A snapshot taken after the delete would tell you customer 42 never existed at all. That difference — preserving what was deleted and how it changed — is the whole reason CDC exists.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can now move data in <em>and</em> capture every change to it with full fidelity. Next we turn that raw, ingested data into clean, tested, business-ready tables using the modern transformation tool. → <a href="07-transformation-with-dbt.html">Transformation with dbt</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 02 — Ingestion — Land Raw to Bronze — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal</a>
+    <a href="#bronze">What "bronze" means</a>
+    <a href="#extract">Writing the extractor</a>
+    <a href="#run">Run it</a>
+    <a href="#idempotent">Run it twice (idempotency)</a>
+    <a href="#verify">Verify the bronze layer</a>
+    <a href="#commit">Commit Lab 02</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-project-setup-and-data-generator.html">← Previous</a>
+    <a href="03-transform-silver-gold-dbt.html">Next: Lab 03 — Transform →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 02 — Ingestion — Land Raw to Bronze</h1>
+  <p class="subtitle">Your generator filled Postgres with a living marketplace. Now you'll build the first real pipeline: an extractor that lands that source data into a <strong>bronze</strong> layer inside a DuckDB warehouse — faithfully, incrementally, and idempotently, so re-running it never doubles your data. This is the front door of every platform you'll ever build.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need <strong>Lab 01 finished</strong>: your <code>mini-griddp</code> Compose stack running, with Postgres seeded by the generator (tables <code>customers</code>, <code>gpus</code>, <code>gpu_prices</code>, <code>rentals</code>). Confirm with <code>docker compose ps</code> — the <code>postgres</code> service should be <em>up</em>. You also need <strong>DuckDB</strong> available to Python; install it into your project venv with <code>uv add duckdb</code> (and the Postgres scanner extension, which DuckDB downloads on first use). Work from your repo root: <code>cd mini-griddp</code>.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal</h2>
+  <p>In Lab 01 your sources came alive. In this lab you build <strong>ingestion</strong> — the <code>ingest/extract_postgres.py</code> script that copies source tables out of Postgres and lands them into a <strong>bronze</strong> schema inside a single DuckDB file (<code>warehouse.duckdb</code>). That file becomes your warehouse for the rest of the capstone: silver and gold (Lab 03) build on top of bronze.</p>
+  <div class="flow">  SOURCE (Postgres)            INGEST                 WAREHOUSE (DuckDB)
+  ┌──────────────────┐      ┌─────────────────┐     ┌──────────────────────┐
+  │ customers        │      │ extract_postgres│     │ bronze.customers     │
+  │ gpus             │─────▶│   .py           │────▶│ bronze.gpus          │
+  │ gpu_prices       │      │  • full refresh │     │ bronze.gpu_prices    │
+  │ rentals  (grows) │      │  • incremental  │     │ bronze.rentals       │
+  └──────────────────┘      │  • idempotent   │     │ bronze._watermarks   │
+                            └─────────────────┘     └──────────────────────┘
+  ───────────────────────────────────────────────────────────────────────────▶
+  re-running is SAFE: small tables get replaced; rentals only pulls NEW rows</div>
+  <p>Two properties matter more than anything else here, and they're what separate a toy script from a pipeline:</p>
+  <ul>
+    <li><strong>Idempotent</strong> — running it twice leaves the warehouse in the same state as running it once. No duplicate rows, ever.</li>
+    <li><strong>Incremental</strong> — the big, growing table (<code>rentals</code>) is pulled using a <em>high-watermark</em>, so a second run only fetches rows newer than what you already have. Cheap to re-run.</li>
+  </ul>
+</section>
+
+<section id="bronze">
+  <h2>What "bronze" means</h2>
+  <p>The <strong>medallion architecture</strong> (bronze → silver → gold) organizes a warehouse into layers of increasing refinement. Bronze is the <strong>landing zone</strong>: a near-exact copy of the source, captured as-is, with as little transformation as possible. You don't clean it, rename columns, or fix types here — you just get it <em>in</em>, reliably.</p>
+  <table>
+    <thead><tr><th>Layer</th><th>What it holds</th><th>Built in</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Bronze</strong></td><td>Raw source rows, landed as-is. The system of record for "what the source said."</td><td>This lab</td></tr>
+      <tr><td><strong>Silver</strong></td><td>Cleaned, typed, deduplicated; one tidy row per entity.</td><td>Lab 03</td></tr>
+      <tr><td><strong>Gold</strong></td><td>Business-ready star schema: dims + facts for analytics.</td><td>Lab 03</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Why land raw first?</span>
+    <p>If a downstream transform has a bug, you don't want to have already discarded the source detail — you'd have to re-pull everything. Bronze keeps a faithful copy so you can rebuild silver and gold any time by replaying transforms. It's "immutable-ish": you append and refresh, but you never edit a landed row by hand.</p>
+  </div>
+  <p>Let's create the warehouse file and the bronze schema. DuckDB is a single file — creating it is just connecting to a path that doesn't exist yet.</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># from the repo root, create the schema in a fresh warehouse file
+duckdb warehouse.duckdb "CREATE SCHEMA IF NOT EXISTS bronze;"
+
+# confirm it exists
+duckdb warehouse.duckdb "SELECT schema_name FROM information_schema.schemata;"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A <code>warehouse.duckdb</code> file appear in your repo, and the second command lists <code>bronze</code> alongside DuckDB's built-in schemas (<code>main</code>, <code>information_schema</code>). The schema is empty for now — the extractor fills it.</p>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">Gitignore the warehouse</span>
+    <p>The <code>.duckdb</code> file is generated data, not source. Add <code>warehouse.duckdb</code> (and <code>*.duckdb.wal</code>) to your <code>.gitignore</code> now so you don't commit a binary blob. You commit the <em>code</em> that builds it, never the file itself.</p>
+  </div>
+</section>
+
+<section id="extract">
+  <h2>Writing the extractor</h2>
+  <p>Here's the plan. The three small reference tables (<code>customers</code>, <code>gpus</code>, <code>gpu_prices</code>) change slowly and are cheap, so we <strong>full-refresh</strong> them: drop and replace on every run. That's trivially idempotent. The <code>rentals</code> table grows continuously, so we pull it <strong>incrementally</strong> using a high-watermark — we remember the largest <code>rental_id</code> we've already landed, and ask Postgres only for rows above it.</p>
+  <p>We'll use DuckDB's <strong>Postgres scanner</strong> extension, which lets DuckDB read Postgres tables directly inside a SQL query — no separate Postgres driver, no row-by-row copying in Python. Create the file:</p>
+  <div class="code-wrap"><div class="code-header"><span>ingest/extract_postgres.py</span></div><pre><code class="language-python">"""Extract source tables from Postgres and land them in the bronze layer.
+
+Full-refresh for small reference tables; high-watermark incremental for rentals.
+Safe to re-run: idempotent by construction.
+"""
+import os
+import duckdb
+
+WAREHOUSE = os.getenv("WAREHOUSE", "warehouse.duckdb")
+
+# Connection string for DuckDB's postgres scanner. Matches your Lab 01 .env.
+PG = os.getenv(
+    "PG_CONN",
+    "host=localhost port=5432 dbname=griddp user=griddp password=griddp",
+)
+
+# Small tables we simply replace every run -> trivially idempotent.
+FULL_REFRESH = ["customers", "gpus", "gpu_prices"]
+
+
+def connect():
+    con = duckdb.connect(WAREHOUSE)
+    con.execute("INSTALL postgres; LOAD postgres;")
+    # Attach Postgres as a read-only catalog called `pg`.
+    con.execute(f"ATTACH '{PG}' AS pg (TYPE postgres, READ_ONLY);")
+    con.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
+    return con
+
+
+def full_refresh(con, table):
+    """Replace a bronze table with a fresh copy from Postgres."""
+    con.execute(f"CREATE OR REPLACE TABLE bronze.{table} AS "
+                f"SELECT * FROM pg.public.{table};")
+    n = con.execute(f"SELECT count(*) FROM bronze.{table}").fetchone()[0]
+    print(f"  full-refresh bronze.{table:12s} -> {n} rows")
+
+
+def ensure_watermark_store(con):
+    """A tiny table that remembers how far we've ingested each source."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bronze._watermarks (
+            source_table VARCHAR PRIMARY KEY,
+            high_watermark BIGINT
+        );
+    """)
+
+
+def get_watermark(con, table):
+    row = con.execute(
+        "SELECT high_watermark FROM bronze._watermarks WHERE source_table = ?",
+        [table],
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def set_watermark(con, table, value):
+    con.execute("""
+        INSERT INTO bronze._watermarks VALUES (?, ?)
+        ON CONFLICT (source_table) DO UPDATE SET high_watermark = excluded.high_watermark;
+    """, [table, value])
+
+
+def incremental_rentals(con):
+    """Pull only rentals newer than the last high-watermark (max rental_id)."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bronze.rentals AS
+        SELECT * FROM pg.public.rentals WHERE false;
+    """)
+    wm = get_watermark(con, "rentals")
+
+    new_rows = con.execute(
+        "SELECT count(*) FROM pg.public.rentals WHERE rental_id > ?", [wm]
+    ).fetchone()[0]
+
+    con.execute(
+        "INSERT INTO bronze.rentals "
+        "SELECT * FROM pg.public.rentals WHERE rental_id > ?", [wm]
+    )
+
+    new_wm = con.execute(
+        "SELECT max(rental_id) FROM bronze.rentals"
+    ).fetchone()[0] or 0
+    set_watermark(con, "rentals", new_wm)
+
+    total = con.execute("SELECT count(*) FROM bronze.rentals").fetchone()[0]
+    print(f"  incremental bronze.rentals      -> +{new_rows} new "
+          f"(watermark rental_id={new_wm}, total {total})")
+
+
+def main():
+    con = connect()
+    ensure_watermark_store(con)
+    print(f"Landing bronze into {WAREHOUSE} ...")
+    for t in FULL_REFRESH:
+        full_refresh(con, t)
+    incremental_rentals(con)
+    con.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">How the idempotency is built in</span>
+    <p>Two mechanisms. The small tables use <code>CREATE OR REPLACE TABLE</code> — re-running just rebuilds them from the current source, so there's nothing to duplicate. <code>rentals</code> uses the <code>_watermarks</code> table: each run only inserts rows with <code>rental_id</code> greater than the stored high-watermark, then advances the watermark. Run it again immediately and <code>rental_id &gt; watermark</code> matches nothing — zero new rows.</p>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">Match the connection details to your stack</span>
+    <p>The <code>PG_CONN</code> and table names above assume the Lab 01 generator (database <code>griddp</code>, schema <code>public</code>, an auto-incrementing <code>rental_id</code>). If your generator used different names, set <code>PG_CONN</code> in your environment or edit the defaults. A watermark needs a monotonically increasing column — <code>rental_id</code> works because rows are only ever appended.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>Run it</h2>
+  <p>Run the extractor from the repo root:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python ingest/extract_postgres.py</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Output like this, with counts that match your source tables:</p>
+    <div class="code-wrap"><div class="code-header"><span>output</span></div><pre><code class="language-text">Landing bronze into warehouse.duckdb ...
+  full-refresh bronze.customers    -> 200 rows
+  full-refresh bronze.gpus         -> 12 rows
+  full-refresh bronze.gpu_prices   -> 360 rows
+  incremental bronze.rentals      -> +5000 new (watermark rental_id=5000, total 5000)
+Done.</code></pre></div>
+    <p>Your exact numbers depend on how much data Lab 01 generated, but bronze counts should equal the source. Cross-check one: <code>duckdb warehouse.duckdb "SELECT count(*) FROM bronze.customers;"</code> should match <code>docker compose exec postgres psql -U griddp -d griddp -c "SELECT count(*) FROM customers;"</code>.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">If the postgres scanner fails to load</span>
+    <p>DuckDB downloads the <code>postgres</code> extension on first use, so you need network access the first time. If <code>ATTACH</code> errors with a connection refused, the host/port are wrong — from your laptop use <code>localhost:5432</code> (the port Compose published); from <em>inside</em> the Compose network you'd use the service name <code>postgres:5432</code>. We run this script from the host, so <code>localhost</code> is correct.</p>
+  </div>
+</section>
+
+<section id="idempotent">
+  <h2>Run it twice (idempotency)</h2>
+  <p>This is the test that proves your pipeline is safe. Run the <em>exact same command</em> a second time, without generating any new data:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python ingest/extract_postgres.py</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The full-refresh counts are <strong>identical</strong> to the first run, and rentals pulls <strong>zero</strong> new rows — the total does not double:</p>
+    <div class="code-wrap"><div class="code-header"><span>output</span></div><pre><code class="language-text">  full-refresh bronze.customers    -> 200 rows
+  full-refresh bronze.gpus         -> 12 rows
+  full-refresh bronze.gpu_prices   -> 360 rows
+  incremental bronze.rentals      -> +0 new (watermark rental_id=5000, total 5000)
+Done.</code></pre></div>
+    <p><code>total 5000</code>, not <code>10000</code>. That <code>+0 new</code> is idempotency you can see. The small tables were rebuilt from scratch (same input, same output), and the watermark blocked any rental re-insert.</p>
+  </div>
+  <div class="callout insight">
+    <span class="callout-label">Why this matters — the Foundations connection</span>
+    <p>Back in the <a href="../foundations/index.html">Foundations</a> course and the Course 4 ingestion chapters, idempotency was the headline rule: pipelines fail and get retried, and a retry must not corrupt your data. A scheduler (Dagster, in Lab 05) might re-run this asset after a crash, or you might run it twice by hand. Because every operation here is idempotent, none of that can hurt you. <strong>Test it by running twice</strong> — that's the cheapest way to catch a non-idempotent pipeline.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">See incremental actually pull new rows</span>
+    <p>Want proof the incremental path isn't just a no-op? Re-run your Lab 01 generator to append more rentals to Postgres, then run the extractor again. This time you'll see <code>+N new</code> where N is exactly the rentals added, and the watermark advances — only the new rows crossed the wire.</p>
+  </div>
+</section>
+
+<section id="verify">
+  <h2>Verify the bronze layer</h2>
+  <p>Open the warehouse and look at what landed. DuckDB's CLI gives you a SQL prompt straight against the file:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">duckdb warehouse.duckdb</code></pre></div>
+  <div class="code-wrap"><div class="code-header"><span>DuckDB SQL</span></div><pre><code class="language-sql">-- what tables landed in bronze?
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'bronze' ORDER BY table_name;
+
+-- row counts per bronze table
+SELECT 'customers'  AS t, count(*) FROM bronze.customers
+UNION ALL SELECT 'gpus',       count(*) FROM bronze.gpus
+UNION ALL SELECT 'gpu_prices', count(*) FROM bronze.gpu_prices
+UNION ALL SELECT 'rentals',    count(*) FROM bronze.rentals;
+
+-- the watermark we're tracking
+SELECT * FROM bronze._watermarks;
+
+-- peek at a few landed rentals
+SELECT rental_id, customer_id, gpu_id, started_at
+FROM bronze.rentals ORDER BY rental_id DESC LIMIT 5;</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The bronze schema listing your four tables plus <code>_watermarks</code>; counts matching the source; and a <code>_watermarks</code> row reading <code>rentals | 5000</code> (or whatever your max <code>rental_id</code> is). The rentals look exactly like the source — bronze is a faithful copy, not a transformation. Type <code>.quit</code> to leave the DuckDB prompt.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit Lab 02</h2>
+  <p>You've added the ingestion stage. Commit the <em>code</em> (the warehouse file stays gitignored):</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git add ingest/extract_postgres.py .gitignore
+git status                       # confirm warehouse.duckdb is NOT staged
+git commit -m "Lab 02: ingest Postgres -> bronze (incremental + idempotent)"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A commit containing your extractor and the updated <code>.gitignore</code> — and <code>git status</code> showing <code>warehouse.duckdb</code> as ignored, never staged. Your history now reads "Lab 01 → Lab 02," one honest step at a time.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain why bronze lands data <em>raw</em>, with no cleaning, and what you'd lose if you cleaned it here instead?</li>
+    <li>Why are <code>customers</code>/<code>gpus</code>/<code>gpu_prices</code> full-refreshed but <code>rentals</code> incremental — what makes that the right call for each?</li>
+    <li>What does the <code>_watermarks</code> table store, and how does it stop a second run from duplicating rentals?</li>
+    <li>If you re-ran the extractor right now, how many new rentals would it pull — and why?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Make the rentals extract incremental so a second run only pulls new rows</strong></summary>
+    <div class="collapse-card-body">
+      <p>Suppose a colleague's first draft pulled rentals with a plain full copy each run:</p>
+      <div class="code-wrap"><div class="code-header"><span>before — duplicates on every run</span></div><pre><code class="language-python">def naive_rentals(con):
+    con.execute("CREATE OR REPLACE TABLE bronze.rentals AS "
+                "SELECT * FROM pg.public.rentals;")</code></pre></div>
+      <p>That's actually idempotent (replace, not append), but it re-copies <em>every</em> rental on every run — wasteful as the table grows to millions of rows. Worse, a tempting "fix" of switching <code>CREATE OR REPLACE</code> to <code>INSERT INTO</code> would duplicate rows. Your task: rewrite it to land only rentals newer than the last run, using a high-watermark, and prove a second run pulls <code>+0</code>.</p>
+      <p><strong>Solution.</strong> Track the max <code>rental_id</code> in a watermark table and insert only rows above it — exactly the <code>incremental_rentals</code> pattern from this lab. The essence:</p>
+      <div class="code-wrap"><div class="code-header"><span>after — incremental + idempotent</span></div><pre><code class="language-python">def incremental_rentals(con):
+    # 1) make sure the target exists (empty, same shape as source)
+    con.execute("CREATE TABLE IF NOT EXISTS bronze.rentals AS "
+                "SELECT * FROM pg.public.rentals WHERE false;")
+
+    # 2) read how far we've already ingested (0 the first time)
+    wm = get_watermark(con, "rentals")
+
+    # 3) insert ONLY rows newer than the watermark
+    con.execute("INSERT INTO bronze.rentals "
+                "SELECT * FROM pg.public.rentals WHERE rental_id > ?", [wm])
+
+    # 4) advance the watermark to the new max
+    new_wm = con.execute(
+        "SELECT max(rental_id) FROM bronze.rentals").fetchone()[0] or 0
+    set_watermark(con, "rentals", new_wm)</code></pre></div>
+      <p><strong>Prove it.</strong> Run the extractor, note the total. Run it again with no new source data — the insert's <code>WHERE rental_id &gt; ?</code> now matches nothing, so the total is unchanged and you see <code>+0 new</code>. Then re-run the Lab 01 generator to append rentals and run once more: you'll see exactly the new count land, and the watermark step up. That's a pipeline that's cheap to re-run <em>and</em> safe to retry — the two properties every ingestion job needs.</p>
+      <div class="callout tip">
+        <span class="callout-label">Going further</span>
+        <p>Some sources update existing rows (a rental's <code>ended_at</code> gets filled in later). A pure append watermark would miss those edits. The fix is a <em>merge/upsert</em> on the primary key — land new rows and update changed ones. You'll meet exactly this idea in Lab 03 when silver handles slowly-changing dimensions.</p>
+      </div>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Bronze is a faithful but messy copy. Time to clean it, type it, and shape it into an analytics-ready star schema. → <a href="03-transform-silver-gold-dbt.html">Lab 03 — Transform — Silver &amp; Gold with dbt</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

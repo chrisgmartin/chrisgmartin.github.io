@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orchestration with Dagster — The DE Craft</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#problem">The pile-of-scripts problem</a>
+    <a href="#what">What an orchestrator does</a>
+    <a href="#assets">Dagster's asset model</a>
+    <a href="#schedules">Schedules &amp; sensors</a>
+    <a href="#hands-on">Hands-on: build the graph</a>
+    <a href="#backfills">Backfills &amp; partitions</a>
+    <a href="#wider">How this connects</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="09-streaming-fundamentals.html">← Previous</a>
+    <a href="11-data-quality-and-testing.html">Next: Data Quality &amp; Testing →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 4 · The Craft</span>
+  <h1>Orchestration with Dagster</h1>
+  <p class="subtitle">You've learned to model, move, and transform data. But a pipeline that only runs when you type a command isn't a pipeline — it's a demo. Orchestration is how the whole thing runs itself: on time, in the right order, recovering from failure, and telling you when something breaks. This lab builds a real, observable asset graph for the marketplace and runs it in Dagster's UI.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>In your <code>mini-griddp</code> repo, add Dagster and its web UI. With <a href="https://docs.astral.sh/uv/">uv</a> (recommended): <code>uv add dagster dagster-webserver</code>. With plain pip: <code>pip install dagster dagster-webserver</code>. That gives you the <code>dagster</code> command and the local web app you'll open later. Have your Postgres/DuckDB stack from Course 2 alive too — we'll wire real data into the graph.</p>
+</div>
+
+<section id="problem">
+  <h2>The pile-of-scripts problem</h2>
+  <p>Most data pipelines start the same innocent way: a few scripts, and a <code>cron</code> entry to run each one on a schedule. <code>extract.py</code> at 1am, <code>transform.py</code> at 2am, <code>load.py</code> at 3am. It works — until it doesn't. And cron will never tell you that it didn't.</p>
+  <p>Here's what that pile actually looks like, versus what you want:</p>
+  <div class="flow">  THE PILE OF SCRIPTS (cron)                  AN ORCHESTRATED ASSET GRAPH
+  ───────────────────────────                 ───────────────────────────
+
+  1:00am  extract.py   ──┐                       ┌─ extract_rentals
+  2:00am  transform.py   │  hope #1 finished      │        │  (knows it depends on extract)
+  3:00am  load.py        │  before #2 started!    │        ▼
+                         │                        │   transform_revenue
+  ✗ no ordering ─────────┘                        │        │
+  ✗ no retries (one blip = no data all day)       │        ▼
+  ✗ no visibility (did it even run?)              │     load_mart
+  ✗ fails SILENTLY at 2:07am, you find out        │
+    when a dashboard is empty Monday              └─ runs IN ORDER, retries,
+                                                     logs every run, alerts on fail</div>
+  <p>The cron version has four fatal gaps. There's <strong>no dependency ordering</strong> — cron just fires at a clock time and prays the upstream job already finished. There are <strong>no retries</strong> — a one-second network blip means no data for the whole day. There's <strong>no visibility</strong> — you can't see what ran, what it produced, or how long it took. And worst of all, it <strong>fails silently</strong> — a script crashes at 2:07am and the first you hear of it is an empty dashboard on Monday morning. An orchestrator closes all four gaps.</p>
+</section>
+
+<section id="what">
+  <h2>What an orchestrator does — the four jobs</h2>
+  <p>Strip away the jargon and an orchestrator has exactly four jobs. Hold these in your head; everything else is detail.</p>
+  <table>
+    <thead><tr><th>Job</th><th>What it means</th><th>What it replaces</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Schedule</strong></td><td>Run work on a cadence (every night, every hour) <em>or</em> when new data appears.</td><td>A <code>crontab</code> line, run manually.</td></tr>
+      <tr><td><strong>Order</strong></td><td>Run steps in dependency order — never start a step until its inputs are ready.</td><td>Guessing run times and hoping.</td></tr>
+      <tr><td><strong>Retry &amp; recover</strong></td><td>Re-run a failed step automatically; resume a pipeline from where it broke.</td><td>A failed script that just… stays failed.</td></tr>
+      <tr><td><strong>Observe &amp; alert</strong></td><td>Show every run, its logs, duration, and outputs; ping you when something fails.</td><td>Silence. You find out from a user.</td></tr>
+    </tbody>
+  </table>
+  <p>A fifth capability falls out of the first four: <strong>backfill</strong> — re-running history for a range of dates when you change logic or recover from an outage. We'll touch that at the end.</p>
+  <div class="callout insight">
+    <span class="callout-label">The mental shift</span>
+    <p>Cron answers "<em>when</em> should this run?" An orchestrator answers "<em>what</em> needs to be true, and <em>in what order</em>, for this data to exist?" That second question is the right one for data work — and it leads directly to how Dagster thinks.</p>
+  </div>
+</section>
+
+<section id="assets">
+  <h2>Dagster's asset model</h2>
+  <p>Most older orchestrators (Airflow is the classic) are <strong>task-based</strong>: you describe a graph of <em>actions</em> — "run script A, then run script B" — and the tool runs them in order. It never knows or cares <em>what those actions produce</em>. The graph is about doing, not about having.</p>
+  <p>Dagster flips this. You declare <strong>data assets</strong> — the things you actually want to exist: a table, a file, a model. Each asset is a Python function that <em>produces</em> that thing, and you say which other assets it depends on. Dagster reads those dependencies and <strong>builds the graph for you</strong>. You describe the world you want; it figures out the order.</p>
+  <table>
+    <thead><tr><th></th><th>Task-based (e.g. Airflow)</th><th>Asset-based (Dagster)</th></tr></thead>
+    <tbody>
+      <tr><td>You declare…</td><td>Actions to perform, wired in order</td><td>Data assets to produce, with dependencies</td></tr>
+      <tr><td>The unit is…</td><td>A task ("run this")</td><td>An asset ("this table exists")</td></tr>
+      <tr><td>The graph is about…</td><td>Doing</td><td>Having</td></tr>
+      <tr><td>Lineage / "what is this column?"</td><td>Bolt-on, external</td><td>Built in — the graph <em>is</em> the lineage</td></tr>
+      <tr><td>Natural question</td><td>"Did the job run?"</td><td>"Is this table fresh and correct?"</td></tr>
+    </tbody>
+  </table>
+  <p>Why does asset-based fit data work so well? Because in data engineering you almost never care that a script <em>ran</em> — you care that a <em>table is fresh and correct</em>. The asset model makes that the first-class thing. Your dependency graph doubles as your data lineage map, for free.</p>
+  <p>Here's the whole idea in code. An asset is a plain function decorated with <code>@asset</code>; it depends on another asset simply by naming it as a parameter:</p>
+  <div class="code-wrap"><div class="code-header"><span>python</span></div><pre><code class="language-python">from dagster import asset
+
+@asset
+def extract_rentals():
+    # produce the raw data — return it, and Dagster passes it downstream
+    return [{"gpu": "a100", "hours": 3, "rate": 2}, {"gpu": "h100", "hours": 1, "rate": 5}]
+
+@asset
+def transform_revenue(extract_rentals):   # ← the PARAMETER name = the upstream asset
+    # Dagster sees this dependency and orders the graph automatically
+    return [{**r, "revenue": r["hours"] * r["rate"]} for r in extract_rentals]</code></pre></div>
+  <p>Notice what you did <em>not</em> write: any ordering, any "run extract before transform" instruction. The parameter <code>extract_rentals</code> on <code>transform_revenue</code> <em>is</em> the dependency. Dagster reads it and knows the order. That's the asset model in one breath.</p>
+</section>
+
+<section id="schedules">
+  <h2>Schedules &amp; sensors</h2>
+  <p>Declaring the graph is half the job; the other half is <em>when</em> it runs. Dagster gives you two triggers:</p>
+  <ul>
+    <li><strong>Schedules</strong> — time-based, expressed as cron. "Materialize these assets every day at 6am." This is the workhorse for most batch pipelines.</li>
+    <li><strong>Sensors</strong> — event-based and <em>data-aware</em>. A sensor watches for a condition — a new file landed in a bucket, an upstream table got fresh — and kicks off a run the moment it's true, instead of waiting for the clock. This is how you get pipelines that react to data rather than guessing at timing.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Rule of thumb</span>
+    <p>Reach for a <strong>schedule</strong> when work is naturally periodic ("nightly revenue refresh"). Reach for a <strong>sensor</strong> when work should follow data arrival ("the vendor dropped a file — process it now"). You'll add a daily schedule yourself in the exercise.</p>
+  </div>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: build the marketplace graph</h2>
+  <p>Time to build a real one. We'll create three assets for the GPU-rental marketplace — <code>extract_rentals</code> → <code>transform_revenue</code> → <code>load_mart</code> — run Dagster locally, and watch the lineage graph light up in the UI.</p>
+  <p>In your <code>mini-griddp</code> repo, create a folder and a single file:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">mkdir -p orchestration
+cd orchestration</code></pre></div>
+  <p>Now the assets. Create <code>orchestration/marketplace.py</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>python</span></div><pre><code class="language-python"># orchestration/marketplace.py
+import duckdb
+from dagster import asset, Definitions, MaterializeResult, MetadataValue
+
+
+@asset
+def extract_rentals():
+    """Stage 1: pull raw rentals. Here we fake a small batch; in production
+    this would read from Postgres (Course 4, ch. 05 ingestion)."""
+    rows = [
+        {"customer": "acme",  "gpu": "a100", "hours": 3, "rate": 2.0},
+        {"customer": "acme",  "gpu": "h100", "hours": 1, "rate": 5.0},
+        {"customer": "globex", "gpu": "a100", "hours": 4, "rate": 2.0},
+    ]
+    return rows
+
+
+@asset
+def transform_revenue(extract_rentals):
+    """Stage 2: derive revenue per rental. Depends on extract_rentals
+    purely by naming it as a parameter — Dagster orders the graph."""
+    return [
+        {**r, "revenue": round(r["hours"] * r["rate"], 2)}
+        for r in extract_rentals
+    ]
+
+
+@asset
+def load_mart(transform_revenue):
+    """Stage 3: write a revenue-by-GPU mart into DuckDB."""
+    con = duckdb.connect("marketplace.duckdb")
+    con.execute("CREATE OR REPLACE TABLE revenue_by_gpu (gpu VARCHAR, revenue DOUBLE)")
+    totals = {}
+    for r in transform_revenue:
+        totals[r["gpu"]] = totals.get(r["gpu"], 0) + r["revenue"]
+    for gpu, rev in totals.items():
+        con.execute("INSERT INTO revenue_by_gpu VALUES (?, ?)", [gpu, round(rev, 2)])
+    n = con.execute("SELECT count(*) FROM revenue_by_gpu").fetchone()[0]
+    con.close()
+    # surface a number into the UI so you can see what the run produced
+    return MaterializeResult(metadata={"rows_written": MetadataValue.int(n)})
+
+
+# Definitions is how Dagster discovers your assets.
+defs = Definitions(assets=[extract_rentals, transform_revenue, load_mart])</code></pre></div>
+  <p>Three functions, two implicit dependencies, and one <code>Definitions</code> object that hands the assets to Dagster. That's a complete project. Now launch the local UI from the same folder:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># from inside the orchestration/ folder
+dagster dev -f marketplace.py</code></pre></div>
+  <p>Dagster starts a local web server (it prints a URL, usually <code>http://127.0.0.1:3000</code>). Open it. Click into <strong>Assets</strong> → <strong>View global asset lineage</strong>, then hit the <strong>Materialize all</strong> button to run the graph.</p>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The UI draws a left-to-right <strong>lineage graph</strong>: <code>extract_rentals</code> → <code>transform_revenue</code> → <code>load_mart</code>, with arrows showing the dependencies <em>you never explicitly wrote</em>. After clicking <strong>Materialize all</strong>, each box turns green in order, and <code>load_mart</code> shows <code>rows_written: 2</code> in its metadata. Confirm the data really landed: <code>python -c "import duckdb; print(duckdb.connect('marketplace.duckdb').sql('SELECT * FROM revenue_by_gpu').fetchall())"</code> prints the per-GPU revenue. If the boxes ran out of order or skipped, your parameter names don't match the upstream asset names — that's the only wiring there is.</p>
+  </div>
+  <div class="callout danger">
+    <span class="callout-label">⚠ The dependency is the parameter name</span>
+    <p>In the asset model there's no separate "set the order" step — so a typo <em>is</em> a broken graph. If <code>transform_revenue</code>'s parameter were spelled <code>extract_rental</code> (no <em>s</em>), Dagster would treat it as a different, missing upstream asset and refuse to wire them. When a dependency doesn't appear, check the spelling first.</p>
+  </div>
+</section>
+
+<section id="backfills">
+  <h2>Backfills &amp; partitions</h2>
+  <p>Two more ideas you'll meet constantly, briefly. So far our assets produce "the latest" data in one lump. Real pipelines usually slice data by time — one chunk per day. In Dagster you declare a <strong>partitioned asset</strong> (say, daily partitions keyed by date), and each day's data becomes its own independently-materializable cell.</p>
+  <p>Once an asset is partitioned, a <strong>backfill</strong> is just "materialize this range of partitions." Changed your revenue logic and need to recompute the last 30 days? Select the date range in the UI and Dagster runs all 30 partitions, in order, with retries and a progress bar — no hand-written loop, no forgotten dates. This is the single feature that makes recovering from an outage or a logic bug a calm afternoon instead of a panic.</p>
+  <div class="callout tip">
+    <span class="callout-label">Why partitions matter</span>
+    <p>Partitioning turns "re-run everything" (slow, risky) into "re-run only what changed" (fast, surgical). It's the orchestration counterpart to the incremental thinking you met with dbt and CDC — process the slice, not the world.</p>
+  </div>
+</section>
+
+<section id="wider">
+  <h2>How this connects</h2>
+  <p>The three-asset toy you built is the same shape as a production platform — just bigger. In a real <code>mini-griddp</code>, Dagster sits on top of everything you've learned in this course and runs it as one coordinated graph:</p>
+  <ul>
+    <li>Your <strong>ingestion</strong> (Course 4, ch. 05–06) becomes the upstream "extract" assets that pull from Postgres.</li>
+    <li>Your <strong>dbt</strong> models (ch. 07) become assets too — Dagster has a native integration that turns each dbt model into a Dagster asset, so your SQL transformations and your Python steps live in <em>one</em> lineage graph.</li>
+    <li>Your <strong>data-quality tests</strong> (next chapter) run as part of the graph — a failing test can block downstream assets, so bad data never reaches a dashboard.</li>
+  </ul>
+  <p>That unified graph — ingest, transform, test, all scheduled and observable in one place — is exactly what you'll assemble in the capstone. You just built its smallest working version.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you name the four jobs an orchestrator does that cron does not?</li>
+    <li>Can you explain the difference between task-based and asset-based orchestration — and why asset-based fits data work?</li>
+    <li>In a Dagster asset function, what creates a dependency on an upstream asset?</li>
+    <li>When would you use a sensor instead of a schedule?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Add a fourth asset and a daily schedule</strong></summary>
+    <div class="collapse-card-body">
+      <p>Extend the graph: add a downstream asset <code>top_gpu</code> that depends on <code>load_mart</code> and reports the single highest-revenue GPU. Then add a schedule that materializes the whole graph every day at 6am. Re-run <code>dagster dev</code> and confirm the new node appears in the lineage and the schedule shows up under the <strong>Automation</strong> tab.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — add to marketplace.py</span></div><pre><code class="language-python">from dagster import (
+    asset, Definitions, MaterializeResult, MetadataValue,
+    define_asset_job, ScheduleDefinition,
+)
+
+@asset
+def top_gpu(load_mart):
+    """Fourth asset, downstream of load_mart. (load_mart returns a
+    MaterializeResult, so read the mart back from DuckDB.)"""
+    import duckdb
+    con = duckdb.connect("marketplace.duckdb")
+    gpu, rev = con.execute(
+        "SELECT gpu, revenue FROM revenue_by_gpu ORDER BY revenue DESC LIMIT 1"
+    ).fetchone()
+    con.close()
+    return MaterializeResult(
+        metadata={"top_gpu": MetadataValue.text(gpu),
+                  "revenue": MetadataValue.float(rev)}
+    )
+
+# a job that targets all assets, and a schedule that runs it daily at 6am
+daily_job = define_asset_job("daily_refresh", selection="*")
+daily_schedule = ScheduleDefinition(job=daily_job, cron_schedule="0 6 * * *")
+
+defs = Definitions(
+    assets=[extract_rentals, transform_revenue, load_mart, top_gpu],
+    jobs=[daily_job],
+    schedules=[daily_schedule],
+)</code></pre></div>
+      <p><strong>You should see</strong> a fourth box, <code>top_gpu</code>, hanging off <code>load_mart</code> in the lineage graph; materializing it surfaces <code>top_gpu</code> and <code>revenue</code> in its metadata. Under <strong>Automation</strong>, <code>daily_refresh</code> appears with cron <code>0 6 * * *</code> (toggle it on to arm it). You've now declared dependencies, produced data, surfaced metadata, and scheduled the lot — the full orchestration loop in one file.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>Your pipeline runs itself now — but running on time means nothing if the numbers are wrong. Next we make the data <em>trustworthy</em>: testing and quality checks that catch bad data before anyone sees it. → <a href="11-data-quality-and-testing.html">Data Quality &amp; Testing</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

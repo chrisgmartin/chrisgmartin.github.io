@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Files &amp; Serialization at Scale — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-format">The format is a decision</a>
+    <a href="#row-vs-col-files">Row vs columnar files</a>
+    <a href="#parquet">Inside a Parquet file</a>
+    <a href="#compression">Compression codecs</a>
+    <a href="#partitioning">Partitioning &amp; small files</a>
+    <a href="#object-storage">Object storage as the lake</a>
+    <a href="#hands-on">Hands-on: CSV vs Parquet</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-python-for-de.html">← Previous</a>
+    <a href="08-operating-systems.html">Next: Operating Systems &amp; Resources →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Files &amp; Serialization at Scale</h1>
+  <p class="subtitle">Back in Chapter 01 you learned that "saving data" means serializing it — turning structured values into a flat stream of bytes. Now we ask the question that decides whether your pipeline is cheap and fast or slow and expensive: <em>which</em> byte layout? The same dataset stored as CSV versus Parquet can differ 5–10× in size and scan time. This chapter shows you why, and lets you measure it with your own hands.</p>
+</header>
+
+<section id="why-format">
+  <h2>The format is a decision, not an afterthought</h2>
+  <p>Beginners reach for CSV by reflex — it opens in a spreadsheet, it's human-readable, every tool accepts it. For small files that's fine. But the moment your data grows, the <strong>file format becomes a performance and cost decision</strong>, and CSV is usually the wrong one.</p>
+  <p>Here's the concrete stake. In Chapter 01 you saw that a file is just serialized bytes. In Chapter 03 you met the distinction between <strong>row-oriented</strong> and <strong>columnar</strong> storage inside a database. File formats make exactly the same choice — but now you can see and touch the result, because it's a file on disk you can measure. A dashboard that scans a 50&nbsp;GB CSV every time someone clicks a filter will be slow and run up a cloud bill; the identical data in partitioned, compressed Parquet might scan 2&nbsp;GB and cost a tenth as much. Nothing about the <em>data</em> changed — only its physical layout.</p>
+  <div class="callout insight">
+    <span class="callout-label">The one-sentence version</span>
+    <p>CSV is a great <em>interchange</em> format (passing data between humans and tools) and a terrible <em>analytics</em> format (querying it at scale). Knowing when to switch is one of the highest-leverage habits a data engineer has.</p>
+  </div>
+</section>
+
+<section id="row-vs-col-files">
+  <h2>Row formats vs columnar formats</h2>
+  <p>Every file format has to decide one thing: as it lays bytes down on disk, does it keep a whole <em>record</em> together, or a whole <em>column</em> together? That single choice splits the format world in two.</p>
+  <ul>
+    <li><strong>Row-oriented:</strong> CSV, JSON (lines), Avro. Values for one record sit next to each other.</li>
+    <li><strong>Columnar:</strong> Parquet, ORC. Values for one column sit next to each other.</li>
+  </ul>
+  <p>Picture a tiny table of three rows and three columns, and look at the byte order each layout writes:</p>
+  <div class="flow">  THE TABLE                 ROW LAYOUT (CSV/Avro)        COLUMNAR LAYOUT (Parquet/ORC)
+  id  region  amount      ──────────────────────       ─────────────────────────────
+   1   us      120        [1,us,120]                     [1,2,3]            ← all ids
+   2   eu       80        [2,eu,80]                      [us,eu,us]         ← all regions
+   3   us      200        [3,us,200]                     [120,80,200]       ← all amounts
+                          one record at a time           one column at a time
+                          ▲ great for "write/read        ▲ great for "scan ONE column
+                            a whole row"                    across MANY rows"</div>
+  <p>Why does columnar make files <em>smaller</em>? Because similar values end up adjacent. A column of <code>region</code> values is just <code>us, eu, us, us, eu…</code> — lots of repetition, which compresses brilliantly. A column of timestamps increases steadily, so you can store the differences instead of full values. When you mix all three columns together (the row layout), the byte stream looks random and compresses poorly.</p>
+  <p>Why does columnar make analytics <em>faster</em>? Analytics queries are wide and shallow: <code>SELECT region, SUM(amount) … GROUP BY region</code> touches 2 of maybe 200 columns, but every row. In a columnar file the engine reads <em>only</em> the <code>region</code> and <code>amount</code> chunks and skips the other 198 entirely. In a row file it must read every byte of every row to get at those two fields.</p>
+  <div class="callout tip">
+    <span class="callout-label">When row formats win</span>
+    <p>Columnar isn't always better. If you're <em>streaming</em> events and appending one whole record at a time, or you fetch entire records by key (transactional workloads), a row format like Avro is the right tool — it writes a complete record cheaply and doesn't have to touch every column to add one row. Use columnar for <em>analytics over many rows</em>; use row for <em>whole-record writes and streaming</em>.</p>
+  </div>
+  <table>
+    <thead><tr><th>Format</th><th>Layout</th><th>Compresses</th><th>Best at</th><th>Human-readable</th></tr></thead>
+    <tbody>
+      <tr><td>CSV</td><td>Row</td><td>Poorly</td><td>Interchange, small files, eyeballing</td><td>Yes</td></tr>
+      <tr><td>JSON (lines)</td><td>Row</td><td>Poorly</td><td>Nested/flexible records, APIs, logs</td><td>Yes</td></tr>
+      <tr><td>Avro</td><td>Row</td><td>Well</td><td>Streaming, row-by-row writes, schema evolution</td><td>No (binary)</td></tr>
+      <tr><td>Parquet</td><td>Columnar</td><td>Very well</td><td>Analytics, scans, the lakehouse</td><td>No (binary)</td></tr>
+      <tr><td>ORC</td><td>Columnar</td><td>Very well</td><td>Analytics (Hive/Spark ecosystem)</td><td>No (binary)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="parquet">
+  <h2>Inside a Parquet file</h2>
+  <p>Parquet is the default analytics format you'll meet everywhere — DuckDB, Spark, BigQuery, Snowflake all read and write it. It's worth understanding its insides, because they explain <em>why</em> a well-targeted query barely touches the disk.</p>
+  <p>A Parquet file is a nested structure, not a flat dump:</p>
+  <div class="flow">  PARQUET FILE
+  ├─ Row group 1   (a horizontal slice of rows, e.g. ~1 million)
+  │    ├─ Column chunk: id        ┐
+  │    │     ├─ page ├─ page …    │  each chunk holds ONE column's
+  │    ├─ Column chunk: region    │  values for THIS row group,
+  │    │     ├─ page ├─ page …    │  split into compressed "pages"
+  │    └─ Column chunk: amount    ┘
+  ├─ Row group 2  ├─ id ├─ region ├─ amount  …
+  ├─ …
+  └─ Footer  ──►  embedded SCHEMA (column names + types)
+                 + per-column STATISTICS (min, max, null count)
+                   for every row group</div>
+  <p>Three things in there change the game:</p>
+  <ul>
+    <li><strong>Embedded schema and types.</strong> Unlike CSV — where everything is text and <code>"2026-06-21"</code> might be a date or a string, you can't tell — Parquet stores the real type of each column. An engine reads a Parquet file already knowing column 3 is a 64-bit integer. No guessing, no parsing dates out of strings.</li>
+    <li><strong>Column chunks.</strong> Because each column lives in its own chunk, an engine seeks straight to the chunks it needs and reads nothing else. This is the file-level version of the columnar advantage above.</li>
+    <li><strong>Per-column statistics.</strong> The footer records the min and max value of each column <em>within each row group</em>. This is the quiet superpower.</li>
+  </ul>
+  <p>Those statistics enable <strong>predicate pushdown</strong> (also called row-group skipping). Suppose a row group's <code>date</code> column has <code>min = 2026-01-01</code> and <code>max = 2026-01-31</code>, and your query says <code>WHERE date = '2026-06-21'</code>. The engine reads just the footer, sees that June&nbsp;21 cannot possibly be in a January-only row group, and <strong>skips the entire row group without reading it</strong>. On a file with hundreds of row groups, a selective filter might touch only one or two — that's how "<code>WHERE date = X</code>" stays cheap even on huge files.</p>
+  <div class="callout insight">
+    <span class="callout-label">The mental model</span>
+    <p>A CSV makes the engine read every byte and decide afterward what to keep. Parquet lets the engine read a tiny footer first, then <em>decide what not to read at all</em>. Skipping work is always faster than doing it efficiently.</p>
+  </div>
+</section>
+
+<section id="compression">
+  <h2>Compression: the CPU-vs-size tradeoff</h2>
+  <p>On top of the columnar layout, Parquet compresses each page with a <strong>codec</strong>. Compression shrinks the bytes on disk (less storage cost, fewer bytes to read from disk or network) at the price of CPU time to compress when writing and decompress when reading. That's the whole tradeoff: <strong>smaller files cost more CPU</strong>. The art is picking where to sit on that curve.</p>
+  <p>Columnar data compresses far better than row data for the reason we saw: a column is full of similar, often repeated values, and compression algorithms feed on repetition. The same gzip applied to a CSV might cut it in half; applied to columnar pages it can cut it by 5×.</p>
+  <table>
+    <thead><tr><th>Codec</th><th>Compression ratio</th><th>Speed (compress/decompress)</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Snappy</strong></td><td>Modest</td><td>Very fast</td><td>Default for Parquet; you want speed and "good enough" size</td></tr>
+      <tr><td><strong>Zstd</strong></td><td>High (and tunable by level)</td><td>Fast</td><td>Best all-rounder today — near-gzip ratios at near-Snappy speed</td></tr>
+      <tr><td><strong>gzip</strong></td><td>High</td><td>Slow</td><td>Maximum portability; archival where read speed matters less</td></tr>
+      <tr><td><strong>Uncompressed</strong></td><td>None</td><td>Fastest</td><td>Rare — CPU-bound pipeline where bytes are cheap and free</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">A safe default</span>
+    <p>For most analytics workloads, <strong>Snappy</strong> (the Parquet default) is a fine starting point, and <strong>Zstd</strong> is the modern upgrade when you want smaller files without paying much read-time penalty. Reach for gzip only when something downstream demands it. Don't agonize — measure on your data, as you will in the lab below.</p>
+  </div>
+</section>
+
+<section id="partitioning">
+  <h2>Partitioning and the small-files problem</h2>
+  <p>Row-group skipping happens <em>inside</em> a file. <strong>Partitioning</strong> applies the same idea one level up — across <em>files</em>. You split a dataset into a folder tree keyed by a column, most often a date:</p>
+  <div class="flow">  events/
+  ├─ date=2026-06-20/  part-0.parquet  part-1.parquet
+  ├─ date=2026-06-21/  part-0.parquet  part-1.parquet   ◄── query for June 21
+  └─ date=2026-06-22/  part-0.parquet                       reads ONLY this folder
+
+  WHERE date = '2026-06-21'  ──►  engine reads the folder name, skips the
+                                   other days' files entirely (partition pruning)</div>
+  <p>Now a query filtered on <code>date</code> never even opens the other days' files — the engine prunes them by reading the directory names. This is wildly effective for the most common analytics filter (a date range), which is why date partitioning is the default move.</p>
+  <p>But there's a trap, and it's the one beginners fall into: the <strong>small-files problem</strong>. If you partition too finely — say by minute, or by date <em>and</em> region <em>and</em> user — you end up with millions of tiny files. Every file carries fixed overhead (open it, read its footer, list it in the directory), so thousands of 10&nbsp;KB files are dramatically slower to scan than a handful of 256&nbsp;MB files holding the same rows. Object storage especially punishes many small reads.</p>
+  <div class="callout danger">
+    <span class="callout-label">⚠ Partition coarsely</span>
+    <p>Partition on a low-cardinality column you actually filter on (date is the classic), and aim for files in the tens-to-hundreds of megabytes. Partitioning by a high-cardinality column like <code>user_id</code> is a common, painful mistake — it explodes into millions of files and makes <em>everything</em> slow.</p>
+  </div>
+  <p>The fix when small files accumulate is <strong>compaction</strong>: a periodic job that reads many small files in a partition and rewrites them as a few large ones.</p>
+</section>
+
+<section id="object-storage">
+  <h2>Object storage: the substrate of the lake</h2>
+  <p>Where do all these Parquet files live? Increasingly, in <strong>object storage</strong> — Amazon S3, Google Cloud Storage, or the MinIO server you stood up locally in Course 2. Object storage is the substrate that makes the modern data platform possible:</p>
+  <ul>
+    <li><strong>Cheap.</strong> Far cheaper per gigabyte than database storage or attached disks.</li>
+    <li><strong>Durable.</strong> Providers replicate your bytes across machines and facilities; data loss is vanishingly rare.</li>
+    <li><strong>Effectively infinite.</strong> You never run out of space or manage volumes — you just write more objects.</li>
+  </ul>
+  <p>The catch: object storage has <strong>higher latency</strong> than a local disk. Each object is fetched over the network via an HTTP request, so a single read is slow to <em>start</em>, even though throughput once flowing is high. This is precisely why the techniques above matter so much here — column chunks, row-group skipping, and partition pruning all <em>minimize the number and size of reads</em>, which is exactly what high-latency object storage rewards.</p>
+  <div class="callout insight">
+    <span class="callout-label">This is the data lake</span>
+    <p>Put it together: <strong>files (Parquet) in object storage (S3/MinIO) is a data lake.</strong> No database server owns the data — engines like DuckDB, Spark, or Trino read the files directly, on demand. The format and layout decisions in this chapter are what make querying that lake fast and cheap instead of slow and expensive. (Add a transaction log on top and a lake becomes a <em>lakehouse</em> — a thread we'll pick up in later courses.)</p>
+  </div>
+</section>
+
+<section id="hands-on">
+  <h2>Hands-on: measure CSV vs Parquet yourself</h2>
+  <p>Claims about "5–10× smaller and faster" only stick once you've seen them. Let's generate a dataset, write it both ways, and compare. We'll use <strong>DuckDB</strong> from Python (installed in Course 2; if not, <code>pip install duckdb</code>). DuckDB is itself a columnar engine and reads/writes Parquet natively.</p>
+
+  <div class="code-wrap"><div class="code-header"><span>files_lab.py</span></div><pre><code class="language-python">import duckdb, os, time
+
+con = duckdb.connect()
+
+# 1) Build a realistic-ish table: 5 million rows, a few repetitive columns.
+con.execute("""
+    CREATE TABLE events AS
+    SELECT
+        i                                   AS id,
+        DATE '2026-01-01' + (i % 180)       AS event_date,   -- 180 distinct days
+        ['us','eu','apac'][1 + (i % 3)]     AS region,        -- only 3 values
+        (i * 7 % 1000) / 10.0               AS amount
+    FROM range(5_000_000) t(i);
+""")
+
+# 2) Write the SAME data two ways.
+con.execute("COPY events TO 'events.csv'     (FORMAT CSV, HEADER);")
+con.execute("COPY events TO 'events.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);")
+
+# 3) Compare file sizes.
+csv_mb = os.path.getsize('events.csv') / 1e6
+pq_mb  = os.path.getsize('events.parquet') / 1e6
+print(f"CSV    : {csv_mb:8.1f} MB")
+print(f"Parquet: {pq_mb:8.1f} MB   ({csv_mb / pq_mb:.1f}x smaller)")
+
+# 4) Compare scan speed for a typical analytics query.
+def timed(sql):
+    start = time.perf_counter()
+    con.execute(sql).fetchall()
+    return time.perf_counter() - start
+
+q = "SELECT region, SUM(amount) FROM read_{}('events.{}') WHERE event_date = DATE '2026-03-01' GROUP BY region"
+t_csv = timed(q.format('csv', 'csv'))
+t_pq  = timed(q.format('parquet', 'parquet'))
+print(f"\nScan CSV    : {t_csv*1000:7.1f} ms")
+print(f"Scan Parquet: {t_pq*1000:7.1f} ms   ({t_csv / t_pq:.1f}x faster)")</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The Parquet file is dramatically smaller — commonly <strong>5–10× smaller</strong> than the CSV — because the <code>region</code> column (three repeated strings) and <code>event_date</code> (180 repeated dates) compress almost to nothing in columnar form. The Parquet scan is also several times faster: DuckDB reads only the two columns the query needs and uses the row-group <code>min/max</code> on <code>event_date</code> to skip data the CSV reader is forced to parse line by line. Exact numbers depend on your machine, but the <em>direction</em> is never in doubt.</p>
+  </div>
+
+  <p>Prefer pandas? The same comparison, fewer moving parts:</p>
+  <div class="code-wrap"><div class="code-header"><span>files_lab_pandas.py</span></div><pre><code class="language-python">import pandas as pd, numpy as np, os
+
+n = 5_000_000
+df = pd.DataFrame({
+    "id": np.arange(n),
+    "event_date": pd.Timestamp("2026-01-01") + pd.to_timedelta(np.arange(n) % 180, "D"),
+    "region": np.array(["us", "eu", "apac"])[np.arange(n) % 3],
+    "amount": (np.arange(n) * 7 % 1000) / 10.0,
+})
+
+df.to_csv("events.csv", index=False)
+df.to_parquet("events.parquet", compression="zstd")   # needs pyarrow
+
+csv_mb = os.path.getsize("events.csv") / 1e6
+pq_mb  = os.path.getsize("events.parquet") / 1e6
+print(f"CSV {csv_mb:.1f} MB  vs  Parquet {pq_mb:.1f} MB  ({csv_mb/pq_mb:.1f}x smaller)")</code></pre></div>
+
+  <p>You can also confirm the format is doing real work with a one-liner of SQL — DuckDB will read <code>events.parquet</code> straight off disk, no load step:</p>
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- Only the needed columns are read; the date filter prunes row groups.
+SELECT region, COUNT(*), AVG(amount)
+FROM 'events.parquet'
+WHERE event_date BETWEEN DATE '2026-03-01' AND DATE '2026-03-07'
+GROUP BY region
+ORDER BY region;</code></pre></div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain, in one sentence each, why columnar files are smaller <em>and</em> why they're faster for analytics?</li>
+    <li>What do per-column min/max statistics let an engine do, and what is that called?</li>
+    <li>Why is partitioning by <code>user_id</code> usually a mistake?</li>
+    <li>Why do the techniques in this chapter matter <em>more</em> on object storage than on a local disk?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Prove it, then explain a dashboard</strong></summary>
+    <div class="collapse-card-body">
+      <p>Part A: Write any DataFrame (use the one above, or your own) to both CSV and Parquet, and print the size ratio. Part B: In your own words, explain why a dashboard query is faster on <em>partitioned</em> Parquet than on one big CSV.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — Part A</span></div><pre><code class="language-python">import pandas as pd, numpy as np, os
+
+n = 2_000_000
+df = pd.DataFrame({
+    "day": pd.Timestamp("2026-06-01") + pd.to_timedelta(np.arange(n) % 30, "D"),
+    "region": np.array(["us", "eu", "apac"])[np.arange(n) % 3],
+    "amount": np.random.rand(n) * 100,
+})
+df.to_csv("d.csv", index=False)
+df.to_parquet("d.parquet", compression="zstd")
+
+size = lambda f: os.path.getsize(f) / 1e6
+print(f"CSV {size('d.csv'):.1f} MB | Parquet {size('d.parquet'):.1f} MB "
+      f"| {size('d.csv')/size('d.parquet'):.1f}x smaller")</code></pre></div>
+      <p><strong>Part B — the explanation we're looking for:</strong> A dashboard filter is almost always something like <code>WHERE day = today AND region = 'us'</code>, touching a few columns and one slice of dates. On <em>partitioned</em> Parquet, three layers of skipping stack up: (1) <strong>partition pruning</strong> reads only the <code>day=…</code> folder for the requested date, ignoring every other day's files; (2) within those files, <strong>row-group skipping</strong> uses min/max statistics to skip chunks that can't match; and (3) <strong>columnar reads</strong> pull only the <code>region</code> and <code>amount</code> columns, not the rest. The CSV has none of these — it must read and parse every byte of the entire file, every time, just to throw most of it away. Less data read means less disk/network I/O and less CPU, which is the whole game on a high-latency data lake.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You can now make data small and fast on disk — but the moment a query runs, those bytes have to fit in memory and on a CPU, and that's where pipelines actually break. → <a href="08-operating-systems.html">Operating Systems &amp; Resources</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

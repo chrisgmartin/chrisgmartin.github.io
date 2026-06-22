@@ -34,8 +34,7 @@
         { name: 'The FDE-DE Playbook', folder: 'fde-de-playbook' },
         { name: 'Contract Data Model — Reference', folder: 'contract-data-model-reference' },
         { name: 'Enterprise Integration Atlas', folder: 'enterprise-integration-atlas' },
-        { name: 'Data Engineering for Neoclouds', folder: 'data-engineering-for-neoclouds' },
-        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
+        { name: 'Data Engineering for Neoclouds', folder: 'data-engineering-for-neoclouds' }
       ]
     },
     {
@@ -82,6 +81,21 @@
         { name: 'Neocloud — History & Future', folder: 'neocloud-history-future' },
         { name: 'Physical Futures Marketplaces', folder: 'compute-futures-marketplaces' },
         { name: 'The Neocloud Landscape — Comparison', folder: 'neocloud-comparison' }
+      ]
+    },
+    {
+      name: 'Data Platform',
+      folder: 'data-platform',
+      guides: [
+        { name: 'Start Here & Roadmap', folder: 'start-here-roadmap' },
+        { name: 'Orientation & Setup', folder: 'orientation-setup' },
+        { name: 'Foundations', folder: 'foundations' },
+        { name: 'The DE Craft', folder: 'the-de-craft' },
+        { name: 'Tooling & the Modern Stack', folder: 'tooling-stack' },
+        { name: 'Capstone Labs', folder: 'capstone-labs' },
+        { name: 'Career & Getting the Job', folder: 'career' },
+        { name: 'Glossary & Cheat Sheets', folder: 'glossary' },
+        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
       ]
     }
   ];

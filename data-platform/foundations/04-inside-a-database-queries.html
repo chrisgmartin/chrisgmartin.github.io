@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inside a Database II — Queries &amp; Transactions — Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#lifecycle">A query's life</a>
+    <a href="#planner">The query planner</a>
+    <a href="#explain">Reading EXPLAIN</a>
+    <a href="#transactions">Transactions</a>
+    <a href="#acid">ACID, plainly</a>
+    <a href="#isolation">Isolation levels</a>
+    <a href="#mvcc">A taste of MVCC</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-inside-a-database-storage.html">← Previous</a>
+    <a href="05-sql-in-depth.html">Next: SQL in Depth →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 3 · Foundations</span>
+  <h1>Inside a Database II — Queries &amp; Transactions</h1>
+  <p class="subtitle">Last chapter we saw how a database lays bytes on disk and finds them fast with B-tree indexes. Now we follow what happens after you press Enter: how the engine turns your SQL into a plan, why the same query can suddenly run 100× slower, and how a database keeps your money safe when two things must happen together or not at all. These are the ideas behind "why is this slow" and "can we trust this number."</p>
+</header>
+
+<section id="lifecycle">
+  <h2>A query's life: from text to result</h2>
+  <p>When you send <code>SELECT … FROM … WHERE …</code> to Postgres or DuckDB, it doesn't just "run." Your query passes through a small assembly line of stages, each handing its work to the next:</p>
+
+  <div class="flow">  SELECT name FROM users WHERE age > 30;
+        │
+        ▼
+  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │  PARSE   │──▶│   PLAN   │──▶│ OPTIMIZE │──▶│ EXECUTE  │──▶│  RETURN  │
+  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
+   is this        what are        which plan      actually     ship rows
+   valid SQL?     the possible    is cheapest?    run the       back to
+   build a        ways to do                      chosen        the client
+   syntax tree    it?                             plan</div>
+
+  <p>Read that left to right. <strong>Parse</strong> checks your SQL is well-formed and turns the text into a tree the engine can reason about. <strong>Plan</strong> enumerates the <em>ways</em> the result could be produced — scan the whole table, or use an index? join table A to B, or B to A? <strong>Optimize</strong> estimates the cost of each candidate and picks the cheapest. <strong>Execute</strong> runs that winning plan, pulling bytes from disk (or cache) and applying the algorithms from <a href="02-data-structures-algorithms.html">chapter 02</a>. <strong>Return</strong> streams the rows back to you.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">The key insight: SQL is declarative</span>
+    <p>You never told the database <em>how</em> to get the rows — only <em>what</em> rows you wanted. You said "users older than 30," not "open the table, loop row by row, compare the age column." That gap is the whole point. SQL is a <strong>declarative</strong> language: you declare the goal, and the engine's planner decides the procedure. This is why the same query can speed up after you add an index without you changing a single character — the <em>what</em> stayed the same, but the engine found a faster <em>how</em>.</p>
+  </div>
+</section>
+
+<section id="planner">
+  <h2>The query planner: a cost estimator that guesses</h2>
+  <p>The planner (also called the <strong>optimizer</strong>) is the brain of the database. Its job is to look at all the plausible plans and pick the one it believes is cheapest. But "cheapest" is a guess — the planner hasn't run anything yet. So how does it guess?</p>
+  <p>It keeps <strong>statistics</strong> about your data: roughly how many rows are in each table, how many distinct values a column has, how those values are spread out, what fraction is the most common value. From those numbers it estimates things like "<code>WHERE age &gt; 30</code> will match about 12% of rows." That estimate drives the decision:</p>
+  <ul>
+    <li>If a filter matches <strong>most</strong> of the table, reading the whole table top to bottom (a <strong>sequential scan</strong>) is actually cheapest — an index would just add overhead.</li>
+    <li>If a filter matches a <strong>tiny</strong> slice, jumping straight to those rows through an index (an <strong>index scan</strong>) wins big.</li>
+  </ul>
+  <p>This is why <strong>the same query can get a different plan as your data grows</strong>. A table with 100 rows is faster to scan whole; the planner ignores the index. The same table at 10 million rows tips the math, and the planner switches to the index — automatically. You didn't change the query; the <em>data</em> changed, so the best <em>how</em> changed.</p>
+
+  <div class="callout danger">
+    <span class="callout-label">⚠ The "100× slower overnight" mystery</span>
+    <p>Remember the riddle from <a href="00-START-HERE.html">chapter 00</a>: a query that was fast yesterday is crawling today, with no code change. The usual culprit is <strong>stale statistics</strong>. A nightly load doubled the table, but the planner is still working off old row counts. It estimates "this filter matches 50 rows" when really it now matches 5 million — so it picks a plan tuned for a tiny result and gets crushed. The fix is to refresh the stats: in Postgres, <code>ANALYZE your_table;</code> (autovacuum normally does this, but big bulk loads can outrun it). A planner is only as good as the numbers it's fed.</p>
+  </div>
+</section>
+
+<section id="explain">
+  <h2>Reading EXPLAIN: seeing the plan</h2>
+  <p>You don't have to guess what the planner decided — you can ask it. Put <code>EXPLAIN</code> in front of any query and the database prints the plan it <em>would</em> run, without running it. Add <code>ANALYZE</code> and it actually runs the query and reports real timings and row counts beside its estimates. Let's do it. (Postgres syntax shown; DuckDB is nearly identical — use <code>EXPLAIN</code> there too.)</p>
+
+  <div class="code-wrap"><div class="code-header"><span>psql</span></div><pre><code class="language-sql">-- a throwaway table with a million rows
+CREATE TABLE events AS
+  SELECT g AS id,
+         (random() * 1000)::int AS user_id,
+         (random() * 100)::int  AS amount
+  FROM generate_series(1, 1000000) AS g;
+
+-- no index yet: how does the engine find one user's events?
+EXPLAIN ANALYZE
+SELECT * FROM events WHERE user_id = 42;</code></pre></div>
+
+  <p>A plan is a <strong>tree</strong>, read from the most-indented node outward (leaves run first, feeding their parents). For the query above, with no index, you get a single leaf:</p>
+
+  <div class="flow">  Gather                          ← collect results from workers
+    └─ Seq Scan on events         ← read ALL 1,000,000 rows, keep matches
+         Filter: (user_id = 42)   ← the condition applied to every row
+         Rows Removed by Filter: ~999,000   ← the giveaway: huge waste</div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A <code>Seq Scan on events</code> with a <code>Filter</code> line, and (because of <code>ANALYZE</code>) an <code>actual time=…</code> and a large <code>Rows Removed by Filter</code> count — the engine touched a million rows to return a handful. The total <code>Execution Time</code> is in the tens of milliseconds. That "removed almost everything" pattern is your signal that an index could help.</p>
+  </div>
+
+  <p>Now add an index and re-run the exact same query:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>psql</span></div><pre><code class="language-sql">CREATE INDEX idx_events_user ON events (user_id);
+ANALYZE events;            -- refresh stats so the planner knows about the index
+
+EXPLAIN ANALYZE
+SELECT * FROM events WHERE user_id = 42;</code></pre></div>
+
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>The leaf node flips from <code>Seq Scan</code> to <code>Index Scan using idx_events_user</code> (or a <code>Bitmap Index Scan</code>). There's no more "Rows Removed by Filter" — the engine jumped straight to the matching rows via the B-tree. <code>Execution Time</code> drops by one or two orders of magnitude. Same SQL, smarter <em>how</em>.</p>
+  </div>
+
+  <p>When a query joins two tables, the plan grows a <strong>join node</strong> with two children — each child a scan, the parent combining them:</p>
+
+  <div class="flow">  Hash Join                       ← combine the two inputs on the join key
+    ├─ Seq Scan on orders         ← left input
+    └─ Hash                       ← build a hash table from the right input
+         └─ Seq Scan on users     ← right input
+
+  Reading a plan, ask three things:
+    1. Are big tables hit by Seq Scan when a filter is selective?  (missing index?)
+    2. Which node has the largest cost / actual time?  (that's your bottleneck)
+    3. Is the row ESTIMATE near the ACTUAL?  (far off ⇒ stale stats)</div>
+
+  <p>That last check is gold. <code>EXPLAIN ANALYZE</code> prints both the planner's estimate and the real count for every node. When they diverge wildly — "estimated 50 rows, got 4 million" — you've found why the plan is bad: the planner was guessing from stale or skewed statistics, exactly the stale-stats trap from the section above.</p>
+</section>
+
+<section id="transactions">
+  <h2>Transactions: all-or-nothing units of work</h2>
+  <p>So far we've read data. Changing data raises a harder question: what if a change is really <em>several</em> changes that must succeed together? The classic example is a bank transfer. Moving $100 from Alice to Bob is two operations:</p>
+
+  <div class="code-wrap"><div class="code-header"><span>psql</span></div><pre><code class="language-sql">BEGIN;                                              -- start a transaction
+  UPDATE accounts SET balance = balance - 100 WHERE name = 'alice';
+  UPDATE accounts SET balance = balance + 100 WHERE name = 'bob';
+COMMIT;                                              -- make both permanent</code></pre></div>
+
+  <p>Imagine the server crashes <em>between</em> those two updates. Alice has been debited; Bob was never credited. $100 has vanished. That must never be allowed to happen. A <strong>transaction</strong> is the database's promise that the operations inside it are a single <strong>all-or-nothing</strong> unit: either every statement takes effect, or none does. The three commands that bound it:</p>
+  <ul>
+    <li><code>BEGIN</code> — open a transaction; nothing inside is visible to others yet.</li>
+    <li><code>COMMIT</code> — finalize; all changes become permanent and visible at once.</li>
+    <li><code>ROLLBACK</code> — abandon everything since <code>BEGIN</code>, as if it never happened.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-label">ROLLBACK is your safety net</span>
+    <p>If the second update fails — Bob's account doesn't exist, a constraint is violated — you issue <code>ROLLBACK</code> (or the database does it for you on a crash) and Alice's debit is undone too. After a crash mid-transaction, the database comes back up with the transfer as if it had never started. No money lost, no partial state. That guarantee is the difference between a database and a pile of files.</p>
+  </div>
+</section>
+
+<section id="acid">
+  <h2>ACID, plainly</h2>
+  <p>The transaction guarantee has four parts, remembered by the acronym <strong>ACID</strong>. Each one maps to a worry a data engineer who handles money, ledgers, or billing actually loses sleep over:</p>
+
+  <table>
+    <thead><tr><th>Letter</th><th>Means (one line)</th><th>Why a data engineer cares</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A</strong>tomicity</td><td>All statements in a transaction happen, or none do.</td><td>A billing run that debits but fails to credit can never leave half-applied money in the ledger.</td></tr>
+      <tr><td><strong>C</strong>onsistency</td><td>A transaction moves the DB from one valid state to another; rules (constraints) always hold.</td><td>Balances never go negative, foreign keys never dangle — invariants you can build correctness on.</td></tr>
+      <tr><td><strong>I</strong>solation</td><td>Concurrent transactions don't step on each other; each sees a coherent view.</td><td>Two invoices settling at once won't read each other's half-finished totals and double-charge.</td></tr>
+      <tr><td><strong>D</strong>urability</td><td>Once committed, the change survives crashes and power loss.</td><td>A confirmed payment stays confirmed even if the server dies one second later.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout insight">
+    <span class="callout-label">Why this is the heart of "can we trust this number"</span>
+    <p>Every correctness story in a ledger or billing system reduces to ACID. When finance asks "does this total reconcile," what they're really relying on is atomicity (no half-transfers), consistency (no broken invariants), isolation (no cross-contamination between concurrent runs), and durability (committed means committed). Lose any one and the number becomes a maybe.</p>
+  </div>
+</section>
+
+<section id="isolation">
+  <h2>Isolation levels: how much do transactions hide from each other?</h2>
+  <p>Isolation is the trickiest letter, because perfect isolation is expensive. If every transaction had to run completely alone, your database could only do one thing at a time — useless under load. So databases offer a dial: <strong>isolation levels</strong>, trading concurrency for protection. The higher the level, the more anomalies it prevents, but the less work can happen in parallel.</p>
+  <p>First, the three classic <strong>anomalies</strong> — bad things that can happen when transactions overlap:</p>
+  <ul>
+    <li><strong>Dirty read</strong> — you read a row another transaction changed but hasn't committed; it might still <code>ROLLBACK</code>, so you read a value that never officially existed.</li>
+    <li><strong>Non-repeatable read</strong> — you read a row twice in one transaction and get different values because someone else committed a change in between.</li>
+    <li><strong>Phantom read</strong> — you run the same <code>WHERE</code> twice and a <em>new</em> row appears (or vanishes) because someone else inserted/deleted matching rows.</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th></tr></thead>
+    <tbody>
+      <tr><td>Read Uncommitted</td><td>possible</td><td>possible</td><td>possible</td></tr>
+      <tr><td>Read Committed</td><td>prevented</td><td>possible</td><td>possible</td></tr>
+      <tr><td>Repeatable Read</td><td>prevented</td><td>prevented</td><td>possible*</td></tr>
+      <tr><td>Serializable</td><td>prevented</td><td>prevented</td><td>prevented</td></tr>
+    </tbody>
+  </table>
+  <p style="font-size:0.9em;opacity:0.8">* The SQL standard allows phantoms at Repeatable Read; Postgres's snapshot-based Repeatable Read actually prevents them too, and reserves true serial-equivalent behavior for Serializable.</p>
+
+  <div class="callout tip">
+    <span class="callout-label">The tradeoff, and a sane default</span>
+    <p>Read down the table: each step up prevents one more anomaly, but each step also forces the engine to hold more locks or do more conflict-checking, so fewer transactions run concurrently. <strong>Serializable</strong> behaves as if every transaction ran one at a time — the strongest guarantee, the most contention. Most databases default to <strong>Read Committed</strong> (Postgres does), which is the everyday sweet spot. Reach for Serializable when correctness truly demands it — like financial settlement where a phantom row would corrupt a total.</p>
+  </div>
+</section>
+
+<section id="mvcc">
+  <h2>A taste of how: MVCC</h2>
+  <p>You might assume isolation means locking every row a reader touches so writers can't change it — but that would stall the whole system. Instead, Postgres uses <strong>MVCC (multi-version concurrency control)</strong>: every update writes a <em>new version</em> of the row rather than overwriting the old one, and each transaction sees the snapshot of versions that existed when it began. The payoff is the famous rule — <strong>readers never block writers and writers never block readers</strong> — because they're simply looking at different versions of the same row.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain why SQL being <em>declarative</em> is what lets a query speed up after you add an index, with no change to the SQL?</li>
+    <li>What does the planner use to decide between a sequential scan and an index scan — and what makes a query go "100× slower overnight"?</li>
+    <li>In an <code>EXPLAIN ANALYZE</code> plan, which two numbers tell you the stats are stale?</li>
+    <li>Why must a bank transfer be wrapped in a single transaction? Which ACID letter is that?</li>
+    <li>Which isolation level prevents a dirty read, and what is a dirty read?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Watch the plan change, and reason about isolation</strong></summary>
+    <div class="collapse-card-body">
+      <p><strong>Part 1.</strong> Using the <code>events</code> table from the EXPLAIN section, run the selective query with <code>EXPLAIN ANALYZE</code> before and after creating the index. Describe in one sentence how the plan's leaf node changed and what happened to the execution time.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution</span></div><pre><code class="language-sql">-- BEFORE the index:
+EXPLAIN ANALYZE SELECT * FROM events WHERE user_id = 42;
+--   -> Seq Scan on events, Filter: (user_id = 42),
+--      ~1,000,000 rows read, ~999,000 Rows Removed by Filter,
+--      Execution Time on the order of tens of ms.
+
+CREATE INDEX idx_events_user ON events (user_id);
+ANALYZE events;
+
+-- AFTER the index:
+EXPLAIN ANALYZE SELECT * FROM events WHERE user_id = 42;
+--   -> Index Scan using idx_events_user on events,
+--      no "Rows Removed by Filter", the B-tree jumps straight
+--      to matches, Execution Time drops 10-100x.</code></pre></div>
+      <p>The change: the leaf node went from <strong>Seq Scan</strong> (read every row, throw most away) to <strong>Index Scan</strong> (jump to the matching rows), and execution time fell by one or two orders of magnitude — the same query, a faster plan, because the planner now had a cheaper <em>how</em> available.</p>
+      <p><strong>Part 2.</strong> Which isolation level prevents a dirty read, and why?</p>
+      <p>A <strong>dirty read</strong> is reading a row another transaction has modified but <em>not yet committed</em> — if that transaction later rolls back, you've acted on a value that never officially existed. The lowest level that prevents it is <strong>Read Committed</strong>: it guarantees you only ever see data that has been committed, so uncommitted, possibly-doomed changes are invisible to you. (Repeatable Read and Serializable prevent it too, since they're stricter.) Read Uncommitted is the only level that allows dirty reads — and Postgres doesn't even implement it as truly "uncommitted," so in practice you're protected by default.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>You now know how a database plans, executes, and protects your queries — time to get fluent in the language itself, from joins to window functions. → <a href="05-sql-in-depth.html">SQL in Depth</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

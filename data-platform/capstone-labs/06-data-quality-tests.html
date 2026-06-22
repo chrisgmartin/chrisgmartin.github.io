@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab 06 — Data Quality &amp; Tests — Capstone Labs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#goal">The goal — a trust layer</a>
+    <a href="#tests">Schema tests on gold</a>
+    <a href="#freshness">Freshness checks</a>
+    <a href="#custom">A custom assertion</a>
+    <a href="#break">Break it, then fix it</a>
+    <a href="#wire">Wire tests into Dagster</a>
+    <a href="#commit">Commit Lab 06</a>
+    <a href="#check">Check yourself</a>
+    <a href="#next">Next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-orchestration-dagster.html">← Previous</a>
+    <a href="07-semantic-layer-metrics.html">Next: Lab 07 — The Semantic Layer →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Course 6 · Capstone</span>
+  <h1>Lab 06 — Data Quality &amp; Tests</h1>
+  <p class="subtitle">A pipeline that runs is not the same as a pipeline you can trust. In this lab you add the <strong>trust layer</strong> to mini-GridDP: dbt schema tests on the gold star schema, a freshness check that catches stale data, and a custom assertion that enforces a business rule. Then you'll deliberately break a row, watch a test fail with a clear message, fix it, and watch it go green — and finally wire <code>dbt test</code> into the Dagster pipeline so quality runs every time the data does.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Setup — do this first</span>
+  <p>You need two things from earlier labs running: the <strong>dbt project</strong> from <a href="03-transform-silver-gold-dbt.html">Lab 03</a> (the <code>dbt/</code> folder with <code>dim_customer</code>, <code>dim_gpu</code>, <code>fct_rentals</code>, and <code>fct_telemetry_hourly</code> built into DuckDB), and the <strong>Dagster pipeline</strong> from <a href="05-orchestration-dagster.html">Lab 05</a>. From your repo root, confirm the warehouse is populated:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp/dbt
+dbt build          # ingest + model so gold tables exist and are fresh
+dbt ls             # you should see dim_customer, fct_rentals, fct_telemetry_hourly</code></pre></div>
+  <p>If <code>dbt build</code> succeeds and the gold models exist, you're ready. Everything in this lab is added inside the <code>dbt/</code> project and the <code>dagster_app/</code> folder.</p>
+</div>
+
+<section id="goal">
+  <h2>The goal — a trust layer</h2>
+  <p>So far mini-GridDP <em>moves</em> data: Postgres → bronze → silver → gold, on a schedule. But nothing yet <em>checks</em> that the data is correct. A duplicated rental, a customer that points at a tier that doesn't exist, a feed that silently stopped loading last Tuesday — all of these pass through happily and poison the dashboard. The fix is a layer of automated assertions that run with the pipeline and fail loudly when reality violates an expectation.</p>
+  <p>Tests sit <strong>after</strong> transformation and <strong>before</strong> serving — a gate the data must pass to reach the dashboard:</p>
+  <div class="flow">  INGEST          MODEL (dbt)              QUALITY GATE                SERVE
+  ┌────────┐    ┌──────────────┐    ┌────────────────────────┐    ┌──────────┐
+  │ bronze │───▶│ silver →gold │───▶│  dbt test               │───▶│ semantic │
+  │ raw    │    │ star schema  │    │   ├ schema tests        │    │ layer +  │
+  └────────┘    └──────────────┘    │   │   not_null, unique  │    │ dashboard│
+                                    │   │   relationships     │    └──────────┘
+                                    │   │   accepted_values   │
+                                    │   ├ freshness check      │
+                                    │   └ custom assertions    │        ▲
+                                    └────────────┬─────────────┘        │
+                                                 │  ✗ FAIL → stop ──────┘
+                                                 ▼  blocks bad data from serving</div>
+  <p>By the end of this lab the gate has three kinds of checks:</p>
+  <table>
+    <thead><tr><th>Check</th><th>Catches</th><th>How</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Schema tests</strong></td><td>Nulls in keys, duplicate keys, broken joins, invalid categories</td><td>dbt generic tests in <code>schema.yml</code></td></tr>
+      <tr><td><strong>Freshness</strong></td><td>A feed that silently stopped — yesterday's data masquerading as today's</td><td>dbt <code>source freshness</code></td></tr>
+      <tr><td><strong>Custom assertions</strong></td><td>Business rules: negative revenue, zero-hour rentals, row counts that don't reconcile</td><td>dbt singular tests (SQL)</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">A test is just a query that should return zero rows</span>
+    <p>Every dbt test compiles to a SELECT. If that query returns <em>any</em> rows, those rows are the failures and the test fails. Hold onto this idea — it makes both the built-in tests and the custom ones you'll write feel like the same simple thing.</p>
+  </div>
+</section>
+
+<section id="tests">
+  <h2>Schema tests on the gold models</h2>
+  <p>dbt ships four generic tests you'll reach for constantly: <code>not_null</code>, <code>unique</code>, <code>relationships</code> (a foreign-key check), and <code>accepted_values</code>. You declare them in a <code>schema.yml</code> beside your models — no SQL required. Create or open the schema file for the gold marts and describe your star schema's contracts.</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/marts/schema.yml</span></div><pre><code class="language-yaml">version: 2
+
+models:
+  - name: fct_rentals
+    description: "One row per GPU rental. The central fact of the star schema."
+    columns:
+      - name: rental_id
+        description: "Surrogate key — unique per rental."
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+        description: "FK to dim_customer."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_id
+      - name: gpu_id
+        description: "FK to dim_gpu."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_gpu')
+              field: gpu_id
+      - name: rental_hours
+        tests:
+          - not_null
+
+  - name: dim_customer
+    description: "Customer dimension (SCD2 — one row per version)."
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+      - name: tier
+        description: "Pricing tier the customer is on."
+        tests:
+          - accepted_values:
+              values: ['free', 'pro', 'enterprise']</code></pre></div>
+  <p>Run just the tests (no rebuild) and read the summary:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt test --select fct_rentals dim_customer</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A line per test and a green summary like <code>PASS=7 WARN=0 ERROR=0 SKIP=0 TOTAL=7</code>. dbt names each test automatically — e.g. <code>unique_fct_rentals_rental_id</code> and <code>relationships_fct_rentals_customer_id__customer_id__ref_dim_customer_</code>. Every one passing means: no duplicate or null rental IDs, every rental points at a real customer and GPU, and every customer sits on a known tier. That is a real contract, enforced.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Why these four are the workhorses</span>
+    <p><code>unique</code> + <code>not_null</code> on every primary key catches the single most common warehouse bug — a fan-out join that silently doubles your rows and inflates revenue. <code>relationships</code> catches the second — an orphaned fact whose dimension was never loaded. Put them on every key in every gold table and you've eliminated a whole class of "the numbers look wrong" incidents.</p>
+  </div>
+</section>
+
+<section id="freshness">
+  <h2>Freshness — is the data even current?</h2>
+  <p>Schema tests check that the data is <em>shaped</em> right. They say nothing about whether it's <em>recent</em>. If the Postgres extract silently failed three days ago, every schema test still passes — the old rows are perfectly valid, just stale. Freshness is the check that catches a feed that quietly died.</p>
+  <p>dbt has freshness built in for <strong>sources</strong>. In your sources file, point dbt at the column that carries the load/event time and set thresholds:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/staging/sources.yml</span></div><pre><code class="language-yaml">version: 2
+
+sources:
+  - name: bronze
+    schema: bronze
+    loaded_at_field: loaded_at        # the ingest timestamp we stamp on each row
+    freshness:
+      warn_after:  {count: 6,  period: hour}   # noisy but ok
+      error_after: {count: 24, period: hour}   # a full day stale = broken
+    tables:
+      - name: raw_rentals
+      - name: raw_telemetry
+        freshness:                    # telemetry is a firehose — tighter bound
+          warn_after:  {count: 30, period: minute}
+          error_after: {count: 2,  period: hour}</code></pre></div>
+  <p>Run the freshness check on its own:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt source freshness</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>One line per source table with a verdict — <code>PASS</code>, <code>WARN</code>, or <code>ERROR</code> — and the actual age, e.g. <code>PASS freshness of bronze.raw_rentals (max loaded_at 0:04:11 old)</code>. If you just ran <code>dbt build</code>, everything is freshly loaded and passes. Stop your ingest, wait past a threshold, and the verdict flips to ERROR — exactly the alarm you want when a feed dies.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Freshness vs. a row test</span>
+    <p>Freshness reads the <em>max</em> of a timestamp column and compares it to "now" — it doesn't scan every row, so it's cheap to run often. Reach for it whenever "did this feed update?" matters more than "is each row correct?". For mini-GridDP, run it at the top of every pipeline tick so a stale feed stops the run before it builds a misleading dashboard.</p>
+  </div>
+</section>
+
+<section id="custom">
+  <h2>A custom assertion — enforce a business rule</h2>
+  <p>The generic tests don't know your business. <em>Revenue is never negative. A rental lasts more than zero hours. Every rental in bronze made it into the fact table.</em> Those are <strong>singular tests</strong> — a single SQL file in <code>tests/</code> that selects the rows that <em>violate</em> the rule. Remember the golden rule: a test passes when its query returns zero rows.</p>
+  <p>Write one that asserts rental hours and revenue are always positive:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/tests/assert_rentals_positive.sql</span></div><pre><code class="language-sql">-- Fail if any rental has non-positive hours or negative revenue.
+-- A passing test returns ZERO rows.
+select
+    rental_id,
+    rental_hours,
+    revenue
+from {{ ref('fct_rentals') }}
+where rental_hours &lt;= 0
+   or revenue &lt; 0</code></pre></div>
+  <p>And a reconciliation test — every rental that landed in bronze should appear in the gold fact, so the counts must match:</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/tests/assert_rental_count_reconciles.sql</span></div><pre><code class="language-sql">-- Fail if the gold fact row count drifts from the bronze source.
+-- Returns a single row only when the counts disagree.
+with bronze as (
+    select count(*) as n from {{ source('bronze', 'raw_rentals') }}
+),
+gold as (
+    select count(*) as n from {{ ref('fct_rentals') }}
+)
+select bronze.n as bronze_rows, gold.n as gold_rows
+from bronze, gold
+where bronze.n != gold.n</code></pre></div>
+  <p>Run your custom tests:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt test --select test_type:singular</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>Both pass: <code>PASS assert_rentals_positive</code> and <code>PASS assert_rental_count_reconciles</code>. Each one ran its SELECT, got zero rows back, and reported green. You've just encoded two business invariants as code that runs forever — no more "I assume revenue is positive," only "the test proves it."</p>
+  </div>
+</section>
+
+<section id="break">
+  <h2>Break it, then fix it</h2>
+  <p>A test you've never seen fail is a test you don't trust. Let's prove the trust layer works by injecting a bad row — a rental with negative hours — straight into bronze, rebuilding, and running the suite.</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal — inject a bad row</span></div><pre><code class="language-bash"># open a DuckDB shell on the warehouse
+duckdb warehouse.duckdb
+
+-- inside duckdb: a rental that lasted -5 hours. Nonsense, but realistic
+-- (a clock skew or a bad upstream record could produce exactly this).
+INSERT INTO bronze.raw_rentals (rental_id, customer_id, gpu_id, rental_hours, revenue, loaded_at)
+VALUES ('BAD-001', 'C-100', 'G-7', -5, 240.00, now());
+.quit</code></pre></div>
+  <p>Now rebuild gold so the bad row flows through, and run the full test suite:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt build --select fct_rentals
+dbt test</code></pre></div>
+  <div class="callout danger">
+    <span class="callout-label">✓ You should see — the FAIL</span>
+    <p>A red failure with a message that points right at the problem:</p>
+    <div class="code-wrap"><div class="code-header"><span>output</span></div><pre><code class="language-text">Failure in test assert_rentals_positive (tests/assert_rentals_positive.sql)
+  Got 1 result, configured to fail if != 0
+
+  compiled code at target/compiled/mini_griddp/tests/assert_rentals_positive.sql
+
+Done. PASS=10 WARN=0 ERROR=1 SKIP=0 TOTAL=11</code></pre></div>
+    <p>One ERROR, ten PASS. dbt even tells you how to inspect the offending rows — run the compiled SQL and you'll see <code>rental_id = 'BAD-001'</code> with <code>rental_hours = -5</code>. The gate caught it before it could reach the dashboard.</p>
+  </div>
+  <p>Now fix it — remove the bad row, rebuild, and re-test:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal — fix it</span></div><pre><code class="language-bash">duckdb warehouse.duckdb "DELETE FROM bronze.raw_rentals WHERE rental_id = 'BAD-001';"
+dbt build --select fct_rentals
+dbt test</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see — the PASS</span>
+    <p>Back to green: <code>Done. PASS=11 WARN=0 ERROR=0 SKIP=0 TOTAL=11</code>. That fail → fix → pass cycle is the whole point of a trust layer. The test didn't just sit there being green; it actively caught a real defect, named it, and went green again only once the data was correct.</p>
+  </div>
+</section>
+
+<section id="wire">
+  <h2>Wire tests into the Dagster pipeline</h2>
+  <p>Tests that only run when <em>you</em> remember to type <code>dbt test</code> aren't a trust layer — they're a good intention. The point is that quality runs automatically <em>with</em> the pipeline, so bad data is caught the moment it's produced, on every scheduled tick. In Dagster, the clean way to express "this data must pass these checks" is an <strong>asset check</strong>.</p>
+  <p>In Lab 05 you exposed your dbt models as Dagster assets via <code>@dbt_assets</code>. dbt's tests come along for free: the dagster-dbt integration emits each dbt test as an <strong>asset check</strong> on the model it covers, as long as you run them. Make your dbt asset run <code>build</code> (which is <code>run</code> + <code>test</code> together) instead of bare <code>run</code>:</p>
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/assets.py</span></div><pre><code class="language-python">from dagster import AssetCheckResult, asset_check
+from dagster_dbt import DbtCliResource, dbt_assets
+
+@dbt_assets(manifest=dbt_manifest_path)
+def griddp_dbt_assets(context, dbt: DbtCliResource):
+    # `build` = run + test. Each dbt test surfaces as an asset check
+    # on its model, so a failing test marks the asset check as failed.
+    yield from dbt.cli(["build"], context=context).stream()
+
+
+# A standalone freshness gate, expressed as a Dagster asset check.
+# It fails the check (and the run) if `dbt source freshness` errors.
+@asset_check(asset="raw_rentals")
+def rentals_are_fresh(dbt: DbtCliResource):
+    result = dbt.cli(
+        ["source", "freshness"], raise_on_error=False
+    ).wait()
+    return AssetCheckResult(
+        passed=result.is_successful(),
+        metadata={"detail": "dbt source freshness on bronze.raw_rentals"},
+    )</code></pre></div>
+  <p>Reload the Dagster code location and materialize the pipeline:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd ../dagster_app
+dagster dev          # then materialize the dbt assets from the UI, or:
+dagster asset materialize --select griddp_dbt_assets</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>In the Dagster UI, each gold asset now shows a <strong>Checks</strong> tab listing its dbt tests — <code>unique_fct_rentals_rental_id</code>, <code>assert_rentals_positive</code>, and the rest — each with a green check. Re-inject <code>BAD-001</code>, materialize again, and the run goes <strong>red</strong>: the asset check fails and the failure is attached to <code>fct_rentals</code>, so you can see <em>exactly which asset</em> broke and why. Quality now runs every time the pipeline does — no remembering required.</p>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Block bad data from serving</span>
+    <p>Because the check is attached to the asset, you can make it a hard gate: downstream assets (the semantic layer in Lab 07) won't materialize if the upstream check failed. That's the difference between a test that <em>reports</em> a problem and a gate that <em>stops</em> bad data — set the check's severity to <code>ERROR</code> so a failure halts the run.</p>
+  </div>
+</section>
+
+<section id="commit">
+  <h2>Commit Lab 06</h2>
+  <p>You've added a whole layer to the platform. Commit it so the trust layer is part of the story your git history tells.</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd ..
+git add dbt/models/marts/schema.yml \
+        dbt/models/staging/sources.yml \
+        dbt/tests/ \
+        dagster_app/assets.py
+git status                              # confirm only the trust-layer files are staged
+git commit -m "Lab 06: data quality — schema tests, freshness, custom assertions, Dagster checks"</code></pre></div>
+  <div class="callout insight">
+    <span class="callout-label">✓ You should see</span>
+    <p>A commit summarizing the new <code>schema.yml</code> contracts, the freshness config, two singular tests, and the wired-in Dagster asset checks. Run <code>git log --oneline</code> and you'll see Lab 06 sitting right after Lab 05 — the pipeline now ships with its own quality gate.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <ul>
+    <li>Can you explain why "a dbt test is a query that should return zero rows" — and how both generic and singular tests fit that rule?</li>
+    <li>Which test catches a fan-out join that doubles your rows? Which catches a feed that silently stopped loading?</li>
+    <li>What's the difference between a freshness check and a row-level test, and why is freshness cheap to run often?</li>
+    <li>Why is running <code>dbt build</code> (not <code>dbt run</code>) from the Dagster asset what turns your tests into a real gate?</li>
+  </ul>
+  <details class="collapse-card">
+    <summary><strong>Exercise — Assert telemetry utilization is a valid percentage (15 minutes)</strong></summary>
+    <div class="collapse-card-body">
+      <p>The <code>fct_telemetry_hourly</code> rollup has a <code>util_pct</code> column — GPU utilization as a percentage. A percentage must sit between 0 and 100; anything outside that range is a bug (a bad reading, a divide error, a unit mix-up). Add a test that asserts <code>util_pct</code> is always in <code>[0, 100]</code>, run it, and confirm it passes.</p>
+      <p>Do it the singular-test way (one SQL file). If you want a bonus, also express the same rule the generic way using the <code>accepted_range</code> test from the <code>dbt_utils</code> package.</p>
+      <div class="code-wrap"><div class="code-header"><span>solution — dbt/tests/assert_util_pct_in_range.sql</span></div><pre><code class="language-sql">-- Fail if any hourly utilization falls outside 0..100.
+-- Returns the offending rows; zero rows = pass.
+select
+    gpu_id,
+    hour,
+    util_pct
+from {{ ref('fct_telemetry_hourly') }}
+where util_pct &lt; 0
+   or util_pct &gt; 100</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>bonus — generic version in marts/schema.yml</span></div><pre><code class="language-yaml">  - name: fct_telemetry_hourly
+    columns:
+      - name: util_pct
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
+              inclusive: true</code></pre></div>
+      <div class="code-wrap"><div class="code-header"><span>run it</span></div><pre><code class="language-bash">dbt test --select fct_telemetry_hourly
+# -> PASS assert_util_pct_in_range</code></pre></div>
+      <p>To really convince yourself, inject a row with <code>util_pct = 142</code> into the rollup's source, rebuild, and watch this test fail with <code>Got 1 result</code> — then remove it and watch it pass. Same fail → fix → pass loop, now guarding your telemetry.</p>
+    </div>
+  </details>
+</section>
+
+<section id="next">
+  <h2>Next</h2>
+  <p>With a trusted star schema, you can finally define metrics once and serve them everywhere — turning raw columns into the business language of revenue, utilization, and churn. → <a href="07-semantic-layer-metrics.html">Lab 07 — The Semantic Layer &amp; Metrics</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
