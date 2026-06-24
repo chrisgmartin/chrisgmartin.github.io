@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Deep Dive — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Mental model</h2>
+    <a href="#grain">Grain — declare it first</a>
+    <a href="#order">Logical query order</a>
+
+    <h2>Correctness</h2>
+    <a href="#joins">Joins &amp; fan-out</a>
+    <a href="#null">NULL traps</a>
+    <a href="#group">GROUP BY &amp; HAVING</a>
+
+    <h2>Power tools</h2>
+    <a href="#cte">CTEs &amp; structure</a>
+    <a href="#window">Window functions</a>
+    <a href="#qualify">QUALIFY &amp; dedup</a>
+    <a href="#patterns">Gaps, islands, sessions</a>
+    <a href="#pivot">Conditional aggregation</a>
+
+    <h2>Performance</h2>
+    <a href="#perf">What to say</a>
+    <a href="#anti">Anti-patterns</a>
+
+    <h2>Interview</h2>
+    <a href="#approach">Approaching live SQL</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-the-first-data-hire-mandate.html">← Previous: The Mandate</a>
+    <a href="02b-sql-advanced.html">Next: SQL Advanced →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Critical</span>
+  <h1>SQL Deep Dive</h1>
+  <p class="subtitle">The most-tested live skill in the loop. It's graded on fluency and correctness, not cleverness — and as the only data person, a wrong number you ship is a wrong number the company acts on. Master the mental model, then drill <a href="03-sql-problems.html">03</a>.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">Reality check</span>
+  <p>You should write correct CTEs and window functions without hesitating, narrating as you type. Examples here use a marketplace flavor — <code>instances</code> (rented GPU machines), <code>usage_events</code> (metered runtime), <code>invoices</code> — but every pattern is general.</p>
+</div>
+
+<section id="grain">
+  <h2>Grain — declare it before you write a line</h2>
+  <p>Before any query, answer two questions out loud:</p>
+  <ol>
+    <li><strong>What is the grain of my result?</strong> One row per <em>what</em>? Per customer? Per customer-per-day? Per usage event?</li>
+    <li><strong>What is the grain of each input table?</strong> Mismatched grain is the #1 cause of wrong answers — it's why a join silently fans out and inflates a <code>SUM</code>.</li>
+  </ol>
+  <p>Saying "this result is one row per customer per day, and <code>usage_events</code> is one row per metered interval, so I'll aggregate before joining" is the single clearest seniority signal in a SQL screen. It also prevents the bug before it happens.</p>
+</section>
+
+<section id="order">
+  <h2>Logical query order — know this cold</h2>
+  <p>SQL is written one way and executed another. The logical order:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>SQL logical order</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">1. FROM        (and JOINs)
+2. WHERE       (filters rows BEFORE grouping)
+3. GROUP BY
+4. HAVING      (filters groups AFTER grouping)
+5. SELECT      (expressions/aliases computed here)
+6. DISTINCT
+7. ORDER BY    (SELECT aliases ARE available here)
+8. LIMIT / OFFSET</code></pre>
+</div>
+  <p>This explains the errors interviewers love to catch:</p>
+  <ul>
+    <li>"Why can't I use a SELECT alias in WHERE?" — WHERE runs before SELECT.</li>
+    <li>"Why is COUNT(*) higher than COUNT(col)?" — <code>COUNT(*)</code> counts rows; <code>COUNT(col)</code> skips NULLs.</li>
+    <li>"Why does HAVING work where WHERE didn't?" — HAVING filters after grouping; WHERE filters before.</li>
+  </ul>
+</section>
+
+<section id="joins">
+  <h2>Joins &amp; fan-out — where people quietly go wrong</h2>
+  <table>
+    <thead><tr><th>Join</th><th>Returns</th><th>Pitfall</th></tr></thead>
+    <tbody>
+      <tr><td><code>INNER</code></td><td>Rows matching on both sides</td><td>Silent data loss when keys are unmatched or NULL</td></tr>
+      <tr><td><code>LEFT</code></td><td>All left rows; NULLs where right is missing</td><td>Row explosion when right has many matches</td></tr>
+      <tr><td><code>FULL OUTER</code></td><td>All rows from both, NULLs where unmatched</td><td>Rarely needed; usually signals a modeling gap</td></tr>
+      <tr><td><code>CROSS</code></td><td>Cartesian product</td><td>Only intentional (e.g. date spine × dims)</td></tr>
+    </tbody>
+  </table>
+  <p><strong>The LEFT JOIN → WHERE trap.</strong> Filtering the right table in <code>WHERE</code> silently turns a LEFT JOIN back into an INNER JOIN, because <code>WHERE right.col = 'x'</code> drops the NULL rows. Put the condition in <code>ON</code>:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>left_join_filter.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- WRONG: this is now effectively an inner join
+SELECT c.customer_id, i.invoice_id
+FROM customers c
+LEFT JOIN invoices i ON i.customer_id = c.customer_id
+WHERE i.status = 'paid';        -- kills customers with no paid invoice
+
+-- RIGHT: keep all customers, only join paid invoices
+SELECT c.customer_id, i.invoice_id
+FROM customers c
+LEFT JOIN invoices i
+  ON i.customer_id = c.customer_id
+ AND i.status = 'paid';</code></pre>
+</div>
+  <p><strong>Fan-out.</strong> If the right side has multiple rows per key, left rows multiply. <code>SUM</code> a left-side column afterward and it's inflated. Defense: aggregate the right side to the join grain <em>first</em>.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>avoid_fanout.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Customer's plan fee should NOT be multiplied by their many usage rows.
+WITH usage AS (
+  SELECT customer_id, SUM(gpu_seconds) AS gpu_seconds
+  FROM usage_events
+  GROUP BY customer_id            -- collapse to one row per customer FIRST
+)
+SELECT c.customer_id, c.monthly_fee, u.gpu_seconds
+FROM customers c
+LEFT JOIN usage u ON u.customer_id = c.customer_id;</code></pre>
+</div>
+  <p><strong>Anti-join</strong> (rows in A with no match in B) — three idioms, and a trap:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>anti_join.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Preferred: explicit, index-friendly
+SELECT a.* FROM a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL;
+
+-- Also clear, NULL-safe
+SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id);
+
+-- TRAP: if b.id has even one NULL, NOT IN returns ZERO rows
+SELECT * FROM a WHERE id NOT IN (SELECT id FROM b);</code></pre>
+</div>
+  <p>The <code>NOT IN</code> + NULL trap is a favorite: <code>x &lt;&gt; NULL</code> is unknown, so a single NULL in the subquery makes the whole predicate fail for every row. Use <code>NOT EXISTS</code> or the LEFT JOIN idiom.</p>
+</section>
+
+<section id="null">
+  <h2>NULL traps</h2>
+  <ul>
+    <li><code>NULL = NULL</code> is <em>unknown</em>, not true. Compare with <code>IS NULL</code> / <code>IS DISTINCT FROM</code>.</li>
+    <li>Aggregates ignore NULLs: <code>AVG(col)</code> divides by the count of non-NULLs, which may not be what you want.</li>
+    <li><code>COUNT(col)</code> skips NULLs; <code>COUNT(*)</code> doesn't.</li>
+    <li>Divide-by-zero: guard with <code>NULLIF(denominator, 0)</code> so the result is NULL instead of an error.</li>
+    <li><code>COALESCE(col, 0)</code> to default; but decide whether a missing value should really be 0 or stay NULL (a customer with no usage vs. zero usage may be different).</li>
+  </ul>
+</section>
+
+<section id="group">
+  <h2>GROUP BY &amp; HAVING</h2>
+  <p>Every non-aggregated SELECT column must be in GROUP BY (outside MySQL's loose mode). Use <code>HAVING</code> to filter on aggregates, <code>WHERE</code> to filter rows before aggregating — pushing filters into WHERE is both correct and faster.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>where_vs_having.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT customer_id, SUM(amount) AS revenue
+FROM invoices
+WHERE status = 'paid'            -- filter rows first (cheap, correct)
+GROUP BY customer_id
+HAVING SUM(amount) > 1000;       -- filter groups after aggregation</code></pre>
+</div>
+</section>
+
+<section id="cte">
+  <h2>CTEs &amp; structure</h2>
+  <p>Build queries as a pipeline of named CTEs, each one transformation. It reads top-to-bottom, is debuggable (run one CTE at a time), and shows the interviewer your thinking. Prefer this to deeply nested subqueries.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>cte_pipeline.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (        -- 1. roll usage up to customer-day
+  SELECT customer_id, DATE(started_at) AS day, SUM(gpu_seconds) AS secs
+  FROM usage_events
+  GROUP BY 1, 2
+),
+billed AS (            -- 2. price it
+  SELECT customer_id, day, secs, secs / 3600.0 * 1.20 AS cost_usd
+  FROM daily
+)
+SELECT * FROM billed WHERE day >= CURRENT_DATE - 7;</code></pre>
+</div>
+  <p>Note: recursive CTEs (<code>WITH RECURSIVE</code>) handle hierarchies (org charts, referral chains) and generating date spines — worth being able to recognize, less commonly required to write live.</p>
+</section>
+
+<section id="window">
+  <h2>Window functions — the highest-leverage skill</h2>
+  <p>If you master one thing, make it windows. They separate junior from mid/senior SQL. Anatomy:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>window_anatomy.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">FUNCTION() OVER (
+  PARTITION BY <reset groups>      -- like GROUP BY but keeps every row
+  ORDER BY     <ordering>          -- required for ranking / running calcs
+  ROWS BETWEEN <frame>             -- which rows feed the function
+)</code></pre>
+</div>
+  <p><strong>Ranking — know the three:</strong> <code>ROW_NUMBER</code> (always unique: 1,2,3,4), <code>RANK</code> (gaps after ties: 1,2,2,4), <code>DENSE_RANK</code> (no gaps: 1,2,2,3). For "latest row per group" you want <code>ROW_NUMBER</code>; for "Nth distinct value" you want <code>DENSE_RANK</code>.</p>
+  <p><strong>Running totals &amp; moving averages:</strong></p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>running.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  day,
+  revenue,
+  SUM(revenue) OVER (ORDER BY day
+       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+  AVG(revenue) OVER (ORDER BY day
+       ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)         AS rolling_7d_avg
+FROM daily_revenue;</code></pre>
+</div>
+  <div class="callout">
+    <span class="callout-label">Frame gotcha</span>
+    <p>With <code>ORDER BY</code> and no explicit frame, the default is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> — and <code>RANGE</code> lumps together peer rows with equal ORDER BY values, which can over-count. Specify <code>ROWS</code> when you mean row-by-row.</p>
+  </div>
+  <p><strong>Period-over-period with LAG/LEAD:</strong></p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>mom.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  month,
+  revenue,
+  LAG(revenue) OVER (ORDER BY month) AS prev_month,
+  ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+        / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 1) AS mom_pct
+FROM monthly_revenue;</code></pre>
+</div>
+  <p>Note the <code>NULLIF(..., 0)</code> guard — small detail, signals care.</p>
+</section>
+
+<section id="qualify">
+  <h2>QUALIFY &amp; the dedup pattern</h2>
+  <p>The most-asked window pattern: keep the latest record per key. Two ways — and <code>QUALIFY</code> (Snowflake/BigQuery/Databricks) lets you filter on a window function without a wrapping CTE:</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>dedup.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Portable: CTE + ROW_NUMBER
+WITH ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY customer_id
+                       ORDER BY updated_at DESC, id DESC) AS rn  -- tiebreaker!
+  FROM customers
+)
+SELECT * FROM ranked WHERE rn = 1;
+
+-- Snowflake / BigQuery / Databricks: QUALIFY
+SELECT *
+FROM customers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id
+                           ORDER BY updated_at DESC, id DESC) = 1;</code></pre>
+</div>
+  <p>Always include a deterministic tiebreaker in the ORDER BY (e.g. <code>id DESC</code>) — otherwise "latest" is nondeterministic when timestamps tie, and your result changes between runs.</p>
+</section>
+
+<section id="patterns">
+  <h2>Gaps &amp; islands, sessionization</h2>
+  <p><strong>Gaps and islands</strong> — find consecutive streaks (e.g. consecutive days a customer had active instances). The trick: subtract a row number from the date; consecutive rows share a constant.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>islands.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH g AS (
+  SELECT customer_id, active_date,
+    active_date
+      - (ROW_NUMBER() OVER (PARTITION BY customer_id
+                            ORDER BY active_date))::int AS grp
+  FROM daily_active
+)
+SELECT customer_id, MIN(active_date) AS streak_start,
+       MAX(active_date) AS streak_end, COUNT(*) AS streak_len
+FROM g
+GROUP BY customer_id, grp;</code></pre>
+</div>
+  <p>Be ready to explain <em>why</em> it works: the offset stays constant only when dates increment by exactly one, so each unbroken run collapses to a single <code>grp</code>.</p>
+  <p><strong>Sessionization</strong> — group events into sessions with a 30-minute inactivity gap. Pattern: flag boundaries, then a running <code>SUM</code> of the flag generates IDs.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>sessions.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH lagged AS (
+  SELECT customer_id, event_ts,
+    LAG(event_ts) OVER (PARTITION BY customer_id ORDER BY event_ts) AS prev_ts
+  FROM events
+),
+flagged AS (
+  SELECT *,
+    CASE WHEN prev_ts IS NULL
+           OR event_ts - prev_ts > INTERVAL '30 minutes'
+         THEN 1 ELSE 0 END AS is_new
+  FROM lagged
+)
+SELECT *,
+  SUM(is_new) OVER (PARTITION BY customer_id ORDER BY event_ts) AS session_id
+FROM flagged;</code></pre>
+</div>
+  <p>The "flag a boundary, running-sum the flag" pattern generalizes to many problems — recognize it.</p>
+</section>
+
+<section id="pivot">
+  <h2>Conditional aggregation (pivot)</h2>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>pivot.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- FILTER is the clean Postgres/standard way
+SELECT customer_id,
+  COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+  COUNT(*) FILTER (WHERE status = 'failed')    AS failed
+FROM jobs GROUP BY customer_id;
+
+-- SUM(CASE ...) is the portable equivalent every engine supports
+SELECT customer_id,
+  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+  SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END) AS failed
+FROM jobs GROUP BY customer_id;</code></pre>
+</div>
+</section>
+
+<section id="perf">
+  <h2>Performance — what to say</h2>
+  <p>You don't need to be a query-planner expert, but have informed opinions:</p>
+  <ul>
+    <li><strong><code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code></strong> is how you diagnose. Look for sequential scans on big tables and bad join order.</li>
+    <li><strong>Indexes</strong> help selective lookups and joins but cost write throughput; a query reading most of a table will ignore the index and scan anyway.</li>
+    <li><strong>Don't wrap indexed columns in functions in WHERE.</strong> <code>WHERE DATE(ts) = '2026-01-01'</code> can't use an index on <code>ts</code>; rewrite as a range: <code>ts &gt;= '2026-01-01' AND ts &lt; '2026-01-02'</code>.</li>
+    <li><strong>Columnar warehouses (BigQuery, Snowflake, Redshift) change the game.</strong> Partitioning and clustering / sort keys matter more than traditional indexes, and you pay for <em>bytes scanned</em> — so <code>SELECT *</code> and unpartitioned full scans are expensive. Select only needed columns and filter on the partition column.</li>
+    <li><strong>Pre-aggregate</strong> when many queries hit the same rollup; materialize it rather than recomputing.</li>
+  </ul>
+  <p>As the first hire, add the cost lens: "On a usage-based warehouse I'd partition <code>usage_events</code> by day and cluster by customer, because nearly every query filters on a date range and a customer — that keeps scan cost and bill predictable."</p>
+</section>
+
+<section id="anti">
+  <h2>Anti-patterns to call out</h2>
+  <ul>
+    <li><code>SELECT *</code> in production models — breaks on schema change and scans extra bytes.</li>
+    <li>Correlated subqueries in SELECT that re-run per row — usually replaceable with a join or window.</li>
+    <li><code>DISTINCT</code> used to paper over a fan-out bug instead of fixing the join grain.</li>
+    <li>Implicit cross joins from comma-joins with a forgotten condition.</li>
+    <li><code>ORDER BY</code> inside subqueries/CTEs (ignored, wasteful) — order only at the end.</li>
+  </ul>
+</section>
+
+<section id="approach">
+  <h2>Approaching live SQL — the performance</h2>
+  <ol>
+    <li><strong>Restate &amp; clarify.</strong> "So you want one row per customer per day, and a customer with no usage that day should appear with zero — yes?" Confirm grain and edge cases.</li>
+    <li><strong>Name the shape.</strong> "This is a latest-per-group / a gaps-and-islands / a sessionization problem." Pattern-naming reassures the interviewer.</li>
+    <li><strong>Build with CTEs</strong>, narrating each step. Don't go silent.</li>
+    <li><strong>Sanity-check.</strong> "Let me confirm row counts didn't explode after that join." Mention how you'd validate against a known total.</li>
+    <li><strong>Mention NULL / tie / empty-input edge cases</strong> even if you don't fully handle them — it shows you see them.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Next</span>
+    <p>Go deeper on advanced techniques in <a href="02b-sql-advanced.html">02b — SQL Advanced</a>, then drill the patterns in <a href="03-sql-problems.html">03 — SQL Problems</a> →</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

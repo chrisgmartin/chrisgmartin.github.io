@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Advanced — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Windows, deeper</h2>
+    <a href="#frames">Frames: ROWS / RANGE / GROUPS</a>
+    <a href="#firstlast">FIRST/LAST/NTH_VALUE</a>
+    <a href="#named">Named windows</a>
+    <a href="#ntile">NTILE &amp; percentiles</a>
+
+    <h2>Set &amp; grouping</h2>
+    <a href="#setops">Set operations</a>
+    <a href="#grouping">ROLLUP / CUBE / GROUPING SETS</a>
+
+    <h2>Joins, deeper</h2>
+    <a href="#lateral">LATERAL / APPLY</a>
+    <a href="#asof">As-of (point-in-time) joins</a>
+
+    <h2>Semi-structured</h2>
+    <a href="#json">JSON, arrays, structs</a>
+    <a href="#dates">Dates, intervals, timezones</a>
+
+    <h2>Recursion</h2>
+    <a href="#recursive">Recursive CTEs</a>
+
+    <h2>Performance</h2>
+    <a href="#explain">Reading EXPLAIN</a>
+    <a href="#joinalgos">Join algorithms</a>
+    <a href="#pruning">Pruning, skew, spill</a>
+    <a href="#approx">Approximate aggregates</a>
+    <a href="#debug">A debugging method</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-sql-deep-dive.html">← Previous: SQL Deep Dive</a>
+    <a href="03-sql-problems.html">Next: SQL Problems →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Critical</span>
+  <h1>SQL Advanced</h1>
+  <p class="subtitle">The second SQL layer — the techniques that separate "writes correct queries" from "reaches for the exactly-right tool and reasons about the query plan." For a technical loop this is where you earn senior signal. Pair with the harder drills in <a href="03b-sql-problems-advanced.html">03b</a>.</p>
+</header>
+
+<div class="callout tip">
+  <span class="callout-label">How to use this</span>
+  <p>Don't memorize syntax — internalize <em>when</em> each tool is the right one, and the one gotcha each carries. Interviewers reward "I'd use a LATERAL join here because…" far more than flawless recall.</p>
+</div>
+
+<section id="frames">
+  <h2>Window frames: ROWS vs RANGE vs GROUPS</h2>
+  <p>The frame defines which rows feed the window function for the current row. Getting it wrong silently changes results — a top interview trap.</p>
+  <ul>
+    <li><strong>ROWS</strong> — physical rows. <code>ROWS BETWEEN 6 PRECEDING AND CURRENT ROW</code> = exactly 7 rows. Use for moving averages over a row count.</li>
+    <li><strong>RANGE</strong> — logical value range over the ORDER BY column. <code>RANGE BETWEEN '7 days' PRECEDING AND CURRENT ROW</code> = all rows whose ORDER BY value is within 7 days — row count varies. Crucially, peers (equal ORDER BY values) are lumped together.</li>
+    <li><strong>GROUPS</strong> — peer groups of equal ORDER BY values (Postgres 11+). Useful when ties should count as one step.</li>
+  </ul>
+  <div class="callout">
+    <span class="callout-label">The default-frame trap</span>
+    <p>With <code>ORDER BY</code> and no explicit frame, the default is <code>RANGE UNBOUNDED PRECEDING AND CURRENT ROW</code>. So a running <code>SUM(x) OVER (ORDER BY day)</code> when multiple rows share a <code>day</code> sums <em>all</em> rows of that day at once — not row-by-row. Specify <code>ROWS</code> when you mean physical rows.</p>
+  </div>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>frames.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Time-based 7-day rolling sum that's correct even with gaps in days:
+SELECT day, revenue,
+  SUM(revenue) OVER (ORDER BY day
+       RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW) AS rev_7d
+FROM daily_revenue;
+
+-- Centered moving average (3 before, 3 after) — physical rows:
+SELECT day, gpu_price,
+  AVG(gpu_price) OVER (ORDER BY day
+       ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS smoothed
+FROM price_history;</code></pre></div>
+</section>
+
+<section id="firstlast">
+  <h2>FIRST_VALUE, LAST_VALUE, NTH_VALUE</h2>
+  <p>Grab a specific row's value within the partition without a self-join. The classic gotcha: <code>LAST_VALUE</code> with the default frame returns the current row, not the partition's last — because the frame ends at CURRENT ROW.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>first_last.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT customer_id, event_ts, amount,
+  FIRST_VALUE(amount) OVER w AS first_amt,
+  -- WRONG without full frame: returns current row
+  LAST_VALUE(amount)  OVER (PARTITION BY customer_id ORDER BY event_ts
+       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amt
+FROM charges
+WINDOW w AS (PARTITION BY customer_id ORDER BY event_ts);</code></pre></div>
+  <p>Tip: "first and last in one pass" is often cleaner as <code>MIN/MAX(... ) OVER</code> when you only need extremes, or <code>ROW_NUMBER</code>-then-filter when you need whole rows.</p>
+</section>
+
+<section id="named">
+  <h2>Named windows (WINDOW clause)</h2>
+  <p>When several functions share a window spec, define it once. Cleaner, less error-prone, and a subtle seniority tell.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>named_window.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT customer_id, day, spend,
+  SUM(spend)        OVER w  AS running_spend,
+  AVG(spend)        OVER w  AS running_avg,
+  ROW_NUMBER()      OVER w  AS day_rank
+FROM daily_spend
+WINDOW w AS (PARTITION BY customer_id ORDER BY day);</code></pre></div>
+</section>
+
+<section id="ntile">
+  <h2>NTILE &amp; percentiles</h2>
+  <ul>
+    <li><strong><code>NTILE(n)</code></strong> — split a partition into n roughly equal buckets (deciles, quartiles). Great for "which spend decile is this customer in?"</li>
+    <li><strong><code>PERCENTILE_CONT(p)</code></strong> (interpolated) vs <strong><code>PERCENTILE_DISC(p)</code></strong> (actual value). Use CONT for medians of continuous measures, DISC when you need a real observed value.</li>
+    <li><strong><code>APPROX_QUANTILES</code></strong> / <code>APPROX_PERCENTILE</code> — fast approximate percentiles on huge tables (BigQuery/Snowflake/Spark).</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>buckets.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT customer_id, gpu_hours,
+  NTILE(10) OVER (ORDER BY gpu_hours) AS usage_decile,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gpu_hours) OVER () AS median_all
+FROM monthly_usage;</code></pre></div>
+</section>
+
+<section id="setops">
+  <h2>Set operations &amp; data diffing</h2>
+  <ul>
+    <li><strong>UNION</strong> dedups (sorts — expensive); <strong>UNION ALL</strong> doesn't. Default to UNION ALL unless you truly need dedup.</li>
+    <li><strong>INTERSECT</strong> — rows in both. <strong>EXCEPT</strong> (a.k.a. MINUS) — rows in A not in B.</li>
+    <li><strong>Data diffing</strong> — to compare two tables/models row-for-row, <code>(SELECT * FROM a EXCEPT SELECT * FROM b) UNION ALL (SELECT * FROM b EXCEPT SELECT * FROM a)</code> returns every differing row. Invaluable when validating a refactor produces identical output.</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>diff.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Did my refactored model change any rows vs the old one? Should return 0 rows.
+SELECT 'only_old' src, * FROM (SELECT * FROM model_old EXCEPT SELECT * FROM model_new) a
+UNION ALL
+SELECT 'only_new' src, * FROM (SELECT * FROM model_new EXCEPT SELECT * FROM model_old) b;</code></pre></div>
+</section>
+
+<section id="grouping">
+  <h2>ROLLUP, CUBE, GROUPING SETS</h2>
+  <p>Compute subtotals and grand totals in one pass instead of UNIONing many aggregates — exactly what BI summary tables need.</p>
+  <ul>
+    <li><strong>ROLLUP(a, b)</strong> — hierarchy subtotals: (a,b), (a), (). Region → region+gpu → grand total.</li>
+    <li><strong>CUBE(a, b)</strong> — all combinations: (a,b), (a), (b), ().</li>
+    <li><strong>GROUPING SETS</strong> — you specify exactly which groupings you want.</li>
+    <li><strong>GROUPING(col)</strong> — returns 1 if the column is rolled up in that row, so you can label "All".</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>rollup.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  CASE WHEN GROUPING(region)=1 THEN 'ALL' ELSE region END AS region,
+  CASE WHEN GROUPING(gpu_type)=1 THEN 'ALL' ELSE gpu_type END AS gpu_type,
+  SUM(revenue) AS revenue
+FROM fct_usage
+GROUP BY ROLLUP(region, gpu_type)
+ORDER BY region, gpu_type;</code></pre></div>
+</section>
+
+<section id="lateral">
+  <h2>LATERAL joins / CROSS APPLY</h2>
+  <p>A LATERAL subquery can reference columns from the table before it — letting you run a correlated, per-row subquery as a join. The canonical use: <strong>top-N per group</strong> efficiently, or calling a set-returning function per row.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>lateral.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Most recent 3 charges per customer (often faster than a window over a huge table)
+SELECT c.customer_id, x.amount, x.charged_at
+FROM customers c
+CROSS JOIN LATERAL (
+  SELECT amount, charged_at
+  FROM charges ch
+  WHERE ch.customer_id = c.customer_id
+  ORDER BY charged_at DESC
+  LIMIT 3
+) x;</code></pre></div>
+  <p>Window-function top-N reads the whole table; LATERAL can use an index per customer. Know both and when each wins (LATERAL shines with selective indexed lookups; windows shine when you're scanning everything anyway).</p>
+</section>
+
+<section id="asof">
+  <h2>As-of (point-in-time) joins</h2>
+  <p>Join a fact to the dimension/price that was in effect <em>at the fact's timestamp</em> — the backbone of SCD2 lookups, pricing at time-of-use, and time-series alignment. Some engines have native <code>ASOF JOIN</code> (Snowflake, ClickHouse, DuckDB); elsewhere you express it with a range join or a windowed lookup.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>asof.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Price each usage row at the host's price that was active at the time.
+-- Portable form: range join on a validity window.
+SELECT u.usage_id, u.started_at, u.gpu_seconds, p.price_per_hr
+FROM usage_events u
+JOIN price_history p
+  ON p.machine_id = u.machine_id
+ AND u.started_at >= p.valid_from
+ AND u.started_at <  p.valid_to;
+
+-- Native (Snowflake/DuckDB):
+-- SELECT ... FROM usage_events u
+-- ASOF JOIN price_history p MATCH_CONDITION(u.started_at >= p.valid_from)
+--   ON u.machine_id = p.machine_id;</code></pre></div>
+  <p>Watch for overlapping or open-ended validity windows producing fan-out — ensure the dimension's windows are non-overlapping (a quality test worth adding).</p>
+</section>
+
+<section id="json">
+  <h2>JSON, arrays, structs</h2>
+  <p>Telemetry and event data land semi-structured. Know how to extract, flatten, and aggregate it.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>json_arrays.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Extract a field (Postgres -&gt;&gt; ; Snowflake : ; BigQuery JSON_VALUE)
+SELECT payload->>'gpu_model'           AS gpu_model,     -- Postgres
+       (payload:gpu_count)::int        AS gpu_count      -- Snowflake
+FROM raw_events;
+
+-- Explode an array into rows
+SELECT e.instance_id, tag
+FROM instances e, UNNEST(e.tags) AS tag;                 -- BigQuery / Postgres: unnest()
+
+-- Aggregate back into an array
+SELECT customer_id, ARRAY_AGG(DISTINCT gpu_type) AS gpu_types
+FROM usage_events GROUP BY customer_id;</code></pre></div>
+  <p>Modeling note: extract hot fields into typed columns in staging; keep the raw blob for replay. Don't make BI users parse JSON.</p>
+</section>
+
+<section id="dates">
+  <h2>Dates, intervals, timezones, spines</h2>
+  <ul>
+    <li><strong>Truncation:</strong> <code>DATE_TRUNC('hour'|'day'|'month', ts)</code> for bucketing.</li>
+    <li><strong>Timezones:</strong> store UTC, convert at the edge. <code>ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'</code>. Be explicit — "daily revenue" depends on which timezone's midnight.</li>
+    <li><strong>Date spine:</strong> <code>generate_series</code> (Postgres) / <code>GENERATE_DATE_ARRAY</code> (BigQuery) to create a gap-free calendar; LEFT JOIN data onto it so missing days appear as zero.</li>
+    <li><strong>LOCF (last observation carried forward):</strong> fill gaps by carrying the last known value — a spine + <code>LAST_VALUE(... IGNORE NULLS)</code> over the ordered window.</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>spine_locf.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH spine AS (
+  SELECT generate_series(DATE '2026-01-01', CURRENT_DATE, INTERVAL '1 day')::date AS day
+)
+SELECT s.day,
+  LAST_VALUE(p.price IGNORE NULLS) OVER (ORDER BY s.day
+       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS price_locf
+FROM spine s
+LEFT JOIN daily_price p ON p.day = s.day;</code></pre></div>
+</section>
+
+<section id="recursive">
+  <h2>Recursive CTEs</h2>
+  <p>For hierarchies (host → sub-accounts, referral chains, org charts), graph traversal, and generating sequences. Structure: an anchor member UNION ALL a recursive member that references the CTE.</p>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>recursive.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Referral depth: who referred whom, how many hops from a root
+WITH RECURSIVE chain AS (
+  SELECT customer_id, referrer_id, 0 AS depth
+  FROM customers WHERE referrer_id IS NULL          -- anchor: roots
+  UNION ALL
+  SELECT c.customer_id, c.referrer_id, ch.depth + 1
+  FROM customers c
+  JOIN chain ch ON c.referrer_id = ch.customer_id   -- recurse
+)
+SELECT * FROM chain;</code></pre></div>
+  <p>Always ensure termination (no cycles, or a depth cap) — a recursive CTE on cyclic data runs forever. Mention the safeguard.</p>
+</section>
+
+<section id="explain">
+  <h2>Reading EXPLAIN / EXPLAIN ANALYZE</h2>
+  <p>You should be able to read a plan and name the problem. Read it bottom-up (leaves run first). What to look for:</p>
+  <ul>
+    <li><strong>Seq Scan on a big table</strong> where you expected an index/partition prune → missing index or a non-sargable predicate (function on the column).</li>
+    <li><strong>Estimated vs actual rows wildly off</strong> (EXPLAIN ANALYZE) → stale statistics; the planner is choosing a bad join order/algorithm. Fix with <code>ANALYZE</code>.</li>
+    <li><strong>Nested Loop over many rows</strong> → should likely be a hash join; often a join-key type mismatch prevents it.</li>
+    <li><strong>Spill to disk / external sort</strong> → not enough memory; reduce data earlier or increase work_mem.</li>
+    <li><strong>In warehouses:</strong> bytes scanned, partitions pruned, and whether a broadcast vs shuffle join was used.</li>
+  </ul>
+</section>
+
+<section id="joinalgos">
+  <h2>Join algorithms (so plans make sense)</h2>
+  <table>
+    <thead><tr><th>Algorithm</th><th>How</th><th>Best when</th></tr></thead>
+    <tbody>
+      <tr><td>Nested loop</td><td>For each outer row, probe inner</td><td>Small outer + indexed inner</td></tr>
+      <tr><td>Hash join</td><td>Build hash on smaller side, probe</td><td>Large equi-joins, no useful index</td></tr>
+      <tr><td>Merge join</td><td>Sort both, merge</td><td>Both already sorted on the key</td></tr>
+      <tr><td>Broadcast (MPP)</td><td>Ship small table to all nodes</td><td>One side tiny (dim) in a warehouse</td></tr>
+      <tr><td>Shuffle/repartition (MPP)</td><td>Redistribute both by key</td><td>Both large; watch for skew</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="pruning">
+  <h2>Partition pruning, clustering, skew, spill</h2>
+  <ul>
+    <li><strong>Partition pruning:</strong> filter on the partition column (a literal/range, not a function on it) so the engine skips partitions. The single biggest warehouse cost lever.</li>
+    <li><strong>Clustering / sort keys:</strong> co-locate rows by a common filter/join key so scans touch fewer micro-partitions.</li>
+    <li><strong>Data skew:</strong> one key with vastly more rows overloads one node in a shuffle (e.g. a whale customer, or a NULL join key). Mitigate by salting the hot key or filtering NULLs out of the join.</li>
+    <li><strong>Spill:</strong> aggregations/sorts exceeding memory write to disk and slow down. Reduce cardinality early, or pre-aggregate.</li>
+  </ul>
+</section>
+
+<section id="approx">
+  <h2>Approximate aggregates</h2>
+  <p>On large data, exact distinct counts are expensive (they must track every value). Approximate algorithms trade a tiny error for huge speed:</p>
+  <ul>
+    <li><strong>HyperLogLog</strong> — <code>APPROX_COUNT_DISTINCT</code> for distinct counts (~1-2% error, fraction of the cost). Great for daily active users at scale.</li>
+    <li><strong>Approx percentiles</strong> — <code>APPROX_QUANTILES</code> / t-digest for distributions.</li>
+    <li><strong>Sketch state</strong> — some engines let you store and merge HLL sketches across days for incremental distinct counts. Mention it for "rolling 30-day actives without rescanning."</li>
+  </ul>
+</section>
+
+<section id="debug">
+  <h2>A method for debugging a wrong query</h2>
+  <ol>
+    <li><strong>Check the grain at each CTE.</strong> Add <code>SELECT COUNT(*), COUNT(DISTINCT key)</code> after each step — the first place they diverge is your fan-out.</li>
+    <li><strong>Isolate the join.</strong> Comment out downstream logic; verify row counts pre/post each join.</li>
+    <li><strong>Hunt NULLs</strong> in join keys and filter columns — the silent cause of dropped or exploded rows.</li>
+    <li><strong>Compare to a known total.</strong> Reconcile a sample against a source-of-truth number you trust.</li>
+    <li><strong>Diff against the prior version</strong> with EXCEPT when refactoring.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Next</span>
+    <p>Now apply all of this on harder problems — the foundational set in <a href="03-sql-problems.html">03</a>, then the advanced set in <a href="03b-sql-problems-advanced.html">03b</a> →</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

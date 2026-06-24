@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Pipelines — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Foundations</h2>
+    <a href="#elt">ELT vs ETL</a>
+    <a href="#layers">The layered warehouse</a>
+    <a href="#batchstream">Batch vs streaming</a>
+
+    <h2>Correctness</h2>
+    <a href="#idempotency">Idempotency</a>
+    <a href="#incremental">Incremental loads</a>
+    <a href="#latedata">Late &amp; out-of-order data</a>
+    <a href="#backfill">Backfills</a>
+    <a href="#schema">Schema evolution</a>
+
+    <h2>Operations</h2>
+    <a href="#orchestration">Orchestration</a>
+    <a href="#cdc">CDC &amp; ingestion patterns</a>
+
+    <h2>Interview</h2>
+    <a href="#design">Designing a pipeline out loud</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03b-sql-problems-advanced.html">← Previous: SQL Problems II</a>
+    <a href="04b-pipelines-advanced.html">Next: Pipelines Advanced →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Pipelines</span>
+  <h1>Data Pipelines</h1>
+  <p class="subtitle">How data gets from source systems into trusted models. The systems-design half of the loop. As the first hire you'll design these from scratch — so the grading is about correctness under failure, not throughput at scale.</p>
+</header>
+
+<div class="callout insight">
+  <span class="callout-label">The first-hire principle</span>
+  <p>Your pipelines will fail — networks drop, sources change, jobs get re-run. Design so that a re-run produces the <em>same</em> correct result. An idempotent, re-runnable pipeline is the difference between a 5-minute fix and a midnight data-corruption incident. Lead with this in any design question.</p>
+</div>
+
+<section id="elt">
+  <h2>ELT vs ETL</h2>
+  <p><strong>ETL</strong> (extract, transform, load): transform <em>before</em> loading — historically because storage/compute were expensive. <strong>ELT</strong> (extract, load, transform): land raw data in the warehouse first, transform <em>inside</em> it with SQL/dbt. ELT is the modern default because cloud warehouses make storage cheap and compute elastic.</p>
+  <ul>
+    <li><strong>Why ELT wins for a first hire:</strong> raw data is preserved (you can re-transform when logic changes without re-extracting), transformations are versioned SQL, and you're not maintaining bespoke transform code in an extraction layer.</li>
+    <li><strong>When you still pre-transform:</strong> PII that must never land raw (mask/drop at ingest), or huge volumes where you filter before loading to control cost.</li>
+  </ul>
+</section>
+
+<section id="layers">
+  <h2>The layered warehouse</h2>
+  <p>Even as one person, impose layers — it's how you keep trust as complexity grows. The common naming:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Purpose</th><th>Rules</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Raw / landing</strong></td><td>Exact copy of source, append-only</td><td>Never edited; the source of truth to replay from</td></tr>
+      <tr><td><strong>Staging</strong></td><td>Light cleanup: rename, cast, dedup, 1:1 with source tables</td><td>No business logic, no joins across sources</td></tr>
+      <tr><td><strong>Intermediate</strong></td><td>Reusable joins/logic between staging and marts</td><td>Building blocks, not exposed to BI</td></tr>
+      <tr><td><strong>Marts</strong></td><td>Business-facing facts &amp; dimensions</td><td>Modeled to the question; what BI/stakeholders query</td></tr>
+    </tbody>
+  </table>
+  <p>This maps directly onto a dbt project (<code>staging/</code>, <code>intermediate/</code>, <code>marts/</code>). Mentioning it signals you'll build maintainable structure, not a tangle of one-off queries.</p>
+</section>
+
+<section id="batchstream">
+  <h2>Batch vs streaming — and why you'll choose batch first</h2>
+  <p><strong>Batch</strong>: process data in scheduled chunks (hourly/daily). Simple, cheap, easy to reason about and backfill. <strong>Streaming</strong>: process events continuously (Kafka, Kinesis, Flink). Low latency, but far more operational complexity — exactly-once semantics, state, watermarks, and harder debugging.</p>
+  <div class="callout tip">
+    <span class="callout-label">First-hire answer</span>
+    <p>"I'd start batch. Almost every metric a young company needs — revenue, utilization, retention — is fine on hourly or daily freshness. Streaming earns its complexity only when a real-time <em>decision</em> depends on sub-minute data, e.g. fraud or autoscaling. Until then, streaming just makes us wrong faster and costs my only engineer-week." This is the sequencing judgement from <a href="01-the-first-data-hire-mandate.html">chapter 01</a>.</p>
+  </div>
+  <p>A pragmatic middle ground: <strong>micro-batch</strong> (every few minutes) gives near-real-time freshness with batch's simplicity. Often the right "real-time" answer.</p>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency — the most important property</h2>
+  <p>An idempotent pipeline produces the same result whether it runs once or five times. Without it, retries and backfills duplicate or corrupt data. The standard techniques:</p>
+  <ul>
+    <li><strong>Delete-insert / overwrite by partition:</strong> before loading day D, delete day D's rows, then insert. Re-running just replaces the partition. Clean and the most common pattern.</li>
+    <li><strong>MERGE / upsert on a primary key:</strong> insert new keys, update existing ones. Requires a reliable unique key.</li>
+    <li><strong>Deterministic outputs:</strong> no <code>now()</code> or random ordering baked into stored values; given the same input the transform yields the same output.</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>idempotent_partition.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Re-runnable load of one day's usage. Safe to run any number of times.
+BEGIN;
+DELETE FROM usage_daily WHERE day = DATE '2026-06-23';
+INSERT INTO usage_daily
+SELECT DATE(started_at) AS day, customer_id, SUM(gpu_seconds) AS gpu_seconds
+FROM usage_events
+WHERE started_at >= '2026-06-23' AND started_at < '2026-06-24'
+GROUP BY 1,2;
+COMMIT;</code></pre></div>
+  <p>Contrast with a naive <code>INSERT ... SELECT</code> with no delete: re-running doubles the day. Interviewers probe exactly this.</p>
+</section>
+
+<section id="incremental">
+  <h2>Incremental loads</h2>
+  <p>Reprocessing all history every run is slow and expensive. Incremental models process only new/changed rows since a high-water mark.</p>
+  <ul>
+    <li><strong>High-water mark:</strong> track the max <code>updated_at</code> (or an ingestion timestamp) processed; next run reads rows above it.</li>
+    <li><strong>Lookback window:</strong> reprocess the last N hours/days too, so late-arriving rows within the window are captured. A small lookback is cheap insurance.</li>
+    <li><strong>The trap:</strong> using <code>created_at</code> when rows can be <em>updated</em> later — you'll miss updates. Use a column that moves on every change.</li>
+  </ul>
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>incremental.sql (dbt-style)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{{ config(materialized='incremental', unique_key='event_id') }}
+SELECT * FROM {{ source('app','usage_events') }}
+{% if is_incremental() %}
+  -- 3-day lookback to catch late/updated rows
+  WHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }}) - INTERVAL '3 days'
+{% endif %}</code></pre></div>
+</section>
+
+<section id="latedata">
+  <h2>Late &amp; out-of-order data</h2>
+  <p>Events arrive after their event-time (mobile offline, retries, clock skew). Decide how to handle it explicitly:</p>
+  <ul>
+    <li><strong>Event time vs ingestion time:</strong> partition and aggregate by <em>event time</em> for business correctness, but track ingestion time for ops/debugging. Knowing the difference is a senior signal.</li>
+    <li><strong>Lookback reprocessing</strong> (above) folds late data into the correct day.</li>
+    <li><strong>Accept the cutoff:</strong> document that, say, data older than 7 days is final. Tradeoff between correctness and never-ending recomputation.</li>
+  </ul>
+</section>
+
+<section id="backfill">
+  <h2>Backfills</h2>
+  <p>Loading or reprocessing historical data — for a new model, a bug fix, or a new source. The interview wants to hear that backfills are safe and bounded:</p>
+  <ul>
+    <li><strong>Idempotency makes backfills safe</strong> — you can replay any partition without duplication. This is why it's the first principle.</li>
+    <li><strong>Chunk by partition</strong> (per day/month) rather than one giant query — bounds cost, lets you resume after failure, avoids warehouse blowups.</li>
+    <li><strong>Backfill into a side table, validate, then swap</strong> for risky reprocessing, so you never expose half-rebuilt data.</li>
+    <li><strong>Watch cost</strong> on usage-based warehouses — a naive full-history backfill can be a surprise bill. Estimate bytes scanned first.</li>
+  </ul>
+</section>
+
+<section id="schema">
+  <h2>Schema evolution</h2>
+  <p>Source schemas change without warning — that's the reality you must absorb. Strategies:</p>
+  <ul>
+    <li><strong>Additive changes are safe</strong> (new nullable column). Drops and type changes break downstream — these are what you defend against.</li>
+    <li><strong>Land semi-structured raw</strong> (JSON/VARIANT) so a new field doesn't break ingestion; promote fields into typed columns deliberately in staging.</li>
+    <li><strong>Schema-on-read vs schema-on-write:</strong> raw layer is forgiving (read-time parsing), modeled layers are strict (write-time contracts). Know the terms.</li>
+    <li><strong>Tests as tripwires:</strong> a "expected columns present / types unchanged" test catches an upstream change before it silently corrupts a metric. Leads into <a href="05-data-quality.html">chapter 05</a>.</li>
+  </ul>
+</section>
+
+<section id="orchestration">
+  <h2>Orchestration</h2>
+  <p>The scheduler that runs tasks in dependency order with retries and visibility. Options: <strong>Airflow</strong> (ubiquitous, mature, verbose), <strong>Dagster</strong> (asset-centric, great local dev, modern), <strong>Prefect</strong> (Pythonic, lightweight), or managed/built-in schedulers (dbt Cloud, cloud-native).</p>
+  <div class="callout tip">
+    <span class="callout-label">First-hire answer</span>
+    <p>"I wouldn't stand up Airflow on day one for three pipelines — that's ops overhead for one person. I'd start with a managed scheduler or Dagster for its asset model and local dev, and move to something heavier only when DAG complexity demands it." Match tooling to stage.</p>
+  </div>
+  <p>Concepts to know regardless of tool: <strong>DAG</strong> (dependency graph), <strong>idempotent tasks</strong>, <strong>retries with backoff</strong>, <strong>sensors</strong> (wait for upstream readiness), <strong>SLAs/alerting</strong>, and <strong>backfill support</strong>.</p>
+</section>
+
+<section id="cdc">
+  <h2>CDC &amp; ingestion patterns</h2>
+  <ul>
+    <li><strong>Full snapshot:</strong> copy the whole table each run. Simple, fine for small dimension tables; wasteful for large ones.</li>
+    <li><strong>Incremental key:</strong> pull rows where <code>updated_at &gt; last_seen</code>. Good default for app DBs with a reliable update column.</li>
+    <li><strong>CDC (change data capture):</strong> stream inserts/updates/deletes from the DB's transaction log (Debezium, Fivetran log-based). Captures deletes and is low-impact on the source — but more moving parts.</li>
+    <li><strong>Event/stream ingestion:</strong> product events to a queue/warehouse directly. Watch for duplicates (at-least-once delivery → dedup in staging, see <a href="03-sql-problems.html">problem 6</a>).</li>
+  </ul>
+  <p>First-hire lean: <strong>buy ingestion, build transformation.</strong> Managed connectors (Fivetran/Airbyte) for getting data in; your value-add is the modeling, not maintaining a Salesforce connector. Covered in <a href="08-stack-and-roadmap.html">chapter 08</a>.</p>
+</section>
+
+<section id="design">
+  <h2>Designing a pipeline out loud (interview script)</h2>
+  <p>When asked "design a pipeline to get usage data into reporting," walk this skeleton:</p>
+  <ol>
+    <li><strong>Clarify:</strong> volume, freshness need, can rows be updated/deleted, what decisions the output drives.</li>
+    <li><strong>Ingest:</strong> how data lands in raw (managed connector / CDC / event stream), append-only, partitioned by load date.</li>
+    <li><strong>Stage:</strong> cast, rename, <em>dedup</em> (at-least-once → ROW_NUMBER), one model per source table.</li>
+    <li><strong>Model:</strong> join to the business grain, build the fact/dim (see <a href="06-modeling-judgement.html">chapter 06</a>).</li>
+    <li><strong>Make it idempotent &amp; incremental:</strong> delete-insert by partition, high-water mark with lookback.</li>
+    <li><strong>Test &amp; monitor:</strong> freshness, volume, key uniqueness, the reconciliation check (chapter 05).</li>
+    <li><strong>Orchestrate:</strong> schedule, dependencies, retries, alert on failure.</li>
+    <li><strong>State tradeoffs:</strong> batch over streaming, buy ingestion over build, and what would change your mind.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Next</span>
+    <p>Go deeper on streaming, CDC, and orchestration in <a href="04b-pipelines-advanced.html">04b — Pipelines Advanced</a> →</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

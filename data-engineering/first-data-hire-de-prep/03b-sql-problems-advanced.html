@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Problems II — Advanced — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body data-practice-key="fdh-sql-problems-adv-practiced">
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Problems</h2>
+    <ol class="step-list">
+      <li><a href="#a1">As-of price join</a></li>
+      <li><a href="#a2">Merge overlapping rentals</a></li>
+      <li><a href="#a3">Rolling 30-day actives</a></li>
+      <li><a href="#a4">Interruptions &amp; resume time</a></li>
+      <li><a href="#a5">Time-boxed funnel</a></li>
+      <li><a href="#a6">Retention curve</a></li>
+      <li><a href="#a7">Dedup w/ conflict resolution</a></li>
+      <li><a href="#a8">Sessions with a duration cap</a></li>
+      <li><a href="#a9">Price deciles per GPU</a></li>
+      <li><a href="#a10">Z-score anomaly</a></li>
+      <li><a href="#a11">Gap-fill + LOCF</a></li>
+      <li><a href="#a12">Median clearing bid</a></li>
+    </ol>
+
+    <h2>Reference</h2>
+    <a href="02b-sql-advanced.html">← SQL advanced</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-data-pipelines.html">Next: Pipelines →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Drill · Advanced · Solutions Hidden</span>
+  <h1>SQL Problems II — Advanced</h1>
+  <p class="subtitle">Twelve harder problems — as-of joins, interval merging, rolling distinct counts, anomaly detection in SQL. These are the ones that decide a senior screen. Drill mode on, timer running.</p>
+  <div class="meta-row">
+    <span>🎯 12 problems</span>
+    <span>🔥 Harder set</span>
+    <span>⏱ 20-30 min each</span>
+    <span>🔁 Progress saved locally</span>
+  </div>
+</header>
+
+<div class="drill-bar">
+  <label>
+    <input type="checkbox" id="drillToggle">
+    <span class="toggle"></span>
+    <span><strong>Drill mode</strong> — hide all solutions until you click</span>
+  </label>
+  <span class="progress" id="practiceProgress">0 / 12 practiced</span>
+</div>
+
+<div class="callout tip">
+  <span class="callout-label">Schema (extends 03)</span>
+  <p><code>rentals(rental_id, machine_id, customer_id, started_at, ended_at, rental_type)</code> · <code>price_history(machine_id, price_per_hr, valid_from, valid_to)</code> · <code>instance_state_log(instance_id, state, changed_at)</code> · <code>bids(bid_id, machine_id, customer_id, bid_price, placed_at, won)</code> · <code>usage_events(...)</code> as before.</p>
+</div>
+
+<!-- A1 -->
+<section id="a1">
+  <h2><span class="step-num">1</span>As-of price join <button class="practice-check" data-id="a1">practiced</button></h2>
+  <p><span class="tag join">Range join</span> · Point-in-time.</p>
+  <p><strong>Prompt:</strong> Price each usage interval at the machine's price that was active when it ran. Prices change over time in <code>price_history</code> (non-overlapping validity windows).</p>
+  <details class="reveal"><summary>Solution</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a1.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT u.event_id, u.machine_id, u.started_at,
+       u.gpu_seconds / 3600.0 * p.price_per_hr AS cost
+FROM usage_events u
+JOIN price_history p
+  ON p.machine_id = u.machine_id
+ AND u.started_at >= p.valid_from
+ AND u.started_at <  p.valid_to;</code></pre></div>
+  <p><strong>Watch:</strong> if windows can overlap you fan out — add a test that windows are disjoint, or pick the latest with <code>QUALIFY ROW_NUMBER() OVER (PARTITION BY u.event_id ORDER BY p.valid_from DESC)=1</code>. Engines with native <code>ASOF JOIN</code> do this directly.</p>
+  </div></details>
+</section>
+
+<!-- A2 -->
+<section id="a2">
+  <h2><span class="step-num">2</span>Merge overlapping rental intervals <button class="practice-check" data-id="a2">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Interval merge / "sweep".</p>
+  <p><strong>Prompt:</strong> Per machine, collapse overlapping or back-to-back rental intervals into continuous "busy" periods (to compute true occupied time without double-counting).</p>
+  <details class="reveal"><summary>Solution — running max end, flag new island</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a2.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH ordered AS (
+  SELECT machine_id, started_at, ended_at,
+    MAX(ended_at) OVER (PARTITION BY machine_id ORDER BY started_at
+         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max_end
+  FROM rentals
+),
+flagged AS (
+  SELECT *, CASE WHEN prev_max_end IS NULL OR started_at > prev_max_end
+                 THEN 1 ELSE 0 END AS new_island
+  FROM ordered
+),
+grouped AS (
+  SELECT *, SUM(new_island) OVER (PARTITION BY machine_id ORDER BY started_at) AS grp
+  FROM flagged
+)
+SELECT machine_id, MIN(started_at) AS busy_start, MAX(ended_at) AS busy_end
+FROM grouped GROUP BY machine_id, grp;</code></pre></div>
+  <p><strong>Idea:</strong> a new period starts only when this interval begins after the running max end seen so far. Running-max + flag + running-sum = islands over intervals. Classic and impressive.</p>
+  </div></details>
+</section>
+
+<!-- A3 -->
+<section id="a3">
+  <h2><span class="step-num">3</span>Rolling 30-day active customers <button class="practice-check" data-id="a3">practiced</button></h2>
+  <p><span class="tag agg">Aggregate</span> · Rolling distinct count.</p>
+  <p><strong>Prompt:</strong> For each day, how many distinct customers were active in the trailing 30 days? (Distinct counts don't compose with a simple window SUM — that's the trap.)</p>
+  <details class="reveal"><summary>Solution — self-join on date range (and the scale note)</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a3.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT DISTINCT customer_id, DATE(started_at) AS day FROM usage_events
+),
+spine AS (
+  SELECT generate_series(DATE '2026-01-01', CURRENT_DATE, INTERVAL '1 day')::date AS day
+)
+SELECT s.day, COUNT(DISTINCT d.customer_id) AS rolling_30d_active
+FROM spine s
+JOIN daily d ON d.day > s.day - 30 AND d.day <= s.day
+GROUP BY s.day
+ORDER BY s.day;</code></pre></div>
+  <p><strong>Why not a window:</strong> <code>COUNT(DISTINCT)</code> isn't a windowable rolling op in most engines. The range self-join is correct; at scale, switch to mergeable <strong>HLL sketches</strong> per day and union the trailing 30 (mention this — it's the senior answer).</p>
+  </div></details>
+</section>
+
+<!-- A4 -->
+<section id="a4">
+  <h2><span class="step-num">4</span>Interruptions &amp; time-to-resume <button class="practice-check" data-id="a4">practiced</button></h2>
+  <p><span class="tag window">Window</span> · State machine.</p>
+  <p><strong>Prompt:</strong> From <code>instance_state_log</code> (states: <code>running</code>, <code>stopped</code>), count interruptions per instance and the median time from a stop to the next run.</p>
+  <details class="reveal"><summary>Solution — LEAD to pair stop→next-run</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a4.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH seq AS (
+  SELECT instance_id, state, changed_at,
+    LEAD(state)      OVER (PARTITION BY instance_id ORDER BY changed_at) AS next_state,
+    LEAD(changed_at) OVER (PARTITION BY instance_id ORDER BY changed_at) AS next_at
+  FROM instance_state_log
+),
+interruptions AS (
+  SELECT instance_id, changed_at AS stopped_at, next_at AS resumed_at
+  FROM seq
+  WHERE state = 'stopped' AND next_state = 'running'   -- a true resume
+)
+SELECT instance_id,
+       COUNT(*) AS interruptions,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY resumed_at - stopped_at) AS median_resume
+FROM interruptions GROUP BY instance_id;</code></pre></div>
+  <p><strong>Watch:</strong> a stop with no following run is a permanent kill, not an interruption — the <code>next_state='running'</code> guard excludes it. Very relevant to interruptible-instance analytics.</p>
+  </div></details>
+</section>
+
+<!-- A5 -->
+<section id="a5">
+  <h2><span class="step-num">5</span>Time-boxed funnel <button class="practice-check" data-id="a5">practiced</button></h2>
+  <p><span class="tag join">Join</span> · Funnel with windows.</p>
+  <p><strong>Prompt:</strong> Of customers who ran a search, how many placed a bid within 1 hour, and of those, how many had a running instance within 1 hour of the bid? Counts per stage.</p>
+  <details class="reveal"><summary>Solution — staged EXISTS with time bounds</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a5.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH first_search AS (
+  SELECT customer_id, MIN(searched_at) AS t0 FROM searches GROUP BY customer_id
+),
+bid AS (
+  SELECT f.customer_id, MIN(b.placed_at) AS t1
+  FROM first_search f
+  JOIN bids b ON b.customer_id=f.customer_id
+             AND b.placed_at BETWEEN f.t0 AND f.t0 + INTERVAL '1 hour'
+  GROUP BY f.customer_id
+),
+ran AS (
+  SELECT bd.customer_id
+  FROM bid bd
+  JOIN instance_state_log s ON s.customer_id=bd.customer_id AND s.state='running'
+             AND s.changed_at BETWEEN bd.t1 AND bd.t1 + INTERVAL '1 hour'
+  GROUP BY bd.customer_id
+)
+SELECT (SELECT COUNT(*) FROM first_search) AS searched,
+       (SELECT COUNT(*) FROM bid)          AS bid_1h,
+       (SELECT COUNT(*) FROM ran)          AS ran_1h;</code></pre></div>
+  <p><strong>Watch:</strong> clarify strict ordering (each step after the previous) vs independent. Time-boxing each hop is what makes it a real funnel, not a co-occurrence count.</p>
+  </div></details>
+</section>
+
+<!-- A6 -->
+<section id="a6">
+  <h2><span class="step-num">6</span>Retention curve (Nx) <button class="practice-check" data-id="a6">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Cohort rate.</p>
+  <p><strong>Prompt:</strong> For each signup-week cohort, output the % of customers active in week 0..8 after signup (a triangle/retention curve).</p>
+  <details class="reveal"><summary>Solution — offset + divide by cohort size</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a6.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH cohort AS (
+  SELECT customer_id, DATE_TRUNC('week', signed_up_at) AS wk0 FROM customers
+),
+size AS (SELECT wk0, COUNT(*) n FROM cohort GROUP BY wk0),
+act AS (
+  SELECT DISTINCT c.wk0,
+    FLOOR((DATE_TRUNC('week', u.started_at) - c.wk0) / 7)::int AS wk_offset,
+    u.customer_id
+  FROM cohort c JOIN usage_events u USING (customer_id)
+)
+SELECT a.wk0, a.wk_offset,
+       COUNT(DISTINCT a.customer_id) AS active,
+       ROUND(100.0*COUNT(DISTINCT a.customer_id)/s.n, 1) AS pct
+FROM act a JOIN size s ON s.wk0=a.wk0
+WHERE a.wk_offset BETWEEN 0 AND 8
+GROUP BY a.wk0, a.wk_offset, s.n
+ORDER BY a.wk0, a.wk_offset;</code></pre></div>
+  <p><strong>Watch:</strong> divide by the cohort's own size for a rate; pivoting offset→columns gives the familiar triangle.</p>
+  </div></details>
+</section>
+
+<!-- A7 -->
+<section id="a7">
+  <h2><span class="step-num">7</span>Dedup with conflict resolution <button class="practice-check" data-id="a7">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Survivorship.</p>
+  <p><strong>Prompt:</strong> A customer record arrives from 3 sources with conflicting fields. Produce one golden row per customer: most-recent non-null value <em>per field</em> (not just the latest whole row).</p>
+  <details class="reveal"><summary>Solution — per-column LAST non-null</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a7.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- "Carry forward the latest non-null per field" survivorship
+SELECT customer_id,
+  (ARRAY_AGG(email      ORDER BY updated_at DESC) FILTER (WHERE email      IS NOT NULL))[1] AS email,
+  (ARRAY_AGG(country    ORDER BY updated_at DESC) FILTER (WHERE country    IS NOT NULL))[1] AS country,
+  (ARRAY_AGG(plan_tier  ORDER BY updated_at DESC) FILTER (WHERE plan_tier  IS NOT NULL))[1] AS plan_tier
+FROM customer_sources
+GROUP BY customer_id;</code></pre></div>
+  <p><strong>Idea:</strong> picking the latest <em>whole row</em> loses fields that row left null. Field-level survivorship — newest non-null per column — is the real-world MDM answer. (Engine-specific: BigQuery uses <code>ARRAY_AGG(... IGNORE NULLS LIMIT 1)</code>.)</p>
+  </div></details>
+</section>
+
+<!-- A8 -->
+<section id="a8">
+  <h2><span class="step-num">8</span>Sessions with a duration cap <button class="practice-check" data-id="a8">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Constrained sessionization.</p>
+  <p><strong>Prompt:</strong> Sessionize events with a 30-min inactivity gap <em>and</em> a hard cap: no session longer than 2 hours (a long continuous stream still splits every 2h).</p>
+  <details class="reveal"><summary>Solution — gap flag, then cap within run</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a8.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH lagged AS (
+  SELECT customer_id, event_ts,
+    LAG(event_ts) OVER (PARTITION BY customer_id ORDER BY event_ts) AS prev
+  FROM events
+),
+gapflag AS (
+  SELECT *, CASE WHEN prev IS NULL OR event_ts-prev > INTERVAL '30 min' THEN 1 ELSE 0 END AS gap_new
+  FROM lagged
+),
+gapsess AS (
+  SELECT *, SUM(gap_new) OVER (PARTITION BY customer_id ORDER BY event_ts) AS gap_sid
+  FROM gapflag
+)
+SELECT *,
+  gap_sid::text || '-' ||
+  FLOOR(EXTRACT(EPOCH FROM (event_ts -
+        MIN(event_ts) OVER (PARTITION BY customer_id, gap_sid))) / 7200)::text AS session_id
+FROM gapsess;</code></pre></div>
+  <p><strong>Idea:</strong> first split on inactivity gaps, then within each gap-session bucket by elapsed-since-start / 2h. Composing two rules is the harder-than-it-looks part.</p>
+  </div></details>
+</section>
+
+<!-- A9 -->
+<section id="a9">
+  <h2><span class="step-num">9</span>Price deciles per GPU type <button class="practice-check" data-id="a9">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Distribution.</p>
+  <p><strong>Prompt:</strong> For each GPU type, bucket current listed machines into price deciles and return the boundary price of each decile (for a pricing-competitiveness view).</p>
+  <details class="reveal"><summary>Solution — NTILE per partition, boundaries</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a9.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH d AS (
+  SELECT gpu_type, price_per_hr,
+    NTILE(10) OVER (PARTITION BY gpu_type ORDER BY price_per_hr) AS decile
+  FROM listings WHERE status = 'available'
+)
+SELECT gpu_type, decile,
+       MIN(price_per_hr) AS decile_low,
+       MAX(price_per_hr) AS decile_high,
+       COUNT(*)          AS n
+FROM d GROUP BY gpu_type, decile
+ORDER BY gpu_type, decile;</code></pre></div>
+  <p><strong>Alt:</strong> <code>PERCENTILE_CONT(ARRAY[0.1,0.5,0.9])</code> if you only need specific cut points rather than full deciles.</p>
+  </div></details>
+</section>
+
+<!-- A10 -->
+<section id="a10">
+  <h2><span class="step-num">10</span>Z-score anomaly detection <button class="practice-check" data-id="a10">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Statistical test in SQL.</p>
+  <p><strong>Prompt:</strong> Flag days where total GPU-hours deviate &gt; 3 standard deviations from the trailing 28-day mean (excluding the day itself).</p>
+  <details class="reveal"><summary>Solution — trailing mean/stddev window</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a10.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH daily AS (
+  SELECT DATE(started_at) AS day, SUM(gpu_seconds)/3600.0 AS gpu_hours
+  FROM usage_events GROUP BY 1
+),
+stats AS (
+  SELECT day, gpu_hours,
+    AVG(gpu_hours)    OVER w AS mean_28,
+    STDDEV(gpu_hours) OVER w AS sd_28
+  FROM daily
+  WINDOW w AS (ORDER BY day ROWS BETWEEN 28 PRECEDING AND 1 PRECEDING)
+)
+SELECT day, gpu_hours, mean_28, sd_28,
+       (gpu_hours - mean_28) / NULLIF(sd_28,0) AS z
+FROM stats
+WHERE sd_28 > 0 AND ABS((gpu_hours - mean_28)/sd_28) > 3
+ORDER BY day;</code></pre></div>
+  <p><strong>Watch:</strong> exclude the current row (<code>1 PRECEDING</code>) so a spike doesn't inflate its own baseline. Account for weekly seasonality by comparing like-days if needed (chapter 05b).</p>
+  </div></details>
+</section>
+
+<!-- A11 -->
+<section id="a11">
+  <h2><span class="step-num">11</span>Gap-fill + carry-forward <button class="practice-check" data-id="a11">practiced</button></h2>
+  <p><span class="tag join">Spine</span> · LOCF.</p>
+  <p><strong>Prompt:</strong> Produce a continuous daily series of each machine's listed price, carrying the last known price forward over days with no price change.</p>
+  <details class="reveal"><summary>Solution — spine × machines, LAST_VALUE IGNORE NULLS</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a11.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH spine AS (
+  SELECT generate_series(DATE '2026-01-01', CURRENT_DATE, INTERVAL '1 day')::date AS day
+),
+m AS (SELECT DISTINCT machine_id FROM price_changes),
+grid AS (SELECT m.machine_id, s.day FROM m CROSS JOIN spine s),
+joined AS (
+  SELECT g.machine_id, g.day, pc.new_price
+  FROM grid g
+  LEFT JOIN price_changes pc
+    ON pc.machine_id=g.machine_id AND DATE(pc.changed_at)=g.day
+)
+SELECT machine_id, day,
+  LAST_VALUE(new_price IGNORE NULLS) OVER (
+    PARTITION BY machine_id ORDER BY day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS price_locf
+FROM joined;</code></pre></div>
+  <p><strong>Idea:</strong> build the full machine×day grid, attach changes where they happen, then carry forward the last non-null. The standard recipe for "value as of each day."</p>
+  </div></details>
+</section>
+
+<!-- A12 -->
+<section id="a12">
+  <h2><span class="step-num">12</span>Median clearing bid per hour <button class="practice-check" data-id="a12">practiced</button></h2>
+  <p><span class="tag agg">Aggregate</span> · Market price discovery.</p>
+  <p><strong>Prompt:</strong> For each GPU type and hour, what was the median <em>winning</em> bid price (the market-clearing price)? Only bids that actually won count.</p>
+  <details class="reveal"><summary>Solution — filter to winners, percentile by bucket</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>a12.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT m.gpu_type,
+       DATE_TRUNC('hour', b.placed_at) AS hour,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY b.bid_price) AS median_clearing_price,
+       COUNT(*) AS winning_bids
+FROM bids b
+JOIN machines m ON m.machine_id = b.machine_id
+WHERE b.won = true
+GROUP BY m.gpu_type, DATE_TRUNC('hour', b.placed_at)
+ORDER BY gpu_type, hour;</code></pre></div>
+  <p><strong>Why it matters:</strong> on an auction marketplace the clearing price <em>is</em> the price signal. Add P10/P90 (<code>PERCENTILE_CONT(ARRAY[0.1,0.9])</code>) to show spread, and compare to on-demand list price to quantify interruptible savings.</p>
+  </div></details>
+</section>
+
+<div class="callout tip">
+  <span class="callout-label">Next</span>
+  <p>You've gone deep on SQL. Now the systems around it: <a href="04-data-pipelines.html">04 — Data Pipelines</a> →</p>
+</div>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL Problems Worked Out — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body data-practice-key="fdh-sql-problems-practiced">
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Problems</h2>
+    <ol class="step-list">
+      <li><a href="#p1">Latest state per instance</a></li>
+      <li><a href="#p2">Top-N customers per region</a></li>
+      <li><a href="#p3">Running monthly revenue</a></li>
+      <li><a href="#p4">Consecutive active days</a></li>
+      <li><a href="#p5">Sessionize usage</a></li>
+      <li><a href="#p6">Dedup with tiebreaker</a></li>
+      <li><a href="#p7">Cohort retention</a></li>
+      <li><a href="#p8">Median GPU-hours</a></li>
+      <li><a href="#p9">Month-over-month growth</a></li>
+      <li><a href="#p10">Signup → paid funnel</a></li>
+      <li><a href="#p11">Daily fleet utilization</a></li>
+      <li><a href="#p12">Billing reconciliation</a></li>
+    </ol>
+
+    <h2>Reference</h2>
+    <a href="02-sql-deep-dive.html">← SQL deep dive</a>
+    <a href="02b-sql-advanced.html">← SQL advanced</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03b-sql-problems-advanced.html">Next: SQL Problems II →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Drill · Solutions Hidden</span>
+  <h1>SQL Problems Worked Out</h1>
+  <p class="subtitle">12 problems covering the patterns interviewers actually test, with a usage-marketplace flavor. Turn on drill mode, try each on a timer, then reveal. Progress saves locally.</p>
+  <div class="meta-row">
+    <span>🎯 12 problems</span>
+    <span>🐘 Postgres / Snowflake / BigQuery dialects</span>
+    <span>⏱ 15-25 min each</span>
+    <span>🔁 Progress saved locally</span>
+  </div>
+</header>
+
+<div class="drill-bar">
+  <label>
+    <input type="checkbox" id="drillToggle">
+    <span class="toggle"></span>
+    <span><strong>Drill mode</strong> — hide all solutions until you click</span>
+  </label>
+  <span class="progress" id="practiceProgress">0 / 12 practiced</span>
+</div>
+
+<div class="callout tip">
+  <span class="callout-label">Schema you'll use</span>
+  <p><code>instances(instance_id, machine_id, customer_id, region, status, started_at, ended_at)</code> · <code>usage_events(event_id, customer_id, instance_id, gpu_seconds, started_at)</code> · <code>invoices(invoice_id, customer_id, amount, billing_month, status)</code> · <code>customers(customer_id, region, signed_up_at)</code></p>
+</div>
+
+<!-- P1 -->
+<section id="p1">
+  <h2><span class="step-num">1</span>Latest state per instance <button class="practice-check" data-id="p1">practiced</button></h2>
+  <p><span class="tag window">Window</span> · The single most common pattern.</p>
+  <p><strong>Prompt:</strong> <code>instance_status_log(instance_id, status, changed_at)</code> records every status change. Return the current status of each instance.</p>
+  <details class="reveal"><summary>Approach — ROW_NUMBER (or QUALIFY)</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p1.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY instance_id
+                       ORDER BY changed_at DESC, status DESC) AS rn
+  FROM instance_status_log
+)
+SELECT instance_id, status, changed_at FROM ranked WHERE rn = 1;
+
+-- Snowflake/BigQuery:
+-- SELECT * FROM instance_status_log
+-- QUALIFY ROW_NUMBER() OVER (PARTITION BY instance_id ORDER BY changed_at DESC) = 1;</code></pre></div>
+  <p><strong>Watch:</strong> deterministic tiebreaker so "latest" is stable. Don't use <code>MAX(changed_at)</code> + self-join — it breaks on ties and is slower.</p>
+  </div></details>
+</section>
+
+<!-- P2 -->
+<section id="p2">
+  <h2><span class="step-num">2</span>Top-N customers per region <button class="practice-check" data-id="p2">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Top-N per group.</p>
+  <p><strong>Prompt:</strong> Return the top 3 customers by total paid invoice amount within each region.</p>
+  <details class="reveal"><summary>Approach — aggregate then RANK</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p2.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH spend AS (
+  SELECT c.region, c.customer_id, SUM(i.amount) AS total
+  FROM customers c
+  JOIN invoices i ON i.customer_id = c.customer_id AND i.status = 'paid'
+  GROUP BY c.region, c.customer_id
+),
+ranked AS (
+  SELECT *, DENSE_RANK() OVER (PARTITION BY region ORDER BY total DESC) AS rnk
+  FROM spend
+)
+SELECT region, customer_id, total FROM ranked WHERE rnk <= 3
+ORDER BY region, total DESC;</code></pre></div>
+  <p><strong>Watch:</strong> <code>ROW_NUMBER</code> picks exactly 3 (arbitrary tiebreak); <code>DENSE_RANK</code> includes ties at 3rd. Clarify which they want.</p>
+  </div></details>
+</section>
+
+<!-- P3 -->
+<section id="p3">
+  <h2><span class="step-num">3</span>Running monthly revenue <button class="practice-check" data-id="p3">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Running total.</p>
+  <p><strong>Prompt:</strong> Show paid revenue per month and a cumulative running total over time.</p>
+  <details class="reveal"><summary>Approach — aggregate then windowed SUM</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p3.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH monthly AS (
+  SELECT billing_month, SUM(amount) AS revenue
+  FROM invoices WHERE status = 'paid'
+  GROUP BY billing_month
+)
+SELECT billing_month, revenue,
+  SUM(revenue) OVER (ORDER BY billing_month
+       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative
+FROM monthly
+ORDER BY billing_month;</code></pre></div>
+  <p><strong>Watch:</strong> aggregate to the grain first, then apply the window. Specify <code>ROWS</code> to avoid RANGE peer-lumping.</p>
+  </div></details>
+</section>
+
+<!-- P4 -->
+<section id="p4">
+  <h2><span class="step-num">4</span>Consecutive active days <button class="practice-check" data-id="p4">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Gaps and islands.</p>
+  <p><strong>Prompt:</strong> <code>daily_active(customer_id, active_date)</code> has one row per active day. Find each customer's longest streak of consecutive active days.</p>
+  <details class="reveal"><summary>Approach — date minus row number</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p4.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH g AS (
+  SELECT customer_id, active_date,
+    active_date - (ROW_NUMBER() OVER (PARTITION BY customer_id
+                                      ORDER BY active_date))::int AS grp
+  FROM daily_active
+),
+streaks AS (
+  SELECT customer_id, grp, COUNT(*) AS len
+  FROM g GROUP BY customer_id, grp
+)
+SELECT customer_id, MAX(len) AS longest_streak
+FROM streaks GROUP BY customer_id;</code></pre></div>
+  <p><strong>Why it works:</strong> consecutive dates increase by 1, the row number also increases by 1, so their difference is constant across an unbroken run. Be ready to explain that.</p>
+  </div></details>
+</section>
+
+<!-- P5 -->
+<section id="p5">
+  <h2><span class="step-num">5</span>Sessionize usage events <button class="practice-check" data-id="p5">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Sessionization.</p>
+  <p><strong>Prompt:</strong> Group each customer's <code>usage_events</code> into sessions, where a gap &gt; 30 minutes starts a new session.</p>
+  <details class="reveal"><summary>Approach — flag boundary, running sum</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p5.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH lagged AS (
+  SELECT customer_id, event_id, started_at,
+    LAG(started_at) OVER (PARTITION BY customer_id ORDER BY started_at) AS prev
+  FROM usage_events
+),
+flagged AS (
+  SELECT *, CASE WHEN prev IS NULL
+                   OR started_at - prev > INTERVAL '30 minutes'
+                 THEN 1 ELSE 0 END AS is_new
+  FROM lagged
+)
+SELECT customer_id, event_id, started_at,
+  SUM(is_new) OVER (PARTITION BY customer_id ORDER BY started_at) AS session_id
+FROM flagged;</code></pre></div>
+  <p><strong>Pattern:</strong> flag boundaries, running-sum the flag to mint IDs. Generalizes widely.</p>
+  </div></details>
+</section>
+
+<!-- P6 -->
+<section id="p6">
+  <h2><span class="step-num">6</span>Dedup with tiebreaker <button class="practice-check" data-id="p6">practiced</button></h2>
+  <p><span class="tag window">Window</span> · Dedup.</p>
+  <p><strong>Prompt:</strong> A raw events feed has duplicate rows for the same <code>event_id</code> from at-least-once delivery. Keep one row per <code>event_id</code> — the most recently ingested.</p>
+  <details class="reveal"><summary>Approach — ROW_NUMBER on the dedup key</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p6.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY event_id
+                       ORDER BY ingested_at DESC) AS rn
+  FROM raw_events
+)
+SELECT * EXCEPT(rn)   -- BigQuery; else list columns
+FROM ranked WHERE rn = 1;</code></pre></div>
+  <p><strong>First-hire note:</strong> say you'd push this dedup into the staging model so every downstream consumer gets clean, idempotent data — not re-solve it per query. Ties to <a href="04-data-pipelines.html">idempotency</a>.</p>
+  </div></details>
+</section>
+
+<!-- P7 -->
+<section id="p7">
+  <h2><span class="step-num">7</span>Cohort retention <button class="practice-check" data-id="p7">practiced</button></h2>
+  <p><span class="tag join">Join</span><span class="tag window">Window</span> · Cohorts.</p>
+  <p><strong>Prompt:</strong> Group customers by signup month. For each cohort, show how many were still active (had usage) in months 0, 1, 2 after signup.</p>
+  <details class="reveal"><summary>Approach — cohort month + month offset</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p7.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH cohort AS (
+  SELECT customer_id, DATE_TRUNC('month', signed_up_at) AS cohort_month
+  FROM customers
+),
+activity AS (
+  SELECT DISTINCT customer_id, DATE_TRUNC('month', started_at) AS active_month
+  FROM usage_events
+),
+joined AS (
+  SELECT c.cohort_month, c.customer_id,
+    (EXTRACT(YEAR FROM a.active_month) - EXTRACT(YEAR FROM c.cohort_month)) * 12
+      + (EXTRACT(MONTH FROM a.active_month) - EXTRACT(MONTH FROM c.cohort_month))
+      AS month_offset
+  FROM cohort c JOIN activity a ON a.customer_id = c.customer_id
+)
+SELECT cohort_month, month_offset, COUNT(DISTINCT customer_id) AS retained
+FROM joined
+WHERE month_offset BETWEEN 0 AND 2
+GROUP BY cohort_month, month_offset
+ORDER BY cohort_month, month_offset;</code></pre></div>
+  <p><strong>Watch:</strong> divide retained by cohort size for a rate. Mention you'd build this as a model, not re-derive it ad hoc.</p>
+  </div></details>
+</section>
+
+<!-- P8 -->
+<section id="p8">
+  <h2><span class="step-num">8</span>Median GPU-hours <button class="practice-check" data-id="p8">practiced</button></h2>
+  <p><span class="tag agg">Aggregate</span> · Percentiles.</p>
+  <p><strong>Prompt:</strong> Find the median GPU-hours consumed per customer last month.</p>
+  <details class="reveal"><summary>Approach — PERCENTILE_CONT (and the portable fallback)</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p8.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH per_customer AS (
+  SELECT customer_id, SUM(gpu_seconds)/3600.0 AS gpu_hours
+  FROM usage_events
+  WHERE started_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND started_at <  DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY customer_id
+)
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gpu_hours) AS median_hours
+FROM per_customer;
+
+-- Portable fallback if PERCENTILE_CONT is unavailable:
+-- rank rows, pick the middle one(s) with ROW_NUMBER + COUNT.</code></pre></div>
+  <p><strong>Note:</strong> mention median over mean because usage is heavily right-skewed (a few whales dominate the average).</p>
+  </div></details>
+</section>
+
+<!-- P9 -->
+<section id="p9">
+  <h2><span class="step-num">9</span>Month-over-month growth <button class="practice-check" data-id="p9">practiced</button></h2>
+  <p><span class="tag window">Window</span> · LAG.</p>
+  <p><strong>Prompt:</strong> For each month, show revenue, prior-month revenue, and MoM % change.</p>
+  <details class="reveal"><summary>Approach — LAG with divide-by-zero guard</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p9.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH monthly AS (
+  SELECT billing_month, SUM(amount) AS rev
+  FROM invoices WHERE status='paid' GROUP BY billing_month
+)
+SELECT billing_month, rev,
+  LAG(rev) OVER (ORDER BY billing_month) AS prev_rev,
+  ROUND(100.0*(rev - LAG(rev) OVER (ORDER BY billing_month))
+        / NULLIF(LAG(rev) OVER (ORDER BY billing_month),0), 1) AS mom_pct
+FROM monthly ORDER BY billing_month;</code></pre></div>
+  <p><strong>Watch:</strong> <code>NULLIF(...,0)</code> prevents divide-by-zero; the first month's % is correctly NULL.</p>
+  </div></details>
+</section>
+
+<!-- P10 -->
+<section id="p10">
+  <h2><span class="step-num">10</span>Signup → paid funnel <button class="practice-check" data-id="p10">practiced</button></h2>
+  <p><span class="tag agg">Aggregate</span> · Funnel.</p>
+  <p><strong>Prompt:</strong> Of customers who signed up, how many launched a first instance, and how many produced a paid invoice? Show counts and conversion rates.</p>
+  <details class="reveal"><summary>Approach — boolean flags via EXISTS, then aggregate</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p10.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH flags AS (
+  SELECT c.customer_id,
+    EXISTS(SELECT 1 FROM instances i WHERE i.customer_id=c.customer_id) AS launched,
+    EXISTS(SELECT 1 FROM invoices v
+           WHERE v.customer_id=c.customer_id AND v.status='paid')       AS paid
+  FROM customers c
+)
+SELECT
+  COUNT(*)                                   AS signed_up,
+  COUNT(*) FILTER (WHERE launched)           AS launched,
+  COUNT(*) FILTER (WHERE paid)               AS paid,
+  ROUND(100.0*COUNT(*) FILTER (WHERE launched)/COUNT(*),1) AS pct_launched,
+  ROUND(100.0*COUNT(*) FILTER (WHERE paid)
+        / NULLIF(COUNT(*) FILTER (WHERE launched),0),1)    AS pct_launched_to_paid
+FROM flags;</code></pre></div>
+  <p><strong>Watch:</strong> decide whether each stage requires the previous (strict funnel) or is independent. Clarify before coding.</p>
+  </div></details>
+</section>
+
+<!-- P11 -->
+<section id="p11">
+  <h2><span class="step-num">11</span>Daily fleet utilization <button class="practice-check" data-id="p11">practiced</button></h2>
+  <p><span class="tag join">Join</span> · Date spine + ratio.</p>
+  <p><strong>Prompt:</strong> For each day, compute utilization = rented GPU-hours / available GPU-hours across the fleet. Days with zero rentals must still appear (as 0%).</p>
+  <details class="reveal"><summary>Approach — generate a date spine, LEFT JOIN usage</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p11.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH days AS (
+  SELECT generate_series(DATE '2026-01-01', CURRENT_DATE, INTERVAL '1 day')::date AS day
+),
+rented AS (
+  SELECT DATE(started_at) AS day, SUM(gpu_seconds)/3600.0 AS rented_hours
+  FROM usage_events GROUP BY 1
+),
+capacity AS (   -- e.g. 500 GPUs * 24h available per day
+  SELECT 500 * 24.0 AS available_hours
+)
+SELECT d.day,
+  COALESCE(r.rented_hours,0) AS rented_hours,
+  ROUND(100.0*COALESCE(r.rented_hours,0)/cap.available_hours,1) AS utilization_pct
+FROM days d
+CROSS JOIN capacity cap
+LEFT JOIN rented r ON r.day = d.day
+ORDER BY d.day;</code></pre></div>
+  <p><strong>Why the spine:</strong> a plain GROUP BY drops zero-rental days; the LEFT JOIN against a generated calendar guarantees a continuous series. This is the canonical "no gaps in the time axis" trick.</p>
+  </div></details>
+</section>
+
+<!-- P12 -->
+<section id="p12">
+  <h2><span class="step-num">12</span>Billing reconciliation <button class="practice-check" data-id="p12">practiced</button></h2>
+  <p><span class="tag join">Join</span><span class="tag agg">Aggregate</span> · Reconciliation / data quality.</p>
+  <p><strong>Prompt:</strong> Find customers whose metered usage (priced) disagrees with what was invoiced for a given month by more than $1. This is a real first-hire task: catch billing leakage.</p>
+  <details class="reveal"><summary>Approach — aggregate both sides to same grain, FULL OUTER JOIN, compare</summary><div class="reveal-body">
+<div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>p12.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">WITH metered AS (
+  SELECT customer_id, DATE_TRUNC('month', started_at) AS month,
+         SUM(gpu_seconds)/3600.0 * 1.20 AS expected_amount
+  FROM usage_events GROUP BY 1,2
+),
+invoiced AS (
+  SELECT customer_id, billing_month AS month, SUM(amount) AS invoiced_amount
+  FROM invoices GROUP BY 1,2
+)
+SELECT
+  COALESCE(m.customer_id, i.customer_id) AS customer_id,
+  COALESCE(m.month, i.month)             AS month,
+  COALESCE(m.expected_amount,0)          AS expected_amount,
+  COALESCE(i.invoiced_amount,0)          AS invoiced_amount,
+  COALESCE(i.invoiced_amount,0) - COALESCE(m.expected_amount,0) AS diff
+FROM metered m
+FULL OUTER JOIN invoiced i
+  ON m.customer_id = i.customer_id AND m.month = i.month
+WHERE ABS(COALESCE(i.invoiced_amount,0) - COALESCE(m.expected_amount,0)) > 1
+ORDER BY ABS(COALESCE(i.invoiced_amount,0) - COALESCE(m.expected_amount,0)) DESC;</code></pre></div>
+  <p><strong>Why FULL OUTER:</strong> it catches both directions — metered-but-not-invoiced (lost revenue) <em>and</em> invoiced-but-not-metered (over-charge). Aggregate both sides to identical grain before joining or you'll fan out. This query <em>is</em> a data-quality check; in <a href="05-data-quality.html">05</a> we turn it into an automated test.</p>
+  </div></details>
+</section>
+
+<div class="callout tip">
+  <span class="callout-label">Next</span>
+  <p>Ready for harder problems? <a href="03b-sql-problems-advanced.html">03b — SQL Problems II (Advanced)</a> →</p>
+</div>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

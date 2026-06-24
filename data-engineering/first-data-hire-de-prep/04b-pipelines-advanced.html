@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipelines Advanced — First Data Hire DE Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Streaming</h2>
+    <a href="#delivery">Delivery semantics</a>
+    <a href="#windowing">Windowing &amp; watermarks</a>
+    <a href="#exactly-once">Exactly-once in practice</a>
+
+    <h2>Ingestion</h2>
+    <a href="#cdc">CDC, deeply</a>
+    <a href="#formats">File &amp; table formats</a>
+    <a href="#lakehouse">Lakehouse vs warehouse</a>
+
+    <h2>Orchestration</h2>
+    <a href="#patterns">Patterns that matter</a>
+    <a href="#errors">Errors, retries, DLQ</a>
+    <a href="#wap">Write-audit-publish</a>
+
+    <h2>Engineering it</h2>
+    <a href="#testing">Testing pipelines</a>
+    <a href="#cost">Cost &amp; performance</a>
+    <a href="#config">Config, secrets, env</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-data-pipelines.html">← Previous: Data Pipelines</a>
+    <a href="05-data-quality.html">Next: Data Quality →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Pipelines</span>
+  <h1>Pipelines Advanced</h1>
+  <p class="subtitle">The depth a systems-design round probes: streaming semantics, CDC internals, table formats, orchestration patterns, and how you make pipelines testable and cheap. Founding-hire lens still applies — know these so you can decide what's worth adopting, not just describe them.</p>
+</header>
+
+<div class="callout insight">
+  <span class="callout-label">Framing for the loop</span>
+  <p>You'll rarely build all of this at a startup — but you must be able to <em>reason</em> about it: "here's how exactly-once actually works, here's why I'd still start batch, and here's the trigger that would make streaming worth it." Depth + judgement, together.</p>
+</div>
+
+<section id="delivery">
+  <h2>Delivery semantics</h2>
+  <p>The vocabulary that anchors every streaming discussion:</p>
+  <ul>
+    <li><strong>At-most-once:</strong> may drop messages, never duplicates. Rarely acceptable for billing/usage.</li>
+    <li><strong>At-least-once:</strong> never drops, may duplicate (the common default). You handle duplicates downstream via dedup on an idempotency key.</li>
+    <li><strong>Exactly-once:</strong> each message reflected once in the result. Real but expensive — achieved through idempotent writes + transactional offset commits, not magic.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">The pragmatic truth to state</span>
+    <p>"True end-to-end exactly-once is hard; the practical pattern is <strong>at-least-once delivery + idempotent, deduplicated writes</strong> keyed on a stable event id. That gives effectively-once results without distributed-transaction complexity." Saying this signals you've actually shipped streaming, not just read about it.</p>
+  </div>
+</section>
+
+<section id="windowing">
+  <h2>Windowing &amp; watermarks</h2>
+  <p>Stream processors aggregate over windows of <em>event time</em>, and must decide when a window is "done" despite late data — that's the watermark.</p>
+  <ul>
+    <li><strong>Tumbling</strong> (fixed, non-overlapping), <strong>hopping/sliding</strong> (overlapping), <strong>session</strong> (gap-defined) windows.</li>
+    <li><strong>Event time vs processing time:</strong> aggregate by when the event happened, not when it arrived, or your hourly metrics are wrong under lag.</li>
+    <li><strong>Watermark:</strong> "I believe I've seen all events up to time T." It triggers window emission. A larger allowed-lateness = more correctness, more latency/state. This tradeoff is the heart of streaming correctness.</li>
+    <li><strong>Late data after the watermark:</strong> drop, side-output, or update — pick deliberately.</li>
+  </ul>
+</section>
+
+<section id="exactly-once">
+  <h2>Exactly-once in practice</h2>
+  <p>How systems actually get there, so you can speak to it:</p>
+  <ul>
+    <li><strong>Idempotent sink:</strong> upsert/merge on a deterministic key so reprocessing overwrites rather than appends.</li>
+    <li><strong>Transactional offsets:</strong> commit the consumer offset in the same transaction as the output write (Kafka transactions, Flink checkpoints) so a crash can't double-count.</li>
+    <li><strong>Checkpoint/replay:</strong> on failure, restore state from the last checkpoint and replay from the committed offset.</li>
+  </ul>
+  <p>Connect it back: this is the streaming version of chapter 04's <em>idempotency</em> — same principle, harder setting.</p>
+</section>
+
+<section id="cdc">
+  <h2>CDC, deeply</h2>
+  <ul>
+    <li><strong>Log-based CDC</strong> (Debezium, Fivetran log mode) reads the DB's write-ahead/binlog. Captures inserts, updates, <em>and deletes</em> with low source load — the gold standard.</li>
+    <li><strong>Query-based CDC</strong> polls <code>updated_at &gt; last_seen</code>. Simple but misses hard deletes and rows updated without bumping the timestamp.</li>
+    <li><strong>Soft vs hard deletes:</strong> log CDC emits delete events; decide whether your warehouse hard-deletes or marks <code>is_deleted</code> (usually the latter — you want history).</li>
+    <li><strong>Ordering &amp; idempotency:</strong> CDC events carry a log sequence number (LSN/SCN); apply with a MERGE keyed on PK, keeping the highest LSN, so out-of-order or replayed events converge correctly.</li>
+    <li><strong>Snapshot + stream:</strong> initial full snapshot, then incremental log tailing — know that handoff is where bugs live (gaps/overlaps at the boundary).</li>
+  </ul>
+</section>
+
+<section id="formats">
+  <h2>File &amp; table formats</h2>
+  <p>Even warehouse-first shops hit these via external/iceberg tables and lakes.</p>
+  <ul>
+    <li><strong>Columnar files — Parquet/ORC:</strong> column pruning + compression + predicate pushdown. Default for analytics-at-rest. Avoid row formats (CSV/JSON) for big data.</li>
+    <li><strong>Open table formats — Iceberg / Delta / Hudi:</strong> add ACID transactions, schema evolution, time travel, and hidden partitioning <em>on top of</em> Parquet files. They turn a file dump into a real table.</li>
+    <li><strong>The small-files problem:</strong> streaming writes create many tiny files that wreck scan performance; you run <strong>compaction</strong> to coalesce them. Know this exists.</li>
+    <li><strong>Partitioning vs clustering:</strong> partition by a low-cardinality, frequently-filtered column (date); cluster/Z-order within for secondary keys. Over-partitioning (e.g. by customer) creates millions of tiny partitions — a classic mistake.</li>
+  </ul>
+</section>
+
+<section id="lakehouse">
+  <h2>Lakehouse vs warehouse</h2>
+  <table>
+    <thead><tr><th></th><th>Warehouse (Snowflake/BigQuery)</th><th>Lakehouse (Databricks/Iceberg)</th></tr></thead>
+    <tbody>
+      <tr><td>Sweet spot</td><td>SQL analytics, BI, governance</td><td>ML, huge/unstructured data, open formats</td></tr>
+      <tr><td>Storage</td><td>Managed, proprietary</td><td>Open files in your object store</td></tr>
+      <tr><td>Lock-in</td><td>Higher</td><td>Lower (open formats)</td></tr>
+      <tr><td>Ops burden</td><td>Lower</td><td>Higher</td></tr>
+    </tbody>
+  </table>
+  <p><strong>First-hire take:</strong> "Warehouse-first for a small team — it's lower ops and SQL-native. I'd reach for lakehouse/Iceberg when data volume, ML workloads, or open-format/cost concerns justify it. The two are converging anyway (warehouses now read Iceberg)."</p>
+</section>
+
+<section id="patterns">
+  <h2>Orchestration patterns that matter</h2>
+  <ul>
+    <li><strong>Idempotency key per run</strong> (the logical date/partition) so retries and backfills target a specific slice — the orchestration twin of delete-insert.</li>
+    <li><strong>Sensors / triggers:</strong> wait for upstream readiness (a file lands, a source table is fresh) instead of guessing with fixed schedules.</li>
+    <li><strong>Dynamic task mapping / fan-out:</strong> generate one task per partition/customer at runtime; bounds blast radius and enables parallel backfills.</li>
+    <li><strong>Retries with exponential backoff + jitter</strong> for transient failures; cap attempts so you fail loudly rather than retry forever.</li>
+    <li><strong>Asset/data-aware orchestration</strong> (Dagster): model the data assets and their lineage, not just tasks — failures and staleness are expressed in terms of data.</li>
+    <li><strong>Concurrency &amp; pools:</strong> limit simultaneous hits on a source DB / warehouse to avoid self-inflicted outages.</li>
+  </ul>
+</section>
+
+<section id="errors">
+  <h2>Errors, retries, dead-letter queues</h2>
+  <ul>
+    <li><strong>Distinguish transient vs poison:</strong> retry transient (network, rate limit); route permanently-bad records to a <strong>dead-letter queue</strong> so one malformed row doesn't halt the whole batch.</li>
+    <li><strong>Quarantine, don't drop:</strong> bad rows go to a quarantine table with the reason — you can inspect, fix, and reprocess. Silent dropping destroys trust.</li>
+    <li><strong>Partial-failure semantics:</strong> design so a failed batch leaves the target unchanged (transaction or staging-then-swap), never half-written.</li>
+    <li><strong>Alert on the DLQ growing</strong>, not just on job failure — a job can "succeed" while quietly quarantining everything.</li>
+  </ul>
+</section>
+
+<section id="wap">
+  <h2>Write-audit-publish (WAP)</h2>
+  <p>The pattern that prevents bad data from ever reaching consumers — and the cleanest answer to "how do you deploy data changes safely?"</p>
+  <ol>
+    <li><strong>Write</strong> the new data to a staging/branch location (or an Iceberg branch).</li>
+    <li><strong>Audit</strong> — run quality tests against the staged data.</li>
+    <li><strong>Publish</strong> — atomically swap it into production only if audits pass; otherwise hold and alert.</li>
+  </ol>
+  <p>Blue-green for data. Combine with idempotent partitions so a failed publish is a no-op. This is also how you do zero-downtime backfills of a live table.</p>
+</section>
+
+<section id="testing">
+  <h2>Testing pipelines (not just data)</h2>
+  <ul>
+    <li><strong>Unit tests on transform logic:</strong> dbt unit tests / seeds with fixed inputs → assert exact outputs. Catches logic regressions before they touch real data.</li>
+    <li><strong>Schema/contract tests at ingest</strong> (chapter 05) as the upstream tripwire.</li>
+    <li><strong>Integration tests on a sample warehouse:</strong> build the DAG end-to-end on seeded data in CI.</li>
+    <li><strong>Idempotency test:</strong> run the load twice, assert the output is identical — directly proves the property interviewers care about.</li>
+    <li><strong>Reconciliation as a test:</strong> row-count and sum checks vs source (the diff/EXCEPT pattern from 02b).</li>
+  </ul>
+</section>
+
+<section id="cost">
+  <h2>Cost &amp; performance optimization</h2>
+  <ul>
+    <li><strong>Incremental over full-refresh</strong> — the biggest lever; reprocess only new partitions.</li>
+    <li><strong>Partition pruning &amp; clustering</strong> so queries scan less (bytes = dollars on BigQuery; warehouse-seconds on Snowflake).</li>
+    <li><strong>Materialize hot rollups</strong> consumed by many dashboards instead of recomputing per view.</li>
+    <li><strong>Right-size warehouses / auto-suspend</strong> idle compute; separate ELT and BI warehouses so one doesn't starve the other.</li>
+    <li><strong>Prune ingestion:</strong> only sync columns/tables you use; high-volume connectors priced per row add up fast.</li>
+    <li><strong>Watch backfills</strong> — estimate bytes before replaying history; chunk by partition.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Founding-hire angle</span>
+    <p>At a cost-sensitive, usage-based business, a DE who instruments and controls warehouse spend is a partner to finance. Mention you'd tag/monitor query cost and set budgets early.</p>
+  </div>
+</section>
+
+<section id="config">
+  <h2>Config, secrets, environments</h2>
+  <ul>
+    <li><strong>Separate dev/staging/prod</strong> targets (separate schemas/databases) so you never test on prod tables.</li>
+    <li><strong>Secrets in a manager</strong> (cloud secret manager / env), never in code or dbt profiles committed to git.</li>
+    <li><strong>Config as code &amp; version control everything</strong> — dbt project, orchestration DAGs, infra. Reproducibility is part of trust.</li>
+    <li><strong>CI on pull requests:</strong> build changed models + run tests on a sample before merge (slim CI / state:modified). Covered more in <a href="05b-data-quality-advanced.html">05b</a>.</li>
+  </ul>
+  <div class="callout">
+    <span class="callout-label">Next</span>
+    <p>Pipelines feed quality. Go deep on trust engineering: <a href="05-data-quality.html">05 — Data Quality</a> and <a href="05b-data-quality-advanced.html">05b — Advanced</a> →</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

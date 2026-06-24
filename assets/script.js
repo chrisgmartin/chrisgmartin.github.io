@@ -39,7 +39,8 @@
         { name: 'The FDE-DE Playbook', folder: 'fde-de-playbook' },
         { name: 'Contract Data Model — Reference', folder: 'contract-data-model-reference' },
         { name: 'Enterprise Integration Atlas', folder: 'enterprise-integration-atlas' },
-        { name: 'Data Engineering for Neoclouds', folder: 'data-engineering-for-neoclouds' }
+        { name: 'Data Engineering for Neoclouds', folder: 'data-engineering-for-neoclouds' },
+        { name: 'First Data Hire — DE Interview Prep', folder: 'first-data-hire-de-prep' }
       ]
     },
     {
