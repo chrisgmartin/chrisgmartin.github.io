@@ -64,7 +64,9 @@
       guides: [
         { name: 'Product & Analytics Data Science', folder: 'product-analytics-ds' },
         { name: 'Full-Stack & Applied Data Science', folder: 'full-stack-applied-ds' },
-        { name: 'Data Science for Neoclouds', folder: 'data-science-for-neoclouds' }
+        { name: 'Data Science for Neoclouds', folder: 'data-science-for-neoclouds' },
+        { name: 'Senior Data Scientist, Business Analytics — Interview Prep', folder: 'senior-ds-business-analytics-prep' },
+        { name: 'Venice.ai — Company Research', folder: 'venice-ai-company-research' }
       ]
     },
     {

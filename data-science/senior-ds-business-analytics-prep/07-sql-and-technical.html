@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL &amp; Technical Screen — Data Scientist Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#tests">What the screen tests</a>
+    <a href="#schema">The schema you'll reason about</a>
+    <a href="#windows">Window functions on subscription data</a>
+    <a href="#funnels">Usage funnels &amp; retention on metadata</a>
+    <a href="#gotchas">The SQL gotchas</a>
+    <a href="#production">Production-quality code</a>
+    <a href="#run">How to run the screen</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-onchain-analytics.html">← Previous</a>
+    <a href="08-stakeholder-communication.html">Next: Communicating Uncertainty →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Technical &amp; Communication</span>
+  <h1>SQL &amp; Technical Screen</h1>
+  <p class="subtitle">The posting asks for SQL fluency <em>and</em> production-quality code. This chapter drills both on realistic, privacy-shaped tables — subscriptions, content-free usage metadata, and on-chain flows — not a generic employees-and-departments toy schema.</p>
+</header>
+
+<section id="tests">
+  <h2>What the screen tests</h2>
+  <p>For a first-data-hire role at a roughly 50-person company, the SQL screen is not there to see whether you can write a <code>JOIN</code>. It's there to answer one question the VP of Business Operations actually cares about: <strong>if I hand you a schema I built in a hurry and a fuzzy business question, do I get back a correct, fast, readable answer — or a mess I have to double-check?</strong> Concretely, a screen like this tests:</p>
+  <ul>
+    <li><strong>Timed SQL under mild pressure.</strong> Usually 30–45 minutes, 2–4 questions of increasing difficulty, live-shared or in a take-home. The clock rewards reaching for the right construct immediately rather than discovering it after two wrong attempts.</li>
+    <li><strong>Window functions.</strong> This is the single highest-signal skill. MRR movement, retention cohorts, running totals, top-N-per-group, period-over-period deltas — all of them are window-function problems, and all of them are the company's daily bread. A candidate who self-joins their way through a "second-highest plan price" question is telling the interviewer they haven't done much analytics.</li>
+    <li><strong>Correct <em>and</em> fast.</strong> Correct first. But a query that scans a billion API-request rows because you filtered inside a window instead of before it is a production incident waiting to happen. They want to see you think about the shape and size of the data.</li>
+    <li><strong>Reading a schema you didn't write.</strong> They'll give you tables and expect you to notice the foreign keys, the nullable columns, the grain of each table (one row per what?), and the columns that <em>aren't</em> there — because at this company, the missing columns are the whole point.</li>
+    <li><strong>One or two sharp clarifying questions.</strong> Not twenty. The senior signal is asking the <em>one</em> question that changes the query — "does churn here mean the cancel event or the end of the paid period?" — then stating your assumption and moving.</li>
+    <li><strong>Evidence you write production-quality code.</strong> The posting explicitly pairs "SQL fluency" with "production-quality code." Expect either a code-review conversation, a small take-home that gets read as software (not just as an answer), or direct questions about how you'd turn a query into a tested, versioned, scheduled model. Section 6 is about exactly this.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The meta-signal</span>
+    <p>Every question in this screen is secretly a <em>privacy</em> question too. The tables you're handed will have usage metadata and never content. If you instinctively write <code>GROUP BY user_id</code> on something that should be aggregated to a cohort, or reach for a column that would de-anonymize a wallet, you've failed the part of the screen that matters most here — before you've even run the query. Keep <a href="02-privacy-first-analytics.html">Chapter 02</a>'s safe-vs-unsafe line in your head the entire time.</p>
+  </div>
+</section>
+
+<section id="schema">
+  <h2>The schema you'll reason about</h2>
+  <p>There is no published schema, so here is a small, realistic one this chapter uses throughout. It's the schema a first hire would actually build from Stripe + Postgres + the API gateway + PostHog + on-chain loaders (see <a href="03-building-the-data-stack.html">Chapter 03</a>). Memorize its <em>shape</em> — the grain of each table and, crucially, what each table deliberately does <strong>not</strong> store.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>schema.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- One row per registered account. No prompts, no content, ever.
+CREATE TABLE users (
+    user_id       BIGINT PRIMARY KEY,
+    signed_up_at  TIMESTAMPTZ NOT NULL,
+    signup_source TEXT,          -- 'organic','referral','api_docs', ...
+    country_bucket TEXT          -- coarse region, never precise geo
+);
+
+-- One row per subscription *state change*, Stripe-sourced.
+-- A user can appear multiple times (upgrade, downgrade, churn, win-back).
+CREATE TABLE subscriptions (
+    subscription_id BIGINT PRIMARY KEY,
+    user_id         BIGINT REFERENCES users(user_id),
+    plan            TEXT NOT NULL,       -- 'free','pro','pro_plus','max'
+    mrr             NUMERIC(10,2) NOT NULL,  -- monthly recurring revenue, USD
+    started_at      TIMESTAMPTZ NOT NULL,
+    canceled_at     TIMESTAMPTZ          -- NULL = still active
+);
+
+-- One row per API inference request. METADATA ONLY.
+-- No prompt, no response, no token *content* -- just counts and timings.
+CREATE TABLE api_requests (
+    request_id  BIGINT PRIMARY KEY,
+    api_key_id  BIGINT,          -- pseudonymous key, not a user trail
+    user_id     BIGINT,          -- nullable: anonymous-tier calls have none
+    ts          TIMESTAMPTZ NOT NULL,
+    model       TEXT NOT NULL,   -- 'uncensored-model','llama-3.3-70b', ...
+    tokens_in   INTEGER NOT NULL,
+    tokens_out  INTEGER NOT NULL,
+    latency_ms  INTEGER NOT NULL,
+    status      TEXT NOT NULL    -- 'ok','rate_limited','error'
+);
+
+-- Content-free product events (PostHog-style, person_profiles: identified_only).
+-- event names only -- never what the user typed or generated.
+CREATE TABLE events (
+    event_id   BIGINT PRIMARY KEY,
+    user_id    BIGINT,          -- nullable for logged-out / anonymized events
+    ts         TIMESTAMPTZ NOT NULL,
+    event_name TEXT NOT NULL    -- 'signed_in','chat_created','image_generated',
+                                -- 'model_switched','upgrade_clicked'
+);
+
+-- On-chain staking/credit activity. Fully PUBLIC data (Ethereum L2), pseudonymous wallets.
+-- Join to users ONLY via consented_wallets (a first-party opt-in mapping).
+CREATE TABLE onchain_stakes (
+    tx_hash     TEXT PRIMARY KEY,
+    wallet      TEXT NOT NULL,   -- pseudonymous address, never a user_id
+    action      TEXT NOT NULL,   -- 'stake','unstake','mint_credit','burn'
+    token_amount  NUMERIC(38,18) NOT NULL,
+    block_time  TIMESTAMPTZ NOT NULL
+);
+
+-- The ONLY sanctioned wallet<->user bridge: explicit, consented, opt-in.
+CREATE TABLE consented_wallets (
+    user_id     BIGINT REFERENCES users(user_id),
+    wallet      TEXT NOT NULL,
+    consented_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (user_id, wallet)
+);</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">The columns that aren't there</span>
+    <p>Notice what <code>api_requests</code> and <code>events</code> do <em>not</em> have: no prompt text, no response, no IP tied to a user, no cross-session device fingerprint. That's not an oversight in this schema — it's <a href="02-privacy-first-analytics.html">the company's design</a>. Usage rows carry <strong>metadata</strong> (counts, timings, model, status); they never carry <strong>content</strong>. If an interviewer asks a question that would require content — "what are users asking the uncensored model about?" — the correct answer is "we don't and can't know that by design; here's the metadata proxy I'd use instead." Naming that boundary unprompted is a strong senior signal.</p>
+  </div>
+</section>
+
+<section id="windows">
+  <h2>Window functions on subscription data</h2>
+  <p>Subscriptions are the safest, richest data the company has — Stripe events are fully first-party and content-free. Nearly every finance question is a window-function problem over the <code>subscriptions</code> table. Here are the three that come up constantly.</p>
+
+  <h3>1. MRR movement — new / expansion / contraction / churn</h3>
+  <p>The VP wants one number decomposed: how did MRR change month over month, and <em>why</em>. The classic approach compares each user's MRR in consecutive months with <code>LAG</code>, then classifies the delta. First build a per-user monthly MRR snapshot, then window over it.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>mrr_movement.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- Grain: one row per user per month with their active MRR that month.
+-- (Assume a helper that expands subscription state-changes into monthly
+--  snapshots; in dbt this is a model, not a subquery you rewrite each time.)
+WITH monthly_mrr AS (
+    SELECT
+        user_id,
+        date_trunc('month', month_start) AS month,
+        SUM(mrr) AS mrr
+    FROM user_month_subscription_snapshot   -- built upstream
+    GROUP BY user_id, date_trunc('month', month_start)
+),
+with_prev AS (
+    SELECT
+        user_id,
+        month,
+        mrr,
+        LAG(mrr) OVER (
+            PARTITION BY user_id ORDER BY month
+        ) AS prev_mrr
+    FROM monthly_mrr
+)
+SELECT
+    month,
+    SUM(CASE WHEN prev_mrr IS NULL AND mrr > 0
+             THEN mrr END)                       AS new_mrr,
+    SUM(CASE WHEN prev_mrr > 0 AND mrr > prev_mrr
+             THEN mrr - prev_mrr END)            AS expansion_mrr,
+    SUM(CASE WHEN prev_mrr > 0 AND mrr < prev_mrr AND mrr > 0
+             THEN mrr - prev_mrr END)            AS contraction_mrr,  -- negative
+    SUM(CASE WHEN prev_mrr > 0 AND mrr = 0
+             THEN -prev_mrr END)                 AS churned_mrr       -- negative
+FROM with_prev
+GROUP BY month
+ORDER BY month;</code></pre>
+  </div>
+
+  <p>The senior touches here: <code>LAG</code> partitioned per user and ordered by month is what makes this readable — a self-join on <code>month = month - 1</code> is both slower and buggier around gaps. The <code>prev_mrr IS NULL</code> branch is genuinely "new," and the <code>mrr = 0</code> branch is churn. Note that the company's freemium shape means "downgrade to free" is contraction-to-zero, i.e. churn of <em>paid</em> MRR even though the account survives — call that distinction out loud.</p>
+
+  <h3>2. Retention cohorts</h3>
+  <p>Group paying users by the month they first converted, then measure how many are still paying N months later. This is a two-window pattern: find each user's cohort with a <code>MIN() OVER</code> (or a grouped min), then count survivors per cohort-month offset.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>retention_cohorts.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">WITH paid_months AS (
+    SELECT DISTINCT
+        user_id,
+        date_trunc('month', month_start) AS month
+    FROM user_month_subscription_snapshot
+    WHERE mrr > 0
+),
+cohorts AS (
+    SELECT
+        user_id,
+        month,
+        MIN(month) OVER (PARTITION BY user_id) AS cohort_month
+    FROM paid_months
+)
+SELECT
+    cohort_month,
+    (EXTRACT(YEAR FROM age(month, cohort_month)) * 12
+       + EXTRACT(MONTH FROM age(month, cohort_month)))::INT AS months_since_first,
+    COUNT(DISTINCT user_id) AS retained_users
+FROM cohorts
+GROUP BY cohort_month, months_since_first
+HAVING COUNT(DISTINCT user_id) >= 20   -- k-anonymity: suppress tiny cohorts
+ORDER BY cohort_month, months_since_first;</code></pre>
+  </div>
+
+  <p>The <code>HAVING COUNT(DISTINCT user_id) &gt;= 20</code> is not decoration — it's the k-anonymity habit from <a href="02-privacy-first-analytics.html">Chapter 02</a> applied reflexively. A cohort of three people is both statistically meaningless and a small re-identification risk. Building suppression into the query by default, rather than as an afterthought, is exactly the instinct this role screens for.</p>
+
+  <h3>3. Second-highest / top-N per group — and the tie/NULL traps</h3>
+  <p>The canonical "rank" question. It's really a test of whether you know the difference between the three ranking windows and can reason about ties and NULLs. Suppose they ask: <em>"For each plan, return the account with the second-highest lifetime spend."</em></p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>top_n_per_group.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- ROW_NUMBER : arbitrary tiebreak, exactly one row per rank -> use for "the Nth".
+-- RANK       : ties share a rank, then it SKIPS (1,1,3) -> "2nd" may not exist.
+-- DENSE_RANK : ties share a rank, no skip (1,1,2)       -> "2nd distinct value".
+WITH spend AS (
+    SELECT
+        s.plan,
+        s.user_id,
+        SUM(s.mrr) AS lifetime_spend
+    FROM subscriptions s
+    GROUP BY s.plan, s.user_id
+),
+ranked AS (
+    SELECT
+        plan,
+        user_id,
+        lifetime_spend,
+        ROW_NUMBER() OVER (
+            PARTITION BY plan
+            ORDER BY lifetime_spend DESC, user_id   -- deterministic tiebreak
+        ) AS rn
+    FROM spend
+)
+SELECT plan, user_id, lifetime_spend
+FROM ranked
+WHERE rn = 2;</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Say this out loud during the screen</span>
+    <p>"I'm using <code>ROW_NUMBER</code> because you asked for a single account; if you meant the second-highest <em>spend value</em> and want everyone tied at it, I'd switch to <code>DENSE_RANK = 2</code>. And I added <code>user_id</code> as a tiebreak so the result is deterministic across runs." That one sentence demonstrates you understand all three functions, ties, and reproducibility — more signal than a correct-but-silent query. On NULLs: <code>ORDER BY ... DESC</code> puts NULLs first in Postgres unless you add <code>NULLS LAST</code>, which will silently rank a user with no spend as #1. If lifetime spend can be NULL, handle it.</p>
+  </div>
+</section>
+
+<section id="funnels">
+  <h2>Usage funnels &amp; retention on metadata</h2>
+  <p>Now the harder, company-specific half: measuring behavior when all you have is content-free events and metadata. You cannot build a per-user behavioral trail across sessions (that's off-limits — see <a href="02-privacy-first-analytics.html">Chapter 02</a>). But you can build activation funnels and retention on the events that <em>are</em> logged, and you must do it k-anonymously.</p>
+
+  <h3>Activation funnel: signup → first chat → first paid inference</h3>
+  <p>Activation is the highest-leverage growth metric for a freemium product. Here it's a funnel over content-free milestones. The clean pattern is one CTE per milestone timestamp, joined on <code>user_id</code>, then counted.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>activation_funnel.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">WITH signups AS (
+    SELECT user_id, signed_up_at
+    FROM users
+    WHERE signed_up_at >= DATE '2026-07-01'
+),
+first_chat AS (
+    SELECT user_id, MIN(ts) AS first_chat_at
+    FROM events
+    WHERE event_name = 'chat_created'
+    GROUP BY user_id
+),
+first_paid_inference AS (
+    -- first API request made by a user on a paid subscription
+    SELECT r.user_id, MIN(r.ts) AS first_paid_at
+    FROM api_requests r
+    WHERE r.user_id IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = r.user_id
+            AND s.mrr > 0
+            AND s.started_at <= r.ts
+            AND (s.canceled_at IS NULL OR s.canceled_at > r.ts)
+      )
+    GROUP BY r.user_id
+)
+SELECT
+    COUNT(*)                                              AS signed_up,
+    COUNT(fc.first_chat_at)                               AS reached_first_chat,
+    COUNT(fp.first_paid_at)                               AS reached_first_paid,
+    ROUND(100.0 * COUNT(fc.first_chat_at) / COUNT(*), 1)  AS pct_to_chat,
+    ROUND(100.0 * COUNT(fp.first_paid_at)
+          / NULLIF(COUNT(fc.first_chat_at), 0), 1)        AS pct_chat_to_paid
+FROM signups su
+LEFT JOIN first_chat fc            USING (user_id)
+LEFT JOIN first_paid_inference fp  USING (user_id)
+WHERE su.user_id IN (SELECT user_id FROM signups);</code></pre>
+  </div>
+
+  <p><code>LEFT JOIN</code> from the signup cohort is what keeps the denominator honest — every signup counts whether or not they progressed, and <code>COUNT(col)</code> ignores the NULLs the outer join produces. <code>NULLIF(..., 0)</code> guards the divide-by-zero when a cohort has no chatters yet. The <code>EXISTS</code> correlated to an active paid subscription is more precise here than a join, because a user can have several subscription rows.</p>
+
+  <h3>N-day retention on content-free events</h3>
+  <p>"Of users active on day 0, what fraction were active again on day N?" — computed purely from event timestamps, no content required.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>n_day_retention.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">WITH activity AS (
+    SELECT DISTINCT user_id, date_trunc('day', ts)::date AS active_day
+    FROM events
+    WHERE user_id IS NOT NULL
+),
+first_seen AS (
+    SELECT user_id, MIN(active_day) AS day0
+    FROM activity
+    GROUP BY user_id
+)
+SELECT
+    a.active_day - f.day0                       AS day_n,
+    COUNT(DISTINCT a.user_id)                   AS retained
+FROM activity a
+JOIN first_seen f USING (user_id)
+WHERE a.active_day - f.day0 BETWEEN 0 AND 30
+GROUP BY a.active_day - f.day0
+HAVING COUNT(DISTINCT a.user_id) >= 20          -- suppress small cells
+ORDER BY day_n;</code></pre>
+  </div>
+
+  <h3>A k-anonymity-respecting aggregate</h3>
+  <p>Any breakdown you might export, embed in a dashboard, or hand to a growth PM should refuse to emit a row backed by fewer than <em>k</em> distinct users. Bake it into the query, not the reviewer's memory.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>k_anon_model_mix.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- Per-model usage, but only report a model if >= k distinct users touched it.
+SELECT
+    model,
+    COUNT(*)                    AS requests,
+    SUM(tokens_in + tokens_out) AS total_tokens,
+    ROUND(AVG(latency_ms))      AS avg_latency_ms
+FROM api_requests
+WHERE ts >= DATE '2026-08-01'
+GROUP BY model
+HAVING COUNT(DISTINCT user_id) >= 20   -- k = 20; drop long-tail single-user models
+ORDER BY requests DESC;</code></pre>
+  </div>
+
+  <div class="callout insight">
+    <span class="callout-label">Why this reads as senior</span>
+    <p>Anyone can write the <code>GROUP BY model</code>. The <code>HAVING COUNT(DISTINCT user_id) &gt;= 20</code> line is what tells the interviewer you've internalized that at this company, a query is also a privacy decision. You're not anonymizing after the fact — you're refusing to emit re-identifiable small cells in the first place. Do this reflexively and mention it once; don't lecture.</p>
+  </div>
+</section>
+
+<section id="gotchas">
+  <h2>The SQL gotchas</h2>
+  <p>These are the traps that separate someone who writes SQL daily from someone who learned it for interviews. Each one shows up in a question shaped by this company's data.</p>
+
+  <h3>Window functions can't live in WHERE</h3>
+  <p>A window function is computed <em>after</em> <code>WHERE</code>/<code>GROUP BY</code>, so you cannot filter on it in the same query level. "Give me each user's most recent request" is the classic case — wrap the window in a CTE (or subquery) and filter in the outer query.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>window_in_where.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- WRONG: window functions are not allowed in WHERE.
+-- SELECT * FROM api_requests
+-- WHERE ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts DESC) = 1;  -- error
+
+-- RIGHT: compute in a CTE, filter outside.
+WITH ranked AS (
+    SELECT
+        r.*,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts DESC) AS rn
+    FROM api_requests r
+    WHERE user_id IS NOT NULL
+)
+SELECT * FROM ranked WHERE rn = 1;   -- (QUALIFY rn = 1 in BigQuery/Snowflake)</code></pre>
+  </div>
+
+  <h3>NULLs in aggregates and NOT IN</h3>
+  <p>Two separate landmines. First, <code>COUNT(col)</code> skips NULLs while <code>COUNT(*)</code> counts every row — mixing them up silently corrupts a conversion rate. Second, <code>NOT IN</code> against a subquery that returns even one NULL returns <em>zero rows</em>, because <code>x NOT IN (1, NULL)</code> evaluates to <code>UNKNOWN</code>, never <code>TRUE</code>. Here this bites constantly because <code>api_requests.user_id</code> is nullable (anonymous-tier calls).</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>not_in_null_trap.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- DANGER: if ANY api_requests.user_id is NULL, this returns NOTHING.
+-- SELECT * FROM users
+-- WHERE user_id NOT IN (SELECT user_id FROM api_requests);
+
+-- SAFE: NOT EXISTS is null-proof and usually faster.
+SELECT u.*
+FROM users u
+WHERE NOT EXISTS (
+    SELECT 1 FROM api_requests r WHERE r.user_id = u.user_id
+);</code></pre>
+  </div>
+
+  <h3>Dedupe deliberately</h3>
+  <p>Event streams and on-chain loaders both produce duplicate rows — retries, at-least-once delivery, chain reorgs. Never let <code>SELECT DISTINCT *</code> be your dedupe strategy; it hides the question "duplicate on <em>what key</em>?" Decide the natural key and keep one row per key on purpose.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>dedupe.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- Keep one row per logical event, preferring the earliest ingest.
+WITH deduped AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY event_id          -- the true natural key
+            ORDER BY ts                    -- keep the first-seen copy
+        ) AS rn
+    FROM events e
+)
+SELECT * FROM deduped WHERE rn = 1;</code></pre>
+  </div>
+
+  <h3>Date-boundary and timezone bugs</h3>
+  <p>The platform's staking-token allocation <strong>resets daily at 00:00 UTC</strong> — a detail worth memorizing. If you bucket usage by <code>date_trunc('day', ts)</code> in a session timezone that isn't UTC, your "daily" numbers won't line up with the entitlement window, and you'll report phantom over/under-utilization. Always truncate on-chain and entitlement-linked timestamps in UTC explicitly.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>utc_day_boundary.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">-- Align usage to the SAME 00:00 UTC boundary the staking allocation resets on.
+SELECT
+    date_trunc('day', ts AT TIME ZONE 'UTC') AS utc_day,
+    COUNT(*)                                 AS requests,
+    SUM(tokens_out)                          AS tokens_served
+FROM api_requests
+GROUP BY date_trunc('day', ts AT TIME ZONE 'UTC')
+ORDER BY utc_day;
+-- Half-open intervals [start, end) beat BETWEEN for timestamps:
+--   ts >= '2026-08-01' AND ts < '2026-09-01'
+-- avoids the "misses/double-counts the last millisecond" BETWEEN bug.</code></pre>
+  </div>
+
+  <h3>Gaps-and-islands for sessionization on metadata</h3>
+  <p>You can't track a user across sessions, but you <em>can</em> group one identified user's own events into sessions (e.g. a 30-minute inactivity gap starts a new session) — the classic gaps-and-islands pattern. It's a favorite advanced screen question because it forces two stacked windows: <code>LAG</code> to find gaps, a running <code>SUM</code> to assign island IDs.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>sessionize.sql</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">WITH flagged AS (
+    SELECT
+        user_id,
+        ts,
+        CASE WHEN ts - LAG(ts) OVER (PARTITION BY user_id ORDER BY ts)
+                  > INTERVAL '30 minutes'
+             OR LAG(ts) OVER (PARTITION BY user_id ORDER BY ts) IS NULL
+             THEN 1 ELSE 0 END AS is_new_session
+    FROM events
+    WHERE user_id IS NOT NULL
+),
+sessioned AS (
+    SELECT
+        user_id,
+        ts,
+        SUM(is_new_session) OVER (
+            PARTITION BY user_id ORDER BY ts
+            ROWS UNBOUNDED PRECEDING
+        ) AS session_seq
+    FROM flagged
+)
+SELECT
+    user_id, session_seq,
+    MIN(ts) AS session_start,
+    MAX(ts) AS session_end,
+    COUNT(*) AS events_in_session
+FROM sessioned
+GROUP BY user_id, session_seq;</code></pre>
+  </div>
+</section>
+
+<section id="production">
+  <h2>Production-quality code</h2>
+  <p>The posting pairs product-mindedness <em>with</em> engineering capability, and pairs SQL fluency <em>with</em> "production-quality code." For a first data hire, "production-quality" doesn't mean microservices — it means the analytics you ship behaves like software the rest of the eng org (Rust/Go/TS people) will respect. Concretely:</p>
+  <ul>
+    <li><strong>Idempotent, tested transformations.</strong> Re-running a model produces the same result; you don't accumulate duplicates or drift. In dbt that means deterministic materializations plus <code>unique</code>, <code>not_null</code>, and relationship tests on keys — so a broken upstream load fails loudly instead of silently poisoning the MRR chart.</li>
+    <li><strong>Version control, always.</strong> Every model, metric definition, and dashboard-backing query lives in git and ships through PRs. No "final query" pasted into a BI tool that no one can find or review later.</li>
+    <li><strong>Readable CTEs over nested subqueries.</strong> A five-CTE model that reads top-to-bottom like a paragraph beats a three-deep nested subquery that's technically shorter. You're optimizing for the next person (often future-you) to change it safely.</li>
+    <li><strong>Parameterization, no hardcoded secrets.</strong> Date ranges, thresholds (like <em>k</em>), and connection details are variables/env config — never literals sprinkled through the code, and never a Stripe key or DB password in the repo.</li>
+    <li><strong>Code review.</strong> Even as the only data person, you invite review — from an eng peer on the SQL logic, from finance on the metric definitions. It's how a metric becomes <em>the</em> definition instead of your private opinion.</li>
+  </ul>
+
+  <p>Have one dbt example ready to describe: a staging model that's tested and idempotent. And be ready to show plain engineering capability — the posting is explicit about it — with a small, tidy Python transform. Something like this: a pure, typed, documented, testable function that turns raw usage rows into per-model daily rollups, deliberately dropping content and suppressing small cells.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>rollup.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">"""Aggregate content-free API-usage rows into k-anonymous daily rollups.
+
+Pure function, no I/O -- easy to unit-test and safe to reuse in a dbt
+Python model, an Airflow task, or an ad-hoc notebook.
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+def daily_model_rollup(
+    requests: pd.DataFrame,
+    *,
+    k: int = 20,
+    tz: str = "UTC",  # align to the 00:00 UTC staking-reset boundary
+) -> pd.DataFrame:
+    """Roll usage metadata up to (utc_day, model), suppressing small cells.
+
+    Args:
+        requests: rows with columns
+            [ts, user_id, model, tokens_in, tokens_out, latency_ms].
+            Carries METADATA ONLY -- never prompt/response content.
+        k: minimum distinct users required to emit a (day, model) cell.
+        tz: timezone to bucket ``ts`` into before truncating to the day.
+
+    Returns:
+        One row per (utc_day, model) with >= k distinct users.
+    """
+    required = {"ts", "user_id", "model", "tokens_in", "tokens_out", "latency_ms"}
+    missing = required - set(requests.columns)
+    if missing:
+        raise ValueError(f"missing required columns: {sorted(missing)}")
+
+    df = requests.copy()
+    df["utc_day"] = (
+        pd.to_datetime(df["ts"], utc=True).dt.tz_convert(tz).dt.floor("D")
+    )
+    df["tokens_total"] = df["tokens_in"] + df["tokens_out"]
+
+    grouped = df.groupby(["utc_day", "model"], as_index=False).agg(
+        requests=("ts", "size"),
+        distinct_users=("user_id", "nunique"),
+        tokens_total=("tokens_total", "sum"),
+        avg_latency_ms=("latency_ms", "mean"),
+    )
+    # k-anonymity: never emit a cell backed by fewer than k users.
+    return grouped[grouped["distinct_users"] >= k].reset_index(drop=True)</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>test_rollup.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import pandas as pd
+import pytest
+
+from rollup import daily_model_rollup
+
+
+def _rows(n_users: int, model: str = "uncensored-model") -> pd.DataFrame:
+    return pd.DataFrame({
+        "ts": ["2026-08-01T12:00:00Z"] * n_users,
+        "user_id": range(n_users),
+        "model": [model] * n_users,
+        "tokens_in": [10] * n_users,
+        "tokens_out": [20] * n_users,
+        "latency_ms": [100] * n_users,
+    })
+
+
+def test_suppresses_cells_below_k():
+    out = daily_model_rollup(_rows(5), k=20)
+    assert out.empty  # 5 users < k -> nothing emitted
+
+
+def test_emits_cell_at_or_above_k():
+    out = daily_model_rollup(_rows(25), k=20)
+    assert len(out) == 1
+    assert out.loc[0, "distinct_users"] == 25
+    assert out.loc[0, "tokens_total"] == 25 * 30
+
+
+def test_rejects_missing_columns():
+    with pytest.raises(ValueError, match="missing required columns"):
+        daily_model_rollup(pd.DataFrame({"ts": []}), k=1)</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Bring the tests, not just the function</span>
+    <p>If a take-home lets you, submit the function <em>with its tests</em>. Most candidates submit a script; a senior one submits a tested, documented, reusable unit and a one-line note on how it slots into the pipeline. The k-suppression baked into the function — and the test that proves it — quietly demonstrates that you build privacy in at the code level, which is the whole differentiator at a privacy-first company.</p>
+  </div>
+</section>
+
+<section id="run">
+  <h2>How to run the screen</h2>
+  <p>Same principles whether it's live-shared or a take-home. The screen is graded on judgment as much as syntax.</p>
+  <ol>
+    <li><strong>Read the schema first, out loud.</strong> "So <code>subscriptions</code> is one row per state change, not one per user — a user can appear several times. <code>api_requests.user_id</code> is nullable for anonymous calls. And there's no content anywhere, which I'll assume is deliberate." You've just shown you read a schema like an analyst and internalized the company's privacy shape in ten seconds.</li>
+    <li><strong>Ask the one clarifying question that changes the query.</strong> Usually the metric definition: does churn mean the cancel event or the end of the paid period? Is "active" any event or a successful inference? Ask that; don't ask five.</li>
+    <li><strong>State your assumptions, then commit.</strong> "I'll treat churn as MRR dropping to zero and count downgrade-to-free as paid churn. Flag me if you meant otherwise." This is the interview version of the job's "transparent about uncertainty" — see <a href="08-stakeholder-communication.html">Chapter 08</a>.</li>
+    <li><strong>Narrate your thinking as you build.</strong> "This is period-over-period, so I want <code>LAG</code> per user rather than a self-join." The interviewer is buying your reasoning, not just your final <code>SELECT</code>.</li>
+    <li><strong>Reach for windows before self-joins.</strong> If you catch yourself joining a table to a shifted copy of itself, stop — it's almost always a window function (<code>LAG</code>/<code>LEAD</code>/<code>ROW_NUMBER</code>/running <code>SUM</code>) that's faster, shorter, and correct around gaps.</li>
+    <li><strong>Sanity-check the result.</strong> Eyeball row counts and totals. "Retention above 100% at day 0 would mean a bug" — catching your own error before they point it out is a strong close.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">Calibration</span>
+    <p>You will not be graded on perfect syntax recall — everyone forgets exact <code>date_trunc</code> arguments under a clock, and that's fine to look up. You <em>are</em> graded on: reaching for the right construct immediately, handling NULL/tie/timezone edge cases without being prompted, and treating every aggregate as a privacy decision. Get those three right and a missed comma is noise. Miss them and flawless syntax won't save you. Next: <a href="08-stakeholder-communication.html">turning the answer into a recommendation an executive can act on →</a></p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

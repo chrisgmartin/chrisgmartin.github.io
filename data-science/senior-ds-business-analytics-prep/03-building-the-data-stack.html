@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Building the Data Stack — Data Scientist Prep</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#mandate">The mandate</a>
+    <a href="#sources">The sources you're consolidating</a>
+    <a href="#stack">The reference stack</a>
+    <a href="#dbt">dbt modeling for consolidation</a>
+    <a href="#buildbuy">Build vs buy, and sequencing</a>
+    <a href="#plan">The 30-60-90</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-privacy-first-analytics.html">← Previous</a>
+    <a href="04-metrics-that-matter.html">Next: Metrics That Matter →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The Core Challenge</span>
+  <h1>Building the Data Stack From Scratch</h1>
+  <p class="subtitle">The company has no analytics function yet. You are the first hire, and the posting hands you a greenfield: decide where data lives, consolidate financial, product, and growth metrics into one place, and kill the duplicate systems that a startup of roughly 50 people has already quietly grown.</p>
+</header>
+
+<section id="mandate">
+  <h2>The mandate</h2>
+  <p>Read the posting literally: <em>"establish end-to-end data infrastructure — decide where data sourcing, storage, and querying happens"</em> and <em>"consolidate data access across financial, product, and growth metrics to eliminate duplicate systems."</em> That is not a request for a dashboard. It is a request to <strong>own the entire data platform</strong>, from the point where a Stripe webhook fires to the point where the VP of Business Operations reads a number and trusts it.</p>
+  <p>Today that platform does not exist. What exists — at a profitable, roughly-50-person, fast-moving company — is the usual pre-first-hire sprawl: finance has a spreadsheet pulling from the Stripe dashboard, growth has PostHog open in a browser tab, an engineer wrote a one-off script that queries the production Postgres for a board deck, and someone on the token side keeps a Dune dashboard bookmarked. Every one of those is a "system," and several of them disagree about basic facts like how many paying users there are. Your first act of value is not building something new — it is making all of them <strong>reconcile to one warehouse and one set of definitions</strong>.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe for this chapter</span>
+    <p>"Consolidate to eliminate duplicate systems" is the real deliverable. The stack is just the means. When you present a design in the loop, lead with the <em>consolidation story</em> — one warehouse, one metrics layer, one source of truth — and treat the specific tools as swappable implementation detail. That is what a senior first hire sounds like; a junior leads with a logo diagram.</p>
+  </div>
+  <p>Two company-specific constraints shape everything that follows. First, this is a <strong>privacy-first company</strong>, so your default is self-hosted, OSS tooling that keeps data inside the company's own trust boundary — you should not be shipping product data to a dozen third-party SaaS processors, and you'll want to be the person who <em>says so</em> unprompted (<a href="02-privacy-first-analytics.html">Chapter 02</a>). Second, the product iterates fast, so you build for change: metrics defined once, in code, so a schema churn doesn't silently break the number the CEO quotes on a podcast.</p>
+</section>
+
+<section id="sources">
+  <h2>The sources you're consolidating</h2>
+  <p>Before choosing tools, inventory what's actually generating data. Here is the likely source map at the company, and — critically — which sources are <strong>content-free</strong> (safe to warehouse in full) versus which touch the privacy boundary and must be handled as metadata only. This table is also a great thing to sketch on a whiteboard in the interview: it proves you understand both the business and the constraint.</p>
+  <table>
+    <thead><tr><th>Source</th><th>What it holds</th><th>Grain</th><th>Privacy posture</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Stripe / billing</strong></td><td>Subscriptions, invoices, upgrades, churn, MRR, plan tier, refunds, disputes</td><td>Customer · event</td><td>Content-free financial data — warehouse in full</td></tr>
+      <tr><td><strong>Postgres app DB</strong></td><td>Users, API keys, plan tier, rate-limit state, referral/points, feature entitlements</td><td>User · row</td><td>Account metadata — safe; <em>no prompt/response content exists here to begin with</em></td></tr>
+      <tr><td><strong>API-gateway logs</strong></td><td>Requests/day, tokens in/out, selected model, latency, error &amp; rate-limit codes, timestamps</td><td>Request event</td><td>Aggregate usage metadata — safe if you never join to prompt bodies (there are none)</td></tr>
+      <tr><td><strong>PostHog</strong></td><td>Content-free product events: sign-in, chat-created, image-generated, model-switched, upgrade-clicked</td><td>Event</td><td>Configured <code>identified_only</code>, PII-masked — the guardrails live here</td></tr>
+      <tr><td><strong>On-chain token data ($TOKEN / $CREDIT, Ethereum L2)</strong></td><td>Holders, staking flows, sTOKEN, compute-credit mint/consumption, burns, transfers</td><td>Wallet · tx</td><td>Fully public; pseudonymous. Relate on <em>cohorts</em>, join to users only on consented linkage</td></tr>
+      <tr><td><strong>Marketing / ad platforms</strong></td><td>Spend, impressions, clicks, campaign attribution (Google/X/etc.)</td><td>Campaign · day</td><td>Third-party; feeds CAC. Aggregate only</td></tr>
+      <tr><td><strong>Zendesk / feedback tool</strong></td><td>Support tickets, feature requests, CSAT</td><td>Ticket</td><td>Contains user text — treat as sensitive; warehouse metadata &amp; tags, not raw bodies</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Say this out loud</span>
+    <p>Notice that the two scariest-sounding sources — the app DB and the API-gateway logs — are already safe, because <em>the company never wrote prompt content to them in the first place</em>. The gateway logs a token <em>count</em>, not the tokens. This is the point to make explicitly: the privacy architecture means your warehouse is born clean. You are not the person retrofitting anonymization onto a surveillance pipeline; you are the person who gets to build the pipeline that was privacy-safe by construction.</p>
+  </div>
+  <p>Note the two genuinely different data-gravity problems here. Stripe, Postgres, PostHog, and Zendesk are standard SaaS/DB sources with off-the-shelf connectors. The <strong>API-gateway logs</strong> (high-volume, emitted by Rust and Go services) and the <strong>on-chain data</strong> (a blockchain, not a database) are the two that need custom thought — they're where a naive "just buy Fivetran" answer falls apart.</p>
+</section>
+
+<section id="stack">
+  <h2>The reference stack</h2>
+  <p>Here is a defensible end-to-end design. The one-liner to memorize, because it's the whole chapter in a sentence:</p>
+  <div class="callout insight">
+    <span class="callout-label">The stack in one breath</span>
+    <p>"Consolidate Stripe + Postgres + PostHog + API-gateway logs + on-chain into a warehouse via Airbyte and custom loaders, model with dbt into financial, product, and growth marts, surface in self-hosted Metabase, and run experiments through PostHog/GrowthBook — all self-hostable to keep data in our own trust boundary."</p>
+  </div>
+  <p>Layer by layer, with the choices and the reasoning a senior candidate should be ready to defend:</p>
+
+  <h3>Warehouse</h3>
+  <p>Start on the <strong>existing Postgres</strong> — a read replica or a separate analytics schema. At the company's scale (single-digit-millions of users, with API request volume well within a single Postgres's reach), Postgres with good indexing will carry you for a long time and costs nothing new to stand up. When query volume or transformation cost outgrows it, the low-ops moves are <strong>BigQuery</strong> (serverless, cheap at this scale, trivial to hand out read access) or <strong>DuckDB + MotherDuck</strong> (astonishingly cheap, self-hostable, great for a small team). <strong>Snowflake is overkill early</strong> — its cost and ops surface are aimed at a data-team-of-many; adopting it as the first hire is a classic over-engineering tell.</p>
+
+  <h3>Ingestion</h3>
+  <p>For the standard sources use <strong>Airbyte (OSS, self-hosted)</strong> — the connectors for Stripe, PostHog, and Zendesk are mature, and self-hosting keeps that data inside the company's boundary, which is the culturally-aligned default here. <strong>Fivetran</strong> is the managed alternative if you'd rather trade dollars for zero connector maintenance, but sending product data to a third-party processor cuts against the privacy posture and I'd flag that trade-off rather than make it silently. The two custom pieces: a lightweight <strong>loader for the API-gateway logs</strong> (structured-log ingestion — the Rust/Go services emit JSON lines; ship them to the warehouse via a log pipeline or a small batch job), and an <strong>on-chain loader</strong> pulling token/credit activity from <strong>Dune or Flipside APIs</strong> (or an L2 indexer) on a schedule.</p>
+
+  <h3>Transformation</h3>
+  <p><strong>dbt</strong>, non-negotiable. It's where consolidation actually happens: raw sources in, conformed <strong>financial / product / growth marts</strong> out, with tests and documentation. This is also where metric definitions become code (next section).</p>
+
+  <h3>BI &amp; experimentation</h3>
+  <p><strong>Self-hosted Metabase</strong> for dashboards and self-serve — fast, OSS, easy for non-analysts to slice, and it keeps the BI layer in-boundary. <strong>Hex</strong> for notebook-style deep dives and narrative analysis. For experiments, <strong>PostHog is already chosen</strong> (feature flags + A/B) so lean on it now; graduate to <strong>GrowthBook</strong> (OSS, warehouse-native) if experimentation becomes a core workflow, per <a href="05-experimentation.html">Chapter 05</a>.</p>
+
+  <p>The whole thing as a data-flow diagram:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>data-architecture.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-bash">  SOURCES                    INGESTION              WAREHOUSE            TRANSFORM              CONSUMPTION
+  ---------------------      -----------------      -------------       -----------------      ---------------------
+  Stripe (billing)     ─┐                                              ┌ stg_stripe          ┌ Metabase (dashboards,
+  Postgres (app DB)    ─┤    Airbyte (OSS,     ─┐                      │ stg_app_db          │   self-serve KPIs)
+  PostHog (events)     ─┤    self-hosted)       ├─►  Postgres  ──► dbt ┤ stg_posthog    ──►  ┤
+  Zendesk (support)    ─┘                        │   (→ BigQuery /      │                     │ Hex (notebooks,
+                                                 │    DuckDB later)     ├ fct_financial       │   deep-dive analysis)
+  API-gateway logs     ─── custom log loader  ──►│                      ├ fct_product     ──► │
+  (Rust/Go services)                             │                      ├ fct_growth          │ PostHog / GrowthBook
+                                                 │                      └ metrics (semantic   │   (experiment tracking)
+  On-chain tokens      ─── Dune / Flipside    ──►┘                        layer / marts)      └
+  (Ethereum L2)            API loader
+
+  Everything self-hostable ──► data stays inside the company's trust boundary
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Why the self-hosting thread matters</span>
+    <p>Every layer above has a self-hostable OSS option, and that's deliberate. At most companies "self-host Metabase" is a cost decision. At this company it's a <em>values</em> decision that happens to also be cheap — the same instinct that stops the product from logging prompts should stop the analytics stack from fanning data out to a dozen SaaS vendors. Naming that connection unprompted is a strong signal you actually internalized the privacy-first thesis rather than reciting it.</p>
+  </div>
+</section>
+
+<section id="dbt">
+  <h2>dbt modeling for consolidation</h2>
+  <p>Consolidation is not "put everything in one database" — it's "define each metric once, in one place, so finance's MRR and growth's MRR are literally the same SQL." dbt gives you a <strong>staging → marts</strong> layout where raw sources are cleaned in staging, then conformed into marts at a shared grain. The highest-leverage mart for a freemium + API + token business is a <strong>customer-day</strong> fact that unions billing and usage, because it lets you answer revenue, engagement, and retention questions from one table.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>marts/fct_customer_day.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- One row per paying customer per day: the conformed grain that
+-- billing, product, and growth all agree to reconcile against.
+-- Sources are already content-free; nothing here touches a prompt.
+
+with billing as (
+    select
+        customer_id,
+        date_day,
+        plan_tier,                        -- free / pro / pro_plus / max
+        mrr_usd,                          -- normalized to daily-active MRR
+        is_active_subscription
+    from {{ ref('stg_stripe__subscriptions_daily') }}
+),
+
+usage as (                                -- from API-gateway logs, metadata only
+    select
+        customer_id,
+        date_day,
+        count(*)                as api_requests,
+        sum(tokens_in + tokens_out) as tokens_processed,
+        count(distinct model_id)    as models_used,
+        avg(latency_ms)             as avg_latency_ms
+    from {{ ref('stg_gateway__request_events') }}
+    group by 1, 2
+),
+
+staking as (                             -- on-chain, cohort-level, consented link only
+    select
+        customer_id,                     -- populated ONLY where user consented to link wallet
+        date_day,
+        sum(token_staked)        as token_staked,
+        sum(credit_consumed_usd) as credit_consumed_usd
+    from {{ ref('stg_onchain__consented_staking_daily') }}
+    group by 1, 2
+)
+
+select
+    b.customer_id,
+    b.date_day,
+    b.plan_tier,
+    b.mrr_usd,
+    b.is_active_subscription,
+    coalesce(u.api_requests, 0)        as api_requests,
+    coalesce(u.tokens_processed, 0)    as tokens_processed,
+    coalesce(u.models_used, 0)         as models_used,
+    s.token_staked,
+    s.credit_consumed_usd
+from billing b
+left join usage   u using (customer_id, date_day)
+left join staking s using (customer_id, date_day)
+</code></pre>
+  </div>
+  <p>On top of conformed marts sits the piece that actually kills duplicate systems: a <strong>semantic / metrics layer</strong> where each business metric is defined once as code. When "active paying subscriber," "MRR," or "NRR" lives in exactly one place, every dashboard and every ad-hoc query inherits the same definition — and a rapid product change means editing <em>one</em> model, not hunting through fourteen dashboards.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/metrics/_metrics.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml"># Single source of truth for headline metrics. Change here, every
+# dashboard downstream updates. This is the "eliminate duplicate
+# systems" mandate made concrete.
+metrics:
+  - name: mrr
+    label: Monthly Recurring Revenue
+    model: ref('fct_customer_day')
+    calculation_method: sum
+    expression: mrr_usd
+    filters:
+      - field: is_active_subscription
+        operator: 'is'
+        value: 'true'
+
+  - name: weekly_active_paying_subscribers
+    label: Weekly Active Paying Subscribers   # candidate north star (ch. 04)
+    model: ref('fct_customer_day')
+    calculation_method: count_distinct
+    expression: customer_id
+    filters:
+      - field: plan_tier
+        operator: '!='
+        value: "'free'"
+      - field: api_requests
+        operator: '>'
+        value: '0'
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Interview move</span>
+    <p>When asked "how do you make sure everyone reports the same number?", point at the metrics layer, not at a governance policy. The answer that lands is structural: "the number is defined once in dbt and every tool reads it from there — you <em>can't</em> disagree because there's only one definition." That's a build answer, not a process answer, and it's exactly what a product-minded, engineering-capable first hire should give.</p>
+  </div>
+</section>
+
+<section id="buildbuy">
+  <h2>Build vs buy, and sequencing</h2>
+  <p>A senior first hire is judged as much on what they <em>refuse</em> to build as on what they build. The bias for a small, privacy-conscious, fast-moving team is: <strong>buy/adopt the commodity, build only the two things that are genuinely company-shaped.</strong></p>
+  <table>
+    <thead><tr><th>Component</th><th>Decision</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Warehouse</td><td><strong>Adopt</strong> (Postgres now → BigQuery/DuckDB later)</td><td>Reuse what exists; databases are a solved problem, don't build one</td></tr>
+      <tr><td>SaaS/DB ingestion</td><td><strong>Adopt OSS</strong> (Airbyte, self-hosted)</td><td>Connectors are commodity; self-hosting keeps data in-boundary at ~zero license cost</td></tr>
+      <tr><td>Gateway-log loader</td><td><strong>Build</strong> (small)</td><td>Company-specific schema &amp; volume; no off-the-shelf connector fits it well</td></tr>
+      <tr><td>On-chain loader</td><td><strong>Build thin</strong> on Dune/Flipside</td><td>Blockchain isn't a SaaS source; but lean on their APIs, don't run your own indexer yet</td></tr>
+      <tr><td>Transformation</td><td><strong>Adopt</strong> (dbt)</td><td>Industry standard; the value is <em>your models</em>, not the framework</td></tr>
+      <tr><td>BI &amp; experiments</td><td><strong>Adopt OSS</strong> (Metabase, PostHog)</td><td>Building a BI tool is a company-ending distraction for a first hire</td></tr>
+    </tbody>
+  </table>
+  <p>The trap to name explicitly is <strong>over-engineering</strong>. The "full modern data stack" — Snowflake + Fivetran + a real-time streaming layer + a data catalog + a separate reverse-ETL tool — over-serves a roughly-50-person company and burns your first quarter on plumbing nobody asked for. The posting itself signals the antidote: it wants someone <em>"comfortable iterating fast rather than perfecting,"</em> which is a direct instruction not to gold-plate the infrastructure.</p>
+  <div class="callout warn">
+    <span class="callout-label">The over-engineering tell</span>
+    <p>If your proposed stack has more than one tool per layer, or names Snowflake/Kafka/a data catalog in month one, you've over-built for the audience. The correct first-hire instinct is the <em>smallest stack that reconciles the numbers and ships a dashboard</em> — Postgres, Airbyte, dbt, Metabase — then earn each additional tool with a real bottleneck. Say this before they have to ask; it signals seniority through restraint.</p>
+  </div>
+</section>
+
+<section id="plan">
+  <h2>The 30-60-90</h2>
+  <p>The single most likely infrastructure question in the loop is "what would your first 90 days look like?" Here is a plan calibrated to the first-data-hire reality — and be honest about the timeline: at a company with no data foundation, you will not produce a meaningful strategic insight for roughly three months, because the first three months are spent making the data trustworthy. Saying that out loud is a credibility signal, not a weakness.</p>
+  <table>
+    <thead><tr><th>Window</th><th>Focus</th><th>Concrete deliverables</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>0–30<br>Learn &amp; audit</strong></td>
+        <td>Understand the business before touching a tool</td>
+        <td>Learn the KPIs finance/growth/product already track and where they disagree; audit every existing "system" (spreadsheets, PostHog, Dune, ad-hoc scripts); audit what the app DB &amp; gateway actually log (and confirm the privacy boundary); align a build plan with the VP of Business Ops and leadership on the <em>3–4 questions</em> data should answer first</td>
+      </tr>
+      <tr>
+        <td><strong>31–60<br>Ship &amp; model</strong></td>
+        <td>Prove value fast, start the foundation</td>
+        <td>Stand up warehouse + Airbyte on Stripe/PostHog; ship the <em>first real dashboards</em> on core KPIs (MRR, free→paid, active subscribers) straight from source so leadership sees value early; begin the dbt data model (staging + first conformed marts); wire the custom gateway-log loader</td>
+      </tr>
+      <tr>
+        <td><strong>61–90<br>Consolidate &amp; roadmap</strong></td>
+        <td>Turn dashboards into a trustworthy platform</td>
+        <td>v1 data model with conformed financial/product/growth marts; <em>standardized metric definitions</em> in the semantic layer (one MRR, one NRR); on-chain loader live; a written 6–12-month roadmap with costs, hiring plan, and risks</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Sequencing principle</span>
+    <p>Ship a visible dashboard before you finish the "correct" data model. A first hire who disappears for a quarter to build perfect dbt and emerges with no dashboards has failed politically even if they've succeeded technically — you need an early, visible win to buy trust for the foundational work. Dashboard-then-model, not model-then-dashboard.</p>
+  </div>
+  <p>This is the strategy-and-execution 30-60-90 for the <em>platform</em>. <a href="10-day-of.html">Chapter 10</a> carries a complementary 30-60-90 framed as the pitch you actually deliver in the room, plus the questions to ask and how to close — read the two together and you'll have both the substance and the delivery. Next, the metrics that platform exists to serve: <a href="04-metrics-that-matter.html">Chapter 04 · Metrics That Matter</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
