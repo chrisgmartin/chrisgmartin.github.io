@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Batch vs Streaming</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#definitions">Batch, micro-batch, streaming</a>
+    <a href="#drivers">What actually drives the choice</a>
+    <a href="#semantics">Time, windows &amp; correctness</a>
+    <a href="#exactly-once">Exactly-once &amp; reprocessing</a>
+    <a href="#lambda-kappa">Lambda vs Kappa</a>
+    <a href="#engines">The engine landscape</a>
+    <a href="#matrix">The decision matrix</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-change-data-capture.html">← Previous</a>
+    <a href="06-storage-architectures.html">Next: Lakes, Warehouses &amp; Lakehouses →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · The Big Trade-offs</span>
+  <h1>Batch vs Streaming</h1>
+  <p class="subtitle">The central architectural fork of the interview — and the one candidates most often get wrong by reaching for streaming when a nightly batch meets the SLA at a fraction of the cost.</p>
+</header>
+
+<section id="definitions">
+  <h2>Batch, micro-batch, streaming</h2>
+  <p>Before you can defend a choice, define the options crisply. The distinction is not "fast vs slow" — it's <em>what triggers computation</em> and <em>what the unit of work is</em>.</p>
+  <table>
+    <thead><tr><th>Mode</th><th>Unit of work</th><th>Trigger</th><th>Typical latency</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Batch</strong></td><td>A bounded dataset (a partition, a day, a full table)</td><td>A schedule or an upstream dependency completing</td><td>Minutes to hours</td></tr>
+      <tr><td><strong>Micro-batch</strong></td><td>Small bounded chunks carved from a stream</td><td>A short timer (e.g. every 10s–1min) or a size threshold</td><td>Seconds to a couple of minutes</td></tr>
+      <tr><td><strong>Streaming</strong></td><td>Individual events (or tiny buffers), unbounded</td><td>Arrival of the event itself</td><td>Milliseconds to seconds</td></tr>
+    </tbody>
+  </table>
+  <p>Micro-batch is the pragmatic middle: Spark Structured Streaming's default execution model chops an unbounded stream into a series of tiny batch jobs. It buys most of the freshness of streaming with the operational familiarity and throughput of batch, which is why it's the workhorse for a huge share of "near-real-time" pipelines. True record-at-a-time streaming (Flink) is what you reach for when single-digit-second or sub-second latency and rich per-key state actually matter.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Batch and streaming are not two products; they're two points on a latency/cost curve. Most platforms run <em>both</em> — a streaming path for the handful of use cases with a tight freshness SLA, and batch for everything else. The interview question is rarely "which one" for the whole platform; it's "which one <em>for this data path</em>, and why."</p>
+  </div>
+</section>
+
+<section id="drivers">
+  <h2>What actually drives the choice</h2>
+  <p>The decision is not about technology preference. It's driven, in order, by:</p>
+  <ol>
+    <li><strong>Freshness SLA.</strong> The single dominant input. If a consumer needs data within seconds (fraud scoring, live ops dashboards, alerting), streaming earns its keep. If "by 6am" or "within the hour" is fine (finance reporting, most BI, ML training sets), batch or micro-batch wins comfortably. <em>Ask what the consumer actually does with fresher data</em> — often the answer reveals the real SLA is looser than the ask.</li>
+    <li><strong>Cost.</strong> Streaming means always-on compute and standing infrastructure (a Kafka/Flink cluster running 24/7) versus batch compute you spin up, run, and tear down. At modest volume a nightly warehouse job can be an order of magnitude cheaper than an equivalent streaming stack.</li>
+    <li><strong>Complexity &amp; operational burden.</strong> Streaming pulls in watermarks, windowing, state stores, checkpointing, backpressure, and 24/7 on-call. Batch failures are re-runnable in the morning; a stalled stream is a page.</li>
+    <li><strong>Correctness under late/out-of-order data.</strong> Batch sees a whole bounded window at once, so late data is "just there." Streaming must decide <em>when a window is done</em> in the face of events that haven't arrived yet — a genuinely harder correctness problem (below).</li>
+    <li><strong>Team skill.</strong> A team fluent in SQL and dbt will ship a reliable batch platform far faster than they'll operate Flink well. Match the architecture to who has to run it at 3am.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">The clarifying question that wins</span>
+    <p>"What decision or action does a consumer take on this data, and how stale can it be before that action is wrong?" This converts a vague "real-time" ask into a number, and the number decides the architecture. Fraud blocking needs seconds; a daily revenue dashboard read at 9am does not care whether the data landed at 2am or 5am.</p>
+  </div>
+</section>
+
+<section id="semantics">
+  <h2>Time, windows &amp; correctness</h2>
+  <p>The hardest part of streaming is that events arrive late and out of order, so you must distinguish two clocks:</p>
+  <ul>
+    <li><strong>Event time</strong> — when the event actually happened (stamped at the source). What you almost always want to aggregate by.</li>
+    <li><strong>Processing time</strong> — when your engine saw it. Easy, but wrong for anything time-windowed, because a mobile client that was offline for an hour will inject "old" events into "now."</li>
+  </ul>
+  <p>A <strong>watermark</strong> is the engine's assertion that "I don't expect any more events older than time T," which is what lets a windowed aggregation close and emit. Set it too tight and you drop late events; too loose and you hold state and delay output. This is the crux of streaming correctness — and it has a lot of depth.</p>
+  <div class="callout insight">
+    <span class="callout-label">Cross-link, don't re-teach</span>
+    <p>Event-time semantics, watermarks, allowed-lateness, and how to reprocess when late data lands are covered in depth in the companion guide: <a href="../production-data-pipelines/04-late-arriving-data.html">Production Data Pipelines · Late-Arriving Data</a>. In this interview, know the concepts well enough to say <em>"streaming forces me to make a watermark trade-off between latency and completeness that batch sidesteps"</em> — then point to where the mechanics live rather than whiteboarding a full watermark diagram. Stay at the decision altitude.</p>
+  </div>
+  <p>The architectural takeaway: batch's correctness is easy because it operates on a closed window; streaming trades that ease for freshness, and pays in watermark tuning and late-data handling.</p>
+</section>
+
+<section id="exactly-once">
+  <h2>Exactly-once &amp; reprocessing</h2>
+  <p>"Exactly-once" is a property of the whole path, not a checkbox. In practice you get it by combining <strong>at-least-once delivery</strong> with <strong>idempotent or transactional sinks</strong>, plus checkpointed operator state.</p>
+  <ul>
+    <li><strong>Flink</strong> achieves end-to-end exactly-once via distributed checkpointing (Chandy–Lamport barriers) plus a two-phase-commit sink connector — output is committed only when a checkpoint completes.</li>
+    <li><strong>Spark Structured Streaming</strong> gives exactly-once with replayable sources (Kafka offsets), a write-ahead log, and idempotent sinks (e.g. a Delta table with transactional commits).</li>
+    <li><strong>Kafka</strong> offers transactions and idempotent producers, giving exactly-once <em>within</em> the Kafka-to-Kafka boundary; the sink still has to hold up its end.</li>
+  </ul>
+  <p><strong>Reprocessing</strong> is where the two paradigms diverge most sharply, and it's a favorite deep-dive:</p>
+  <ul>
+    <li><strong>Batch reprocessing is trivial</strong> — a bug in yesterday's logic means re-running yesterday's partition. Idempotent overwrite of a partition is the whole story.</li>
+    <li><strong>Streaming reprocessing is a design problem.</strong> To fix a bug you must replay history from a retained log (Kafka retention or a lake replay), rebuild state, and reconcile with already-emitted results. This is precisely the pain Kappa architecture tries to make routine and Lambda tries to sidestep.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Interview trap</span>
+    <p>Claiming "exactly-once" without naming the mechanism (checkpointing + transactional/idempotent sink) reads as cargo-culting. And remember: exactly-once processing does not mean exactly-once <em>side effects</em> — if your job calls an external API, that call can still fire twice on replay.</p>
+  </div>
+</section>
+
+<section id="lambda-kappa">
+  <h2>Lambda vs Kappa</h2>
+  <p>Two reference architectures for combining freshness with correctness:</p>
+  <ul>
+    <li><strong>Lambda</strong> runs two paths: a <em>speed layer</em> (streaming, approximate, low-latency) and a <em>batch layer</em> (slow, complete, authoritative) that periodically recomputes and corrects the speed layer's output. The serving layer merges them. Cost: you maintain the same business logic twice, in two codebases, and reconcile them.</li>
+    <li><strong>Kappa</strong> keeps one path — streaming only. Reprocessing is done by replaying the log through the same code with new logic. Simpler conceptually and no duplicated logic, but it demands durable, replayable logs and an engine that can reprocess history fast.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Where the industry actually landed</span>
+    <p>Lambda's "two codebases" tax pushed the field toward Kappa-style, streaming-first designs — and, increasingly, toward <em>unified engines</em> where the same code runs on bounded and unbounded data (Flink's unified batch/stream, Beam's model, Spark's batch + Structured Streaming). The modern warehouse-native answer is often quieter still: land data incrementally and let a <strong>materialized view</strong> or <strong>dbt incremental model</strong> keep the result fresh. Naming this trajectory — "Lambda is largely legacy; I'd default to a unified or incremental approach unless there's a reason not to" — signals you've watched the space evolve.</p>
+  </div>
+</section>
+
+<section id="engines">
+  <h2>The engine landscape</h2>
+  <p>Match the engine to the mode and to the correctness/latency need. You should be able to place each of these on the board and say why.</p>
+  <table>
+    <thead><tr><th>Engine</th><th>Model</th><th>Sweet spot</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Spark (batch)</strong></td><td>Bounded batch</td><td>Large-scale ETL, backfills, ML training sets</td><td>Not for sub-minute latency</td></tr>
+      <tr><td><strong>Spark Structured Streaming</strong></td><td>Micro-batch (+ continuous)</td><td>Near-real-time on an existing Spark/Databricks stack; unified code with batch</td><td>Micro-batch floor on latency (~seconds); heavy state can strain</td></tr>
+      <tr><td><strong>Flink</strong></td><td>True record-at-a-time streaming, stateful</td><td>Low-latency, complex event-time windows, large keyed state, CEP</td><td>Operational complexity; steeper team skill bar</td></tr>
+      <tr><td><strong>Beam</strong></td><td>Unified batch/stream model, portable</td><td>Write once, run on Flink/Dataflow/Spark; Google Cloud Dataflow</td><td>Abstraction cost; runner-specific quirks</td></tr>
+      <tr><td><strong>Warehouse-native streaming / materialized views</strong></td><td>Continuous ingest + incremental refresh</td><td>Snowflake Snowpipe Streaming + Dynamic Tables, BigQuery streaming inserts + materialized views</td><td>Latency floor higher than Flink; cost of continuous refresh</td></tr>
+      <tr><td><strong>dbt incremental</strong></td><td>Batch, incremental models</td><td>Analytics transforms on a schedule; SQL-first teams</td><td>Not streaming — freshness bounded by run cadence</td></tr>
+    </tbody>
+  </table>
+  <p>A short Structured Streaming reader shows how thin the code difference between batch and micro-batch actually is — the same DataFrame API, a different source and a trigger:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>stream_orders.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># Micro-batch stream: read Kafka, aggregate by event-time window,
+# tolerate 10 minutes of lateness, write exactly-once to Delta.
+from pyspark.sql import functions as F
+
+events = (spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "broker:9092")
+    .option("subscribe", "orders")
+    .load())
+
+agg = (events
+    .select(F.from_json(F.col("value").cast("string"), schema).alias("e"))
+    .select("e.*")
+    .withWatermark("event_ts", "10 minutes")          # late-data tolerance
+    .groupBy(F.window("event_ts", "5 minutes"), "region")
+    .agg(F.sum("amount").alias("revenue")))
+
+(agg.writeStream
+    .format("delta")
+    .outputMode("append")
+    .option("checkpointLocation", "/chk/orders")       # state + exactly-once
+    .trigger(processingTime="30 seconds")              # micro-batch cadence
+    .start("/lake/gold/revenue_5m"))
+</code></pre>
+  </div>
+</section>
+
+<section id="matrix">
+  <h2>The decision matrix</h2>
+  <p>This is the artifact to reproduce on the whiteboard. Score the requirement against each axis; the column with the better fit for <em>your dominant requirement</em> wins that path.</p>
+  <table>
+    <thead><tr><th>Axis</th><th>Batch</th><th>Micro-batch</th><th>Streaming</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Latency / freshness</strong></td><td>Minutes–hours</td><td>Seconds–minutes</td><td>Milliseconds–seconds ✅</td></tr>
+      <tr><td><strong>Cost</strong></td><td>Lowest — ephemeral compute ✅</td><td>Moderate — near-continuous compute</td><td>Highest — 24/7 standing infra</td></tr>
+      <tr><td><strong>Complexity</strong></td><td>Lowest ✅</td><td>Moderate</td><td>Highest — state, watermarks, checkpoints</td></tr>
+      <tr><td><strong>Correctness w/ late data</strong></td><td>Easiest — closed windows ✅</td><td>Manageable — watermarks</td><td>Hardest — watermark tuning</td></tr>
+      <tr><td><strong>Operational burden</strong></td><td>Re-run in the morning ✅</td><td>Some 24/7</td><td>24/7 on-call, backpressure</td></tr>
+      <tr><td><strong>Reprocessing</strong></td><td>Trivial — re-run a partition ✅</td><td>Moderate</td><td>Hard — replay + state rebuild</td></tr>
+      <tr><td><strong>Team skill required</strong></td><td>SQL / dbt ✅</td><td>Spark familiarity</td><td>Flink / streaming expertise</td></tr>
+    </tbody>
+  </table>
+  <p>Notice batch wins six of seven axes; streaming wins the one that, when it matters, matters absolutely — latency. That asymmetry is the whole trade-off in a sentence.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <p>Deliver these as defended defaults, then name the condition that flips them.</p>
+  <div class="callout tip">
+    <span class="callout-label">Choose batch (or micro-batch) when…</span>
+    <ul>
+      <li>The freshness SLA is measured in minutes-to-hours (most BI, reporting, ML training sets).</li>
+      <li>Cost matters and volume is modest-to-large but not latency-sensitive.</li>
+      <li>The team lives in SQL/dbt and correctness/re-runnability matter more than seconds.</li>
+      <li>You need trivial reprocessing and backfills — a partition re-run.</li>
+      <li><strong>Default here.</strong> Reach for micro-batch when "hourly" quietly becomes "within a few minutes."</li>
+    </ul>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Choose streaming when…</span>
+    <ul>
+      <li>A consumer takes an automated action on the data within seconds — fraud blocking, real-time personalization, alerting, live operational dashboards.</li>
+      <li>The value of the data decays fast (a fraud signal at T+1 hour is worthless).</li>
+      <li>You need continuous, stateful computation (sessionization, running aggregates, CEP) that batch would recompute wastefully.</li>
+      <li>You already run the streaming infra and team skill for it — the marginal cost of one more stream is low.</li>
+    </ul>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">The trap to name out loud</span>
+    <p>The most common senior-level miss is reaching for streaming when a nightly batch meets the SLA at a fraction of the cost and effort. If no consumer acts on the data within the batch window, streaming buys you nothing but a standing cluster, a harder correctness story, and a 24/7 pager. Say it explicitly in the room: <em>"I'd default to batch here — nothing consumes this data faster than daily, so streaming would add cost and operational burden with no payoff. I'd move the fraud path, and only the fraud path, to streaming because it needs sub-second scoring."</em> Splitting the platform by SLA rather than picking one mode for everything is the staff-level answer.</p>
+  </div>
+  <p>Storage sits underneath all of this — where the batch and streaming outputs land, and in what format, is the next fork. Continue to <a href="06-storage-architectures.html">06 · Lakes, Warehouses &amp; Lakehouses</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
