@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Late-Arriving Data</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#three-clocks">Three clocks: event, processing, ingestion</a>
+    <a href="#why-late">Why data arrives late</a>
+    <a href="#watermarks">Watermarks, lateness &amp; windows</a>
+    <a href="#lookback">Batch lookback &amp; reprocessing</a>
+    <a href="#facts-dims">Late facts &amp; late dimensions</a>
+    <a href="#bitemporal">Bitemporal modeling &amp; as-of joins</a>
+    <a href="#lambda-kappa">Lambda, Kappa &amp; safe restatements</a>
+    <a href="#ladder">The leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-orchestration.html">← Previous</a>
+    <a href="05-incremental-processing.html">Next: Incremental Processing →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · The Hard Parts</span>
+  <h1>Late-Arriving Data</h1>
+  <p class="subtitle">The moment your pipeline stops being a diagram and starts being a distributed system: data that describes the past shows up after you already reported on it, and correctness becomes a design problem instead of an afterthought.</p>
+</header>
+
+<section id="three-clocks">
+  <h2>Three clocks: event, processing, ingestion</h2>
+  <p>Almost every late-data bug traces back to conflating three timestamps that are quietly different. Get precise about them and half the confusion evaporates.</p>
+  <table>
+    <thead><tr><th>Clock</th><th>When it's stamped</th><th>What it's good for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Event time</strong></td><td>When the thing actually happened, on the device or source system (the user tapped "buy" at 23:58).</td><td>The <em>only</em> correct axis for business analytics — "revenue on the 3rd" means events whose event time is the 3rd.</td></tr>
+      <tr><td><strong>Ingestion time</strong></td><td>When the record landed in your system — hit Kafka, or was written to the raw/landing table.</td><td>Bookkeeping: what to scan on the next incremental run, retention, debugging arrival lag.</td></tr>
+      <tr><td><strong>Processing time</strong></td><td>When your job actually computed over the record (the wall-clock time your batch or stream operator ran).</td><td>Almost nothing analytical. It's an artifact of <em>when you happened to run</em>, not of the business.</td></tr>
+    </tbody>
+  </table>
+  <p>Late-arriving data is simply the gap between these clocks: an event whose <em>event time</em> is well before its <em>ingestion time</em>. If you always partitioned and aggregated by processing time you'd never see "late" data — but every daily number would be wrong, because a purchase at 23:58 that arrives at 00:04 would land on the wrong day.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>"Late" is not a property of a record; it's a property of the <em>relationship</em> between when an event happened and when you decided a window was done. The instant you commit to a business grain keyed on event time — daily revenue, hourly active users — you have signed up to handle records that arrive after you closed their bucket. There is no partition-by-event-time pipeline without a late-data strategy.</p>
+  </div>
+</section>
+
+<section id="why-late">
+  <h2>Why data arrives late</h2>
+  <p>Interviewers want to hear that you know late data is normal and structural, not a freak event. Concrete causes, roughly in order of how often they bite:</p>
+  <ul>
+    <li><strong>Offline &amp; mobile clients.</strong> A phone in airplane mode queues events for hours or days, then flushes them all with their original event timestamps when it reconnects. This is the classic multi-day straggler.</li>
+    <li><strong>Upstream retries &amp; buffering.</strong> An at-least-once producer that failed and retried, a collector that batches, an SDK that flushes on a timer — all decouple event time from arrival.</li>
+    <li><strong>Out-of-order streams.</strong> Kafka only guarantees order <em>within a partition</em>. Across partitions (or after a rebalance / replay) records for the same key interleave, so a 12:00 event can be consumed after a 12:05 one.</li>
+    <li><strong>Batch cutoffs &amp; extraction windows.</strong> Your 00:00 extract queried the source at 23:59:30; a transaction that committed at 23:59:45 is real, on-time, and simply missed the net — it shows up tomorrow.</li>
+    <li><strong>Timezone &amp; clock skew.</strong> Source in UTC, another in local time, a device with a wrong clock. Mishandled, these masquerade as lateness and corrupt your day boundaries.</li>
+    <li><strong>Corrections upstream.</strong> A refund, a back-dated adjustment, a late-settling payment. The fact isn't just late — its <em>value</em> changed after you first saw it.</li>
+  </ul>
+  <p>The design consequence: you cannot wait for "all" the data, because there is no bound on how late a straggler can be. You pick a <strong>completeness horizon</strong> you're willing to honor and accept a small, quantified error beyond it. That trade-off is the whole game.</p>
+</section>
+
+<section id="watermarks">
+  <h2>Watermarks, allowed lateness &amp; windows</h2>
+  <p>Streaming systems (Flink, Spark Structured Streaming, Beam) formalize the trade-off with <strong>watermarks</strong>. A watermark is the engine's assertion: "I believe I've now seen all events with event time ≤ T." It's an estimate of completeness, usually computed as <code>max(event_time_seen) − allowed_out_of_orderness</code>. When the watermark passes a window's end, the window fires and emits its result.</p>
+  <ul>
+    <li><strong>Bounded out-of-orderness</strong> is the lateness you budget for up front (e.g. 5 minutes). It sets how far the watermark trails the newest event, i.e. how long you hold a window open waiting for stragglers.</li>
+    <li><strong>Allowed lateness</strong> is an extra grace period <em>after</em> the watermark passes: the window stays in state and re-fires an updated result if a late record still trickles in, up to the limit.</li>
+    <li><strong>Beyond allowed lateness</strong>, records are dropped (or routed to a <em>late/side output</em> for separate handling) rather than silently corrupting a closed result.</li>
+  </ul>
+  <p>The knob is the fundamental tension of this whole chapter:</p>
+  <div class="callout tip">
+    <span class="callout-label">Completeness vs latency</span>
+    <p>A larger watermark delay / lookback waits longer, catches more stragglers, and is <em>more complete</em> — but every downstream number is <em>later</em>. A smaller one is fast but emits results that later have to be corrected. There is no free lunch; there is only a number you choose and an error you're accountable for. In the interview, always attach an explicit completeness SLA: "final numbers by T+3 days, provisional before that."</p>
+  </div>
+  <p>Windows are how you bucket unbounded streams into finite results, and each interacts with lateness differently:</p>
+  <table>
+    <thead><tr><th>Window</th><th>Shape</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Tumbling</strong></td><td>Fixed, non-overlapping (each hour).</td><td>Hourly/daily aggregates — the batch analog of a date partition.</td></tr>
+      <tr><td><strong>Sliding</strong></td><td>Fixed size, overlapping (last 1h, advanced every 5m).</td><td>Rolling metrics; a late event updates every window it belongs to.</td></tr>
+      <tr><td><strong>Session</strong></td><td>Dynamic, closed by a gap of inactivity.</td><td>User sessions; a late event can <em>merge</em> two sessions that looked separate.</td></tr>
+    </tbody>
+  </table>
+  <p>Batch pipelines don't say "watermark," but they make the exact same decision — the equivalent of the watermark delay is your <strong>lookback window</strong>, covered next.</p>
+</section>
+
+<section id="lookback">
+  <h2>Batch lookback &amp; reprocessing</h2>
+  <p>In a warehouse you don't hold windows open in memory; instead you <strong>re-read a trailing window of event-date partitions on every run</strong> and re-merge. Yesterday's run already wrote the 3rd; today's run re-scans the last N days of arrivals, finds any stragglers whose event time is the 3rd, and folds them into the 3rd's partition. Lookback is the batch watermark.</p>
+  <p>The non-negotiable property is <strong>idempotency</strong>: reprocessing the same window twice must not double-count. That means the load key is the event's natural/surrogate key, and you <code>MERGE</code> (or partition-overwrite) rather than blind-<code>INSERT</code>. Here's a lookback merge that routes each late fact into the partition of <em>its own</em> event date, not the run date:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>merge_late_facts.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Re-scan a trailing lookback window of ARRIVALS (ingestion time),
+-- but write each row into the partition of its EVENT date.
+-- Idempotent: re-running the same window converges to the same result.
+
+MERGE INTO analytics.fct_orders AS tgt
+USING (
+    SELECT
+        s.order_id,
+        s.customer_id,
+        s.amount,
+        s.event_ts,
+        CAST(s.event_ts AS DATE)  AS event_date,   -- partition key = EVENT time
+        s.ingested_at,
+        -- if the same order_id was corrected multiple times in the window,
+        -- keep only the newest version by source update time
+        ROW_NUMBER() OVER (
+            PARTITION BY s.order_id
+            ORDER BY s.source_updated_at DESC
+        ) AS rn
+    FROM raw.orders_stream AS s
+    -- lookback is on INGESTION time: catch anything that landed recently,
+    -- regardless of how old the event itself is
+    WHERE s.ingested_at >= DATEADD('day', -3, CURRENT_DATE)
+) AS src
+ON  tgt.order_id = src.order_id
+AND src.rn = 1
+WHEN MATCHED AND src.source_updated_at > tgt.source_updated_at THEN UPDATE SET
+    tgt.customer_id       = src.customer_id,
+    tgt.amount            = src.amount,
+    tgt.event_ts          = src.event_ts,
+    tgt.event_date        = src.event_date,
+    tgt.source_updated_at = src.source_updated_at
+WHEN NOT MATCHED AND src.rn = 1 THEN INSERT
+    (order_id, customer_id, amount, event_ts, event_date, source_updated_at)
+    VALUES
+    (src.order_id, src.customer_id, src.amount, src.event_ts,
+     src.event_date, src.source_updated_at);
+</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">The trap: lookback on the wrong clock</span>
+    <p>A tempting but wrong version filters <code>WHERE event_ts &gt;= CURRENT_DATE - 3</code>. That re-scans events from the last 3 days — but a straggler that <em>arrives</em> today with an event time from last week is exactly the record you're trying to catch, and this filter skips it. Lookback must window on <strong>ingestion/arrival time</strong> to decide what to reprocess, then partition on <strong>event time</strong> to decide where it lands. Mixing the two clocks is the most common late-data bug in batch pipelines.</p>
+  </div>
+  <p>What if a straggler arrives <em>beyond</em> your lookback horizon (a 9-day-late mobile flush when you look back 3)? You need a bounded escape hatch: a periodic wide reprocess (re-merge the last 30 days weekly), or a reconciliation loop (<a href="06-reconciliation-and-validation.html">Chapter 06</a>) that flags a partition whose source total drifted and triggers a targeted restatement. The lookback handles the 99% cheaply; the wide sweep handles the tail.</p>
+</section>
+
+<section id="facts-dims">
+  <h2>Late facts &amp; late dimensions</h2>
+  <p>So far the fact itself was late. Two subtler cases show up constantly in a dimensional warehouse, and interviewers use them to separate L2 from L3.</p>
+
+  <h3>Late-arriving facts (dimension not ready yet)</h3>
+  <p>A fact references a dimension member that hasn't loaded — an order for a <code>customer_id</code> your <code>dim_customer</code> hasn't seen. You have three options:</p>
+  <ul>
+    <li><strong>Inferred / placeholder dimension.</strong> Insert a stub row for the unknown key (natural key filled, attributes marked <code>-1</code>/"Unknown", an <code>is_inferred</code> flag) so the fact can join now. When the real dimension arrives, <em>update the stub in place</em> — the surrogate key never changes, so no facts need rewiring. This is the standard, and usually right, answer.</li>
+    <li><strong>Park &amp; retry.</strong> Route facts with unresolved keys to a quarantine/pending table and re-attempt the join on later runs. Cleaner referential integrity, but the fact is invisible until the dimension shows — bad when the fact is the revenue you're supposed to report.</li>
+    <li><strong>Never drop it.</strong> The one wrong answer is silently discarding the fact because its FK doesn't resolve. That's data loss disguised as a constraint.</li>
+  </ul>
+
+  <h3>Late-arriving dimensions (the attribute change is late)</h3>
+  <p>The dimension update itself lands late — a customer's tier changed on the 1st but you learned on the 5th. If the dimension is <strong>SCD Type 2</strong> (a new row per change with effective-dating), a late change means retroactively opening a version whose validity window is in the past, and re-closing the neighbours around it:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>scd2_late_dimension.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- A tier change with a back-dated effective date arrives late.
+-- Insert the new version at its true valid-from, and re-close the
+-- version that was previously "current" so windows never overlap.
+
+-- 1) Close the previously-open version right before the late change begins.
+UPDATE dim_customer AS d
+SET valid_to    = DATEADD('day', -1, :late_valid_from),
+    is_current  = FALSE
+WHERE d.customer_id = :customer_id
+  AND d.is_current  = TRUE
+  AND d.valid_from  <= :late_valid_from;   -- guard: only close an earlier-or-equal version
+
+-- 2) Insert the late version with its TRUE (back-dated) effective window.
+INSERT INTO dim_customer
+    (customer_sk, customer_id, tier, valid_from, valid_to, is_current)
+VALUES
+    (:new_surrogate_key, :customer_id, :new_tier,
+     :late_valid_from, DATE '9999-12-31', TRUE);
+
+-- 3) Any facts in [late_valid_from, now] were joined to the OLD version's
+--    surrogate key. Re-point them so as-of joins resolve to the right tier.
+UPDATE fct_orders AS f
+SET customer_sk = :new_surrogate_key
+WHERE f.customer_id = :customer_id
+  AND f.event_date >= :late_valid_from
+  AND f.event_date <  DATE '9999-12-31';
+</code></pre>
+  </div>
+  <p>Step 3 is the part people forget: a late SCD2 row is only half the fix. Facts already loaded during the back-dated window were stamped with the <em>old</em> surrogate key, so unless you re-point them (or resolve the dimension at query time via an as-of join, below) your history stays wrong. This is exactly why bitemporal thinking earns its keep.</p>
+</section>
+
+<section id="bitemporal">
+  <h2>Bitemporal modeling &amp; as-of joins</h2>
+  <p>The SCD2 example above tracks <strong>valid time</strong> — when a fact was true in the business world. But late data raises a second, orthogonal question interviewers love: <em>what did we believe, and when did we believe it?</em> That's <strong>system time</strong> (a.k.a. transaction time) — when a row was recorded in your system. Tracking both is <strong>bitemporal</strong> modeling.</p>
+  <table>
+    <thead><tr><th>Axis</th><th>Question it answers</th><th>Columns</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Valid time</strong></td><td>When was this true in reality?</td><td><code>valid_from</code>, <code>valid_to</code> (business effective dates)</td></tr>
+      <tr><td><strong>System time</strong></td><td>When did our database know it? / When was it superseded?</td><td><code>system_from</code>, <code>system_to</code> (load/change timestamps)</td></tr>
+    </tbody>
+  </table>
+  <p>Why you need both: valid time alone lets you answer "what was the customer's tier on the 3rd?" — but a late correction silently rewrites that answer. With system time too, you can also answer "what did the <em>3rd's month-end report</em> show, run on the 5th, before the correction landed on the 8th?" That reproducibility is mandatory in finance, and it's the difference between "our numbers changed" and "our numbers are auditable."</p>
+  <p>An <strong>as-of join</strong> resolves a fact against the dimension version that was valid <em>at the event's time</em> rather than the version that's current now — so history stays stable even as dimensions evolve:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>as_of_join.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Resolve each order to the customer tier that was VALID at event time.
+-- Optionally pin SYSTEM time too, to reproduce a report "as we knew it"
+-- at a past reporting instant (:as_of_system_ts).
+
+SELECT
+    f.order_id,
+    f.event_ts,
+    f.amount,
+    d.tier            AS tier_at_event_time
+FROM fct_orders AS f
+JOIN dim_customer AS d
+  ON  d.customer_id = f.customer_id
+  -- valid-time match: the version whose business window covers the event
+  AND f.event_ts >= d.valid_from
+  AND f.event_ts <  d.valid_to
+  -- system-time match: only versions our system had recorded by the
+  -- reporting instant, and not yet superseded as of then
+  AND d.system_from <= :as_of_system_ts
+  AND d.system_to   >  :as_of_system_ts;
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Calibration</span>
+    <p>You don't need bitemporal everywhere — it's overhead. Reach for it when the answer to "can a past report legitimately change, and do we need to explain why?" is yes: finance, regulatory, anything with restatements. For a growth dashboard, SCD2 valid-time plus a documented completeness SLA is plenty. Naming <em>where you'd draw that line</em> is itself an L4 signal.</p>
+  </div>
+</section>
+
+<section id="lambda-kappa">
+  <h2>Lambda, Kappa &amp; safe restatements</h2>
+  <p>At architecture scale, "how do we correct late data?" becomes a question about the shape of the whole pipeline.</p>
+  <ul>
+    <li><strong>Lambda</strong> runs a fast <em>speed layer</em> (streaming, approximate, tolerates late/out-of-order data loosely) alongside a slow <em>batch layer</em> that reprocesses from immutable raw storage and produces the authoritative, complete result. Serving merges the two. It's correct-eventually and battle-tested, but you maintain the same logic twice and reconcile the layers — real operational tax.</li>
+    <li><strong>Kappa</strong> keeps a single streaming code path and treats correction as <em>replay</em>: to restate, you reprocess the retained log (Kafka/Kinesis) from an offset through the same job into a new output, then swap. One codebase, but it leans hard on log retention, deterministic reprocessing, and replay tooling.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>lambda-vs-kappa.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">LAMBDA                                  KAPPA
+
+ raw ─┬─▶ [speed layer] ─▶ realtime      log ─▶ [stream job] ─▶ view v1
+      │                       \                     │
+      │                    serving-merge            └─(replay from offset)─▶ view v2 ─▶ swap
+      │                       /
+      └─▶ [batch layer] ─▶ authoritative   one code path; correctness via replay
+
+ two code paths; batch overwrites speed  need: log retention + deterministic jobs</code></pre>
+  </div>
+  <p>Whichever you pick, the discipline for correcting late data without breaking downstream is the same, and it's the part that matters most in the room:</p>
+  <ul>
+    <li><strong>Immutable raw + reproducible transforms.</strong> Never mutate landed data; keep event time and ingestion time on every row. Any partition can be rebuilt from raw at any time, deterministically.</li>
+    <li><strong>Restate by partition, atomically.</strong> To fix the 3rd, rebuild <em>only</em> the 3rd's partition into a staging location and swap it in one metadata operation (partition-overwrite / Iceberg-Delta snapshot). No half-written state; readers see old or new, never both.</li>
+    <li><strong>Version, don't destroy.</strong> Table-format time travel (Iceberg/Delta snapshots) keeps the pre-restatement version queryable, so an auditor can see exactly what changed — this is bitemporality at the storage layer.</li>
+    <li><strong>Publish a completeness contract.</strong> Tell consumers "data older than T+3 days is final; newer is provisional and may be restated." A restatement inside the provisional window is expected, not an incident — and downstream can design for it instead of being surprised.</li>
+  </ul>
+  <p>Restatement and reprocessing are where this chapter meets the next two: the mechanics of re-running just the affected slices without double-counting live in <a href="05-incremental-processing.html">Chapter 05 · Incremental Processing &amp; Backfills</a>, and the loop that <em>detects</em> a partition needs restating lives in <a href="06-reconciliation-and-validation.html">Chapter 06 · Reconciliation &amp; Validation</a>.</p>
+</section>
+
+<section id="ladder">
+  <h2>The leveling ladder</h2>
+  <p>This is the topic where interviewers most reliably push "and then what?" until you run out of rungs. Have all four ready, and narrate the climb rather than jumping to the top.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"If numbers look off I'd re-run yesterday's job." Knows late data exists; correction is manual and by processing time.</td><td>Understands the problem but has no systematic handle on it.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"A <strong>lookback window</strong> — re-scan the last N days of arrivals each run and <strong>idempotently merge</strong> stragglers into their correct event-date partition." Distinguishes event vs ingestion time.</td><td>Builds re-runnable pipelines that absorb the common case without double-counting.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"Explicit <strong>watermark/completeness SLA</strong> (final at T+3, provisional before), <strong>SCD2 effective-dating</strong> for late dimensions with inferred members for late facts, and a reconciliation check that flags drift beyond the lookback horizon."</td><td>Owns the completeness-vs-latency trade-off and dimensional correctness; makes the SLA explicit.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"<strong>Bitemporal</strong> model (valid + system time) with <strong>as-of joins</strong> for auditable restatements, immutable partitions with atomic swap and time-travel, a <strong>data contract</strong> that publishes the provisional/final boundary, and a closed reconciliation loop that triggers targeted restatements automatically."</td><td>Architects for correctness, auditability, and evolution across teams — restatements are a designed feature, not a fire drill.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Level up</span>
+    <p>The jump from L2 to L3 is where most candidates plateau: it's moving from "I re-run and merge" (a mechanism) to "here is my completeness SLA and here is how I detect when it's violated" (a <em>commitment plus a control</em>). If you can say the sentence "final numbers by T+3, provisional before, and here's the recon check that catches anything beyond that," you've credibly cleared Senior on this topic — then reach for bitemporal only if the scenario's correctness bar (finance, audit) actually demands it.</p>
+  </div>
+  <p>Next, the machinery that makes all of this cheap enough to run every hour — and the backfills that let you rebuild history without double-counting: <a href="05-incremental-processing.html">05 · Incremental Processing &amp; Backfills</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

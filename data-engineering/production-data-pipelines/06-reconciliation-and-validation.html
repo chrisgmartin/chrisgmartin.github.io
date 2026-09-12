@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reconciliation &amp; Validation</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#framing">Reconciliation vs validation</a>
+    <a href="#dimensions">The six data-quality dimensions</a>
+    <a href="#reconciliation">Source-to-target reconciliation</a>
+    <a href="#testing">Testing layers</a>
+    <a href="#contracts">Data contracts</a>
+    <a href="#wap">Write-Audit-Publish &amp; circuit breakers</a>
+    <a href="#anomaly">Anomaly detection &amp; the alert-vs-block trap</a>
+    <a href="#quarantine">Quarantine, audit tables &amp; dashboards</a>
+    <a href="#leveling">The leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-incremental-processing.html">← Previous</a>
+    <a href="07-reliability-and-observability.html">Next: Reliability &amp; Observability →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · The Hard Parts</span>
+  <h1>Reconciliation &amp; Validation</h1>
+  <p class="subtitle">How you prove the numbers are right — source-to-target reconciliation, layered testing, data contracts, and the Write-Audit-Publish machinery that stops a bad batch before anyone sees it.</p>
+</header>
+
+<section id="framing">
+  <h2>Reconciliation vs validation</h2>
+  <p>This is one of the three named topics on the loop, and it's the one candidates hand-wave most. "I'd add some data quality checks" is a fail. The interviewer wants to know exactly <em>what</em> you'd check, <em>how</em> you'd stop a bad load, and how you'd prove to a finance stakeholder that the warehouse agrees with the system of record. Two distinct disciplines sit underneath that, and conflating them is the first mistake:</p>
+  <ul>
+    <li><strong>Validation</strong> asks <em>"is this data well-formed and plausible on its own terms?"</em> — no nulls in the primary key, amounts non-negative, status in an allowed set, row counts within a normal band. It's intrinsic. You can run it knowing nothing about any other system.</li>
+    <li><strong>Reconciliation</strong> asks <em>"does this data agree with the source of truth?"</em> — does <code>sum(amount)</code> in the warehouse match the payments provider's daily settlement total, row for row, penny for penny. It's relational. It needs a second, trusted reference to compare against.</li>
+  </ul>
+  <p>A dataset can pass every validation test and still be wrong: dropped ten thousand rows on ingest, all of them individually valid. Only reconciliation catches that. Conversely, reconciliation totals can tie out while individual rows are garbage (two errors that cancel). You need both, and you need to say so out loud.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe that lands</span>
+    <p>Validation protects you from <em>malformed</em> data; reconciliation protects you from <em>missing or duplicated</em> data. Tests assert what each row should look like. Reconciliation asserts that the <em>set</em> is complete. In a financial pipeline the second is the one that gets people fired — lead with it.</p>
+  </div>
+</section>
+
+<section id="dimensions">
+  <h2>The six data-quality dimensions</h2>
+  <p>When an interviewer asks "how would you think about data quality here?", a vocabulary beats a list of ad-hoc checks. The standard six dimensions give you a checklist you can walk without missing a class of defect:</p>
+  <table>
+    <thead><tr><th>Dimension</th><th>Question it answers</th><th>Typical check</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Completeness</strong></td><td>Is anything missing?</td><td>Row-count recon vs source; not_null on required columns; no missing partitions/days.</td></tr>
+      <tr><td><strong>Uniqueness</strong></td><td>Are there dupes?</td><td>Unique/primary-key test on the grain; no duplicate natural keys after merge.</td></tr>
+      <tr><td><strong>Validity</strong></td><td>Is it well-formed?</td><td>Type, range, regex, accepted_values, referential shape (status in a known set).</td></tr>
+      <tr><td><strong>Accuracy</strong></td><td>Does it match reality?</td><td>Reconciliation against the system of record; control totals; hash-diff.</td></tr>
+      <tr><td><strong>Consistency</strong></td><td>Does it agree with itself &amp; related tables?</td><td>Referential integrity (relationships tests), debits = credits, fact rows point to real dims.</td></tr>
+      <tr><td><strong>Timeliness</strong></td><td>Is it fresh enough?</td><td>Freshness SLA — max(loaded_at) within threshold; partition for today exists by 6am.</td></tr>
+    </tbody>
+  </table>
+  <p>Map each dimension to a concrete mechanism and you've turned "data quality" from a buzzword into an audit. Note that <strong>accuracy</strong> is the only one you generally can't test in isolation — it's where reconciliation lives. Timeliness ties directly into the freshness SLIs in <a href="07-reliability-and-observability.html">Chapter 07</a>.</p>
+</section>
+
+<section id="reconciliation">
+  <h2>Source-to-target reconciliation</h2>
+  <p>Reconciliation is a comparison between two independent counts of the same thing. The design questions are: <em>what</em> do you compare, at <em>what</em> grain, how <em>often</em>, and with what <em>tolerance</em>.</p>
+  <ul>
+    <li><strong>Row counts</strong> — cheapest signal. Count source rows by day vs target rows by day. Catches wholesale drops and duplications.</li>
+    <li><strong>Control totals / aggregate recon</strong> — sum a monetary or quantity column on both sides (<code>sum(amount)</code>, <code>count(distinct order_id)</code>). Catches partial loss that row counts miss (right number of rows, wrong values).</li>
+    <li><strong>Checksums / hash-diff</strong> — hash each row's business columns, aggregate the hashes per partition (e.g. <code>sum(hash) </code>or a bit-xor), and compare. Detects <em>any</em> field-level drift without shipping the full dataset across systems — the workhorse for column-level correctness at scale.</li>
+    <li><strong>Financial reconciliation</strong> — the strict form: internal consistency (<code>sum(debits) = sum(credits)</code>) <em>and</em> external tie-out (warehouse settlement total = provider's reported total). Tolerance here is often exactly zero.</li>
+  </ul>
+
+  <h3>Sampling vs full, cadence, tolerance</h3>
+  <p>Full reconciliation compares every partition; it's authoritative but can be expensive to pull from an OLTP source. Sampling (recon a random subset of days, or a statistical sample of keys) is a cheaper continuous signal with a periodic full recon as backstop. Cadence follows the money: financial pipelines reconcile every load and often re-reconcile a trailing window (late data mutates prior days — see <a href="04-late-arriving-data.html">Chapter 04</a>); softer analytics can reconcile daily or weekly. <strong>Tolerance thresholds</strong> encode how exact the domain demands: revenue is usually a hard <code>= 0</code> break; a distribution metric might tolerate ±0.5%. Set them explicitly per metric — an implicit tolerance of "looks about right" is not reconciliation.</p>
+
+  <p>Here's a recon query that compares source and target by day, computes absolute and relative variance, and flags anything outside tolerance. This is the kind of thing you'd whiteboard and then productionize as an audit table or a dbt test:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>recon_orders_by_day.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Source-to-target reconciliation for the orders pipeline, by event date.
+-- Compares row counts AND a monetary control total, and flags breaks
+-- that exceed a per-metric tolerance. Runs after each load; a non-empty
+-- result set with status='BREAK' is the circuit-breaker signal.
+
+with source as (
+    select
+        order_date,
+        count(*)                          as src_rows,
+        count(distinct order_id)          as src_orders,
+        sum(amount_cents)                 as src_amount_cents
+    from raw.orders_source          -- e.g. a Fivetran/CDC landing of the OLTP table
+    where order_date &gt;= current_date - interval '7 days'   -- trailing recon window
+    group by order_date
+),
+
+target as (
+    select
+        order_date,
+        count(*)                          as tgt_rows,
+        count(distinct order_id)          as tgt_orders,
+        sum(amount_cents)                 as tgt_amount_cents
+    from analytics.fct_orders
+    where order_date &gt;= current_date - interval '7 days'
+    group by order_date
+),
+
+recon as (
+    select
+        coalesce(s.order_date, t.order_date)                        as order_date,
+        s.src_rows,   t.tgt_rows,
+        s.src_amount_cents, t.tgt_amount_cents,
+        coalesce(t.tgt_rows,0)         - coalesce(s.src_rows,0)     as row_diff,
+        coalesce(t.tgt_amount_cents,0) - coalesce(s.src_amount_cents,0) as amount_diff_cents,
+        -- relative variance guards against divide-by-zero on empty days
+        case when coalesce(s.src_amount_cents,0) = 0 then 0
+             else abs(coalesce(t.tgt_amount_cents,0) - s.src_amount_cents)
+                  / s.src_amount_cents::float
+        end                                                          as amount_rel_var
+    from source s
+    full outer join target t on s.order_date = t.order_date
+)
+
+select
+    order_date,
+    src_rows, tgt_rows, row_diff,
+    src_amount_cents, tgt_amount_cents, amount_diff_cents, amount_rel_var,
+    case
+        when row_diff &lt;&gt; 0            then 'BREAK'   -- counts must match exactly
+        when amount_diff_cents &lt;&gt; 0    then 'BREAK'  -- money: zero tolerance
+        else 'OK'
+    end as status
+from recon
+where row_diff &lt;&gt; 0 or amount_diff_cents &lt;&gt; 0    -- only surface breaks
+order by order_date;</code></pre>
+  </div>
+
+  <h3>Break investigation</h3>
+  <p>A break is the start of an investigation, not the end. The disciplined path: (1) <strong>localize</strong> — which day, which metric, which direction (target high ⇒ duplication; target low ⇒ drops)? (2) <strong>bisect the pipeline</strong> — re-run the same recon at each stage (raw vs staging vs mart) to find the layer where the variance appears. (3) <strong>classify</strong> — is it a genuine data loss, a late-arriving-data timing artifact (source moved after your snapshot), a dedup bug, or a definitional mismatch (source counts refunds, target doesn't)? Timing artifacts are the most common false alarm, which is exactly why you recon a trailing window and re-check rather than paging on a single-run diff.</p>
+</section>
+
+<section id="testing">
+  <h2>Testing layers</h2>
+  <p>Reconciliation is one layer. Around it sits a stack of tests, cheapest and most local first. Name the layers as a pyramid — it shows you know where each tool earns its place:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>What it checks</th><th>Tooling</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Schema / constraints</strong></td><td>Types, nullability, PK/FK at the warehouse level</td><td>DDL constraints, contract enforcement at ingest</td></tr>
+      <tr><td><strong>Generic column tests</strong></td><td>not_null, unique, accepted_values, relationships</td><td>dbt generic tests, dbt_utils</td></tr>
+      <tr><td><strong>Singular / expectation tests</strong></td><td>Bespoke business rules, distribution &amp; shape</td><td>dbt singular tests, dbt_expectations, Great&nbsp;Expectations, Soda, Deequ</td></tr>
+      <tr><td><strong>Unit tests</strong></td><td>Transformation logic against fixed input/expected rows</td><td>dbt unit tests, pytest on Python transforms</td></tr>
+      <tr><td><strong>Reconciliation</strong></td><td>Set completeness &amp; accuracy vs source of truth</td><td>Recon queries, audit tables (above)</td></tr>
+      <tr><td><strong>Contract tests</strong></td><td>Producer schema/semantics haven't broken consumers</td><td>Schema registry, dbt contracts, CI checks</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>dbt tests</strong> come in two flavors. <em>Generic</em> tests are reusable and attach to columns in YAML; <em>singular</em> tests are a hand-written SQL query in <code>tests/</code> that must return zero rows to pass. Packages extend the vocabulary: <code>dbt_utils</code> adds <code>unique_combination_of_columns</code>, <code>recency</code>, <code>equal_rowcount</code>; <code>dbt_expectations</code> ports Great Expectations' assertions (value ranges, distributions, regex, column types) into dbt. Here's a schema.yml showing generic tests plus <code>dbt_expectations</code> for shape, and a custom generic test you'd define once and reuse:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/marts/fct_orders.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: fct_orders
+    description: One row per order at order grain.
+    # A model-level contract: enforced at build time, not just tested after.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: order_id
+        data_type: varchar
+        constraints:
+          - type: not_null
+          - type: primary_key
+        data_tests:
+          - unique
+          - not_null
+      - name: amount_cents
+        data_type: integer
+        data_tests:
+          - not_null
+          # bespoke assertion from dbt_expectations: no negative money
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              strictly: false
+      - name: status
+        data_type: varchar
+        data_tests:
+          - accepted_values:
+              values: ['pending', 'paid', 'refunded', 'cancelled']
+      - name: customer_id
+        data_tests:
+          # relationships = referential integrity to the dimension
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+    # model-level test: row volume shouldn't collapse or explode run-to-run
+    data_tests:
+      - dbt_expectations.expect_table_row_count_to_be_between:
+          min_value: 1000
+          max_value: 5000000
+      # custom generic test defined below, reused here
+      - reconciles_to_source:
+          source_relation: source('oltp', 'orders')
+          measure: amount_cents
+          tolerance: 0</code></pre>
+  </div>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>tests/generic/test_reconciles_to_source.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{# A custom generic dbt test. Returns rows only when target disagrees with #}
+{# source beyond tolerance -- any returned row fails the test (and, wired  #}
+{# into a build gate, blocks promotion). Reusable across any fact table.   #}
+
+{% test reconciles_to_source(model, column_name, source_relation, measure, tolerance=0) %}
+
+with target as (
+    select sum({{ measure }}) as target_total
+    from {{ model }}
+),
+source as (
+    select sum({{ measure }}) as source_total
+    from {{ source_relation }}
+)
+select
+    source_total,
+    target_total,
+    abs(target_total - source_total) as variance
+from target
+cross join source
+where abs(target_total - source_total) &gt; {{ tolerance }}
+
+{% endtest %}</code></pre>
+  </div>
+
+  <p><strong>dbt unit tests</strong> (GA in dbt 1.8+) are different in kind: they feed fixed mock input rows into a model's SQL and assert exact output rows, so you can test transformation <em>logic</em> — a tricky window function, a fiscal-week bucketing, a dedup rule — in CI without real data. Use them for the gnarly logic; use data tests for the runtime data. Outside dbt, <strong>Great Expectations</strong> (expectation suites + data docs), <strong>Soda</strong> (SodaCL checks, good for warehouse-native monitoring), and <strong>Deequ</strong> (Spark/Scala, constraint suggestion + verification at big-data scale) cover the same ideas for non-dbt or lakehouse stacks. <strong>Contract tests</strong> sit at the boundary and are the subject of the next section.</p>
+</section>
+
+<section id="contracts">
+  <h2>Data contracts</h2>
+  <p>A data contract is an explicit, versioned agreement between a data <em>producer</em> and its <em>consumers</em>. It's the L4 move: instead of downstream teams reverse-engineering your table and silently breaking when you rename a column, the interface is declared and enforced. A real contract covers three things, not just schema:</p>
+  <ul>
+    <li><strong>Schema</strong> — column names, types, nullability, the grain, the primary key. The part everyone remembers.</li>
+    <li><strong>Semantics</strong> — what the columns <em>mean</em>. Is <code>amount</code> gross or net? Cents or dollars? Does <code>status='refunded'</code> mean fully or partially? Allowed value sets, units, and definitions live here — this is where most "the data is wrong" incidents actually originate.</li>
+    <li><strong>SLA</strong> — freshness (updated by 6am daily), completeness (≥ 99.9% of source rows), availability, and a deprecation/change policy (N days' notice, versioned rollout).</li>
+  </ul>
+  <p>The contract is only real if it's <strong>enforced in two places</strong>: at <strong>CI</strong>, so a producer's PR that breaks the schema fails before merge (dbt's <code>contract: enforced: true</code> does exactly this — the build errors if the model's output diverges from the declared columns/types); and at <strong>ingest</strong>, so a producer emitting malformed events is rejected or quarantined at the door rather than corrupting the warehouse. A schema registry (Confluent, or JSON-Schema/Protobuf checks) enforces the event side; dbt contracts and CI enforce the transform side.</p>
+  <div class="callout tip">
+    <span class="callout-label">Say this in the room</span>
+    <p>"I'd publish a data contract — schema, semantics, and a freshness SLA — and enforce it both in CI on the producer's PR and at ingest, so a breaking change fails fast instead of showing up as a silent reconciliation break three days later." That one sentence signals staff-level thinking: you're designing the <em>interface between teams</em>, not just a table.</p>
+  </div>
+</section>
+
+<section id="wap">
+  <h2>Write-Audit-Publish &amp; circuit breakers</h2>
+  <p>Tests that run <em>after</em> you've already overwritten the production table are a smoke alarm that goes off after the house is ash. The fix is to make validation a <strong>gate</strong>, not a report. <strong>Write-Audit-Publish (WAP)</strong> is the canonical pattern:</p>
+  <ol>
+    <li><strong>Write</strong> — build the new data into a staging location (a temp/branch table, a separate partition, or an Iceberg/Delta branch) that consumers can't see.</li>
+    <li><strong>Audit</strong> — run all validation and reconciliation checks against the staged data.</li>
+    <li><strong>Publish</strong> — <em>only if the audit passes</em>, atomically swap the staged data into production (partition swap, <code>ALTER TABLE ... SWAP</code>, view repoint, or Iceberg branch fast-forward). If it fails, the swap never happens; production keeps serving the last-known-good data.</li>
+  </ol>
+  <p>The publish step must be <strong>atomic</strong> — an all-or-nothing pointer flip — so consumers never see a half-written table. The check that decides whether to publish is the <strong>circuit breaker</strong>: a failed critical check halts promotion. Here it is as an Airflow flow; the shape is identical whether you orchestrate it in Airflow, Dagster, or a dbt build gate:</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>dags/orders_wap.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from airflow.decorators import dag, task
+from airflow.exceptions import AirflowFailException
+from datetime import datetime
+
+@dag(schedule="@daily", start_date=datetime(2026, 1, 1), catchup=False)
+def orders_wap():
+
+    @task
+    def write_staging(ds=None):
+        # Build into an isolated staging table consumers cannot read.
+        run_sql(f"""
+            create or replace table analytics.stg_fct_orders as
+            select * from transform.fct_orders_build where order_date = '{ds}'
+        """)
+
+    @task
+    def audit(ds=None):
+        # 1) intrinsic validation, 2) source-to-target reconciliation.
+        breaks = run_sql(f"""
+            with recon as ( {RECON_ORDERS_BY_DAY} )     -- the query from earlier
+            select * from recon where status = 'BREAK'
+        """)
+        null_keys = run_sql(
+            "select count(*) from analytics.stg_fct_orders where order_id is null"
+        )[0][0]
+
+        if breaks or null_keys &gt; 0:
+            # Circuit breaker: raise, so publish never runs. Prod stays on
+            # last-known-good; page on-call with the specific break rows.
+            raise AirflowFailException(
+                f"AUDIT FAILED: {len(breaks)} recon breaks, {null_keys} null keys"
+            )
+
+    @task
+    def publish(ds=None):
+        # Atomic swap -- consumers flip from old to new in one transaction.
+        run_sql("""
+            alter table analytics.fct_orders swap with analytics.stg_fct_orders
+        """)
+
+    write_staging() &gt;&gt; audit() &gt;&gt; publish()
+
+orders_wap()</code></pre>
+  </div>
+
+  <p>The equivalent in dbt is <code>dbt build</code> (which interleaves tests with model runs) plus a staging schema and a swap, or dbt Cloud's WAP-style deferral; on a lakehouse you'd stage on an Iceberg/Delta branch and fast-forward only on green. The pattern is what matters: <strong>nothing reaches consumers until it has passed audit.</strong></p>
+</section>
+
+<section id="anomaly">
+  <h2>Anomaly detection &amp; the alert-vs-block trap</h2>
+  <p>Explicit tests catch defects you thought to write a rule for. <strong>Anomaly detection</strong> catches the ones you didn't — by learning the normal behavior of a dataset and flagging deviation across four axes (the observability pillars, expanded in <a href="07-reliability-and-observability.html">Chapter 07</a>):</p>
+  <ul>
+    <li><strong>Volume</strong> — today's row count vs the trailing average / a control chart. Sudden 40% drop = upstream problem.</li>
+    <li><strong>Freshness</strong> — how long since the table last updated vs its normal cadence.</li>
+    <li><strong>Distribution</strong> — mean, null rate, cardinality, category mix drifting from history (a currency column that's suddenly 30% null).</li>
+    <li><strong>Schema drift</strong> — a column added, dropped, or retyped upstream without notice.</li>
+  </ul>
+  <p>Managed tools (Monte Carlo, Bigeye, Metaplane, Soda) do this out of the box; you can roll your own with control charts (flag &gt; 3σ from a trailing window) stored in an audit table. The judgment call is what to do when something fires — and this is where candidates walk into a trap:</p>
+  <div class="callout warn">
+    <span class="callout-label">Trap: blocking on everything is as bad as blocking on nothing</span>
+    <p>If you <strong>block</strong> the pipeline on every check — including soft anomaly signals and non-critical columns — you'll halt production on a legitimate Black Friday volume spike or a noisy distribution wobble, erode trust, and train everyone to bypass the gate. If you <strong>only alert</strong> and never block, bad data reaches finance and the alert drowns in a channel no one reads. The answer is a <strong>severity tier</strong>, decided per check in advance: hard <em>correctness</em> checks (PK uniqueness, row-count/monetary reconciliation, not-null on keys) <strong>block</strong> via the WAP circuit breaker; soft <em>plausibility</em> signals (a 3σ volume blip, a distribution nudge) <strong>alert</strong> a human without halting. Wire the wrong check to the wrong action and you've either got a pipeline that cries wolf or one that ships corruption — name this trade-off explicitly and the interviewer knows you've run this in production.</p>
+  </div>
+  <table>
+    <thead><tr><th>Signal</th><th>Action</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>PK not unique; reconciliation break on money</td><td><strong>Block</strong> (fail the WAP audit)</td><td>Certain corruption; cost of shipping it &gt; cost of delay.</td></tr>
+      <tr><td>not_null on a required key fails</td><td><strong>Block</strong></td><td>Breaks downstream joins; unambiguously wrong.</td></tr>
+      <tr><td>Row volume 3σ above trailing mean</td><td><strong>Alert</strong>, don't block</td><td>Often a real event (promo, holiday); a human decides.</td></tr>
+      <tr><td>Null rate on a non-critical column ticks up</td><td><strong>Alert</strong> / warn severity</td><td>Worth watching; not worth halting the business on.</td></tr>
+      <tr><td>New column appears upstream (schema drift)</td><td><strong>Alert</strong> + quarantine-on-ingest if contract-enforced</td><td>Investigate; may be a breaking contract change.</td></tr>
+    </tbody>
+  </table>
+  <p>dbt encodes this directly with test <code>severity: error</code> (block) vs <code>severity: warn</code> (surface but pass), and <code>error_if</code>/<code>warn_if</code> thresholds — the mechanism for the tiering above.</p>
+</section>
+
+<section id="quarantine">
+  <h2>Quarantine, audit tables &amp; dashboards</h2>
+  <p>When validation finds bad rows mid-stream, you have a choice: fail the whole batch, or <strong>quarantine</strong> the offenders and let the good rows through. For high-volume ingestion, all-or-nothing is often too brittle — one malformed event shouldn't block a million good ones. The pattern is a <strong>dead-letter table</strong> (or dead-letter queue for streaming): route rows that fail validation into a side table with the failure reason and raw payload, publish the clean rows, and alert on the quarantine rate. Bad rows are preserved for investigation and replay after the upstream fix, rather than silently dropped.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>quarantine_split.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Split a staged batch into clean rows (published) and bad rows
+-- (dead-lettered with a reason) instead of failing the whole load.
+
+insert into analytics.dead_letter_orders
+select
+    *,
+    case
+        when order_id is null            then 'null_order_id'
+        when amount_cents &lt; 0            then 'negative_amount'
+        when status not in ('pending','paid','refunded','cancelled')
+                                          then 'invalid_status'
+    end                                   as reject_reason,
+    current_timestamp                     as quarantined_at
+from staging.orders_raw
+where order_id is null
+   or amount_cents &lt; 0
+   or status not in ('pending','paid','refunded','cancelled');
+
+-- only the clean remainder proceeds to publish
+insert into analytics.stg_fct_orders
+select * from staging.orders_raw
+where order_id is not null
+  and amount_cents &gt;= 0
+  and status in ('pending','paid','refunded','cancelled');</code></pre>
+  </div>
+  <p>Underpinning all of this are <strong>audit tables</strong>: a persistent log of every recon run — date, metric, source total, target total, variance, status, run id. They give you three things: an <em>evidence trail</em> a finance auditor can inspect, a <em>time series</em> to detect slow drift, and the raw data for <strong>reconciliation dashboards</strong> (green/red per feed per day, trending break rate, quarantine volume, freshness). A quarantine rate that's climbing over a week is a leading indicator of an upstream contract erosion you'd otherwise only catch when a total finally breaks. The dashboard is also your fastest answer to the stakeholder question that ends every one of these interviews: <em>"how do you know the numbers are right?"</em> — you point at the audit table.</p>
+</section>
+
+<section id="leveling">
+  <h2>The leveling ladder</h2>
+  <p>Reconciliation &amp; validation is a topic where the level gap is stark: L1 writes two dbt tests; L4 runs an org-wide contract-and-anomaly regime. Narrate the climb and you demonstrate three rungs in one answer.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"I'd add <code>not_null</code> and <code>unique</code> tests on the primary key, and <code>accepted_values</code> on status." Knows dbt generic tests exist and runs them after the load.</td><td>Knows validation vocabulary; catches malformed rows but not missing ones.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"Plus a daily <strong>row-count and sum reconciliation against source</strong> with a tolerance, and a <strong>freshness check</strong>. Critical checks <strong>block</strong> the pipeline; I set test severity so soft signals only warn."</td><td>Reconciles for completeness, thinks about timeliness, and knows the alert-vs-block distinction.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"I'd wrap the build in <strong>Write-Audit-Publish</strong> with an atomic swap so a failed audit never reaches consumers, add <strong>tolerance thresholds per metric</strong>, publish a <strong>data contract</strong>, and <strong>quarantine</strong> bad rows to a dead-letter table instead of failing the batch."</td><td>Makes validation a gate, owns the producer/consumer interface, designs for partial failure.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"Org-wide: <strong>contracts enforced in CI and at ingest</strong>, <strong>anomaly detection</strong> on volume/freshness/distribution/schema, <strong>freshness &amp; completeness SLAs</strong> with error budgets, <strong>audit tables + recon dashboards</strong> as the evidence trail, and <strong>automated break triage</strong> that localizes the failing layer before paging."</td><td>Architects correctness as a platform capability across teams, with SLAs and automated diagnosis.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Level up</span>
+    <p>The jump from L2 to L3 is the single highest-value move in this topic: it's the shift from checking data <em>after</em> you've published it to <strong>gating</strong> publication on the checks (WAP + circuit breaker). Everything L4 adds — contracts, anomaly detection, SLAs — assumes that gate already exists. If you only level up one rung in the room, make it this one.</p>
+  </div>
+  <p>This closes the "hard parts" — late data (<a href="04-late-arriving-data.html">04</a>), incremental processing (<a href="05-incremental-processing.html">05</a>), and now correctness. Next, the machinery that keeps a pipeline standing once it's live: <a href="07-reliability-and-observability.html">07 · Reliability &amp; Observability</a>, where freshness SLAs, delivery semantics, and lineage turn these checks into an operable system.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Incremental Processing &amp; Backfills</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why incremental, and the risk it carries</a>
+    <a href="#strategies">The five load strategies</a>
+    <a href="#dbt">dbt as the worked example</a>
+    <a href="#microbatch">Microbatch, event_time &amp; snapshots</a>
+    <a href="#watermarks">Watermarks &amp; off-by-one bugs</a>
+    <a href="#cdc">Change data capture</a>
+    <a href="#backfills">Backfills that don't double-count</a>
+    <a href="#ladder">The leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-late-arriving-data.html">← Previous</a>
+    <a href="06-reconciliation-and-validation.html">Next: Reconciliation &amp; Validation →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · The Hard Parts</span>
+  <h1>Incremental Processing &amp; Backfills</h1>
+  <p class="subtitle">Process only what changed — the optimization that makes hourly pipelines affordable, and the one most likely to silently corrupt your data if you get the boundaries wrong.</p>
+</header>
+
+<section id="why">
+  <h2>Why incremental, and the risk it carries</h2>
+  <p>A full refresh — truncate and recompute everything, every run — is gloriously simple and gloriously correct: there's no state, no watermark, nothing to drift. It's also the first thing that stops scaling. When the source is billions of rows, reprocessing all of history every hour burns money and blows past your freshness SLA. <strong>Incremental processing</strong> reads only the slice that changed since last time and folds it into the existing table.</p>
+  <p>The trade you're making is stark and worth saying out loud in an interview:</p>
+  <div class="callout insight">
+    <span class="callout-label">The core tension</span>
+    <p>Full refresh buys <em>correctness for free</em> and pays in <em>cost and latency</em>. Incremental buys <em>cost and latency back</em> and pays in <em>correctness risk</em> — every incremental pipeline now carries state (a watermark), boundary conditions, and the possibility of drift where the incremental result diverges from what a full refresh would produce. Your entire job is to make the incremental result <em>provably equal</em> to the full-refresh result, which is why idempotency and reconciliation keep reappearing.</p>
+  </div>
+  <p>The guardrail is a habit: keep full-refresh cheap enough to run periodically (weekly, or in a lower environment) and reconcile incremental against it. Incremental is an optimization layered on a correct baseline, never a replacement for having one.</p>
+</section>
+
+<section id="strategies">
+  <h2>The five load strategies</h2>
+  <p>Every incremental pipeline is one of a handful of write patterns. Knowing when each is correct — and when it double-counts — is table stakes.</p>
+  <table>
+    <thead><tr><th>Strategy</th><th>How it writes</th><th>Use when</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Append-only</strong></td><td>Insert new rows; never touch old ones.</td><td>Immutable events (logs, clicks). No updates, no dedup needed.</td><td>Any replay or at-least-once source duplicates rows. Needs a dedup key downstream.</td></tr>
+      <tr><td><strong>Merge / upsert</strong></td><td><code>MERGE</code> on a unique key: update if present, insert if not.</td><td>Mutable records with a stable key (orders, accounts) that can change after first load.</td><td>Requires a real unique key and a "which is newer" tiebreaker. Costlier than append.</td></tr>
+      <tr><td><strong>Insert-overwrite</strong> (partition replace)</td><td>Recompute affected partitions; atomically replace them wholesale.</td><td>Partitioned by event date; you can fully recompute a day from raw.</td><td>Must recompute the <em>whole</em> partition, or you drop rows you didn't re-read.</td></tr>
+      <tr><td><strong>Delete + insert</strong></td><td>Delete the changed slice, then insert its new version.</td><td>Engines without a good <code>MERGE</code>; or when the delete predicate is clean.</td><td>Not atomic on most warehouses — a reader between the two steps sees a gap.</td></tr>
+      <tr><td><strong>Microbatch</strong></td><td>Split the load into independent per-period batches (one per day), each idempotently overwritten.</td><td>Large event tables + backfills you want parallel, restartable, and bounded-memory.</td><td>Framework/bookkeeping overhead; each batch must be self-contained.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Pick by the shape of change, not by habit</span>
+    <p>Reach for the decision rule, not a favourite: immutable events ⇒ append; mutable rows with a key ⇒ merge; "I can recompute a whole day deterministically from raw" ⇒ insert-overwrite (the most robust for late data, because a re-run replaces rather than accumulates). The interviewer is listening for <em>why this one here</em>, not for you to name your default.</p>
+  </div>
+</section>
+
+<section id="dbt">
+  <h2>dbt as the worked example</h2>
+  <p>dbt is the shop's transform tool, so make its incremental model second nature. The mechanics: a model materialized <code>incremental</code> runs a full build the first time (and on <code>--full-refresh</code>), and on every subsequent run wraps your <code>WHERE</code> filter in <code>is_incremental()</code> so it only reads new rows. A <code>unique_key</code> plus an incremental <code>strategy</code> tells dbt how to fold that slice in.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/marts/fct_orders.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{{
+  config(
+    materialized       = 'incremental',
+    unique_key         = 'order_id',
+    incremental_strategy = 'merge',
+    on_schema_change   = 'append_new_columns',
+    partition_by       = {'field': 'event_date', 'data_type': 'date'}
+  )
+}}
+
+WITH src AS (
+    SELECT
+        order_id,
+        customer_id,
+        amount,
+        event_ts,
+        CAST(event_ts AS DATE) AS event_date,
+        source_updated_at
+    FROM {{ ref('stg_orders') }}
+
+    {% if is_incremental() %}
+    -- LOOKBACK, not a bare '=': overlap the boundary so late/edited
+    -- rows within the window are re-read and re-merged, not missed.
+    WHERE source_updated_at >= (
+        SELECT DATEADD('day', -3, MAX(source_updated_at)) FROM {{ this }}
+    )
+    {% endif %}
+)
+
+-- collapse any duplicates in the re-read window to one row per key
+SELECT * FROM (
+    SELECT src.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY order_id ORDER BY source_updated_at DESC
+           ) AS rn
+    FROM src
+)
+WHERE rn = 1
+</code></pre>
+  </div>
+  <p>Key config choices and their alternatives:</p>
+  <ul>
+    <li><strong><code>incremental_strategy</code></strong> — <code>merge</code> (upsert on <code>unique_key</code>; the general default on Snowflake/BigQuery/Databricks), <code>insert_overwrite</code> (replace whole partitions; excellent for late data on partitioned warehouses), <code>delete+insert</code>, and <code>append</code>. It maps directly onto the five strategies above; the adapter decides which are available.</li>
+    <li><strong><code>unique_key</code></strong> — the grain that makes re-runs idempotent. Can be a list for a composite key. Without it, <code>merge</code> degrades to append and you get duplicates.</li>
+    <li><strong><code>on_schema_change</code></strong> — <code>append_new_columns</code>, <code>sync_all_columns</code>, <code>ignore</code>, or <code>fail</code>. Governs what happens when the model's columns drift from the table's; pick deliberately rather than being surprised mid-run.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The classic dbt incremental bug</span>
+    <p>Writing <code>WHERE updated_at &gt; (SELECT MAX(updated_at) FROM {{ this }})</code> with a strict <code>&gt;</code> and no overlap. Two ways it bites: rows sharing the exact boundary timestamp get skipped (strict <code>&gt;</code> vs <code>&gt;=</code>), and any row that was edited or arrived late with an older <code>updated_at</code> is never re-read. The fix is the pattern above — a <code>-3 day</code> lookback overlap plus a <code>unique_key</code> merge, so re-reading the boundary is harmless because the merge is idempotent. See <a href="04-late-arriving-data.html">Chapter 04</a> for why the lookback window must exist at all.</p>
+  </div>
+</section>
+
+<section id="microbatch">
+  <h2>Microbatch, event_time &amp; snapshots</h2>
+  <p>dbt's <strong>microbatch</strong> strategy formalizes the whole late-data-plus-backfill pattern so you stop hand-rolling it. You declare an <code>event_time</code> column and a <code>batch_size</code>, and dbt splits the run into one idempotent batch per period, each of which overwrites its own slice. A <code>lookback</code> re-processes the last N periods every run to absorb stragglers, and — crucially — backfills become "just run these batches over this range," in parallel and independently retryable.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>models/marts/fct_orders_microbatch.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">{{
+  config(
+    materialized  = 'incremental',
+    incremental_strategy = 'microbatch',
+    event_time    = 'event_ts',   -- the column dbt buckets batches on
+    batch_size    = 'day',        -- one batch per event day
+    lookback      = 3,            -- re-process the last 3 days each run
+    begin         = '2024-01-01'  -- earliest event_time for backfills
+  )
+}}
+
+SELECT
+    order_id,
+    customer_id,
+    amount,
+    event_ts,
+    source_updated_at
+FROM {{ ref('stg_orders') }}
+-- No is_incremental() plumbing needed: dbt injects the event_time
+-- filter per batch, so each day is recomputed from raw and overwritten.
+-- Backfill a range with:
+--   dbt run --event-time-start 2024-01-01 --event-time-end 2024-02-01
+</code></pre>
+  </div>
+  <p>For dimensions that change over time, dbt <strong>snapshots</strong> implement SCD Type 2 for you — capturing a new versioned row with <code>dbt_valid_from</code>/<code>dbt_valid_to</code> each time a tracked column changes:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>snapshots/dim_customer.yml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">snapshots:
+  - name: dim_customer
+    relation: ref('stg_customer')
+    config:
+      unique_key: customer_id
+      strategy: timestamp          # detect change via a reliable updated_at
+      updated_at: source_updated_at
+      # strategy: check + check_cols: [tier, status]  # when no reliable timestamp
+</code></pre>
+  </div>
+  <p>Snapshots give you the effective-dated dimension that as-of joins in <a href="04-late-arriving-data.html">Chapter 04</a> read against. The same tool that loads facts incrementally also versions your dimensions — one mental model, two materializations.</p>
+</section>
+
+<section id="watermarks">
+  <h2>Watermarks &amp; off-by-one bugs</h2>
+  <p>Every incremental pipeline keeps a <strong>high-water mark</strong>: the marker of "what I've already processed." Choosing the right one is a correctness decision:</p>
+  <table>
+    <thead><tr><th>Watermark</th><th>Advances on</th><th>Failure mode</th></tr></thead>
+    <tbody>
+      <tr><td><code>MAX(updated_at)</code></td><td>Any row change.</td><td>Clock skew &amp; ties at the boundary; a row updated with an <em>older</em> timestamp is missed. Needs overlap.</td></tr>
+      <tr><td>Monotonic sequence / ID</td><td>Each insert.</td><td>Gaps from rolled-back transactions; useless for updates (only tracks inserts).</td></tr>
+      <tr><td>CDC log position (LSN/SCN/binlog offset)</td><td>Every committed change, in commit order.</td><td>The gold standard — captures updates <em>and</em> deletes in order. Needs log-based CDC infrastructure.</td></tr>
+    </tbody>
+  </table>
+  <p>Whichever you pick, the two eternal boundary bugs are the same. <strong>Off-by-one / strict inequality:</strong> <code>WHERE ts &gt; last_watermark</code> silently drops any row sharing the exact boundary timestamp; use <code>&gt;=</code> and dedup. <strong>The lost-update window:</strong> reading <code>[last_watermark, now)</code> assumes every change in that range is durably visible — but a transaction that committed a moment after your snapshot, with an older timestamp, falls through the crack forever. The robust pattern overlaps the boundary and leans on an idempotent merge so re-reading is free:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>robust_incremental_merge.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Robust incremental: OVERLAP the boundary (>= with a lookback), dedup to
+-- one row per key, then MERGE. Re-reading the overlap is harmless because
+-- the merge is idempotent -- this is what makes it safe to re-run.
+
+MERGE INTO analytics.fct_orders AS tgt
+USING (
+    WITH bounds AS (
+        SELECT COALESCE(MAX(source_updated_at), TIMESTAMP '1970-01-01')
+               AS hwm
+        FROM analytics.fct_orders
+    ),
+    changed AS (
+        SELECT s.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.order_id
+                   ORDER BY s.source_updated_at DESC
+               ) AS rn
+        FROM raw.orders s, bounds b
+        -- >= plus a 3-day lookback overlap, NOT a strict '>'
+        WHERE s.source_updated_at >= DATEADD('day', -3, b.hwm)
+    )
+    SELECT * FROM changed WHERE rn = 1
+) AS src
+ON tgt.order_id = src.order_id
+WHEN MATCHED AND src.source_updated_at > tgt.source_updated_at THEN UPDATE SET
+    tgt.customer_id       = src.customer_id,
+    tgt.amount            = src.amount,
+    tgt.event_ts          = src.event_ts,
+    tgt.source_updated_at = src.source_updated_at
+WHEN NOT MATCHED THEN INSERT
+    (order_id, customer_id, amount, event_ts, source_updated_at)
+    VALUES
+    (src.order_id, src.customer_id, src.amount, src.event_ts,
+     src.source_updated_at);
+</code></pre>
+  </div>
+  <p>The <code>WHEN MATCHED AND src.source_updated_at &gt; tgt.source_updated_at</code> guard is what makes re-processing an overlap idempotent: an older or equal version can never clobber a newer one, so running the same window twice converges to the identical table.</p>
+</section>
+
+<section id="cdc">
+  <h2>Change data capture</h2>
+  <p>When the source is an OLTP database, <strong>CDC</strong> is how you get changes incrementally without hammering it. Two families:</p>
+  <ul>
+    <li><strong>Query-based CDC</strong> polls <code>WHERE updated_at &gt; :watermark</code>. Simple, no special access — but it inherits every watermark bug above, <em>cannot see hard deletes</em> (a deleted row just vanishes from the query), and can miss intermediate states between polls.</li>
+    <li><strong>Log-based CDC</strong> (Debezium reading the MySQL binlog / Postgres WAL / Oracle redo) streams every committed change in commit order. It captures inserts, updates, <em>and deletes</em>, preserves ordering, and doesn't load the source with queries. It's the right answer when completeness or deletes matter — at the cost of running the CDC infrastructure.</li>
+  </ul>
+  <p>Three things interviewers probe on CDC:</p>
+  <ul>
+    <li><strong>Deletes.</strong> A log-based feed emits a delete event (op = <code>d</code>). You choose: hard-delete downstream to mirror the source, or <strong>soft-delete</strong> (set <code>is_deleted = true</code>, keep the row) to preserve history and keep the load idempotent. Soft-delete is usually right for analytics; you can't un-hard-delete.</li>
+    <li><strong>Ordering.</strong> Apply changes in <em>commit / log-sequence order</em>, not arrival order. Across Kafka partitions, key your topic by primary key so all changes to one row land in one partition and stay ordered; use the LSN to break ties and reject out-of-order applies.</li>
+    <li><strong>Exactly-once into the warehouse.</strong> The stream is at-least-once, so you'll see duplicates on retry/replay. Achieve <em>effectively-once</em> by making the sink idempotent: MERGE on the primary key, keyed by log position so an already-applied change is a no-op. Idempotent apply beats trying to make delivery truly exactly-once.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>cdc_apply.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Apply a CDC change feed idempotently and in log order.
+-- Keep only the latest change per key (by log sequence), then MERGE;
+-- deletes become soft-deletes so re-applying is a no-op.
+
+MERGE INTO analytics.dim_account AS tgt
+USING (
+    SELECT * FROM (
+        SELECT
+            c.account_id,
+            c.name,
+            c.status,
+            c.op,                 -- 'c' create, 'u' update, 'd' delete
+            c.lsn,                -- log sequence number = ordering key
+            ROW_NUMBER() OVER (
+                PARTITION BY c.account_id ORDER BY c.lsn DESC
+            ) AS rn
+        FROM raw.account_cdc c
+        WHERE c.lsn > (SELECT COALESCE(MAX(last_lsn), 0)
+                       FROM analytics.dim_account)
+    ) WHERE rn = 1
+) AS src
+ON tgt.account_id = src.account_id
+WHEN MATCHED AND src.lsn > tgt.last_lsn AND src.op = 'd' THEN UPDATE SET
+    tgt.is_deleted = TRUE, tgt.last_lsn = src.lsn
+WHEN MATCHED AND src.lsn > tgt.last_lsn AND src.op IN ('c','u') THEN UPDATE SET
+    tgt.name = src.name, tgt.status = src.status,
+    tgt.is_deleted = FALSE, tgt.last_lsn = src.lsn
+WHEN NOT MATCHED AND src.op IN ('c','u') THEN INSERT
+    (account_id, name, status, is_deleted, last_lsn)
+    VALUES (src.account_id, src.name, src.status, FALSE, src.lsn);
+</code></pre>
+  </div>
+</section>
+
+<section id="backfills">
+  <h2>Backfills that don't double-count</h2>
+  <p>A backfill is re-running history — after a bug fix, a new column, or a widened lookback. It's where non-idempotent pipelines detonate: run a naive append-based load over last month and you've now got every row twice. The rules that keep backfills safe are exactly the rules that make incremental safe, applied to a wider range.</p>
+  <ul>
+    <li><strong>Overwrite, don't append.</strong> The safest backfill uses insert-overwrite / partition-replace: recompute each affected partition from raw and swap it in, so re-running a partition is a no-op-to-the-result, not an accumulation. Microbatch does this per period for free.</li>
+    <li><strong>Partition-scoped and parallel.</strong> Backfill by partition so runs are independent, restartable, and bounded — if day 14 of 30 fails, you re-run day 14, not the whole month.</li>
+    <li><strong>Separate backfill from steady-state.</strong> A backfill shouldn't advance the production watermark or trip freshness alerts. Parameterize the date range explicitly; keep it off the schedule that consumers watch.</li>
+    <li><strong>Reconcile after.</strong> A backfill is done when its numbers match the source, not when the job exits 0. Row-count and sum recon per partition against source is the acceptance test — the subject of <a href="06-reconciliation-and-validation.html">Chapter 06</a>.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>partition_overwrite_backfill.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Backfill a bounded date range by atomically REPLACING whole partitions.
+-- Idempotent by construction: re-running the same range yields the same table,
+-- because each partition is fully recomputed from raw and swapped, not appended.
+
+-- Spark / Iceberg / Hive dynamic partition overwrite:
+INSERT OVERWRITE TABLE analytics.fct_orders
+PARTITION (event_date)
+SELECT
+    order_id,
+    customer_id,
+    amount,
+    event_ts,
+    CAST(event_ts AS DATE) AS event_date
+FROM raw.orders
+WHERE CAST(event_ts AS DATE) BETWEEN DATE '2024-01-01'
+                                 AND DATE '2024-01-31'   -- the backfill window
+-- Only the partitions produced by this SELECT are replaced; days outside
+-- the window are untouched. Re-run the same range safely any number of times.
+;
+</code></pre>
+  </div>
+  <div class="callout insight">
+    <span class="callout-label">Idempotency is the whole chapter</span>
+    <p>Every safe pattern here — merge on a unique key, insert-overwrite a partition, apply CDC by log position, microbatch a day — is a different route to the same property: <strong>running it again produces the same result</strong>. If you can only remember one thing walking into this interview, it's that incremental processing, backfills, and late-data reprocessing are all the same problem wearing different hats, and idempotency is the answer to all three. Say that out loud and you've connected three chapters in one sentence.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>The leveling ladder</h2>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"Full refresh nightly — truncate and reload." Or an append filtered on <code>updated_at &gt; MAX</code> with no dedup.</td><td>Correct at small scale, but no handle on cost or the correctness risk of naive incremental.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"Incremental <strong>merge on a unique key</strong> with a high-water mark, using <code>&gt;=</code> plus a lookback overlap and a dedup so re-runs are <strong>idempotent</strong>." Knows the off-by-one traps.</td><td>Builds real incremental models that survive replays and boundary ties.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"Strategy chosen by change shape (merge vs insert-overwrite vs microbatch), <strong>partition-scoped backfills</strong> that overwrite rather than append, backfill separated from steady-state, and <strong>reconciliation</strong> against source/full-refresh after every backfill."</td><td>Owns correctness end to end: designs backfill-safe incrementals and proves they didn't double-count.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"<strong>Log-based CDC</strong> for completeness/deletes/ordering, effectively-once via idempotent apply keyed on LSN, a full-refresh reconciliation baseline as a contract, and backfill tooling (microbatch/parallel partitions) that any team can run safely and repeatably."</td><td>Architects the incremental <em>platform</em> — CDC, idempotency guarantees, and self-serve backfills across teams.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Level up</span>
+    <p>The tell between L2 and L3 is <em>backfills</em>. Plenty of candidates can write an incremental merge; far fewer volunteer, unprompted, "…and here's how I'd re-run last month without double-counting, and how I'd know it worked." Lead with insert-overwrite/microbatch for backfill safety and a post-backfill recon, and you've shown the judgment that separates someone who <em>uses</em> incremental models from someone who can be trusted to <em>own</em> them.</p>
+  </div>
+  <p>You now have the machinery to process only what changed and to rebuild history safely. The remaining question is how you <em>prove</em> the output is right — and stop a bad load before it reaches consumers: <a href="06-reconciliation-and-validation.html">06 · Reconciliation &amp; Validation</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

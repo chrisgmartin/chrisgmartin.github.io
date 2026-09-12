@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reliability &amp; Observability</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#semantics">Delivery semantics &amp; effectively-once</a>
+    <a href="#idempotency">Idempotency keys &amp; atomic swaps</a>
+    <a href="#dualwrite">The dual-write problem &amp; the outbox</a>
+    <a href="#retries">Retries, backoff, timeouts &amp; DLQs</a>
+    <a href="#blast">Failure domains &amp; restartability</a>
+    <a href="#observability">The observability pillars</a>
+    <a href="#lineage">Lineage</a>
+    <a href="#slos">SLAs, SLOs &amp; error budgets</a>
+    <a href="#oncall">Alerting, on-call &amp; incident response</a>
+    <a href="#ladder">Leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-reconciliation-and-validation.html">← Previous</a>
+    <a href="08-scale-and-architecture.html">Next: Scale &amp; Architecture →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production-Grade</span>
+  <h1>Reliability &amp; Observability</h1>
+  <p class="subtitle">The difference between a pipeline that works on your laptop and one you can be paged for at 3am: delivery guarantees you can defend, failure that stays contained, and observability that tells you something broke before a consumer does.</p>
+</header>
+
+<section id="semantics">
+  <h2>Delivery semantics &amp; effectively-once</h2>
+  <p>Every hop in a pipeline — producer to queue, queue to consumer, consumer to warehouse — makes one of three promises about how many times a record is delivered. Interviewers use this vocabulary as a proxy for whether you actually understand distributed failure, so be precise.</p>
+  <table>
+    <thead><tr><th>Guarantee</th><th>What it means</th><th>Failure behavior</th><th>When it's acceptable</th></tr></thead>
+    <tbody>
+      <tr><td><strong>At-most-once</strong></td><td>Deliver, don't retry. Ack before processing.</td><td>Crash mid-process ⇒ record is lost.</td><td>Lossy metrics, sampled telemetry — where a dropped row doesn't matter.</td></tr>
+      <tr><td><strong>At-least-once</strong></td><td>Retry until acked. Ack after processing.</td><td>Crash after work, before ack ⇒ record is reprocessed ⇒ duplicates.</td><td>The pragmatic default. Almost every durable pipeline.</td></tr>
+      <tr><td><strong>Exactly-once</strong></td><td>Each record affects the result once, no loss, no dup.</td><td>Requires coordinated state (transactions, offsets, dedup).</td><td>Rare end-to-end; expensive. Real inside one closed system (e.g. Flink→Kafka).</td></tr>
+    </tbody>
+  </table>
+  <p>True end-to-end exactly-once across independent systems is mostly a myth — you can't atomically commit "I read this Kafka offset" and "I wrote this warehouse row" across two systems that don't share a transaction. What you can build, and what senior engineers actually say, is <strong>effectively-once</strong>: <em>at-least-once delivery plus idempotent processing plus dedup</em>. You accept that records may arrive twice; you make the second arrival a no-op.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe that matters</span>
+    <p>Don't chase exactly-once delivery. Engineer <strong>at-least-once + idempotency</strong> so duplicates are harmless. This is the same property that makes a pipeline safe to re-run and safe to backfill — see idempotency &amp; determinism in <a href="02-pipeline-design-foundations.html">Chapter 02</a> and the incremental merge in <a href="05-incremental-processing.html">Chapter 05</a>. Reliability is idempotency wearing a different hat.</p>
+  </div>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency keys &amp; atomic swaps</h2>
+  <p>Idempotency needs a <strong>key</strong>: a stable identifier that lets you recognize "I have already applied this." It should come from the data or the request, never from <code>now()</code> or a random UUID generated at processing time — those change on every retry and defeat the whole point.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>idempotent_merge.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- At-least-once delivery + a natural idempotency key (order_id) + a
+-- source sequence (updated_at). Re-running with duplicate rows is a no-op,
+-- and stale duplicates never clobber newer state.
+MERGE INTO analytics.orders AS tgt
+USING (
+    SELECT order_id, status, amount_cents, updated_at,
+           ROW_NUMBER() OVER (
+               PARTITION BY order_id ORDER BY updated_at DESC
+           ) AS rn
+    FROM staging.orders_incoming        -- may contain dupes from retries
+) AS src
+ON tgt.order_id = src.order_id AND src.rn = 1
+WHEN MATCHED AND src.updated_at > tgt.updated_at THEN UPDATE SET
+    status = src.status, amount_cents = src.amount_cents,
+    updated_at = src.updated_at
+WHEN NOT MATCHED AND src.rn = 1 THEN INSERT
+    (order_id, status, amount_cents, updated_at)
+    VALUES (src.order_id, src.status, src.amount_cents, src.updated_at);</code></pre>
+  </div>
+  <p>For file- and partition-based systems, the reliability primitive is the <strong>atomic swap</strong>: never mutate the live table in place. Write the new partition or table to a side location, validate it, then flip a pointer in a single metadata operation. Readers see either the old version or the new version, never a half-written one. This is exactly the Write-Audit-Publish flow from <a href="06-reconciliation-and-validation.html">Chapter 06</a>, and it's why table formats like Iceberg and Delta (<a href="08-scale-and-architecture.html">Chapter 08</a>) matter — the commit that swaps the manifest is atomic.</p>
+  <div class="callout tip">
+    <span class="callout-label">Say this in the room</span>
+    <p>"My write is a swap, not an update. I stage, validate, then atomically publish — so a crash mid-write leaves the live table untouched and the retry is clean." That one sentence signals you've operated pipelines, not just built them.</p>
+  </div>
+</section>
+
+<section id="dualwrite">
+  <h2>The dual-write problem &amp; the outbox</h2>
+  <p>Here's the trap that separates L2 from L4. Your service updates its own database <em>and</em> needs to emit an event ("order placed") so the pipeline picks it up. The naive code does both:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>the_bug.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># DUAL-WRITE BUG: two systems, no shared transaction.
+def place_order(order):
+    db.insert(order)              # commit #1: Postgres
+    kafka.produce("orders", order)  # commit #2: Kafka
+    # Crash between the two lines -> DB has the order, Kafka never
+    # heard about it. Or Kafka succeeds and the DB txn rolls back ->
+    # a phantom event for an order that doesn't exist. Silently wrong.</code></pre>
+  </div>
+  <p>You cannot make two independent systems commit atomically. The fix is the <strong>transactional outbox</strong>: write the event into an <code>outbox</code> table <em>in the same local transaction</em> as the business change. Now there's one commit, so the state and the intent-to-publish succeed or fail together. A separate relay process (or log-based CDC — <a href="05-incremental-processing.html">Chapter 05</a>) reads the outbox and publishes downstream, marking rows sent.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>outbox.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- 1. One local transaction writes BOTH the state change and the event.
+BEGIN;
+  INSERT INTO orders (order_id, status, amount_cents)
+  VALUES ('ord_123', 'placed', 4200);
+
+  INSERT INTO outbox (event_id, aggregate_id, event_type, payload, created_at)
+  VALUES (gen_random_uuid(), 'ord_123', 'order.placed',
+          '{"order_id":"ord_123","amount_cents":4200}', now());
+COMMIT;
+
+-- 2. A relay (or Debezium CDC on the outbox table) publishes unsent rows,
+--    at-least-once, then marks them. event_id is the idempotency key so
+--    consumers dedup a re-published event safely.
+SELECT event_id, event_type, payload
+FROM   outbox
+WHERE  published_at IS NULL
+ORDER  BY created_at
+LIMIT  500;
+-- ...publish to Kafka... then:
+UPDATE outbox SET published_at = now() WHERE event_id = ANY(:sent_ids);</code></pre>
+  </div>
+  <div class="callout insight">
+    <span class="callout-label">Why this is the canonical answer</span>
+    <p>The outbox converts a distributed-transaction problem (impossible) into a local-transaction problem (trivial) plus at-least-once publishing (solved by idempotency). Naming it unprompted when an interviewer asks "how does the event reliably reach the pipeline?" is a clean staff-level signal.</p>
+  </div>
+</section>
+
+<section id="retries">
+  <h2>Retries, backoff, timeouts &amp; DLQs</h2>
+  <p>Retries are how at-least-once is actually implemented, but naive retries cause more outages than they cure. Three rules:</p>
+  <ul>
+    <li><strong>Exponential backoff with jitter.</strong> Fixed-interval retries from a thousand workers create a synchronized thundering herd that hammers the recovering dependency at exactly the wrong moment. Multiply the delay each attempt <em>and</em> randomize it so retries spread out.</li>
+    <li><strong>Timeouts on everything.</strong> A call with no timeout isn't a call, it's a resource leak waiting for a hang. Every network and query call gets a bounded timeout; the timeout <em>is</em> a failure that triggers the retry policy.</li>
+    <li><strong>Bounded retries, then a dead-letter.</strong> Retrying forever on a <em>poison message</em> — a record that will never succeed because it's malformed or violates a constraint — blocks the whole partition behind it. Cap the attempts and route the loser to a <strong>dead-letter queue</strong>.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>retry.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import random, time
+
+def with_retries(fn, key, max_attempts=5, base=0.5, cap=30.0):
+    """At-least-once processing. `key` is the idempotency key so a retry
+    that actually succeeded server-side but lost the ack is harmless."""
+    for attempt in range(max_attempts):
+        try:
+            return fn(key, timeout=10)          # bounded timeout, always
+        except RetryableError as e:
+            if attempt == max_attempts - 1:
+                dead_letter(key, reason=str(e))  # poison msg -> DLQ, don't block
+                raise
+            # exponential backoff + full jitter (AWS "Exponential Backoff and Jitter")
+            delay = random.uniform(0, min(cap, base * 2 ** attempt))
+            time.sleep(delay)
+        except NonRetryableError:
+            dead_letter(key, reason="permanent")  # 400-class: never retry
+            raise</code></pre>
+  </div>
+  <p>Distinguish <strong>retryable</strong> failures (timeouts, 5xx, throttling, a lock conflict) from <strong>non-retryable</strong> ones (schema violation, 4xx, a poison record). Retrying a permanent error just wastes the retry budget and delays the DLQ. The DLQ itself must be monitored and drainable — a DLQ nobody watches is just silent data loss with extra steps.</p>
+  <div class="callout warn">
+    <span class="callout-label">Antipattern</span>
+    <p>Retrying a <em>non-idempotent</em> operation. If the retried call double-inserts or double-increments, your reliability mechanism is now a data-corruption mechanism. Retries are only safe on top of the idempotency key — the two are a package deal, never one without the other.</p>
+  </div>
+</section>
+
+<section id="blast">
+  <h2>Failure domains, blast radius &amp; restartability</h2>
+  <p>Reliability isn't only "does one task recover" — it's "when something fails, how much goes down with it?" That's the <strong>blast radius</strong>, and containing it is a design activity, not a monitoring one.</p>
+  <ul>
+    <li><strong>Failure domains.</strong> A shared upstream (one credentials secret, one Spark cluster, one schema-registry) is a domain: when it fails, everything behind it fails together. Draw them explicitly. The goal is that a bad partition for <em>one</em> source doesn't halt the other twenty.</li>
+    <li><strong>Isolate the poison.</strong> Per-source DAGs or per-table tasks (see task-centric vs asset-centric in <a href="03-orchestration.html">Chapter 03</a>) mean one broken feed quarantines to its own lane instead of failing a monolithic run.</li>
+    <li><strong>Graceful degradation.</strong> If the enrichment API is down, can you serve yesterday's dimension and flag the rows <code>stale</code>, rather than failing the whole load? Partial-but-labeled often beats all-or-nothing.</li>
+    <li><strong>Checkpointing &amp; restartability.</strong> A job that must restart from zero after a failure at 90% doesn't scale. Checkpoint progress (processed offsets, last completed partition, a high-water mark) so a restart resumes, not repeats. Idempotency makes the overlap on resume safe.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>architecture.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">     FAILURE DOMAIN A                 FAILURE DOMAIN B
+  ┌──────────────────────┐        ┌──────────────────────┐
+  │ payments CDC ─┐       │        │ app events (Kafka) ─┐ │
+  │ ledger  CDC ──┼─►stage│  ⚡    │ clickstream ────────┼─┤
+  └───────────────┼──────┘        └─────────────────────┼─┘
+                  ▼                                      ▼
+            ┌───────────── shared transform (Spark) ─────────────┐  ⚡ shared
+            │  checkpoint every partition · at-least-once + dedup │     domain!
+            └───────────────────────┬────────────────────────────┘
+                                     ▼   atomic swap (WAP)
+                              ┌────────────┐
+                              │ marts (served)│  freshness SLA: 2h
+                              └────────────┘
+  ⚡ = likely failure point.  If the Spark cluster is the only compute,
+      domains A and B collapse into one blast radius — split or add fallback.</code></pre>
+  </div>
+</section>
+
+<section id="observability">
+  <h2>The observability pillars</h2>
+  <p>Application observability is metrics/logs/traces. <strong>Data</strong> observability adds a second axis: the pipeline can be green while the data is wrong. A job that "succeeds" but writes zero rows, or yesterday's rows, or rows with a shifted schema, is the failure mode that actually pages you. Watch five pillars:</p>
+  <table>
+    <thead><tr><th>Pillar</th><th>The question it answers</th><th>How you measure it</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Freshness</strong></td><td>Is the data recent enough?</td><td><code>now() - max(event_time)</code> vs the SLA; last successful load time.</td></tr>
+      <tr><td><strong>Volume</strong></td><td>Did the expected amount of data arrive?</td><td>Row counts vs a moving baseline; alert on ±X% or a hard floor of 0.</td></tr>
+      <tr><td><strong>Schema</strong></td><td>Did the shape change under me?</td><td>Column adds/drops/type changes vs the last snapshot; contract check at ingest.</td></tr>
+      <tr><td><strong>Lineage</strong></td><td>What's upstream and downstream of this?</td><td>Dependency graph across tables/columns (see next section).</td></tr>
+      <tr><td><strong>Distribution</strong></td><td>Do the values still look right?</td><td>Null rate, cardinality, min/max/mean drift, % in an accepted set.</td></tr>
+    </tbody>
+  </table>
+  <p>Freshness and volume are the highest-ROI pair — they're cheap to compute and catch the majority of real incidents (a stuck upstream, a silently empty load). Distribution monitoring is closer to the anomaly detection in <a href="06-reconciliation-and-validation.html">Chapter 06</a>; you can buy it (Monte Carlo, Metaplane, Soda) or roll your own with control charts on the metrics above. The point in an interview: name the pillars, then say <em>which</em> you'd instrument first and why.</p>
+</section>
+
+<section id="lineage">
+  <h2>Lineage</h2>
+  <p>When a metric is wrong at 9am, lineage is what turns "somewhere upstream" into "this column, from this source, changed at 2am." Two granularities:</p>
+  <ul>
+    <li><strong>Table-level lineage</strong> — which tables feed which. dbt gives you this for free from <code>ref()</code>/<code>source()</code>; the DAG <em>is</em> the lineage graph.</li>
+    <li><strong>Column-level lineage</strong> — which source columns compute which output columns. This is what lets you scope a schema change or a restatement precisely instead of re-running everything downstream.</li>
+  </ul>
+  <p><strong>OpenLineage</strong> (with Marquez as a reference backend) is the emerging open standard for emitting lineage events from Airflow, Spark, and dbt in a tool-neutral way — worth naming as the interoperable answer. On the consumer side, <strong>dbt exposures</strong> declare the dashboards, ML models, and apps that depend on your marts, so lineage extends past the warehouse to "who actually breaks if this table is late." That last mile is what converts a data incident into a stakeholder communication.</p>
+  <div class="callout tip">
+    <span class="callout-label">Why interviewers push on lineage</span>
+    <p>It's the fastest predictor of your incident MTTR. "I'd have column-level lineage plus exposures, so when reconciliation breaks on <code>revenue</code> I know exactly which source and which downstream dashboards are affected, and I can notify owners before they notice." That's L4 blast-radius thinking made concrete.</p>
+  </div>
+</section>
+
+<section id="slos">
+  <h2>SLAs, SLOs &amp; error budgets</h2>
+  <p>These three get muddled constantly; keeping them straight is itself a signal. For data:</p>
+  <ul>
+    <li><strong>SLI</strong> — the measured indicator. "Data freshness = minutes between event time and availability in the mart."</li>
+    <li><strong>SLO</strong> — your internal target on that SLI. "Freshness &lt; 2h for 99% of days." This is what you engineer and alert against.</li>
+    <li><strong>SLA</strong> — the externally-promised, often contractual version, usually looser than the SLO, with consequences if breached. You set the SLO tighter so you notice <em>before</em> the SLA is at risk.</li>
+  </ul>
+  <p>An <strong>error budget</strong> falls straight out of the SLO: a 99% freshness target means 1% of the period is your budget to spend on failures, maintenance, and risky changes. Budget intact ⇒ ship faster; budget exhausted ⇒ freeze changes and stabilize. It turns "how reliable is reliable enough?" from an argument into arithmetic.</p>
+  <div class="callout warn">
+    <span class="callout-label">Airflow SLAs are not SLOs</span>
+    <p>Airflow's <code>sla=</code> only fires a callback when a <em>task</em> misses a wall-clock duration on a run that executed. It's blind to a DAG that never triggered, an upstream that's late, or output that's present but wrong. A real freshness SLO checks the <em>data</em> — <code>now() - max(event_time)</code> in the served table — independent of whether any job "succeeded." Conflating the two is a classic tell that someone has configured Airflow but never owned an SLA.</p>
+  </div>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>freshness_slo_check.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- A real freshness SLI, computed on the DATA, not on job status.
+-- Run it as a monitor; page if it breaches the SLO.
+SELECT
+    max(event_time)                                   AS last_event,
+    datediff('minute', max(event_time), current_timestamp) AS staleness_min,
+    120                                               AS slo_minutes,
+    datediff('minute', max(event_time), current_timestamp) > 120 AS slo_breached
+FROM analytics.orders;</code></pre>
+  </div>
+</section>
+
+<section id="oncall">
+  <h2>Alerting, on-call &amp; incident response</h2>
+  <p>Good instrumentation with bad alerting is worse than no alerting — a flood of noisy pages trains everyone to ignore the one that matters. Design alerts to be:</p>
+  <ul>
+    <li><strong>Actionable.</strong> Every page maps to a decision. "CPU 80%" isn't actionable; "orders freshness breached SLO, 0 rows in 3h" is.</li>
+    <li><strong>Deduped &amp; grouped.</strong> One upstream outage that fails forty tables is <em>one</em> incident, not forty pages. Group by root cause using lineage.</li>
+    <li><strong>Routed &amp; tiered.</strong> Page for SLO breaches on tier-1 data; send a ticket or Slack for warnings. Match severity to consumer impact — the exposures from the lineage section tell you the tier.</li>
+    <li><strong>Warn vs block.</strong> Same decision as <a href="06-reconciliation-and-validation.html">Chapter 06</a>: a failed critical check should <em>halt promotion</em> (circuit breaker), while a soft anomaly warns. Blocking bad data beats alerting on it after it's live.</li>
+  </ul>
+  <p>When something does break, run a repeatable loop rather than improvising:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>incident_loop.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">DETECT   → monitor/SLO breach fires (not a consumer email). Ack, declare.
+CONTAIN  → stop the bleeding: pause the DAG, freeze promotion (WAP holds
+           bad data in staging), flag affected marts as "stale/suspect".
+DIAGNOSE → use lineage to find the changed source/column + the blast radius
+           (which downstream exposures are impacted).
+REMEDIATE→ backfill or RESTATE the affected partitions idempotently
+           (immutable partitions + re-run, per Ch04/05). Reconcile after.
+PREVENT  → add the test/contract/monitor that would have caught it earlier;
+           write the blameless postmortem with an action item + owner.</code></pre>
+  </div>
+  <p>The <strong>runbook</strong> is what makes this executable at 3am by whoever is on-call, not just the author — the alert links to the runbook, the runbook has the exact queries and the rollback command. The <strong>blameless postmortem</strong> is where reliability compounds: each incident should end with a durable control (a new freshness monitor, a data contract, a reconciliation tolerance) so the same class of failure can't recur silently.</p>
+  <div class="callout insight">
+    <span class="callout-label">The cost of data downtime</span>
+    <p>Frame reliability in dollars, not vibes. "Data downtime" — periods where data is missing, wrong, or late — costs decisions made on bad numbers, eroded trust in the platform, and engineer-hours firefighting. The business case for WAP, contracts, and observability is that they convert expensive, trust-destroying <em>silent</em> failures into cheap, loud, contained ones. At staff level you're expected to make that ROI argument, not just build the controls.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>Leveling ladder</h2>
+  <p>Reliability is where the ladder is steepest — the same scenario ("make this pipeline dependable") is answerable at every rung, and interviewers climb it deliberately.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"Turn on Airflow retries and email on failure." Knows failures happen; leans on the orchestrator's defaults.</td><td>Aware of retries; no model of correctness under failure.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"At-least-once with an idempotency key, exponential backoff + jitter, timeouts, and a DLQ for poison messages so one bad record doesn't block the queue."</td><td>Builds pipelines that survive and recover from ordinary failure safely.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"Effectively-once via idempotent merges + atomic WAP swaps; freshness/volume SLOs with error budgets checked on the data; actionable, deduped alerting; a detect→contain→restate→prevent runbook."</td><td>Owns SLAs and incident response; reasons about blast radius and MTTR.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"Transactional outbox to kill dual-writes at the source; explicit failure domains so a bad feed can't collapse the platform; OpenLineage column-level lineage + exposures driving blast-radius routing; postmortems that harden the platform; the whole thing justified as cost-of-downtime avoided."</td><td>Architects reliability across teams and systems; measures it in trust and dollars.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Level up, out loud</span>
+    <p>"The simple version is Airflow retries. That silently drops data on a dual-write and floods you with noise, so in production I'd do at-least-once + idempotency with a DLQ (L2), put real freshness SLOs and WAP promotion on it (L3), and fix the dual-write at the source with an outbox while isolating failure domains (L4) — costs a relay and some plumbing, buys a platform that fails loud and contained instead of quiet and wrong." One arc, four rungs, exactly the through-line from <a href="01-the-discussion-interview.html">Chapter 01</a>.</p>
+  </div>
+  <p>Next, the other half of production-grade: making all of this hold up as data and traffic grow by orders of magnitude — <a href="08-scale-and-architecture.html">08 · Scale &amp; Architecture</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

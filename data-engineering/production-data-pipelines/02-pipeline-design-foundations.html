@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipeline Design Foundations</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#anatomy">Anatomy of a pipeline</a>
+    <a href="#batch-stream">Batch, micro-batch, streaming</a>
+    <a href="#etl-elt">ETL vs ELT</a>
+    <a href="#dag">The DAG mental model</a>
+    <a href="#idempotency">Idempotency &amp; determinism</a>
+    <a href="#modeling">Modeling for pipelines</a>
+    <a href="#ingestion">Push, pull, and CDC</a>
+    <a href="#ladder">Leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-the-discussion-interview.html">← Previous</a>
+    <a href="03-orchestration.html">Next: Orchestration →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Design &amp; Orchestration</span>
+  <h1>Pipeline Design Foundations</h1>
+  <p class="subtitle">The building blocks every deep-dive rests on — the anatomy of a pipeline, the batch-vs-stream decision, ELT, the DAG, and the one property that separates junior designs from production ones: idempotency.</p>
+</header>
+
+<section id="anatomy">
+  <h2>Anatomy of a pipeline</h2>
+  <p>Strip away the tooling and almost every data pipeline is the same four moves: <strong>ingest → store → transform → serve</strong>. Get this skeleton on the board first and you have a frame the interviewer can pull threads from.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>pipeline-anatomy.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  SOURCES            INGEST            STORE               TRANSFORM            SERVE
+ ┌────────┐        ┌────────┐        ┌──────────┐        ┌───────────┐        ┌──────────┐
+ │ app DB │──CDC──▶│        │        │  raw /   │        │ staging → │        │  marts / │
+ │ events │──pull─▶│ loader │──land─▶│ landing  │──read─▶│  interm.  │──write▶│  BI / ML │
+ │ 3p API │──push─▶│        │        │(immutable)│        │  → marts  │        │  serving │
+ └────────┘        └────────┘        └──────────┘        └───────────┘        └──────────┘
+                        │                  │                   │                    │
+   ───────────────── ORCHESTRATION (schedule, deps, retries, backfill) ─────────────────
+   ───────────────── OBSERVABILITY  (freshness, volume, lineage, DQ)   ─────────────────
+                        └──────────── CATALOG / METADATA (schemas, ownership) ──────────</code></pre>
+  </div>
+  <ul>
+    <li><strong>Sources &amp; sinks</strong> — where data comes from (operational DBs, event streams, third-party APIs, files) and where it lands (a warehouse, a lake, a serving store). Every source has a different contract for freshness, ordering, and completeness.</li>
+    <li><strong>Ingestion</strong> — moving bytes from source to storage, batch or streaming, push or pull. This is where most late-data and duplication problems are born.</li>
+    <li><strong>Storage</strong> — the durable landing zone. The best designs land <em>immutable</em> raw data first, then transform copies of it, so any downstream mistake is reproducible from source.</li>
+    <li><strong>Transform</strong> — cleaning, conforming, joining, aggregating. In a modern stack this is SQL running inside the warehouse (dbt), not a separate compute tier.</li>
+    <li><strong>Serve</strong> — the shaped outputs consumers actually query: BI marts, feature tables, reverse-ETL feeds.</li>
+    <li><strong>Cross-cutting concerns</strong> — <strong>orchestration</strong> (Chapter <a href="03-orchestration.html">03</a>), <strong>observability</strong> (Chapter <a href="07-reliability-and-observability.html">07</a>), and a <strong>catalog</strong> of schemas and ownership. Draw these underneath the happy path, not inline, exactly as the whiteboard advice in <a href="01-the-discussion-interview.html">Chapter 01</a> suggests.</li>
+  </ul>
+</section>
+
+<section id="batch-stream">
+  <h2>Batch, micro-batch, streaming</h2>
+  <p>The first real design fork is <em>cadence</em>. How fresh does the served data have to be, and what are you willing to pay in complexity for it? Three regimes, and the honest answer is usually the least glamorous one.</p>
+  <table>
+    <thead><tr><th></th><th>Batch</th><th>Micro-batch</th><th>Streaming</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Latency</strong></td><td>Minutes to a day</td><td>Seconds to minutes</td><td>Sub-second to seconds</td></tr>
+      <tr><td><strong>Unit of work</strong></td><td>Bounded set (a partition)</td><td>Small bounded batches on a trigger</td><td>Unbounded, record-at-a-time</td></tr>
+      <tr><td><strong>Typical engine</strong></td><td>dbt + warehouse, Spark</td><td>Spark Structured Streaming</td><td>Flink, Kafka Streams</td></tr>
+      <tr><td><strong>State &amp; time</strong></td><td>Simple; reprocess whole partition</td><td>Some state / checkpoints</td><td>Watermarks, windows, keyed state</td></tr>
+      <tr><td><strong>Reprocessing</strong></td><td>Trivial — re-run the partition</td><td>Moderate</td><td>Hard — replay from the log</td></tr>
+      <tr><td><strong>Correctness cost</strong></td><td>Low</td><td>Medium</td><td>High — late/out-of-order data is a first-class problem</td></tr>
+      <tr><td><strong>Best when</strong></td><td>Daily/hourly analytics, finance, heavy joins</td><td>Near-real-time dashboards</td><td>Alerting, fraud, real-time features</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Streaming doesn't remove the hard problems, it moves them earlier and makes them permanent. In batch, a late record is absorbed by re-running yesterday's partition. In streaming, that same record forces you to reason about watermarks, allowed lateness, and out-of-order arrival <em>continuously</em>. Reach for streaming when the <em>business</em> needs sub-minute latency — not because it sounds impressive. Most "real-time" requirements are satisfied by a micro-batch on a 5-minute cadence.</p>
+  </div>
+  <p>A useful default: design the correct batch pipeline first, then ask whether any consumer's SLA actually forbids it. The late-data machinery you'll build in Chapter <a href="04-late-arriving-data.html">04</a> applies to all three regimes — streaming just makes it non-optional.</p>
+</section>
+
+<section id="etl-elt">
+  <h2>ETL vs ELT</h2>
+  <p>The order of the letters is the whole argument. <strong>ETL</strong> transforms data in a separate compute tier <em>before</em> loading it; <strong>ELT</strong> loads raw data first and transforms it <em>inside</em> the destination warehouse.</p>
+  <p>ELT won the analytics stack for concrete reasons: cheap, elastic, columnar warehouses (Snowflake, BigQuery, Redshift, Databricks SQL) made in-warehouse SQL transformation cheaper and faster than a bespoke Spark/Informatica tier, and landing raw data first means you can re-derive every downstream table without re-ingesting from source. That reproducibility is the quiet superpower — your transforms become version-controlled SQL (dbt) sitting on top of an immutable raw layer.</p>
+  <table>
+    <thead><tr><th></th><th>ETL</th><th>ELT</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Transform location</strong></td><td>Separate engine, pre-load</td><td>In the warehouse, post-load</td></tr>
+      <tr><td><strong>Raw data retained?</strong></td><td>Often not</td><td>Yes — immutable landing layer</td></tr>
+      <tr><td><strong>Re-derive downstream</strong></td><td>Requires re-ingest</td><td>Just re-run SQL</td></tr>
+      <tr><td><strong>Still the right call for</strong></td><td>PII redaction before landing, heavy unstructured/ML preprocessing, tight egress/compliance limits</td><td>Almost all warehouse analytics</td></tr>
+    </tbody>
+  </table>
+  <p>ETL still earns its place when you <em>must not</em> land the raw bytes — masking PII or secrets before they touch the warehouse — or when the transform is genuinely heavier than SQL (image/text featurization, large-scale ML preprocessing). Naming that nuance signals you understand ELT as a trade-off, not a religion.</p>
+</section>
+
+<section id="dag">
+  <h2>The DAG mental model</h2>
+  <p>Every pipeline is a <strong>directed acyclic graph</strong>: nodes are units of work, edges are dependencies, and "acyclic" means no step can (transitively) depend on itself. The orchestrator's core job is to walk that graph in topological order, running a node only once its upstreams have succeeded. Get comfortable thinking in DAGs because it's the shared vocabulary of the whole orchestration conversation in Chapter <a href="03-orchestration.html">03</a>.</p>
+  <p>There are two ways to <em>express</em> the graph, and the distinction is a genuine leveling signal:</p>
+  <ul>
+    <li><strong>Task-centric</strong> — you wire up <em>operations</em>: "run task A, then B, then C." The classic Airflow model. The graph describes <em>what runs</em>.</li>
+    <li><strong>Asset-centric / data-aware</strong> — you declare the <em>data artifacts</em> (tables, files) and their dependencies; the framework derives the execution graph and knows when an asset is stale. The Dagster and dbt model. The graph describes <em>what exists</em>.</li>
+  </ul>
+  <p>Asset-centric orchestration maps more naturally onto ELT — your dbt <code>ref()</code> graph <em>is</em> the DAG — and it makes lineage and staleness first-class instead of bolted-on. We deep-dive the trade-off in Chapter <a href="03-orchestration.html">03</a>; for now, know that "task vs asset" is a question interviewers use to see if you've felt the pain of a purely imperative DAG.</p>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency &amp; determinism</h2>
+  <p>If you take one property from this chapter into the room, take this one. A pipeline step is <strong>idempotent</strong> if running it twice produces the same result as running it once, and <strong>deterministic</strong> if the same inputs always yield the same outputs. Together they mean: <em>you can safely re-run any partition, at any time, without corrupting the result.</em> Every retry, every backfill, every recovery from a half-failed run depends on it.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why this is the whole game</span>
+    <p>Pipelines fail — a worker dies mid-write, a source hiccups, a deploy re-triggers a run. The only question is whether recovery is "re-run the task and move on" or "page someone to manually clean up duplicated rows." Idempotency is what makes the first world possible. An engineer who reaches for it by default reads as a level above one who doesn't.</p>
+  </div>
+  <p>The enemy is the naive <code>INSERT ... SELECT</code> that <em>appends</em>: re-run it and you double-count. The fix is to make each run <strong>own a partition</strong> and replace it wholesale — <em>partition-overwrite</em> — or to <strong>merge on a natural key</strong> so re-processing updates in place instead of appending. Here's a partition-overwrite that's safe to re-run any number of times:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>load_orders_partition.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Idempotent partitioned load: each run OWNS one event_date partition.
+-- Re-running for the same date replaces the partition atomically — no double-counting.
+-- {{ order_date }} is bound by the orchestrator to the run's data-interval date.
+
+BEGIN;
+
+DELETE FROM analytics.orders
+WHERE order_date = DATE '{{ order_date }}';
+
+INSERT INTO analytics.orders (order_id, customer_id, order_date, status, amount, loaded_at)
+SELECT
+    o.order_id,
+    o.customer_id,
+    o.order_date,
+    o.status,
+    o.amount,
+    CURRENT_TIMESTAMP                       AS loaded_at
+FROM raw.orders AS o
+WHERE o.order_date = DATE '{{ order_date }}'
+  -- keep only the latest version of each order within the partition
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY o.order_id
+      ORDER BY o.updated_at DESC
+  ) = 1;
+
+COMMIT;</code></pre>
+  </div>
+  <p>The delete-then-insert inside a transaction gives you an atomic partition swap: readers see either the old partition or the new one, never a half-loaded mess. The <code>QUALIFY ROW_NUMBER()</code> dedup makes it robust to duplicate source rows. On engines with native partition replace (Spark <code>INSERT OVERWRITE</code>, BigQuery partition decorators, dbt's <code>insert_overwrite</code> strategy) you'd use that instead of explicit delete — same idea, cheaper mechanics. We'll build the incremental-merge variant, with lookback for late data, in Chapter <a href="05-incremental-processing.html">05</a>.</p>
+  <p>The same discipline in Python, wrapping a partitioned write so a retry is a no-op-equivalent rather than an append:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>load_orders_partition.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from datetime import date
+
+def load_orders_partition(warehouse, order_date: date) -> int:
+    """Idempotent load of one day's orders. Safe to re-run for the same date."""
+    rows = extract_orders(order_date)          # deterministic: same date -> same set
+    deduped = latest_by_key(rows, key="order_id", version="updated_at")
+
+    # Overwrite the whole partition atomically: stage -> swap, never append.
+    with warehouse.transaction() as tx:
+        tx.delete("analytics.orders", where={"order_date": order_date})
+        tx.insert("analytics.orders", deduped)
+    return len(deduped)
+
+# Re-running is safe because the run OWNS order_date's partition:
+#   load_orders_partition(wh, date(2026, 9, 10))   # first run
+#   load_orders_partition(wh, date(2026, 9, 10))   # retry -> identical result
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Determinism killers to name</span>
+    <p>Watch for the things that quietly break re-runnability: <code>CURRENT_TIMESTAMP</code> or <code>random()</code> baked into business keys, <code>SELECT</code> without an <code>ORDER BY</code> feeding a <code>LIMIT</code>, non-deterministic surrogate-key generation, and "load everything since I last ran" logic that depends on wall-clock time instead of the run's data interval. Parameterize on the <em>data interval</em>, not on "now."</p>
+  </div>
+</section>
+
+<section id="modeling">
+  <h2>Modeling for pipelines</h2>
+  <p>Raw data is rarely servable as-is. The standard shape is a layered flow — often called <strong>medallion</strong> (bronze → silver → gold) or, in dbt terms, <strong>staging → intermediate → marts</strong>:</p>
+  <ul>
+    <li><strong>Bronze / staging</strong> — raw source data, lightly cleaned and typed, one model per source table. No business logic. This is your reproducible base.</li>
+    <li><strong>Silver / intermediate</strong> — conformed, deduplicated, joined entities. Business logic lives here.</li>
+    <li><strong>Gold / marts</strong> — the shaped, aggregated tables consumers query, modeled to a clear grain.</li>
+  </ul>
+  <p>Two vocabulary anchors interviewers listen for:</p>
+  <ul>
+    <li><strong>Grain</strong> — the precise meaning of one row ("one row per order line per day"). Naming the grain of every table is the fastest way to look like you model deliberately; a fuzzy grain is where double-counting and fan-out bugs hide.</li>
+    <li><strong>Surrogate keys</strong> — stable, warehouse-generated keys (a hash of the natural key, or a deterministic surrogate) that decouple your model from source system keys and give SCD dimensions a place to hang.</li>
+  </ul>
+  <p><strong>Slowly changing dimensions (SCD)</strong> handle attributes that change over time — a customer's tier or address. Type 1 overwrites (you lose history); Type 2 keeps a new row per version with <code>valid_from</code> / <code>valid_to</code> effective-dating, so a fact can join to the dimension value that was true <em>at event time</em>. That effective-dating is exactly what saves you when a dimension arrives late — the full treatment is in Chapter <a href="04-late-arriving-data.html">04</a>, and the mechanics (dbt snapshots) in Chapter <a href="05-incremental-processing.html">05</a>.</p>
+</section>
+
+<section id="ingestion">
+  <h2>Push, pull, and CDC</h2>
+  <p>How data enters the pipeline shapes its failure modes. Two postures:</p>
+  <ul>
+    <li><strong>Pull</strong> — you poll the source on a schedule ("give me everything with <code>updated_at</code> &gt; my last watermark"). Simple, but you own the freshness/latency trade-off and you can miss hard deletes.</li>
+    <li><strong>Push</strong> — the source emits to you (webhooks, events onto Kafka). Fresher, but you must handle bursts, retries, out-of-order arrival, and at-least-once duplication — which loops right back to idempotency.</li>
+  </ul>
+  <p><strong>Change Data Capture (CDC)</strong> is the high-completeness option: instead of polling a table, you read the database's transaction log (Debezium, log-based replication) and receive every insert, update, <em>and delete</em> in commit order. It gives you ordering and delete-visibility that query-based pulls can't, at the cost of operational complexity. It's the L4 answer when the correctness bar is high — we develop it fully in Chapter <a href="05-incremental-processing.html">05</a>.</p>
+  <div class="callout tip">
+    <span class="callout-label">The delete trap</span>
+    <p>Query-based incremental pulls on <code>updated_at</code> silently miss <em>hard deletes</em> — a row removed at source never shows up in a "give me changed rows" query, so it lingers forever in your warehouse. If deletes matter (they usually do for finance), you need CDC, soft-deletes at source, or a periodic full reconciliation. Raising this unprompted is a strong senior signal.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>Leveling ladder</h2>
+  <p>The through-line of this guide is visible skill progression. Here's what "design a pipeline that loads orders into the warehouse" sounds like as you climb — each rung a superset of the one below.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd design / say</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"Nightly job: full-refresh the orders table — truncate and reload with <code>SELECT *</code>. Batch, one step."</td><td>Knows the four moves and can describe a correct simple pipeline. Won't scale, but it's not wrong.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"Land raw immutably, then an <strong>idempotent partition-overwrite</strong> keyed on <code>order_date</code>, deduped by <code>order_id</code>. Staging → marts in dbt. Retryable and re-runnable by design."</td><td>Builds idempotent, re-runnable pipelines and models in layers by reflex.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"Incremental on a high-water mark with a <strong>lookback window</strong> for late data, merging into the correct event-date partition; explicit grain per model; SCD2 on the dimensions; a freshness SLA on the marts."</td><td>Designs for late data and incrementality, reasons about grain and history, owns the SLA.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"For a hard correctness bar, <strong>log-based CDC</strong> for completeness and delete-visibility, immutable partitions, a published <strong>data contract</strong> to consumers, and a lakehouse table format for schema evolution and time-travel."</td><td>Architects for contracts, completeness, and evolution across teams.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Level up</span>
+    <p>The single jump that matters most here is <strong>L1 → L2: from append/full-refresh to idempotent partition ownership.</strong> It's cheap to state and it's the property every later chapter builds on. If you narrate nothing else, narrate this one: "the naive load appends and double-counts on retry; I'd make each run own its partition and overwrite it, so re-runs are free."</p>
+  </div>
+  <p>With the foundations in place, the next question is <em>who runs all this, in what order, and what happens when a step fails</em> — that's orchestration. Next: <a href="03-orchestration.html">03 · Orchestration</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

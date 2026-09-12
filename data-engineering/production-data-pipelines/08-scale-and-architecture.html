@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scale &amp; Architecture</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#partitioning">Partitioning &amp; physical layout</a>
+    <a href="#formats">File formats &amp; pushdown</a>
+    <a href="#tableformats">Table formats &amp; the lakehouse</a>
+    <a href="#warehouse">Warehouse vs lake vs lakehouse</a>
+    <a href="#spark">Spark: skew, shuffle, spill, broadcast</a>
+    <a href="#streaming">Streaming architectures</a>
+    <a href="#decision">Batch vs micro-batch vs streaming</a>
+    <a href="#cost">Cost/performance &amp; multi-region</a>
+    <a href="#migration">Schema evolution &amp; zero-downtime migration</a>
+    <a href="#ladder">Leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-reliability-and-observability.html">← Previous</a>
+    <a href="09-the-design-session.html">Next: The Design Session →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Production-Grade</span>
+  <h1>Scale &amp; Architecture</h1>
+  <p class="subtitle">What changes when the data is a thousand times bigger: the physical-layout decisions, table formats, and streaming/batch trade-offs that a staff engineer reasons about explicitly — and where each one quietly breaks.</p>
+</header>
+
+<section id="partitioning">
+  <h2>Partitioning &amp; physical layout</h2>
+  <p>At scale, the dominant cost is how much data you <em>read</em>, and that's decided by physical layout long before query time. <strong>Partitioning</strong> splits a table into directories by a column so the engine can skip whole partitions — <strong>partition pruning</strong> — instead of scanning everything.</p>
+  <ul>
+    <li><strong>Partition by what you filter on, at the right grain.</strong> For pipeline data that's almost always <strong>event date</strong> (<code>event_date=2026-09-11</code>), because nearly every query and every incremental merge is bounded by a date range. Pruning a query from a full-history scan to three days is often a 100× cost cut.</li>
+    <li><strong>The small-files problem.</strong> Many tiny files (one per micro-batch, per partition) wreck read performance — the engine pays per-file open/list overhead and loses columnar batching. Streaming and over-frequent writes are the usual culprits.</li>
+    <li><strong>Over-partitioning is the mirror image.</strong> Partitioning by <code>(event_date, user_id)</code> yields millions of near-empty directories, catastrophic metadata/listing cost, and <em>worse</em> pruning. Rule of thumb: keep partitions in the hundreds-of-MB-to-GB range, not KB.</li>
+  </ul>
+  <p>The fix for both small files and layout drift is <strong>compaction</strong>: periodically rewrite many small files into fewer large ones. Inside a partition, <strong>clustering / bucketing / Z-ordering</strong> co-locates rows by a secondary key (e.g. <code>customer_id</code>) so filters on that key also skip data. Z-order (Delta) and sort-based clustering multi-dimensionally sort within files so pruning works on more than just the partition column.</p>
+  <div class="callout tip">
+    <span class="callout-label">Say the trade-off</span>
+    <p>"Partition on the always-filtered low-cardinality column — event_date — and <em>cluster</em>, don't partition, on the high-cardinality one. Then run compaction so streaming's small files don't erode reads." That sentence shows you've felt the small-files pain, not just read about pruning.</p>
+  </div>
+</section>
+
+<section id="formats">
+  <h2>File formats &amp; pushdown</h2>
+  <p>The format under the partition matters as much as the partitioning. Analytical pipelines are <strong>columnar</strong> — Parquet or ORC — not row-oriented (Avro/CSV/JSON), and the reason is two forms of pushdown:</p>
+  <ul>
+    <li><strong>Projection pushdown.</strong> Columnar storage lets the engine read only the columns a query touches. <code>SELECT amount FROM orders</code> reads one column's worth of bytes, not the whole row.</li>
+    <li><strong>Predicate pushdown.</strong> Parquet/ORC store per-row-group min/max statistics (and optionally bloom filters), so a <code>WHERE amount &gt; 1000</code> skips entire row groups whose max is below the threshold — reading is pruned <em>inside</em> a file, not just across partitions.</li>
+  </ul>
+  <p>Both formats also compress far better than row formats because a column holds homogeneous values (run-length, dictionary encoding). Row formats like Avro still win for the <em>write</em> side — streaming ingest and per-record serialization — which is why a common shape is Avro on the wire/landing, compacted to Parquet for the analytical layer.</p>
+</section>
+
+<section id="tableformats">
+  <h2>Table formats &amp; the lakehouse</h2>
+  <p>Parquet files in a directory are not a <em>table</em> — there's no atomic commit, no snapshot isolation, no safe concurrent write. <strong>Open table formats</strong> — Iceberg, Delta Lake, Hudi — add a metadata layer over the files that brings ACID transactions, time-travel, and schema/partition evolution to object storage. This is the technical core of the <em>lakehouse</em>, and it's what makes the atomic swap and WAP flow from <a href="07-reliability-and-observability.html">Chapter 07</a> real on a data lake.</p>
+  <table>
+    <thead><tr><th>Capability</th><th>Iceberg</th><th>Delta Lake</th><th>Hudi</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ACID / atomic commit</strong></td><td>Snapshot swap via metadata tree</td><td>Transaction log (<code>_delta_log</code>)</td><td>Timeline of commits</td></tr>
+      <tr><td><strong>Time-travel</strong></td><td>By snapshot id / timestamp</td><td>By version / timestamp</td><td>By commit instant</td></tr>
+      <tr><td><strong>Schema evolution</strong></td><td>Full, id-based (safe rename/reorder)</td><td>Add/rename/reorder</td><td>Add / evolve</td></tr>
+      <tr><td><strong>Partition evolution</strong></td><td>Yes — change partitioning without rewrite; hidden partitioning</td><td>Limited (needs rewrite)</td><td>Limited</td></tr>
+      <tr><td><strong>Update model</strong></td><td>CoW; MoR available</td><td>CoW (deletion vectors add MoR-like)</td><td>MoR <em>or</em> CoW, first-class</td></tr>
+      <tr><td><strong>Sweet spot</strong></td><td>Engine-neutral, huge tables, evolving partitions</td><td>Spark/Databricks-native, simplest ops</td><td>High-frequency upserts, CDC ingestion, incremental reads</td></tr>
+    </tbody>
+  </table>
+  <p>Two concepts every interviewer probes here:</p>
+  <ul>
+    <li><strong>Hidden partitioning</strong> (Iceberg): you declare "partition by day(event_time)" and the engine derives the partition value; queries filtering on <code>event_time</code> prune automatically without users knowing the partition scheme — and it can evolve without rewriting old data.</li>
+    <li><strong>MoR vs CoW.</strong> <em>Copy-on-Write</em> rewrites whole files on update — fast reads, expensive writes (good for read-heavy marts). <em>Merge-on-Read</em> writes lightweight delete/update deltas and merges at read time — cheap frequent writes, more read cost (good for high-frequency upserts and CDC). Compaction periodically materializes MoR deltas back into base files.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">The one-liner that lands</span>
+    <p>"Table formats give me ACID and time-travel on object storage, so my incremental <code>MERGE</code> (<a href="05-incremental-processing.html">Chapter 05</a>) is transactional, my WAP publish is an atomic snapshot swap, and I can restate a partition and still reproduce any prior version for reconciliation (<a href="06-reconciliation-and-validation.html">Chapter 06</a>)." That ties scale back to correctness — exactly the synthesis staff interviews want.</p>
+  </div>
+</section>
+
+<section id="warehouse">
+  <h2>Warehouse vs lake vs lakehouse</h2>
+  <p>Know the three storage paradigms as a trade-off spectrum, not a religion:</p>
+  <table>
+    <thead><tr><th></th><th>Data warehouse</th><th>Data lake</th><th>Lakehouse</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Storage</strong></td><td>Managed columnar (Snowflake, BigQuery)</td><td>Object store + files (S3/GCS)</td><td>Object store + open table format</td></tr>
+      <tr><td><strong>Schema</strong></td><td>Schema-on-write, governed</td><td>Schema-on-read, flexible</td><td>Schema-on-write with evolution</td></tr>
+      <tr><td><strong>ACID / quality</strong></td><td>Strong</td><td>Weak/DIY (easily a swamp)</td><td>Strong (table format)</td></tr>
+      <tr><td><strong>Workloads</strong></td><td>SQL BI, marts</td><td>ML, raw, semi-structured, cheap bulk</td><td>Both — one copy, many engines</td></tr>
+      <tr><td><strong>Cost/lock-in</strong></td><td>Higher compute, some lock-in</td><td>Cheapest storage, no ACID</td><td>Cheap storage + open, engine-neutral</td></tr>
+    </tbody>
+  </table>
+  <p>The industry trend — and the reason ELT won (<a href="02-pipeline-design-foundations.html">Chapter 02</a>) — is the lakehouse collapsing the old two-tier "lake for data science, warehouse for BI" split into one governed copy. But a managed warehouse is still the right, boring answer for a pure-SQL analytics shop; don't reach for a lakehouse to prove sophistication when Snowflake or BigQuery solves it with less operational surface.</p>
+</section>
+
+<section id="spark">
+  <h2>Spark: skew, shuffle, spill, broadcast</h2>
+  <p>Distributed compute at scale lives and dies by the <strong>shuffle</strong> — moving data across the network to co-locate keys for a join or aggregation. Four failure modes come up constantly:</p>
+  <ul>
+    <li><strong>Shuffle cost.</strong> Wide transformations (joins, <code>groupBy</code>) shuffle. Minimize them, filter/aggregate <em>before</em> the shuffle, and don't shuffle more columns than you need.</li>
+    <li><strong>Skew.</strong> If one key holds 40% of the rows (a null <code>customer_id</code>, a whale account), one task does most of the work while the rest idle — the job runs at the speed of its slowest partition. Fixes: salting the hot key, Spark's adaptive skew join (AQE), or filtering/handling nulls separately.</li>
+    <li><strong>Spill.</strong> When a partition doesn't fit in executor memory, Spark spills to disk — correct but slow. It signals skew or under-partitioning; repartition or bump memory/partition count.</li>
+    <li><strong>Broadcast joins.</strong> When one side is small (a dimension), broadcast it to every executor and skip the shuffle entirely. Huge win — but broadcasting something too big causes OOM. Set the threshold deliberately; let AQE decide when it can.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The classic tell</span>
+    <p>"My Spark job is slow" with no mention of the shuffle is junior. "One stage has a straggler task — I'd check the Spark UI for skew, salt the hot key or enable AQE skew handling, and broadcast the small dimension side" is senior. The diagnostic instinct (read the UI, find the straggler) matters more than any single fix.</p>
+  </div>
+</section>
+
+<section id="streaming">
+  <h2>Streaming architectures</h2>
+  <p>When freshness requirements drop below the batch interval, you move to streaming — and inherit a different set of scale concerns. <strong>Kafka</strong> is the usual backbone:</p>
+  <ul>
+    <li><strong>Partitions are the unit of parallelism and of ordering.</strong> Kafka guarantees order <em>within</em> a partition, not across. So the <strong>partition key</strong> is a correctness decision: key by <code>order_id</code> and all events for an order stay ordered on one partition. Too few partitions caps consumer parallelism; too many strains the cluster.</li>
+    <li><strong>Consumer groups</strong> distribute partitions across consumers; a rebalance reassigns them on scale/failure. Offsets are the checkpoint (tie back to restartability in <a href="07-reliability-and-observability.html">Chapter 07</a>).</li>
+    <li><strong>Retention vs compaction.</strong> Time/size retention drops old records; <em>log compaction</em> instead keeps the latest value per key — turning a topic into a changelog you can rebuild state from.</li>
+  </ul>
+  <p>For the processing engine, know the <strong>Flink vs Spark Structured Streaming</strong> distinction:</p>
+  <table>
+    <thead><tr><th></th><th>Flink</th><th>Spark Structured Streaming</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Model</strong></td><td>True record-at-a-time streaming</td><td>Micro-batch (Continuous mode experimental)</td></tr>
+      <tr><td><strong>Latency</strong></td><td>Millisecond</td><td>Seconds (batch interval)</td></tr>
+      <tr><td><strong>State &amp; watermarks</strong></td><td>Rich keyed state, first-class event-time/watermarks</td><td>Watermarks + state store; simpler model</td></tr>
+      <tr><td><strong>Exactly-once sink</strong></td><td>Checkpoint barriers + two-phase commit sinks</td><td>Idempotent/transactional sinks + checkpoint</td></tr>
+      <tr><td><strong>Best when</strong></td><td>Low-latency, complex event-time logic</td><td>Already on Spark; seconds-latency is fine</td></tr>
+    </tbody>
+  </table>
+  <p>Both realize <strong>exactly-once sinks</strong> the same way conceptually — checkpoint the input position and commit the output <em>transactionally together</em>, which is the streaming twin of the effectively-once/outbox story in <a href="07-reliability-and-observability.html">Chapter 07</a>. And the watermark, allowed-lateness, and windowing machinery here is exactly the late-arriving-data model from <a href="04-late-arriving-data.html">Chapter 04</a> — streaming state is where those concepts become infrastructure rather than SQL.</p>
+</section>
+
+<section id="decision">
+  <h2>Batch vs micro-batch vs streaming: a decision framework</h2>
+  <p>The over-engineering trap (<a href="01-the-discussion-interview.html">Chapter 01</a>) is reaching for streaming to look advanced. Drive the choice from requirements:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>decision.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">What is the FRESHNESS requirement?  (ask before choosing — Ch01)
+  hours / daily        ─► BATCH
+       cheapest, simplest, easiest to reconcile & backfill. Default.
+  1–15 min             ─► MICRO-BATCH (Structured Streaming / dbt microbatch)
+       near-real-time without full streaming ops burden.
+  sub-second / seconds ─► STREAMING (Flink / Kafka Streams)
+       only if the business truly consumes it that fresh.
+
+Then sanity-check against:
+  • Correctness bar   : streaming makes reconciliation & restatement HARDER.
+  • Cost              : always-on compute vs scheduled bursts.
+  • Ops maturity      : streaming = 24/7 state, checkpoints, backpressure.
+  • Late data         : both need watermarks (Ch04); batch absorbs via lookback.
+
+Rule: choose the SLOWEST tier that meets the freshness SLA. Earn the complexity.</code></pre>
+  </div>
+  <p>Most "real-time" requirements are actually "fresh enough by the time someone looks," which micro-batch serves at a fraction of streaming's operational cost. Reserve true streaming for cases where a human or system acts on the data within seconds — fraud blocks, live ops dashboards, alerting.</p>
+</section>
+
+<section id="cost">
+  <h2>Cost/performance engineering &amp; multi-region</h2>
+  <p>At scale, architecture <em>is</em> cost engineering — the design that's 3× cheaper often wins over the one that's 10% faster. The levers:</p>
+  <ul>
+    <li><strong>Decouple compute from storage.</strong> The modern default (Snowflake, BigQuery, lakehouse): pay cheap object-storage rates for data at rest, spin compute up only when a job runs. Right-size and auto-suspend warehouses; scan less via the partitioning/pushdown above.</li>
+    <li><strong>Materialization strategy.</strong> Trade compute for storage deliberately — pre-aggregate hot marts (compute once, read many) vs compute-on-read views for cold data. This is the incremental-vs-full-refresh economics from <a href="05-incremental-processing.html">Chapter 05</a> at the table level.</li>
+    <li><strong>Spot/preemptible + caching.</strong> Run fault-tolerant batch on spot instances (restartability makes this safe); cache reference data and broadcast dimensions rather than re-reading them.</li>
+    <li><strong>Backpressure &amp; throughput.</strong> Streaming systems must shed or buffer load gracefully when downstream slows — Kafka's durable log <em>is</em> the buffer; the consumer's lag is the SLI to watch.</li>
+  </ul>
+  <p>For <strong>multi-region / DR</strong>, know the vocabulary: <strong>RPO</strong> (how much data you can lose) and <strong>RTO</strong> (how long recovery takes) drive the design. Cross-region replication of the object store plus reproducible, idempotent pipelines means DR is "re-point compute at the replica and re-run from the last checkpoint" — which only works <em>because</em> the pipeline is idempotent and partitions are immutable. Reliability primitives from <a href="07-reliability-and-observability.html">Chapter 07</a> are what make DR cheap; bolting it on later is what makes it expensive.</p>
+</section>
+
+<section id="migration">
+  <h2>Schema evolution &amp; zero-downtime migration</h2>
+  <p>The hardest scale problem is changing a live system without breaking the consumers depending on it. Two layers:</p>
+  <ul>
+    <li><strong>Schema evolution.</strong> Additive changes (new nullable column) are safe and backward-compatible — the whole point of contracts (<a href="06-reconciliation-and-validation.html">Chapter 06</a>). Breaking changes (drop, rename, retype) need coordination: expand-then-contract — add the new field, dual-write both, migrate readers, <em>then</em> remove the old. Table formats with id-based schema evolution (Iceberg) make the rename safe at the storage layer; a schema registry with compatibility rules enforces it on the wire.</li>
+    <li><strong>Zero-downtime pipeline migration.</strong> To swap a pipeline or a model definition, <strong>dual-run / shadow</strong>: run the new version alongside the old, writing to a parallel table, and <em>reconcile the two outputs</em> (row counts, aggregates, hash-diffs — the recon toolkit from <a href="06-reconciliation-and-validation.html">Chapter 06</a>) until you trust it. Then cut consumers over behind a view or contract, and retire the old path. No flag day, no big-bang risk.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Why shadow-run is the staff answer</span>
+    <p>"I don't cut over on faith. I shadow-run the new pipeline, reconcile its output against the old for N days within tolerance, then flip a pointer." It reuses reconciliation as a <em>migration safety net</em>, has a built-in rollback (the old path is still live), and turns a scary rewrite into a measured, reversible cutover. That's the L4/L5 move — evolving the platform without an outage.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>Leveling ladder</h2>
+  <p>Scale is where the ladder reaches toward staff and principal — the question isn't "can you make it fast?" but "can you reason about the whole system's economics, correctness, and evolution?"</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"Store it as Parquet and partition by date." Knows columnar + partitioning exist.</td><td>Vocabulary of physical layout; no failure/skew model.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"Partition by event_date for pruning, compact small files, use broadcast joins for dimensions, and read the Spark UI when a stage is slow."</td><td>Tunes real jobs; diagnoses shuffle/skew/spill.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"Iceberg/Delta for ACID + time-travel so my merges are transactional and restatable; choose the slowest tier (batch/micro-batch/streaming) that meets the freshness SLA; right-size compute and materialize hot marts for cost."</td><td>Designs for correctness-at-scale and cost, chooses paradigms from requirements.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"Lakehouse with partition evolution and hidden partitioning; Kafka partition-key = ordering contract; exactly-once sinks tied to watermarks; multi-region DR via idempotent replay (RPO/RTO); schema evolution via expand-contract."</td><td>Architects the platform across teams, engines, and regions.</td></tr>
+      <tr><td><strong>L5 · Principal</strong> <span class="callout-label">aspirational</span></td><td>"Set the org standard: one governed lakehouse, contract-enforced schema evolution in CI, and a shadow-run migration playbook so any pipeline can be replaced with zero downtime and reconciled cutover."</td><td>Sets platform strategy, standards, and safe org-wide migration.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Level up, out loud</span>
+    <p>"Naively I'd date-partition Parquet (L1). To make it a real table I'd tune the layout and joins (L2), put it on Iceberg for transactional merges and pick batch over streaming since the SLA is hourly (L3), and design partition evolution, exactly-once streaming for the fraud path, and a shadow-run migration when the schema changes (L4) — earning each layer of complexity against a stated requirement." Same climbing arc as <a href="01-the-discussion-interview.html">Chapter 01</a>, now at architecture scale.</p>
+  </div>
+  <p>You now have the full production-grade toolkit. Next it all comes together in a live, timed whiteboard — <a href="09-the-design-session.html">09 · The Design Session</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

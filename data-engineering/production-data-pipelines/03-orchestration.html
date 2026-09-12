@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orchestration</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what">What an orchestrator gives you</a>
+    <a href="#airflow">Airflow, worked</a>
+    <a href="#scheduling">Scheduling correctness</a>
+    <a href="#backfill">Catchup &amp; backfill</a>
+    <a href="#task-asset">Task-centric vs asset-centric</a>
+    <a href="#comparison">The tool landscape</a>
+    <a href="#antipatterns">Antipatterns</a>
+    <a href="#ladder">Leveling ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-pipeline-design-foundations.html">← Previous</a>
+    <a href="04-late-arriving-data.html">Next: Late-Arriving Data →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Design &amp; Orchestration</span>
+  <h1>Orchestration</h1>
+  <p class="subtitle">The layer that turns a pile of scripts into a system — scheduling, dependency resolution, retries, and backfills — worked through Airflow, then placed against the wider tool landscape.</p>
+</header>
+
+<section id="what">
+  <h2>What an orchestrator gives you</h2>
+  <p>An orchestrator is not a compute engine and it's not a cron replacement — though people misuse it as both. It's the thing that runs your DAG (from Chapter <a href="02-pipeline-design-foundations.html">02</a>) reliably. Concretely, it earns its keep by giving you:</p>
+  <ul>
+    <li><strong>Scheduling</strong> — run this graph on a cadence, or when an upstream dataset updates.</li>
+    <li><strong>Dependency resolution</strong> — walk the DAG in topological order; run a task only once its upstreams succeed.</li>
+    <li><strong>Retries &amp; backoff</strong> — automatically re-run a failed task N times with increasing delay, so transient failures self-heal (which only works if the task is idempotent).</li>
+    <li><strong>Backfill &amp; catchup</strong> — run history: fill in the last 90 days of partitions on demand, or catch up runs missed while the scheduler was down.</li>
+    <li><strong>Sensors / triggers</strong> — wait for an external condition (a file lands, a partition is ready, an API is healthy) before proceeding.</li>
+    <li><strong>SLAs &amp; observability</strong> — alert when a task misses its deadline; surface run history, logs, and durations.</li>
+    <li><strong>Parameterization</strong> — bind each run to its data interval so tasks are functions of a date, not of "now."</li>
+  </ul>
+  <p>That last point is the throughline from Chapter 02: the orchestrator's most valuable habit is handing every task the <em>data interval it's responsible for</em>, which is exactly what makes idempotent, backfillable pipelines possible.</p>
+</section>
+
+<section id="airflow">
+  <h2>Airflow, worked</h2>
+  <p>Airflow is the default in most shops (and the one this company runs alongside dbt), so it's worth being fluent. A DAG is a Python file that <em>declares</em> tasks and their dependencies; the scheduler executes them. The modern idiom is <strong>TaskFlow</strong> — plain Python functions decorated into tasks, with return values passed as dependencies via XCom.</p>
+  <p>Here's a small, idempotent, backfill-safe DAG that waits for a source partition, then loads it — using the partition-overwrite pattern from Chapter 02:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>orders_dag.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from datetime import datetime
+import pendulum
+from airflow.decorators import dag, task
+from airflow.sensors.external_task import ExternalTaskSensor
+
+@dag(
+    schedule="0 2 * * *",                     # daily at 02:00
+    start_date=datetime(2026, 1, 1),
+    catchup=False,                            # don't auto-run all history on deploy
+    max_active_runs=1,                        # serialize runs so partitions don't race
+    default_args={"retries": 3, "retry_exponential_backoff": True},
+    tags=["orders", "elt"],
+)
+def orders_pipeline():
+
+    # Deferrable sensor: releases the worker slot while waiting (no worker starvation).
+    wait_for_raw = ExternalTaskSensor(
+        task_id="wait_for_raw_orders",
+        external_dag_id="ingest_raw_orders",
+        deferrable=True,                      # async: frees the slot until the trigger fires
+        timeout=60 * 60,
+        poke_interval=120,
+    )
+
+    @task
+    def load_partition(data_interval_start=None) -> int:
+        # Parameterize on the RUN'S data interval, never on wall-clock "now".
+        order_date = data_interval_start.date()
+        # Idempotent: this run OWNS order_date's partition and overwrites it.
+        return load_orders_partition(order_date)   # delete-then-insert in a txn
+
+    @task
+    def run_dbt_marts(rows_loaded: int) -> None:
+        run_dbt(select="marts.orders+", vars={"min_rows": rows_loaded})
+
+    wait_for_raw >> run_dbt_marts(load_partition())
+
+orders_pipeline()</code></pre>
+  </div>
+  <p>The pieces worth being able to explain out loud:</p>
+  <ul>
+    <li><strong>Data interval, not <code>execution_date</code>.</strong> Airflow schedules on <em>interval end</em>: the 02:00 run on the 11th processes the interval that <em>ended</em> then. Binding <code>load_partition</code> to <code>data_interval_start</code> is what makes it a pure function of a date — re-runnable and backfillable.</li>
+    <li><strong>Deferrable sensor.</strong> A classic sensor occupies a worker slot the entire time it polls; a hundred of them can starve the pool. The <code>deferrable=True</code> / async version hands the wait to a lightweight <em>triggerer</em> and releases the slot — the standard fix for sensor starvation, and a sharp thing to name.</li>
+    <li><strong>XCom for control flow, not data.</strong> Passing <code>rows_loaded</code> between tasks is fine; XCom has a small size limit (backed by the metadata DB), so never push a dataframe through it — pass a <em>pointer</em> (a path, a partition id) and let the task read the data itself.</li>
+    <li><strong>Idempotent tasks + retries.</strong> <code>retries=3</code> with exponential backoff only heals you because <code>load_partition</code> overwrites its partition. Retries on a non-idempotent append would multiply the damage.</li>
+    <li><strong>Dynamic task mapping</strong> (not shown) lets you fan a task out over a runtime-determined list — e.g. one load task per source region — without hand-writing each one.</li>
+  </ul>
+</section>
+
+<section id="scheduling">
+  <h2>Scheduling correctness</h2>
+  <p>Scheduling is where subtle, expensive bugs live, and interviewers probe it precisely because it separates people who've operated pipelines from people who've only written them.</p>
+  <ul>
+    <li><strong>The interval-end execution model.</strong> A daily DAG doesn't run "on" a day — it runs <em>after</em> the day's interval closes, to process the data that accumulated. Confusing the logical date with the wall-clock run time is the root of a whole class of off-by-one partition bugs.</li>
+    <li><strong>Timezones &amp; DST.</strong> Schedule in an explicit timezone (or UTC) and know what happens across daylight-saving transitions — a naive local schedule can skip or double a run twice a year. Pin it deliberately.</li>
+    <li><strong>Late &amp; missed runs.</strong> If the scheduler is down, what happens when it recovers? With <code>catchup=True</code> it replays every missed interval; with <code>catchup=False</code> it runs only the latest. Both are correct answers — for <em>different</em> pipelines. Choosing consciously is the signal.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Time-based deps are a smell</span>
+    <p>"Run B at 03:00 because A usually finishes by 02:45" is a race waiting to happen. Depend on the <em>data</em> — a sensor on A's output partition, or data-aware scheduling — not on a hopeful clock offset. If A runs long one night, a time-based B reads a half-built table and silently produces wrong numbers.</p>
+  </div>
+</section>
+
+<section id="backfill">
+  <h2>Catchup &amp; backfill</h2>
+  <p>The reason to invest in idempotent, interval-parameterized tasks is that it makes <strong>backfill</strong> trivial: to rebuild history, you just run the same task across a range of past intervals, each owning and overwriting its partition. No special code path.</p>
+  <ul>
+    <li><strong>Catchup</strong> is automatic history-filling by the scheduler between <code>start_date</code> and now. Leave it off (<code>catchup=False</code>) on deploy unless you actually want the whole backlog to fire — a surprise catchup storm is a common self-inflicted outage.</li>
+    <li><strong>Backfill</strong> is a deliberate re-run of a date range (fixed a bug, or a source restated history). Because each run overwrites its partition, a backfill converges to the correct state with no double-counting.</li>
+    <li><strong>Guardrails.</strong> Cap concurrency (<code>max_active_runs</code>, pools) so a 200-day backfill doesn't saturate the warehouse, and be aware that a backfill run and a scheduled run touching the same partition must be serialized. Backfills interact heavily with incremental logic and late data — the full treatment is Chapter <a href="05-incremental-processing.html">05</a>.</li>
+  </ul>
+</section>
+
+<section id="task-asset">
+  <h2>Task-centric vs asset-centric</h2>
+  <p>Chapter 02 introduced the two ways to express a DAG; orchestration is where the choice bites. <strong>Task-centric</strong> orchestration (classic Airflow) schedules <em>operations</em> — you tell it what to run and wire the edges. <strong>Asset-centric</strong> orchestration (Dagster's software-defined assets, dbt's model graph) schedules <em>data artifacts</em> — you declare the tables and their dependencies, and the framework derives the graph, tracks staleness, and knows lineage natively.</p>
+  <p>Airflow has met this world halfway with <strong>Datasets</strong> (data-aware scheduling): a DAG can be triggered by "dataset X was updated" instead of a clock, so downstream pipelines fire when their inputs are actually ready rather than on a hopeful schedule. That's the task-orchestrator borrowing the best idea from the asset-orchestrators. In an interview, being able to say "I'd move the cross-DAG dependency from a sensor to a dataset trigger" is a concrete maturity signal.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Asset-centric orchestration matches ELT's grain: your dbt <code>ref()</code> graph already <em>is</em> the dependency DAG, so declaring assets removes a whole layer of hand-wired tasks and makes "is this table stale?" a first-class question. Task-centric orchestration is more flexible for arbitrary operations (a task that isn't a table — an API call, a training job). Most mature stacks end up asset-aware for the warehouse and task-based at the edges.</p>
+  </div>
+</section>
+
+<section id="comparison">
+  <h2>The tool landscape</h2>
+  <p>Be tool-agnostic first, then place the tools. The honest summary: they differ mostly in <em>what they treat as the primitive</em> (task, asset, or durable workflow) and in developer ergonomics — not in whether they can schedule a DAG.</p>
+  <table>
+    <thead><tr><th>Tool</th><th>Primitive / model</th><th>Sweet spot</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Airflow</strong></td><td>Task-centric DAGs; datasets add data-awareness</td><td>Ubiquitous, huge operator ecosystem, batch ELT scheduling</td><td>Imperative wiring; heavy for tiny jobs; scheduler quirks</td></tr>
+      <tr><td><strong>Dagster</strong></td><td>Asset-centric (software-defined assets), typed I/O</td><td>Data-aware lineage, staleness, testability, dbt-native</td><td>Newer ecosystem; asset mental model has a learning curve</td></tr>
+      <tr><td><strong>Prefect</strong></td><td>Dynamic, Pythonic flows &amp; tasks</td><td>Highly dynamic pipelines, light footprint, fast iteration</td><td>Less opinionated about data lineage</td></tr>
+      <tr><td><strong>Temporal</strong></td><td>Durable execution — long-running stateful workflows</td><td>Exactly-once-ish orchestration of services, sagas, human-in-loop</td><td>Not an analytics scheduler; app-orchestration tool</td></tr>
+      <tr><td><strong>Argo Workflows</strong></td><td>Kubernetes-native, container-per-step DAGs</td><td>Containerized/ML workloads already living in k8s</td><td>YAML-heavy; no data-awareness; you build the DE ergonomics</td></tr>
+      <tr><td><strong>dbt Cloud</strong></td><td>Model-graph scheduler for transforms</td><td>Scheduling the dbt DAG itself, tests, docs</td><td>Transform-layer only — not a general ingestion orchestrator</td></tr>
+    </tbody>
+  </table>
+  <p>A defensible real-world answer for this company: <strong>Airflow (or Dagster) orchestrates ingestion and triggers dbt</strong>, dbt owns the transform DAG, and datasets/asset-sensors wire the handoff so marts rebuild when raw actually lands. Naming <em>why</em> you'd combine them beats declaring one tool universally best.</p>
+</section>
+
+<section id="antipatterns">
+  <h2>Antipatterns</h2>
+  <div class="callout warn">
+    <span class="callout-label">Orchestration traps that read as junior</span>
+    <ul>
+      <li><strong>The giant monolithic DAG.</strong> One 400-task DAG for the whole warehouse — impossible to reason about, backfill, or own. Split by domain and wire with datasets.</li>
+      <li><strong>Business logic inside operators.</strong> SQL and transformation logic buried in Python operators instead of version-controlled dbt/SQL. The orchestrator should <em>invoke</em> logic, not <em>contain</em> it.</li>
+      <li><strong>Non-idempotent tasks.</strong> Tasks that append or depend on "now," so a retry corrupts state. Retries and backfills then become dangerous instead of routine.</li>
+      <li><strong>Heavy work in top-level DAG code.</strong> Queries or API calls at module scope run on <em>every scheduler parse</em> (every few seconds), hammering sources and slowing the scheduler. Keep the top level cheap; do work inside tasks.</li>
+      <li><strong>Time-based deps instead of data deps.</strong> "Run at 03:00, A's usually done" — replace with a sensor or dataset trigger on A's output.</li>
+      <li><strong>Using the orchestrator as a compute engine.</strong> Pulling a million rows into the worker to transform in pandas. Push the compute to the warehouse/Spark; the orchestrator coordinates, it doesn't crunch.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>Leveling ladder</h2>
+  <p>Orchestration maturity is a clean ladder, and it's one interviewers climb quickly once they find your ceiling. Here's how the same "schedule the orders pipeline" answer grows.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What you'd say / do</th><th>What it signals</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"A cron job runs the load script nightly. If it fails, someone re-runs it in the morning."</td><td>Knows something schedules the work, but no dependency, retry, or recovery model.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>"An Airflow DAG with explicit task dependencies, <strong>retries with backoff</strong>, and idempotent tasks parameterized on the data interval, so retries and re-runs are safe."</td><td>Uses the orchestrator correctly — dependencies, retries, idempotency by default.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>"<strong>Data-aware dependencies</strong> (sensors/datasets) instead of time offsets, <strong>deferrable sensors</strong> to avoid worker starvation, SLAs and alerting, and backfill-safe design so restating history is a routine re-run."</td><td>Owns reliability and correctness of the schedule; designs for failure and backfill.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>"DAGs decomposed by domain with clear ownership, <strong>asset-centric lineage</strong> across teams, dataset-triggered handoffs between ingestion and dbt, pools/concurrency as cost controls, and orchestration standards other teams build on."</td><td>Architects the orchestration layer across teams — lineage, ownership, cost, standards.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Level up</span>
+    <p>The rung interviewers reward most is <strong>L2 → L3: replacing time-based dependencies with data-aware ones.</strong> "I wouldn't run the marts at 03:00 hoping ingest finished — I'd trigger them off the dataset so they build when raw actually lands." That one move kills a whole class of silent-wrong-data bugs and shows you've operated pipelines, not just authored them.</p>
+  </div>
+  <p>Orchestration reliably <em>runs</em> the pipeline — but running it correctly the moment data shows up late is a deeper problem. Next, the first of the three named deep-dive topics: <a href="04-late-arriving-data.html">04 · Late-Arriving Data</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
