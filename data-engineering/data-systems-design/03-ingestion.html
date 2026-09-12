@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Ingestion Pipelines</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#taxonomy">The source taxonomy</a>
+    <a href="#pushpull">Push vs pull, batch vs streaming</a>
+    <a href="#architecture">The reference architecture</a>
+    <a href="#backbone">The log/queue backbone</a>
+    <a href="#connectors">Connector frameworks &amp; the raw zone</a>
+    <a href="#schema">Schema handling &amp; the registry</a>
+    <a href="#guarantees">Delivery guarantees</a>
+    <a href="#throughput">Backpressure, batching &amp; dead letters</a>
+    <a href="#ladder">The seniority ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-requirements-and-estimation.html">← Previous</a>
+    <a href="04-change-data-capture.html">Next: Change Data Capture →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building Blocks</span>
+  <h1>Data Ingestion Pipelines</h1>
+  <p class="subtitle">The front door of every data platform — how heterogeneous sources become durable, ordered, replayable data on your side of the wall, and the architecture decisions that make ingestion scale.</p>
+</header>
+
+<section id="taxonomy">
+  <h2>The source taxonomy</h2>
+  <p>Ingestion is one of the two named deep-dive topics for this interview, so know it cold. Start by classifying the sources — because the source class dictates almost everything downstream: the mechanism (push or pull), the shape (files, rows, events), the delivery guarantee you can achieve, and whether you need change data capture at all.</p>
+  <table>
+    <thead><tr><th>Source class</th><th>Examples</th><th>Ingestion approach</th></tr></thead>
+    <tbody>
+      <tr><td><strong>OLTP databases</strong></td><td>Postgres, MySQL, MongoDB behind the app</td><td>Change Data Capture — log-based or query-based. Deep dive in Ch <a href="04-change-data-capture.html">04</a>.</td></tr>
+      <tr><td><strong>App / clickstream events</strong></td><td>Web &amp; mobile analytics, user actions, telemetry</td><td>Push into a log/queue (Kafka/Kinesis/Pub-Sub) via an SDK or collector.</td></tr>
+      <tr><td><strong>Third-party APIs / SaaS</strong></td><td>Stripe, Salesforce, HubSpot, ad platforms</td><td>Pull on a schedule via a connector (Fivetran/Airbyte); rate-limited, often batch.</td></tr>
+      <tr><td><strong>Files / object storage</strong></td><td>CSV/JSON/Parquet drops, partner feeds, exports to S3/GCS</td><td>Batch file ingestion — poll a bucket/prefix, or event-triggered on object-created.</td></tr>
+      <tr><td><strong>IoT / logs / devices</strong></td><td>Sensor telemetry, application logs, edge devices</td><td>High-volume streaming push, often through an edge collector or gateway.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Classify before you design</span>
+    <p>In the room, walk the sources and tag each one: "the app DB is CDC — I'll come back to log vs query-based; clickstream is a streaming push into the log; the SaaS tools are scheduled pulls via a managed connector; the partner feed is file drops." That single pass shows structured breadth and sets up the whole ingestion layer.</p>
+  </div>
+</section>
+
+<section id="pushpull">
+  <h2>Push vs pull, batch vs streaming</h2>
+  <p>Two orthogonal axes govern how data crosses the boundary. Getting the vocabulary precise matters — interviewers probe it.</p>
+  <p><strong>Push</strong>: the source (or an agent near it) sends data to you as it's produced — an SDK emitting clickstream, a device publishing telemetry, an app writing to a queue. You don't control the rate, so you must absorb bursts (backpressure, buffering). <strong>Pull</strong>: you reach out and fetch on a cadence — polling a SaaS API, listing an object-storage prefix, querying a DB for rows changed since a high-water mark. You control the rate and the batching, but you add latency (you only see data at poll time) and you can hammer the source.</p>
+  <p><strong>Batch file ingestion</strong> moves data in bounded chunks — a nightly export, an hourly file drop, a scheduled API pull. Simple, cheap, easy to reason about and reprocess; the cost is freshness. <strong>Event streaming ingestion</strong> moves data as an unbounded flow of records through a log/queue — continuous, low-latency, replayable, but more moving parts and a harder correctness story.</p>
+  <div class="callout insight">
+    <span class="callout-label">Tie it back to freshness</span>
+    <p>The push/pull and batch/stream choice is downstream of the freshness SLA you pinned in Ch <a href="02-requirements-and-estimation.html">02</a>. If BI needs data hourly, a scheduled pull into a raw zone is the right, boring answer. If a fraud model needs sub-minute features, that path streams. Most real platforms are <em>hybrid</em> — stream the few sources that need it, batch the rest — and saying so is a senior move. The batch-vs-streaming trade-off gets its full treatment in Ch <a href="05-batch-vs-streaming.html">05</a>.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>The reference architecture</h2>
+  <p>Here is the ingestion layer as you'd sketch it on the whiteboard: heterogeneous sources on the left, a log/queue backbone in the middle acting as the durable buffer and ordering layer, and a landing/raw zone plus stream consumers on the right. Orchestration and a schema registry sit as cross-cutting concerns.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>ingestion-architecture.txt</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-text">          SOURCES                 BACKBONE (durable log)            LANDING / SINKS
+ ┌───────────────────────┐                                   ┌──────────────────────┐
+ │ App OLTP DB (Postgres) │──CDC (log-based, Debezium)──┐     │  Raw / landing zone   │
+ └───────────────────────┘                             │     │  object storage       │
+ ┌───────────────────────┐                             ▼     │  (immutable, append)  │
+ │ Clickstream / app SDK  │──push──►┌───────────────────────┐ │  s3://raw/<source>/   │
+ └───────────────────────┘         │   Kafka / Kinesis /   │ │    dt=YYYY-MM-DD/     │
+ ┌───────────────────────┐         │   Pub-Sub  (topics,   │─┼─► sink connector ────►│
+ │ SaaS APIs (Stripe,SFDC)│──pull──►│   partitions, keys,   │ │                       │
+ └───────────────────────┘  (conn) │   retention, replay)  │ └──────────────────────┘
+ ┌───────────────────────┐         └───────────┬───────────┘ ┌──────────────────────┐
+ │ File drops (S3/GCS)    │──event-triggered────┘             │  Stream consumers     │
+ └───────────────────────┘                     │             │  Flink/Spark → feature│
+ ┌───────────────────────┐                     └────────────►│  store, real-time DW  │
+ │ IoT / logs (gateway)   │──push (edge)──►                   └──────────────────────┘
+ └───────────────────────┘
+       DLQ ◄── bad/undecodable records          [ schema registry ] [ orchestration ]
+                                                       (cross-cutting, underneath)</code></pre>
+  </div>
+  <p>The key idea: decouple the sources from the consumers with a durable log in the middle. Sources produce at their own rate; consumers read at theirs; the log absorbs the mismatch, preserves order per key, and lets you replay history when a downstream job has a bug. Everything else in this chapter is a property of that backbone or of the edges around it.</p>
+</section>
+
+<section id="backbone">
+  <h2>The log/queue backbone</h2>
+  <p>Kafka, Kinesis, Google Pub/Sub, and Redpanda all implement the same core abstraction: a partitioned, append-only, durable commit log. This is the heart of a scalable ingestion layer, and interviewers will drill the mechanics. Know these six concepts precisely.</p>
+  <table>
+    <thead><tr><th>Concept</th><th>What it is &amp; why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Partitions</strong></td><td>Each topic splits into partitions — the unit of parallelism and ordering. More partitions = more throughput and more parallel consumers, but ordering only holds <em>within</em> a partition, not across them. Partition count is hard to reduce later, so size it for peak.</td></tr>
+      <tr><td><strong>Keys &amp; ordering</strong></td><td>The record key decides the partition (hash of key → partition). Same key → same partition → guaranteed order. Choose the key to be the entity whose event order you must preserve (e.g. <code>user_id</code> or <code>order_id</code>). Order is <em>never</em> guaranteed globally across partitions.</td></tr>
+      <tr><td><strong>Consumer groups</strong></td><td>Consumers in a group split the partitions between them — that's how you scale reads horizontally. Each partition is consumed by exactly one member of a group; adding consumers beyond the partition count buys nothing. Different groups read the same data independently (fan-out).</td></tr>
+      <tr><td><strong>Offsets</strong></td><td>Each consumer tracks its position (offset) per partition. Committing offsets is how you record progress; where you commit relative to processing is the crux of the delivery-guarantee discussion below.</td></tr>
+      <tr><td><strong>Retention</strong></td><td>The log keeps records for a configured window (time or size) regardless of whether they've been consumed. This is what makes <strong>replay</strong> possible — reset a consumer's offset and reprocess. Set retention to cover your worst-case recovery/backfill window.</td></tr>
+      <tr><td><strong>Compaction</strong></td><td>Log compaction keeps only the <em>latest</em> value per key (instead of expiring by time), turning the topic into a changelog / current-state snapshot. Ideal for CDC current-state and for keyed reference data you want to bootstrap new consumers from.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">The hot-partition trap</span>
+    <p>If your partition key is skewed — say most events carry the same <code>tenant_id</code> — one partition takes the bulk of the traffic and its consumer becomes the bottleneck while others idle. This is the ingestion face of the skew problem covered in Ch <a href="08-scalability-and-reliability.html">08</a>. Mitigate with a higher-cardinality key, or salt the key (append a bounded random suffix) when you don't need strict per-entity ordering. Interviewers love to push here — have the answer ready.</p>
+  </div>
+</section>
+
+<section id="connectors">
+  <h2>Connector frameworks &amp; the raw zone</h2>
+  <p>You rarely hand-write ingestion glue anymore; you configure a connector framework. Know the landscape and where each fits — this is also a build-vs-buy micro-decision (Ch <a href="07-build-vs-buy.html">07</a>).</p>
+  <ul>
+    <li><strong>Kafka Connect</strong> — a framework of source and sink connectors around Kafka; declarative config, scales with the cluster, hosts Debezium for CDC. The OSS default when you already run Kafka.</li>
+    <li><strong>Airbyte</strong> — open-source (and cloud) connectors for hundreds of SaaS/DB sources; good for the long tail of third-party APIs; self-host or managed.</li>
+    <li><strong>Fivetran</strong> — fully managed, buy-not-build; you pay per row/MAR but get connector maintenance, schema drift handling, and reliability off your plate. The modern-data-stack default for SaaS ingestion.</li>
+    <li><strong>Custom</strong> — justified only for a source no connector covers, or extreme scale/cost where a managed per-row price is prohibitive.</li>
+  </ul>
+  <p>Whatever the connector, land data first in an <strong>immutable raw / landing zone</strong> — object storage, partitioned by source and date, written append-only. Never transform on the way in. The raw zone is your system of record and your insurance: if a downstream transform has a bug, you replay from raw rather than re-pulling from sources that may have changed or rate-limited you. This is the "bronze" layer of the medallion pattern (Ch <a href="06-storage-architectures.html">06</a>).</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>debezium-postgres-source.json</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-json">{
+  "name": "orders-db-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "orders-db.internal",
+    "database.dbname": "orders",
+    "plugin.name": "pgoutput",
+    "table.include.list": "public.orders,public.order_items",
+    "topic.prefix": "cdc.orders",
+    "snapshot.mode": "initial",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "tombstones.on.delete": "true"
+  }
+}</code></pre>
+  </div>
+  <p>That config reads the Postgres write-ahead log, takes an initial snapshot then streams changes, keys each topic by primary key (so per-row order is preserved), emits deletes as tombstones, and registers schemas with the registry — the whole CDC ingest pattern in one declarative block. The strategy behind it is Chapter <a href="04-change-data-capture.html">04</a>.</p>
+</section>
+
+<section id="schema">
+  <h2>Schema handling &amp; the registry</h2>
+  <p>Data crossing the boundary has a schema, and schemas drift — a source adds a field, renames one, changes a type. How you handle this splits into two philosophies.</p>
+  <p><strong>Schema-on-write</strong> validates and enforces structure at ingest: the record must conform before it lands. You catch bad data early and downstream consumers get guarantees, but a rigid schema rejects data or breaks when the source changes. <strong>Schema-on-read</strong> lands whatever arrives (often as JSON) and imposes structure at query time. Flexible and resilient to drift, but you push the pain — and the surprises — to consumers. Lakes lean schema-on-read for the raw zone; warehouses enforce schema-on-write for curated tables. A common, pragmatic split: schema-on-read into raw, schema-on-write into curated.</p>
+  <p>A <strong>schema registry</strong> (Confluent Schema Registry, AWS Glue Schema Registry) is the mechanism that makes streaming ingest safe. Producers register an <strong>Avro / Protobuf / JSON-Schema</strong> definition; the registry assigns a version and enforces a <strong>compatibility mode</strong> (backward, forward, full) so a producer can't ship a breaking change that would blow up consumers. Records carry a schema ID, not the full schema, keeping them compact.</p>
+  <div class="callout tip">
+    <span class="callout-label">Compatibility modes in one line</span>
+    <p><strong>Backward</strong> — new consumers can read old data (safe to add optional fields, drop fields). <strong>Forward</strong> — old consumers can read new data. <strong>Full</strong> — both. Pick backward as the default for analytics; it lets producers evolve while historical replay still works. Schema evolution gets fuller treatment in Ch <a href="09-data-modeling-and-governance.html">09</a>, and enforcing producer/consumer contracts in CI is covered in the companion guide's <a href="../production-data-pipelines/06-reconciliation-and-validation.html">validation</a> chapter.</p>
+  </div>
+</section>
+
+<section id="guarantees">
+  <h2>Delivery guarantees</h2>
+  <p>This is where ingestion interviews get real. Three levels of guarantee, and you must know why the middle one plus a design trick beats chasing the third directly.</p>
+  <table>
+    <thead><tr><th>Guarantee</th><th>Meaning</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><strong>At-most-once</strong></td><td>Every record delivered zero or one times — may drop on failure.</td><td>Cheapest, but loses data. Rarely acceptable for a platform of record.</td></tr>
+      <tr><td><strong>At-least-once</strong></td><td>Every record delivered one <em>or more</em> times — never lost, but may duplicate on retry.</td><td>The practical default. Duplicates are the price of never losing data.</td></tr>
+      <tr><td><strong>Exactly-once</strong></td><td>Every record's effect applied precisely once.</td><td>Expensive and often impossible end-to-end across heterogeneous systems.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The senior answer: effectively-once</span>
+    <p>Don't promise true end-to-end exactly-once — instead combine <strong>at-least-once delivery with an idempotent sink</strong>. The producer/consumer never drops (at-least-once), and the sink deduplicates on a stable key so re-delivering a record is a no-op. Net effect: exactly-once <em>outcomes</em> without the fragility. Concretely: attach a deterministic <code>dedup_key</code> (or use the source primary key + LSN/offset), and land via an idempotent upsert/<code>MERGE</code> or insert-if-not-exists. "At-least-once plus idempotent sink equals effectively-once" is the sentence that scores. Note that the sink itself must be idempotent — commit offsets only <em>after</em> the write succeeds, or a crash between write and commit reprocesses cleanly.</p>
+  </div>
+  <p>Ordering matters alongside delivery: if you keyed the topic by entity, per-entity order holds within a partition, so an idempotent sink applying updates in offset order converges to the correct current state even if some are redelivered. The merge mechanics that make this land correctly in a warehouse live in the companion guide's <a href="../production-data-pipelines/05-incremental-processing.html">incremental processing</a> chapter — reference it rather than re-teaching the SQL here.</p>
+</section>
+
+<section id="throughput">
+  <h2>Backpressure, batching &amp; dead letters</h2>
+  <p>At scale, the failure modes are about flow and bad data, not happy-path throughput. Three mechanisms you should name.</p>
+  <ul>
+    <li><strong>Backpressure.</strong> When a consumer can't keep up, the system must slow the producer or buffer — not silently drop. The durable log is itself the buffer: producers keep writing, retention gives consumers room to catch up, and lag (the offset gap) is your key health metric. If lag grows unbounded, you scale consumers (up to the partition count) or add partitions.</li>
+    <li><strong>Batching &amp; partitioning for throughput.</strong> Producers batch records before sending (larger, fewer requests) and compress the batch; this is the single biggest throughput lever. Partitioning spreads load across brokers and consumers. Tune batch size and linger against your latency budget — bigger batches mean higher throughput but more latency.</li>
+    <li><strong>Dead-letter queue (DLQ).</strong> Records that can't be decoded, fail schema validation, or repeatedly error must not block the pipeline. Route them to a DLQ (a side topic or table) for inspection and replay, and alert on its depth. Without a DLQ, one poison record halts a partition — a classic outage.</li>
+  </ul>
+  <p>Here's a producer configured for effectively-once, ordered, batched ingest — the config choices matter as much as the code.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>producer.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">from confluent_kafka import Producer
+
+producer = Producer({
+    "bootstrap.servers": "broker:9092",
+    "enable.idempotence": True,      # no duplicate writes on retry
+    "acks": "all",                   # wait for all in-sync replicas -> durable
+    "max.in.flight.requests.per.connection": 5,  # safe w/ idempotence, keeps order
+    "linger.ms": 20,                 # batch window: trade latency for throughput
+    "batch.size": 262144,            # 256 KB batches
+    "compression.type": "zstd",      # shrink bytes on the wire
+})
+
+def emit(event: dict) -> None:
+    # key by entity -> same partition -> per-entity ordering preserved
+    producer.produce(
+        topic="clickstream.events",
+        key=event["user_id"],
+        value=serialize(event),      # Avro/Protobuf via schema registry
+    )
+
+# flush on shutdown so nothing is lost in the buffer
+producer.flush()</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Ingestion vs orchestration</span>
+    <p>Ingestion gets data <em>onto</em> the platform durably and in order. <em>Scheduling</em> the batch pulls, wiring dependencies between jobs, and retrying failed runs is orchestration — a different concern owned by the companion guide's <a href="../production-data-pipelines/03-orchestration.html">orchestration</a> chapter. In the interview, land data reliably here and cross-link there; don't blur the two.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>The seniority ladder</h2>
+  <p>How an ingestion answer reads at each level — a quick self-check for the depth an interviewer expects.</p>
+  <table>
+    <thead><tr><th>Level</th><th>An ingestion answer sounds like…</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>"Pull the data with a connector and load it into the warehouse on a schedule." Correct for simple cases; no mention of ordering, guarantees, or failure.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>Reaches for Kafka or Fivetran appropriately, lands in a raw zone, knows at-least-once vs exactly-once, mentions a DLQ.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>Classifies sources, picks push/pull and batch/stream per source against the freshness SLA, keys topics for ordering, achieves effectively-once with an idempotent sink, handles schema drift with a registry.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>Reasons about hot partitions and key design, sizes partition count for peak, sets retention to the recovery window, designs replay/backfill, weighs connector build-vs-buy on TCO, and draws the boundary to CDC, orchestration, and reconciliation cleanly.</td></tr>
+    </tbody>
+  </table>
+  <p>The single richest source — an OLTP database you must replicate continuously without hammering it — has its own strategy space. That's the next named deep dive: <a href="04-change-data-capture.html">04 · Change Data Capture Strategies</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

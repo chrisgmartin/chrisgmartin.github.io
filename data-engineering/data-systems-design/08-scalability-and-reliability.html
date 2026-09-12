@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scalability &amp; Reliability</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#framing">Scale and reliability as design axes</a>
+    <a href="#partitioning">Partitioning &amp; sharding</a>
+    <a href="#skew">The hot-partition &amp; skew problem</a>
+    <a href="#scaling">Horizontal, vertical &amp; elastic scaling</a>
+    <a href="#reliability">Reliability: durability, fault tolerance, backpressure</a>
+    <a href="#consistency">Consistency for data platforms</a>
+    <a href="#dr">Multi-region &amp; disaster recovery</a>
+    <a href="#bottleneck">Bottleneck analysis in a design</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-build-vs-buy.html">← Previous</a>
+    <a href="09-data-modeling-and-governance.html">Next: Modeling &amp; Governance →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Cross-Cutting Concerns</span>
+  <h1>Scalability &amp; Reliability</h1>
+  <p class="subtitle">The properties that separate a demo from a platform: how it grows without falling over, and how it keeps serving correct data when a node, a zone, or a region dies.</p>
+</header>
+
+<section id="framing">
+  <h2>Scale and reliability as design axes</h2>
+  <p>By this point in a session you have an architecture on the board and the big trade-offs decided. Now the interviewer stress-tests it: "what happens at 10× volume?", "what if this node dies mid-load?", "one customer is 40% of your traffic — what breaks?" These questions live at every layer, so treat scalability and reliability as <em>cross-cutting concerns</em> you can reason about anywhere on the diagram, not a bolt-on section.</p>
+  <p>The two axes trade against each other and against cost. More replicas buy durability and availability but cost money and can hurt consistency. More partitions buy throughput but create small-files and skew problems. The senior signal is naming which property the requirements actually demand — a BI warehouse tolerates hours of downtime and eventual consistency; a fraud-feature path does not — and spending only where it's required.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Scale and reliability aren't "make it bigger and add backups." They're a set of specific mechanisms — partitioning, replication, backpressure, idempotency, quorum — each solving a specific failure. In the room, reach for the mechanism by name and say what failure it addresses. "I'd salt the partition key to spread the hot tenant" beats "I'd make it scale."</p>
+  </div>
+</section>
+
+<section id="partitioning">
+  <h2>Partitioning &amp; sharding</h2>
+  <p>Partitioning is the foundation of horizontal scale: split data into independent chunks so many nodes work in parallel and each query touches only the relevant slice. It shows up everywhere — Kafka topic partitions, warehouse micro-partitions and clustering, object-storage layouts (<code>s3://.../dt=2026-09-12/</code>), and OLTP shards. The two dominant strategies:</p>
+  <ul>
+    <li><strong>By key (hash).</strong> Hash a key (user_id, account_id) to assign a partition. Even distribution and O(1) point lookups by key — but range scans hit every partition, and a single hot key can't be split further.</li>
+    <li><strong>By time (range).</strong> Partition by event date/hour. Ideal for analytics — most queries filter by time, so the engine prunes to a few partitions, and old data ages out cheaply. But the current time-partition is a write hotspot, and time queries can skew.</li>
+  </ul>
+  <p>Most real platforms combine them: partition by time for pruning and retention, cluster/sub-partition by a high-cardinality key within each partition for lookup performance. In Kafka, the partition key also controls <em>ordering</em> — records with the same key land on the same partition in order, which is why you key CDC streams by primary key (see Chapter <a href="04-change-data-capture.html">04</a>).</p>
+  <table>
+    <thead><tr><th>Strategy</th><th>Great for</th><th>Weak at</th><th>Named examples</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hash by key</strong></td><td>Even spread; point lookups; joins on key</td><td>Range scans; hot keys; re-sharding cost</td><td>Kafka key partitioning, Cassandra, DynamoDB partition key</td></tr>
+      <tr><td><strong>Range by time</strong></td><td>Partition pruning; retention/TTL; append workloads</td><td>Current-partition write hotspot; skewed time ranges</td><td>Iceberg/Hive <code>dt=</code> partitions, BigQuery time-partitioned tables</td></tr>
+      <tr><td><strong>Composite (time + key)</strong></td><td>Prune by time, then seek by key</td><td>More metadata; small-files if over-partitioned</td><td>Snowflake micro-partitions + clustering keys, Iceberg partition+sort</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">Over-partitioning is its own failure</span>
+    <p>Partition too finely (by hour × country × device) and you get the small-files problem — millions of tiny files that wreck read performance and metadata. On a lake, compaction jobs fix it; see the storage discussion in Chapter <a href="06-storage-architectures.html">06</a>. Rule of thumb: aim for partition files in the hundreds-of-MB to low-GB range.</p>
+  </div>
+</section>
+
+<section id="skew">
+  <h2>The hot-partition &amp; skew problem</h2>
+  <p>Partitioning assumes even distribution. Reality rarely obliges: one enterprise customer is 40% of your events, <code>NULL</code> collapses into one partition, or a celebrity's user_id gets a spike. That partition becomes a <strong>hotspot</strong> — it lags, its consumer falls behind, its reducer runs long after all others finish, and the whole job's latency is set by the slowest partition. Data skew is the single most common scaling failure interviewers probe, so have the mitigations ready.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>partition-skew.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  EVEN distribution (healthy)            SKEWED distribution (hot partition)
+  ┌─────┬─────┬─────┬─────┐              ┌─────┬─────┬─────┬───────────────┐
+  │ P0  │ P1  │ P2  │ P3  │              │ P0  │ P1  │ P2  │      P3       │
+  │ ▓▓▓ │ ▓▓▓ │ ▓▓▓ │ ▓▓▓ │              │ ▓   │ ▓   │ ▓   │ ▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+  └─────┴─────┴─────┴─────┘              └─────┴─────┴─────┴───────────────┘
+   all consumers keep pace                P3 = "whale" tenant; its consumer
+   job latency = avg partition            lags, job latency = P3, others idle
+
+  MITIGATION — salting the key:  key = tenant_id            (all whale → P3)
+                                 salted = tenant_id + "#" + (hash(row) % N)
+                                 → whale now spread across P3a..P3n
+                                 (aggregations must re-combine the N buckets)</code></pre>
+  </div>
+  <p>Mitigations, roughly in order of preference:</p>
+  <ul>
+    <li><strong>Better key design.</strong> Choose a higher-cardinality or composite key so no single value dominates. Adding a natural sub-dimension (region, event_type) often flattens the distribution for free.</li>
+    <li><strong>Salting.</strong> Append a small random/hashed suffix to the hot key to fan it across N partitions, then re-aggregate the N buckets at read time. Standard for skewed joins in Spark and for hot Kafka keys where strict per-key ordering isn't required.</li>
+    <li><strong>Isolate the whale.</strong> Route the one giant tenant to a dedicated partition, topic, or even pipeline so it can't starve everyone else — a common multi-tenant pattern.</li>
+    <li><strong>Engine-level handling.</strong> Spark's adaptive query execution (AQE) splits skewed join partitions automatically; use it before hand-rolling salting.</li>
+    <li><strong>Two-phase aggregation.</strong> Pre-aggregate locally (map-side / partial) so the skewed key's volume shrinks before the final shuffle.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">The trade-off to say out loud</span>
+    <p>Salting fixes skew but costs a second aggregation pass and breaks strict per-key ordering. So the heuristic: salt when the key is a pure grouping/join key and order doesn't matter; use key redesign or whale-isolation when you need to preserve ordering (like a CDC stream keyed by primary key, where reordering would corrupt the merge).</p>
+  </div>
+</section>
+
+<section id="scaling">
+  <h2>Horizontal, vertical &amp; elastic scaling</h2>
+  <p><strong>Vertical (scale up)</strong> — a bigger machine. Simple, no distribution complexity, but a hard ceiling and a single failure domain. Fine for the metadata DB or a modest warehouse. <strong>Horizontal (scale out)</strong> — more machines. Effectively unbounded and fault-tolerant, but requires partitioning, coordination, and shuffle. Every large data system is horizontal; the question is where you accept the coordination cost.</p>
+  <p>The modern enabler is <strong>storage/compute separation</strong>: data lives in object storage (S3/GCS) and stateless compute scales independently against it. This is why Snowflake, BigQuery, Databricks, and Trino can spin compute up for a heavy query and down to zero after — you pay for storage always and compute only when running. It decouples the two scaling axes so a storage-heavy, compute-light workload doesn't overpay, and it's the architectural reason autoscaling is cheap on these platforms. (More in Chapter <a href="06-storage-architectures.html">06</a>.)</p>
+  <p><strong>Autoscaling</strong> adjusts compute to load — Snowflake multi-cluster warehouses spinning up for concurrency, Kubernetes-based Spark/Flink scaling executors, serverless query engines. The caveats worth naming: cold-start latency, the cost of scaling reactively too late (queues build), and runaway spend if you don't cap it. Autoscaling is a cost-shaping tool, not a substitute for fixing a skewed or under-partitioned job — it'll happily scale a broken query's bill to the moon.</p>
+</section>
+
+<section id="reliability">
+  <h2>Reliability: durability, fault tolerance, backpressure</h2>
+  <p>Reliability is a bundle of distinct guarantees. Name them separately; conflating "reliable" hides which one the requirements actually need.</p>
+  <ul>
+    <li><strong>Durability</strong> — data, once accepted, is not lost. Achieved by <em>replication</em>: object stores keep multiple copies (S3's eleven-nines durability), Kafka replicates each partition to N brokers with a configurable <code>min.insync.replicas</code> and acks, and warehouses replicate under the hood. Durability is cheap and near-absolute on managed cloud storage — the interesting failures are upstream, before data is durably landed.</li>
+    <li><strong>Availability</strong> — the system answers requests now. Set a target against the requirement: BI can tolerate 99% (hours/month down); an operational serving layer feeding a product needs 99.9%+. Availability comes from redundancy and no single point of failure — replicate the metadata store, run multiple query nodes, avoid the one Airflow scheduler being the whole platform's SPOF.</li>
+    <li><strong>Fault tolerance &amp; graceful degradation</strong> — a component failing degrades service rather than collapsing it. Retries with backoff and jitter, dead-letter queues for poison records (Chapter <a href="03-ingestion.html">03</a>), circuit breakers, and serving slightly stale data rather than erroring. A good platform under partial failure keeps the freshness clock ticking on healthy paths and isolates the broken one.</li>
+    <li><strong>Backpressure &amp; flow control</strong> — when a downstream can't keep up, the system slows the source instead of dropping data or exhausting memory. A durable log (Kafka/Kinesis) is the classic buffer: producers write at their rate, consumers read at theirs, and the log absorbs the mismatch up to its retention. Flink and reactive frameworks propagate backpressure explicitly; a naive HTTP-push ingestion path without a buffer has no backpressure and sheds load under a spike.</li>
+    <li><strong>Idempotency &amp; exactly-once</strong> — reprocessing or retrying doesn't double-count. The building block for tolerating the retries that fault tolerance depends on: idempotent writes keyed on a dedup/business key, or an at-least-once source plus an idempotent sink to get effectively-once.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Don't re-derive delivery semantics here</span>
+    <p>Exactly-once, idempotency, and delivery-guarantee mechanics have a full treatment in the companion pipelines guide — <a href="../production-data-pipelines/07-reliability-and-observability.html">Reliability &amp; Observability</a>. In a <em>design</em> discussion, state the guarantee you need and the mechanism at a high level ("at-least-once ingest into an idempotent MERGE keyed on primary key → effectively-once"), then point deeper rather than re-teaching the semantics. Same for platform SLOs — freshness, volume, and lineage monitoring — which that chapter owns.</p>
+  </div>
+</section>
+
+<section id="consistency">
+  <h2>Consistency for data platforms</h2>
+  <p>Distributed systems can't have it all, and data platforms sit on the relaxed end of the spectrum. Two framings worth deploying:</p>
+  <ul>
+    <li><strong>CAP.</strong> Under a network partition you choose availability or consistency. Analytics platforms almost always choose availability — a dashboard returning slightly stale numbers beats one returning an error.</li>
+    <li><strong>PACELC.</strong> The sharper framing: even when there's no partition (Else), you trade latency vs consistency. This maps directly onto data platforms — you accept a source-to-analytics <em>lag</em> (latency of consistency) to get cheap, high-throughput, available reads. Naming PACELC over plain CAP is a seniority tell because it captures the everyday trade, not just the failure case.</li>
+  </ul>
+  <p>The practical consistency question for a platform is <strong>source-to-analytics lag</strong>: how stale is the warehouse relative to the source of truth? A batch pipeline is hours behind by design; CDC-plus-streaming is seconds-to-minutes behind. That lag <em>is</em> your consistency model — the platform is eventually consistent with the OLTP source, converging as data flows through ingestion, transform, and serving. Set the freshness SLA (Chapter <a href="02-requirements-and-estimation.html">02</a>) to the lag each consumer tolerates, and don't pay streaming's cost for a consumer that's happy hours behind.</p>
+  <p><strong>Read-after-write</strong> matters at boundaries: after a MERGE completes, do queries see the new state atomically? Open table formats (Iceberg/Delta) give ACID snapshot isolation on the lake so readers never see a half-written commit — a concrete reason the lakehouse formats exist. Strong consistency within the warehouse, eventual consistency between source and warehouse: that's the normal shape, and saying it precisely shows you know where each guarantee lives.</p>
+</section>
+
+<section id="dr">
+  <h2>Multi-region &amp; disaster recovery</h2>
+  <p>DR is measured by two numbers — state them before proposing a design, because they set the cost:</p>
+  <ul>
+    <li><strong>RPO (Recovery Point Objective)</strong> — how much data you can afford to lose, measured in time. RPO of one hour means hourly backups/replication are enough; RPO near zero demands continuous cross-region replication.</li>
+    <li><strong>RTO (Recovery Time Objective)</strong> — how fast you must be back. RTO of a day tolerates a restore-from-backup; RTO of minutes demands a warm/hot standby.</li>
+  </ul>
+  <table>
+    <thead><tr><th>DR strategy</th><th>RPO / RTO</th><th>Cost</th><th>Fit</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Backup &amp; restore</strong></td><td>Hours / hours–day</td><td>Low</td><td>Analytics platforms, reproducible-from-source data</td></tr>
+      <tr><td><strong>Warm standby (async replica)</strong></td><td>Minutes / minutes</td><td>Medium</td><td>Important pipelines; some data-loss window OK</td></tr>
+      <tr><td><strong>Multi-region active (sync/hot)</strong></td><td>~0 / seconds</td><td>High</td><td>Operational serving that <em>is</em> the product</td></tr>
+    </tbody>
+  </table>
+  <p>A crucial data-platform insight: much analytics data is <strong>reproducible</strong> — it's derived from a source system by pipelines. If you can replay from the raw/bronze layer or re-ingest from source, your effective RPO for the derived marts is bounded by how fast you can reprocess, not by whether you replicated the gold tables. That's why cheap backup-and-restore is often the right DR posture for a warehouse, and why the immutable raw landing zone earns its keep. Backfilling at scale is itself a reliability capability — design ingestion (Chapter <a href="03-ingestion.html">03</a>) so you can replay a day or a region without hammering the source or double-counting, which is again where idempotency pays off.</p>
+</section>
+
+<section id="bottleneck">
+  <h2>Bottleneck analysis in a design</h2>
+  <p>The evolution phase always ends here: "walk me through 10× — what breaks first?" The strong answer isn't "we'd scale everything." It's a systematic sweep that names the <em>first</em> constraint, because a system's throughput is set by its narrowest stage.</p>
+  <ol>
+    <li><strong>Follow the data left to right</strong> and ask where volume or QPS hits a limit first: source extraction rate → ingestion/log throughput → transform compute → warehouse concurrency → BI query load.</li>
+    <li><strong>Find the stage that scales worst.</strong> Stateless, storage/compute-separated stages scale easily; the bottleneck is usually the <em>stateful</em> or <em>single-instance</em> piece — the source database's CDC read capacity, a single-partition hot key, the orchestrator scheduler, a metadata store, or warehouse slot/credit limits under concurrency.</li>
+    <li><strong>Name the mitigation for that specific stage</strong> — more Kafka partitions and consumers, split the hot key, separate compute pools per workload, add read replicas, autoscale the warehouse — and then re-ask what the <em>next</em> bottleneck becomes, since fixing one moves it downstream.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">The move that lands it</span>
+    <p>Pick one concrete bottleneck and trace it end to end: "At 10× clickstream, ingestion is fine — Kafka just needs more partitions and consumers. The first real wall is the CDC read on the source Postgres; a single logical-replication slot can only stream so fast, and it competes with production OLTP. I'd mitigate with read-replica-based capture or partitioned publications, and if that's not enough, that's the point where the source-DB architecture itself has to change." Specific, sequenced, and honest about limits — that's a staff-level answer.</p>
+  </div>
+  <p>With scale and reliability reasoned through, the last cross-cutting concern is making the platform trustworthy and usable. Next: <a href="09-data-modeling-and-governance.html">09 · Modeling, Schema Evolution &amp; Governance</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

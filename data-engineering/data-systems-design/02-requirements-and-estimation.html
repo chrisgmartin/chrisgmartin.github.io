@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Requirements &amp; Back-of-Envelope Estimation</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#functional">Functional vs non-functional</a>
+    <a href="#questions">The clarifying questions</a>
+    <a href="#properties">The six properties that shape a data system</a>
+    <a href="#estimation">Back-of-envelope estimation</a>
+    <a href="#worked">A worked sizing example</a>
+    <a href="#access">Access patterns drive storage</a>
+    <a href="#predecide">How requirements pre-decide the trade-offs</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-the-design-interview.html">← Previous</a>
+    <a href="03-ingestion.html">Next: Ingestion →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building Blocks</span>
+  <h1>Requirements &amp; Back-of-Envelope Estimation</h1>
+  <p class="subtitle">The move that separates seniors: pin the requirements and rough the numbers before you draw a single box, so every later decision has something to defend against.</p>
+</header>
+
+<section id="functional">
+  <h2>Functional vs non-functional</h2>
+  <p>Every scenario the interviewer hands you ("design the data platform for product X") is deliberately under-specified. Your first job is not to draw — it's to turn a vague prompt into a bounded problem. Split the requirements two ways.</p>
+  <p><strong>Functional requirements</strong> are <em>what the platform must do</em>: which sources feed it, which consumers read from it, and which queries or products it serves. They answer "what data, for whom, to do what."</p>
+  <p><strong>Non-functional requirements</strong> are the <em>qualities</em> that data must have: how fresh, how fast to query, how much of it, how correct, how available, how long retained, at what cost, under which compliance regime. In a data-systems interview these carry more design weight than the functional list, because they are what force the hard trade-offs — freshness is what pushes you toward streaming, volume is what pushes you toward a lake, correctness is what pushes you toward log-based CDC.</p>
+  <table>
+    <thead><tr><th>Functional</th><th>Non-functional</th></tr></thead>
+    <tbody>
+      <tr><td>Sources: an OLTP Postgres, clickstream events, a payments API</td><td>Volume / velocity / variety of each source</td></tr>
+      <tr><td>Consumers: BI dashboards, ad-hoc SQL, an ML feature pipeline</td><td>Freshness SLA per consumer (daily BI vs minutes for fraud)</td></tr>
+      <tr><td>Queries: revenue by day, funnel analysis, per-user feature lookups</td><td>Query latency &amp; concurrency at the serving layer</td></tr>
+      <tr><td>Products: a reverse-ETL sync back to the CRM</td><td>Correctness bar, availability, durability, retention, budget, compliance</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Why this ordering wins</span>
+    <p>Interviewers grade "requirements first" explicitly. A candidate who says "before I design anything — who consumes this, how fresh does it need to be, and roughly what volume are we talking about?" has already out-scored one who opens with "I'd use Kafka and Snowflake." The requirements are the argument you return to every time you defend a fork.</p>
+  </div>
+</section>
+
+<section id="questions">
+  <h2>The clarifying questions</h2>
+  <p>Ask a compact, high-leverage set — six to eight questions that each rule design space in or out. Don't interrogate; ask, listen, and let the answers steer your architecture.</p>
+  <ul>
+    <li><strong>Who consumes the data, and for what?</strong> Analysts running SQL, executives reading dashboards, a model scoring in real time, another service — each implies a different serving layer.</li>
+    <li><strong>What are the headline queries?</strong> Point lookups by key, big scans and aggregations, or joins across many tables? This is the single biggest driver of storage choice (see <a href="#access">access patterns</a>).</li>
+    <li><strong>What's the freshness SLA — per consumer?</strong> "Real-time" almost never means the same thing across consumers. Pin it: seconds, minutes, hourly, daily. Different SLAs justify a split architecture.</li>
+    <li><strong>What's the volume and velocity?</strong> Events per second at average and peak, rows in the source DBs, growth rate. You'll convert this to bytes and storage in a moment.</li>
+    <li><strong>How correct must it be?</strong> Is an approximate dashboard fine, or is this financial reporting where a missing row is a defect? This sets the bar for delivery guarantees and reconciliation.</li>
+    <li><strong>How long do we retain it, and at what grain?</strong> Raw events for 30 days but aggregates forever? Retention multiplies every storage estimate.</li>
+    <li><strong>What's the budget and the team?</strong> A three-person team on a startup budget designs a very different platform than a 40-person org — this is where build vs buy is quietly pre-decided.</li>
+    <li><strong>Any compliance constraints?</strong> PII, GDPR/CCPA deletion, data residency, audit. These can force encryption, tokenization, and hard-delete paths into the design from day one.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Turn answers into constraints out loud</span>
+    <p>Reflect each answer back as a design constraint: "OK — hourly freshness for BI, but sub-minute for the fraud features; 50M events a day; and it's financial data so correctness is a hard bar. That tells me I can batch most of it and only stream the fraud path, and I'll need an exactly-once story there." That sentence is you doing the job.</p>
+  </div>
+</section>
+
+<section id="properties">
+  <h2>The six properties that shape a data system</h2>
+  <p>Non-functional requirements collapse into six properties. Interviewers expect you to define these crisply and — critically — to know they trade against each other. You cannot maximize all six; the requirements tell you which to favor.</p>
+  <table>
+    <thead><tr><th>Property</th><th>What it means for a data system</th><th>What it costs / trades against</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Freshness</strong></td><td>How stale the served data is — the lag between an event happening at the source and it being queryable. "Data is at most 5 minutes old."</td><td>Tighter freshness pushes you off cheap nightly batch toward streaming: more cost, more complexity, harder correctness.</td></tr>
+      <tr><td><strong>Latency</strong></td><td>How long a <em>query</em> takes to return once issued. A dashboard tile in &lt;1s; an ad-hoc scan in seconds. Distinct from freshness.</td><td>Low latency wants indexing, columnar formats, pre-aggregation, or a serving store — more storage and pipeline work.</td></tr>
+      <tr><td><strong>Throughput</strong></td><td>How much the system ingests and processes per unit time — events/sec in, rows/sec transformed, concurrent queries served.</td><td>High throughput wants partitioning and horizontal scale; skew and hot partitions become the enemy (Ch <a href="08-scalability-and-reliability.html">08</a>).</td></tr>
+      <tr><td><strong>Availability</strong></td><td>Whether the platform is up to accept and serve data. Often looser for analytics than for OLTP — a few minutes of ingest lag is usually survivable.</td><td>Higher availability wants replication, multi-AZ/region, failover — cost and operational burden.</td></tr>
+      <tr><td><strong>Durability</strong></td><td>Once accepted, data is never lost. Usually the hardest bar — you rarely accept losing an event. Object storage gives ~11 nines by design.</td><td>Durability wants replication and, for correctness, idempotent/at-least-once ingest so nothing is silently dropped.</td></tr>
+      <tr><td><strong>Consistency</strong></td><td>Whether readers see a coherent, up-to-date view — read-after-write, and how far analytics lags the source of truth.</td><td>Strong consistency fights availability and freshness (CAP/PACELC); analytics platforms usually accept eventual consistency with bounded lag.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Freshness and latency are not the same</span>
+    <p>A common muddle. <em>Freshness</em> is how old the data is; <em>latency</em> is how long a query takes. A warehouse can serve a sub-second query (great latency) over data that was loaded last night (poor freshness). Naming them separately signals you've actually operated a platform.</p>
+  </div>
+</section>
+
+<section id="estimation">
+  <h2>Back-of-envelope estimation</h2>
+  <p>Sizing is the step that turns opinions into decisions. You are not trying to be precise — you're trying to land in the right order of magnitude so you know whether this is a laptop problem or a distributed-systems problem. The chain is always the same:</p>
+  <ol>
+    <li><strong>Events/sec → bytes/day.</strong> Multiply the event rate by the average serialized size and by seconds in a day (~86,400, round to 10<sup>5</sup>).</li>
+    <li><strong>Bytes/day → raw storage.</strong> Multiply by retention (days) to get the retained footprint.</li>
+    <li><strong>Adjust for replication and compression.</strong> Multiply by the replication factor (often ×3 for a distributed store), then divide by the compression ratio (columnar formats like Parquet routinely hit 4–10× on analytic data).</li>
+    <li><strong>Read QPS &amp; peak.</strong> Estimate query concurrency, and apply a peak-to-average factor (traffic is bursty — assume peak is 2–10× average).</li>
+    <li><strong>Rough cost.</strong> Storage at ~$20–25/TB/month on object storage; compute separately; watch egress (cross-region/internet transfer is often the surprise line item).</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Round aggressively</span>
+    <p>Use powers of ten. 86,400 s/day ≈ 10<sup>5</sup>. 1 KB ≈ 10<sup>3</sup> B. A day is ~10<sup>5</sup> s, a month ~2.5×10<sup>6</sup> s. The interviewer wants to see you reason to an order of magnitude in your head, not do long division. State your assumptions as you go so the reasoning is auditable even if a number is off.</p>
+  </div>
+  <table>
+    <thead><tr><th>Handy constant</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Seconds per day</td><td>86,400 ≈ 10<sup>5</sup></td></tr>
+      <tr><td>Seconds per month</td><td>~2.6 × 10<sup>6</sup></td></tr>
+      <tr><td>Typical event size (JSON)</td><td>0.5–2 KB</td></tr>
+      <tr><td>Parquet/columnar compression</td><td>4–10× on analytic data</td></tr>
+      <tr><td>Replication factor (distributed store)</td><td>×3</td></tr>
+      <tr><td>Object storage cost</td><td>~$20–25 / TB / month</td></tr>
+      <tr><td>Peak-to-average traffic</td><td>2–10×</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="worked">
+  <h2>A worked sizing example</h2>
+  <p>Scenario: a product emits <strong>50 million clickstream events per day</strong>, each ~<strong>1 KB</strong> serialized as JSON. We retain raw events for <strong>90 days</strong> and roll aggregates up indefinitely. Analysts run dashboards and ad-hoc SQL. Let's size it out loud.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>sizing.txt</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-text">Ingest rate
+  50,000,000 events/day / 86,400 s  ≈  580 events/sec average
+  peak (×5)                          ≈  2,900 events/sec
+
+Raw volume per day
+  50e6 events × 1 KB                 =  50 GB/day (raw JSON)
+
+Retained raw (90 days)
+  50 GB/day × 90                     =  4.5 TB raw, over the window
+
+On object storage, columnar + compressed
+  4.5 TB / 6 (Parquet compression)   ≈  0.75 TB stored (single copy)
+  object storage already durable      -> no ×3 needed (managed replication)
+
+Annualized raw (if we kept a year)
+  50 GB/day × 365                    ≈  18 TB/yr raw  ->  ~3 TB as Parquet
+
+Read side
+  ~200 analyst queries/day, bursty
+  concurrency peak                    ≈  10–20 simultaneous scans
+  each scan touches a partition slice, not the full 0.75 TB
+
+Rough monthly cost (storage only)
+  0.75 TB × $23/TB/mo                 ≈  $17/mo  (trivial)
+  => storage is NOT the cost driver here; compute + query is</code></pre>
+  </div>
+  <div class="callout insight">
+    <span class="callout-label">What the numbers just told us</span>
+    <p>580 events/sec average is <em>modest</em> — a single Kafka partition handles this comfortably, and nightly or hourly batch trivially keeps up. 0.75 TB of stored data is small; storage cost is a rounding error, so the real spend is compute at query time. That immediately argues <strong>against</strong> reaching for a streaming-first, heavily replicated lakehouse: the volume doesn't demand it and the freshness SLA (dashboards) doesn't either. Had the answer been 50 <em>billion</em> events/day, every one of those conclusions flips. This is the payoff — the estimate pre-decides the architecture.</p>
+  </div>
+  <p>Contrast the same math at scale: 50B events/day of 1 KB is 50 TB/day raw, ~8 TB/day compressed, ~700 TB retained over 90 days, and ~580,000 events/sec average — now you genuinely need partitioned streaming ingest, a lake for the cheap raw tier, and careful partitioning to avoid hot spots. Same method, wildly different platform. Always run the number before you commit to the shape.</p>
+</section>
+
+<section id="access">
+  <h2>Access patterns drive storage</h2>
+  <p>Volume tells you <em>how big</em>; access pattern tells you <em>what shape</em>. The way consumers read the data is the strongest single input to the storage and serving choice you'll defend in Chapters <a href="05-batch-vs-streaming.html">05</a> and <a href="06-storage-architectures.html">06</a>.</p>
+  <table>
+    <thead><tr><th>Access pattern</th><th>Looks like</th><th>Wants</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Point lookup</strong></td><td>"Get the current features for user 12345" — fetch one row by key, high concurrency, sub-ms.</td><td>A key-value / OLTP store, a serving DB, or a feature store. Row-oriented, indexed. A columnar warehouse is the wrong tool.</td></tr>
+      <tr><td><strong>Large scan / aggregation</strong></td><td>"Sum revenue by day for the last quarter" — read millions of rows, few columns, aggregate.</td><td>Columnar storage (Parquet/ORC), a warehouse or lakehouse with partition pruning. This is the OLAP sweet spot.</td></tr>
+      <tr><td><strong>Complex joins / ad-hoc</strong></td><td>"Join orders to users to sessions with arbitrary filters" — exploratory, unpredictable.</td><td>A warehouse with a good optimizer, or a lakehouse query engine (Trino/Spark). Modeling (star schema) pays off here.</td></tr>
+      <tr><td><strong>Full replay / reprocessing</strong></td><td>"Rebuild every derived table from raw" — read everything, sequentially.</td><td>Cheap, durable, immutable raw storage (object storage / a raw zone). Retention and immutability matter more than query speed.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">The mismatch trap</span>
+    <p>Serving point lookups out of a columnar warehouse, or running big scans against an OLTP row store, is a classic design smell. When a scenario has <em>both</em> patterns — analysts scanning history <em>and</em> a model doing per-user lookups — that's your cue to propose a split: columnar for analytics, a serving/feature store for the lookups, fed from the same curated layer. Name the two patterns and the two stores; don't force one engine to do both.</p>
+  </div>
+</section>
+
+<section id="predecide">
+  <h2>How requirements pre-decide the trade-offs</h2>
+  <p>The point of this chapter is leverage: five minutes of requirements and sizing quietly settle most of the "big" decisions before you ever debate them. Make that linkage explicit in the room — it's the clearest signal of a senior who reasons from constraints rather than from fashion.</p>
+  <table>
+    <thead><tr><th>If the requirement is…</th><th>…it pre-decides</th></tr></thead>
+    <tbody>
+      <tr><td>Freshness SLA is daily/hourly, modest volume</td><td>Batch over streaming — cheaper, simpler, meets the SLA (Ch <a href="05-batch-vs-streaming.html">05</a>)</td></tr>
+      <tr><td>One consumer needs sub-minute data</td><td>A streaming path <em>only</em> for that consumer; batch the rest</td></tr>
+      <tr><td>Huge volume, cheap raw retention, many formats</td><td>Lake/lakehouse for the raw tier; warehouse for curated BI (Ch <a href="06-storage-architectures.html">06</a>)</td></tr>
+      <tr><td>Small team, startup budget, commodity needs</td><td>Buy (managed SaaS) over build (Ch <a href="07-build-vs-buy.html">07</a>)</td></tr>
+      <tr><td>Financial-grade correctness, must capture deletes</td><td>Log-based CDC over query-based diffs (Ch <a href="04-change-data-capture.html">04</a>)</td></tr>
+      <tr><td>Both scans and point lookups</td><td>A split serving layer — columnar + KV/feature store</td></tr>
+      <tr><td>GDPR/CCPA deletion, PII</td><td>Tokenization, hard-delete paths, retention policy baked in (Ch <a href="09-data-modeling-and-governance.html">09</a>)</td></tr>
+    </tbody>
+  </table>
+  <p>None of this replaces the trade-off discussion — the interviewer will still pull each thread — but walking in with the requirements already mapped to leanings means you enter each fork having done the reasoning. Note that <em>operating</em> these pipelines reliably (backfills, late data, reconciliation) is its own discipline; when the interviewer goes there, cross-link and stay at the architecture altitude — the companion guide's <a href="../production-data-pipelines/06-reconciliation-and-validation.html">reconciliation &amp; validation</a> chapter owns the mechanics.</p>
+  <p>Next: with requirements pinned and the platform roughly sized, we start building it — beginning at the front door, where data actually enters. Continue to <a href="03-ingestion.html">03 · Data Ingestion Pipelines</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

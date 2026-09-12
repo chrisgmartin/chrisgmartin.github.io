@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modeling, Schema Evolution &amp; Governance</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#modeling">Modeling on the platform</a>
+    <a href="#bi-vs-ml">Modeling for BI vs ML</a>
+    <a href="#evolution">Schema evolution</a>
+    <a href="#contracts">Data contracts</a>
+    <a href="#catalog">Catalog, lineage &amp; discovery</a>
+    <a href="#quality-access">Quality, access &amp; PII</a>
+    <a href="#cost">Cost governance</a>
+    <a href="#ladder">The seniority ladder</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-scalability-and-reliability.html">← Previous</a>
+    <a href="10-the-design-session.html">Next: The Design Session →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Cross-Cutting Concerns</span>
+  <h1>Modeling, Schema Evolution &amp; Governance</h1>
+  <p class="subtitle">What turns a pile of tables into a platform people trust: how you model it, how it changes safely over time, and how you keep it discoverable, compliant, and cost-controlled at scale.</p>
+</header>
+
+<section id="modeling">
+  <h2>Modeling on the platform</h2>
+  <p>Once storage and processing are settled, the interviewer often asks "how would you model this?" — and the answer is never one shape for the whole platform. Different layers want different models. The <strong>medallion</strong> layout from Chapter <a href="06-storage-architectures.html">06</a> is the frame: raw/bronze is source-shaped and append-only, silver is cleaned and conformed, and gold is modeled for consumption. The modeling question is really "what shape does gold take?", and there are three defensible answers.</p>
+  <table>
+    <thead><tr><th>Approach</th><th>What it is</th><th>Strengths</th><th>Costs</th><th>Fits when</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Dimensional</strong> (star / snowflake)</td>
+        <td>Facts (events/measures) + conformed dimensions (entities); snowflake normalizes dimensions further.</td>
+        <td>Intuitive for BI, fast aggregations, well-understood grain, great with a semantic layer.</td>
+        <td>ETL to conform dimensions; slowly-changing-dimension (SCD) logic; less flexible to source change.</td>
+        <td>BI and analytics is the primary consumer; stable business entities; you want a semantic model on top.</td>
+      </tr>
+      <tr>
+        <td><strong>Data Vault</strong> (hubs, links, satellites)</td>
+        <td>Hubs = business keys, links = relationships, satellites = descriptive/temporal attributes.</td>
+        <td>Auditable, insert-only, absorbs source change and new sources gracefully; parallel loads.</td>
+        <td>Verbose (many joins), needs a presentation layer (marts) on top before BI can use it; steeper learning curve.</td>
+        <td>Many volatile sources, heavy compliance/audit needs, large teams integrating over time.</td>
+      </tr>
+      <tr>
+        <td><strong>One Big Table</strong> / wide denormalized</td>
+        <td>A single wide table (or a few) with everything pre-joined, often per event or per entity-day.</td>
+        <td>No joins at query time; blazing on columnar engines; simplest for consumers and for ML features.</td>
+        <td>Redundancy, expensive to update, dimension changes force rewrites, can hide grain bugs.</td>
+        <td>Read-heavy columnar warehouses/lakehouses, ML feature tables, dashboards over a fixed grain.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">The senior framing</span>
+    <p>These aren't rivals across the platform — they're layers. A common staff-level answer: <em>Data Vault (or raw+silver) as the integration layer for auditability and source resilience, dimensional marts for BI, and wide OBT tables materialized for the heaviest dashboards and ML features.</em> Columnar storage and cheap compute have made denormalization far more attractive than the classic Kimball era assumed — pre-joining is often cheaper than joining at query time when reads dominate. Say <em>why</em> the layer picks the model, and you've answered the question at the right altitude.</p>
+  </div>
+</section>
+
+<section id="bi-vs-ml">
+  <h2>Modeling for BI vs ML features</h2>
+  <p>The two big consumers of gold pull the model in different directions, and naming the split shows you've served both.</p>
+  <ul>
+    <li><strong>BI/analytics</strong> wants conformed dimensions, a stable grain, and a <strong>semantic/metric layer</strong> (dbt's semantic layer, LookML, Cube) so "revenue" means one thing everywhere. Correctness and consistency beat latency; SCD Type 2 preserves history for as-of reporting.</li>
+    <li><strong>ML features</strong> want wide, per-entity feature vectors with strict <strong>point-in-time correctness</strong> — a feature must reflect only what was known at the label's timestamp, or you leak the future into training. This is why a <strong>feature store</strong> (Feast, Tecton, Databricks/Vertex feature stores) exists: it enforces one definition for offline training and online serving, preventing train/serve skew.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Say the magic words</span>
+    <p>For any ML-features question, name <strong>point-in-time correctness</strong> and <strong>train/serve skew</strong>. "I'd compute features from the same transformation for both the offline training set (as-of the label time) and the online serving path — a feature store gives me that single definition and low-latency lookups" is the answer that lands. The join-to-labels-without-leakage problem is the ML analogue of the correctness stories in ingestion and CDC.</p>
+  </div>
+</section>
+
+<section id="evolution">
+  <h2>Schema evolution: change without breaking consumers</h2>
+  <p>Schemas change constantly — a new column, a renamed field, a tightened type. The design question is: <em>how does a producer change a schema without breaking every downstream consumer?</em> The dividing line is additive vs breaking.</p>
+  <ul>
+    <li><strong>Additive (safe):</strong> adding an optional/nullable field, adding an enum value in some encodings, widening a type. Old readers ignore what they don't know; old data still parses.</li>
+    <li><strong>Breaking (dangerous):</strong> removing or renaming a field, changing a type incompatibly, making an optional field required, changing semantics of an existing field (the silent killer — same name, new meaning).</li>
+  </ul>
+  <p>A <strong>schema registry</strong> (Confluent Schema Registry, AWS Glue Schema Registry, or the schemas embedded in Avro/Protobuf) enforces a <strong>compatibility mode</strong> at write time, so a bad change is rejected before it corrupts the pipeline rather than discovered in a broken dashboard.</p>
+  <table>
+    <thead><tr><th>Compatibility mode</th><th>Guarantees</th><th>Allowed change</th><th>Upgrade order</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Backward</strong></td><td>New schema reads old data</td><td>Delete fields, add optional fields</td><td>Upgrade <em>consumers</em> first</td></tr>
+      <tr><td><strong>Forward</strong></td><td>Old schema reads new data</td><td>Add fields, delete optional fields</td><td>Upgrade <em>producers</em> first</td></tr>
+      <tr><td><strong>Full</strong></td><td>Both directions</td><td>Add/remove optional fields only</td><td>Any order</td></tr>
+      <tr><td><strong>None</strong></td><td>No checks</td><td>Anything</td><td>Coordinate manually (avoid)</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Backward</strong> is the sensible default for analytics: you can redeploy consumers to understand the new schema, then let producers emit it. On the storage side, open table formats make evolution a first-class, metadata-only operation. <strong>Iceberg</strong> tracks columns by a stable field ID (not by name or position), so a rename is a metadata change and never rewrites data files or breaks old readers; it also supports <strong>partition evolution</strong> — changing how a table is partitioned without rewriting history. Plain Parquet evolves too (add columns, read old files as null) but without the transactional guarantees, which is exactly the "swamp" risk a table format removes.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>iceberg-evolve.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Additive + rename, both metadata-only in Iceberg (no file rewrite):
+ALTER TABLE orders ADD COLUMN loyalty_tier STRING;      -- old readers see NULL
+ALTER TABLE orders RENAME COLUMN amt TO amount_usd;     -- tracked by field ID
+
+-- Partition evolution: start partitioning new data by day without touching history
+ALTER TABLE events ADD PARTITION FIELD days(event_ts);
+
+-- Time-travel to read the table as of a prior snapshot (audit / reproducibility)
+SELECT * FROM orders FOR SYSTEM_VERSION AS OF 8123456789012345678;</code></pre>
+  </div>
+  <div class="callout warn">
+    <span class="callout-label">The change that passes the registry and still breaks you</span>
+    <p>Compatibility modes catch structural breaks, not <em>semantic</em> ones. Repurposing <code>status = 'active'</code> to mean something new, or switching a timestamp from local to UTC, keeps the same schema and sails through the registry while silently corrupting every downstream metric. Semantic change is a breaking change even when the shape is identical — which is exactly the gap data contracts close.</p>
+  </div>
+</section>
+
+<section id="contracts">
+  <h2>Data contracts</h2>
+  <p>A <strong>data contract</strong> is an explicit agreement between a data <em>producer</em> and its <em>consumers</em> covering three things: <strong>schema</strong> (fields and types), <strong>semantics</strong> (what each field means, units, allowed values, nullability, the grain), and <strong>SLA</strong> (freshness, availability, and how change is communicated). It moves data quality upstream — the producer owns the shape and meaning of what they emit, instead of a fleet of downstream teams reverse-engineering it and building fragile defensive logic.</p>
+  <p>The contract is worth little unless it's <strong>enforced</strong>. Two enforcement points:</p>
+  <ul>
+    <li><strong>In CI</strong> — a schema/semantic change to a source is checked against the contract in the producer's pull request, so a breaking change is blocked before merge (registry compatibility check + expectation tests on sample data).</li>
+    <li><strong>At ingest / at the gate</strong> — incoming data is validated against the contract on the way into the platform; violations route to a dead-letter path rather than poisoning the warehouse.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>data-contract.yaml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">contract: orders.v2
+owner: checkout-team
+sla:
+  freshness: 15m          # rows land within 15 minutes of the source commit
+  availability: 99.9%
+schema:
+  - name: order_id
+    type: string
+    unique: true
+    nullable: false
+  - name: amount_usd       # renamed from amt; units are USD, not cents
+    type: decimal(12,2)
+    nullable: false
+    constraint: "&gt;= 0"
+  - name: status
+    type: string
+    allowed: [pending, paid, shipped, cancelled]   # semantics pinned
+  - name: event_ts
+    type: timestamp
+    timezone: UTC          # semantic guarantee, not just a type
+compatibility: backward     # enforced in producer CI</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Cross-link, don't re-teach</span>
+    <p>The <em>mechanics</em> of turning these expectations into runnable tests — assertions, thresholds, reconciliation against the source, quarantine of bad rows — belong to the companion guide. Point the interviewer there and stay at the architecture altitude: see <a href="../production-data-pipelines/06-reconciliation-and-validation.html">Reconciliation &amp; Validation</a> in Production Data Pipelines for the test framework, and cite the contract as <em>where the expectations come from</em>.</p>
+  </div>
+</section>
+
+<section id="catalog">
+  <h2>Catalog, lineage &amp; discovery</h2>
+  <p>At platform scale the practical failure isn't that data is missing — it's that nobody can find it, trust it, or tell what breaks if they change it. A <strong>data catalog</strong> (DataHub, OpenMetadata, Amundsen, Unity Catalog, Collibra, or the cloud-native Glue/Dataplex catalogs) is the metadata backbone that fixes this:</p>
+  <ul>
+    <li><strong>Discovery</strong> — search datasets by name, tag, domain, owner; see descriptions, freshness, and popularity so consumers pick the blessed gold table, not a stale copy.</li>
+    <li><strong>Lineage</strong> — column- and table-level graph of what feeds what, harvested from query logs, dbt/orchestrator metadata, and connectors. Lineage answers <em>"if I change this column, what dashboards break?"</em> and <em>"where did this wrong number come from?"</em> — the two questions that dominate real incidents.</li>
+    <li><strong>Ownership &amp; classification</strong> — every dataset has an owner and tags (domain, PII level, tier), which is what makes the access and compliance controls below enforceable.</li>
+  </ul>
+  <p>Lineage is also the substrate for <strong>observability</strong> at scale: freshness, volume, and schema monitors (Monte Carlo, dbt tests, Great Expectations) attach to catalog assets so an anomaly is triaged with its downstream blast radius already known.</p>
+</section>
+
+<section id="quality-access">
+  <h2>Quality, access control &amp; PII</h2>
+  <p>Three governance concerns cluster here because they're all about making a shared platform safe rather than just functional.</p>
+  <p><strong>Quality/observability at platform scale.</strong> Beyond per-pipeline tests, the platform needs standing monitors — freshness SLOs, row-volume anomaly detection, null-rate and distribution drift, and schema-change alerts — reported per dataset and tied to the catalog and contracts. The goal is to detect the bad batch before a consumer does. (Delivery-semantics and pipeline-level reliability live in Chapter <a href="08-scalability-and-reliability.html">08</a> and the pipelines guide's <a href="../production-data-pipelines/07-reliability-and-observability.html">reliability chapter</a>.)</p>
+  <p><strong>Access control.</strong> Prefer <strong>role- or attribute-based</strong> access (RBAC/ABAC) over per-user grants, ideally driven by classification tags rather than table-by-table ACLs. Column- and row-level security (and dynamic masking) let one physical table serve many audiences — analysts see masked emails, the fraud team sees more. Unity Catalog, Snowflake, and BigQuery all express this natively; the design point is <em>governance by policy on tags</em>, so a newly-tagged PII column is protected automatically.</p>
+  <p><strong>PII, security &amp; compliance.</strong> GDPR and CCPA make personal data a first-class design constraint, not an afterthought:</p>
+  <ul>
+    <li><strong>Masking</strong> — redact or partially obscure at read time (dynamic data masking) so most consumers never see raw PII.</li>
+    <li><strong>Tokenization / pseudonymization</strong> — replace PII with tokens, keeping the sensitive values in a separate vault; joins still work on the token, but a lake breach leaks nothing usable.</li>
+    <li><strong>Retention &amp; deletion</strong> — enforce time-based retention and support the <em>right to erasure</em>. This is genuinely hard on immutable, append-only lakes: you need row-level delete support (Iceberg/Delta merge-on-read deletes, or crypto-shredding — destroy the per-subject encryption key so the data is unrecoverable) plus a way to prove propagation across derived tables using lineage.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Interview trap: "how do you delete a user from a data lake?"</span>
+    <p>"Just DELETE" ignores that raw Parquet is immutable and that the user's data has fanned out into a dozen derived tables. The credible answer: table formats with row-level deletes (or partition-scoped rewrites) for the tables that must physically drop rows, <strong>crypto-shredding</strong> for cold/immutable archives, and <strong>lineage-driven propagation</strong> so you can enumerate and prove every place a subject's data landed. Tie it back to retention policy so deletion is routine, not a fire drill.</p>
+  </div>
+</section>
+
+<section id="cost">
+  <h2>Cost governance</h2>
+  <p>On elastic cloud platforms, cost is a design property that erodes silently — an unpartitioned table that full-scans on every query, a dashboard auto-refreshing every minute, a dev running <code>SELECT *</code> on a petabyte. Seniority shows in making cost <em>visible and owned</em>:</p>
+  <ul>
+    <li><strong>Chargeback / showback</strong> — attribute spend to teams via tags, warehouses, or query labels so the team generating the cost sees the bill. Visibility alone kills most waste.</li>
+    <li><strong>Right-sizing</strong> — separate warehouses/clusters per workload, auto-suspend idle compute, cap query bytes/credits, and set retention on cold data (or tier it to cheaper storage) instead of keeping everything hot forever.</li>
+    <li><strong>Design-time levers</strong> — partitioning and clustering to prune scans, materializing heavy aggregations once instead of recomputing per query, and choosing batch over streaming when the freshness SLA allows (Chapter <a href="05-batch-vs-streaming.html">05</a>) are the biggest cost decisions, made long before the invoice arrives.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Governance is the platform's usability layer</span>
+    <p>Modeling, schema evolution, contracts, catalog, security, and cost aren't separate checkboxes — they're the difference between a platform people trust and reach for, and a data swamp with a big bill. When an interviewer probes governance, they're checking whether you've operated a platform at scale, not just built one. The tell is whether you connect these back to concrete failure modes: the broken dashboard, the leaked PII, the surprise bill.</p>
+  </div>
+</section>
+
+<section id="ladder">
+  <h2>The seniority ladder</h2>
+  <p>Where an answer on modeling and governance lands:</p>
+  <table>
+    <thead><tr><th>Level</th><th>Sounds like</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1 · Foundational</strong></td><td>Builds a star schema; knows PII should be protected but treats governance as someone else's job.</td></tr>
+      <tr><td><strong>L2 · Practitioner</strong></td><td>Chooses a model per layer, uses a schema registry with a compatibility mode, adds column masking and a catalog.</td></tr>
+      <tr><td><strong>L3 · Senior</strong></td><td>Enforces data contracts in CI and at ingest, designs point-in-time-correct ML features, and has a real erasure/retention story on an immutable lake.</td></tr>
+      <tr><td><strong>L4 · Staff</strong></td><td>Treats modeling, contracts, lineage, policy-on-tags security, and chargeback as one governance system tied to failure modes and cost — and knows which controls to skip early to avoid over-engineering a small platform.</td></tr>
+    </tbody>
+  </table>
+  <p>Next, everything in Sections A–D comes together on a whiteboard: <a href="10-the-design-session.html">10 · The Design Session</a> walks the six-step method end-to-end on a full platform scenario.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

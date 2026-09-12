@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Change Data Capture (CDC) Strategies</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="../../assets/script.js"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why CDC exists</a>
+    <a href="#approaches">Three approaches, compared</a>
+    <a href="#architecture">Snapshot + stream architecture</a>
+    <a href="#event-shape">The shape of a CDC event</a>
+    <a href="#correctness">Deletes, order &amp; exactly-once</a>
+    <a href="#landing">Landing changes in the lake</a>
+    <a href="#outbox">Dual writes &amp; the outbox</a>
+    <a href="#tooling">The tooling landscape</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-ingestion.html">← Previous</a>
+    <a href="05-batch-vs-streaming.html">Next: Batch vs Streaming →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building Blocks</span>
+  <h1>Change Data Capture (CDC) Strategies</h1>
+  <p class="subtitle">How to replicate a live operational database into the platform continuously and correctly — the approaches, the event shape, the correctness traps, and the decision that separates a hand-wave from a design.</p>
+</header>
+
+<section id="why">
+  <h2>Why CDC exists</h2>
+  <p>Almost every data platform has the same first problem: a transactional database — Postgres, MySQL, Oracle, SQL Server — holds the current state of the business, and the analytics side needs that state without hammering the source. CDC is the discipline of <strong>capturing every insert, update, and delete as it happens</strong> and shipping it downstream, so the warehouse or lake mirrors the OLTP system with low latency and low load.</p>
+  <p>The naive alternative — <code>SELECT *</code> nightly, truncate-and-reload — falls apart the moment the table is large or the freshness bar tightens. It scans the whole table (expensive on the source and on the wire), it can't see rows that were created <em>and</em> deleted between runs, and it captures only the latest state, never the history. CDC replaces that with an incremental, ordered stream of <em>what changed</em>.</p>
+  <p>In an interview, CDC is one of the three named topics, and it's where weak candidates hand-wave ("I'd sync the database into Snowflake"). The differentiator is knowing <em>which</em> mechanism, why, and how you keep it correct across deletes, reordering, and schema drift. This chapter is that depth.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>CDC turns a database's <em>state</em> into a <em>stream of changes</em>. Once you have an ordered change stream, the warehouse table is just a materialized view of that stream — you can rebuild it, replay it, or fork it into multiple sinks. That mental model (state ≙ log of changes) is the whole game.</p>
+  </div>
+</section>
+
+<section id="approaches">
+  <h2>Three approaches, compared</h2>
+  <p>There are exactly three families of CDC, and the interview reward is knowing the trade-offs cold rather than reciting tool names. They differ in how they detect a change.</p>
+  <ul>
+    <li><strong>Query-based / batch diff.</strong> Poll the source on a schedule: <code>WHERE updated_at &gt; :high_water_mark</code>, or snapshot the table and diff against the last snapshot. Simple, works on any database with a timestamp column, no special privileges. But it needs a reliable, monotonic <code>updated_at</code> maintained by the app, it <strong>misses hard deletes</strong> (a deleted row simply stops appearing), it misses intermediate states between polls, and each poll puts scan load on the source.</li>
+    <li><strong>Trigger-based.</strong> Install database triggers that write every change into a shadow/audit table, then ingest that. Captures deletes and every intermediate value. But triggers run <em>inside the source transaction</em> — they add write latency and contention to the OLTP path, they're invasive to schema-manage, and DBAs hate them.</li>
+    <li><strong>Log-based.</strong> Read the database's own replication log — Postgres WAL, MySQL binlog, Oracle redo/LogMiner, SQL Server transaction log — the same stream a read replica consumes. Tools like <strong>Debezium</strong> decode it into structured change events. It's low-impact (no queries against tables, no triggers in the transaction path), <strong>complete</strong> (every insert/update/delete, including hard deletes), and <strong>ordered</strong> (it carries the commit order and a log offset). This is the modern default for anything that matters.</li>
+  </ul>
+  <table>
+    <thead>
+      <tr><th>Dimension</th><th>Query-based / batch diff</th><th>Trigger-based</th><th>Log-based (WAL / binlog / redo)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>How it detects change</strong></td><td>Polls <code>updated_at</code> high-water-mark or diffs snapshots</td><td>DB triggers write to an audit table</td><td>Decodes the replication log (Debezium, native connectors)</td></tr>
+      <tr><td><strong>Captures hard deletes</strong></td><td>No (row just vanishes)</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><strong>Captures intermediate states</strong></td><td>No — only latest per poll</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><strong>Latency</strong></td><td>Poll interval (minutes–hours)</td><td>Near-real-time</td><td>Seconds (sub-second possible)</td></tr>
+      <tr><td><strong>Load on source</strong></td><td>High — repeated scans</td><td>Medium — writes in the txn path</td><td>Low — reads the log a replica already produces</td></tr>
+      <tr><td><strong>Ordering guarantee</strong></td><td>Weak (poll boundaries)</td><td>Per-trigger, needs a sequence</td><td>Strong — commit order + log offset</td></tr>
+      <tr><td><strong>Schema-change handling</strong></td><td>Manual</td><td>Must maintain trigger + audit schema</td><td>DDL surfaces in the log; connectors track it</td></tr>
+      <tr><td><strong>Source privileges</strong></td><td>Just SELECT</td><td>DDL to create triggers</td><td>Replication slot / binlog / logging privileges</td></tr>
+      <tr><td><strong>Operational cost</strong></td><td>Low — a scheduled query</td><td>Medium — schema-coupled</td><td>Higher — a connector to run &amp; monitor (slots, lag)</td></tr>
+      <tr><td><strong>Best when</strong></td><td>Small–medium tables, hourly+ SLA, no hard deletes, append-heavy</td><td>Log access impossible; must audit anyway</td><td>Deletes matter, low latency, large tables, correctness bar high</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <span class="callout-label">The delete trap</span>
+    <p>The single most common query-based failure: a row is <code>DELETE</code>d in the source and silently lives forever in the warehouse, because the poll only ever sees rows that <em>exist</em>. If deletes matter (GDPR erasure, order cancellations, account closures), query-based CDC is quietly wrong. Say this out loud in the interview — it's the fastest way to show you've actually run one.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>Snapshot + stream architecture</h2>
+  <p>Log-based CDC only sees changes <em>from the moment you start reading the log</em>. But the table already has millions of rows of history. So every real deployment is a two-phase pattern: an <strong>initial snapshot</strong> of the current table state, then a continuous <strong>stream</strong> of log events — with a carefully managed handoff so nothing is lost or double-counted at the seam.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>cdc-architecture.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  SOURCE OLTP DB              CAPTURE                 TRANSPORT            SINK / PLATFORM
+  ┌───────────────┐      ┌──────────────────┐    ┌──────────────┐    ┌────────────────────┐
+  │  Postgres     │      │  Debezium         │    │  Kafka topic │    │  Raw change log    │
+  │               │      │  (Kafka Connect)  │    │  per table,  │    │  (append-only)     │
+  │  orders   ────┼─(1)─▶│  ① snapshot       │───▶│  keyed by PK │───▶│  bronze.orders_cdc │
+  │  customers    │ WAL  │     SELECT * ...  │    │  (ordering   │    └─────────┬──────────┘
+  │               │      │                   │    │   per key)   │              │ MERGE / upsert
+  │  replication  │      │  ② stream         │    │              │              ▼
+  │  slot (LSN) ──┼─(2)─▶│     read WAL      │    │  + schema    │    ┌────────────────────┐
+  └───────────────┘      │     from LSN      │    │    registry  │    │  Current-state tbl │
+                         └──────────────────┘    └──────────────┘    │  silver.orders     │
+                              handoff: snapshot           replayable  └────────────────────┘
+                              watermark → resume           from offset        │
+                              streaming at that LSN                           ▼
+                                                                        BI · ML · marts
+</code></pre>
+  </div>
+  <p>The <strong>handoff consistency</strong> is the subtle part. A modern connector (Debezium's incremental snapshotting, based on the DBLog algorithm) reads the snapshot in chunks <em>while the stream is already running</em>, interleaving snapshot chunks and live log events and deduplicating by primary key. The older "consistent snapshot" mode instead takes the snapshot at a single log position (LSN/GTID) and begins streaming from exactly that position, so any change committed during the snapshot is re-observed in the stream. Either way the contract is the same:</p>
+  <ul>
+    <li><strong>No gap:</strong> streaming resumes at (or before) the log position the snapshot was taken at, so nothing committed during the snapshot is lost.</li>
+    <li><strong>Overlap is fine, loss is not:</strong> a change seen in both the snapshot and the early stream is deduplicated by primary key + log offset. CDC pipelines are built to be <strong>idempotent</strong> precisely so this overlap is harmless.</li>
+    <li><strong>Resumability:</strong> the connector checkpoints its log offset (LSN / binlog position / GTID). On restart it resumes from the last committed offset — this is also how you <strong>replay</strong> or <strong>backfill</strong>.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Say the seam out loud</span>
+    <p>Interviewers pull on "what happens during the initial load — do you lose writes?" The strong answer: "The snapshot is anchored to a log position, streaming resumes from that position, and the sink is idempotent on primary key + offset, so the overlap dedupes and nothing is lost. Debezium's incremental snapshot even does this without blocking writes." That one sentence signals you've operated CDC, not just read about it.</p>
+  </div>
+</section>
+
+<section id="event-shape">
+  <h2>The shape of a CDC event</h2>
+  <p>A log-based CDC event is richer than "here's a row." It carries the <strong>before</strong> and <strong>after</strong> images of the row, an <strong>operation type</strong> (<code>c</code>reate / <code>u</code>pdate / <code>d</code>elete / <code>r</code>ead-from-snapshot), and <strong>source metadata</strong> including the log position (LSN / binlog offset) and commit timestamp. That metadata is what makes downstream ordering, dedup, and delete-handling possible.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>orders-cdc-event.json</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-json">{
+  "op": "u",
+  "ts_ms": 1726142400123,
+  "before": {
+    "order_id": 90210,
+    "status": "pending",
+    "total_cents": 4999,
+    "updated_at": "2026-09-12T14:59:58Z"
+  },
+  "after": {
+    "order_id": 90210,
+    "status": "shipped",
+    "total_cents": 4999,
+    "updated_at": "2026-09-12T15:00:00Z"
+  },
+  "source": {
+    "db": "shop",
+    "schema": "public",
+    "table": "orders",
+    "connector": "postgresql",
+    "lsn": 24857123992,
+    "txId": 558012,
+    "ts_ms": 1726142400001,
+    "snapshot": "false"
+  }
+}</code></pre>
+  </div>
+  <ul>
+    <li><strong><code>op</code></strong> — <code>c</code> insert, <code>u</code> update, <code>d</code> delete, <code>r</code> snapshot read. A delete carries a populated <code>before</code> and a null <code>after</code>.</li>
+    <li><strong><code>before</code> / <code>after</code></strong> — full row images. <code>before</code> lets you audit exactly what changed and handle deletes; some sources only populate <code>before</code> when <code>REPLICA IDENTITY FULL</code> (Postgres) or equivalent is set — worth flagging.</li>
+    <li><strong><code>source.lsn</code> / offset / <code>txId</code></strong> — the monotonic log position. This is your ordering key and your dedup key. Never order CDC by wall-clock <code>ts_ms</code>; order by the log offset.</li>
+  </ul>
+  <p>Debezium additionally emits a <strong>tombstone</strong> (a message with the row's key and a <code>null</code> value) right after a delete, so log-compacted Kafka topics physically drop the key. Keep that in mind when the sink is Kafka rather than a warehouse.</p>
+</section>
+
+<section id="correctness">
+  <h2>Deletes, order &amp; exactly-once</h2>
+  <p>Getting bytes off the log is the easy 20%. The correctness edge cases are where designs earn their keep.</p>
+  <h3>Deletes: soft vs hard</h3>
+  <p>A hard <code>DELETE</code> arrives as an <code>op: d</code> with a <code>before</code> image and null <code>after</code>. You have two choices at the sink: apply a real <code>DELETE</code> to the current-state table, or — usually better for analytics — <strong>soft-delete</strong> by keeping the row and setting <code>is_deleted = true</code> plus a <code>deleted_at</code>. Soft deletes preserve history and let you reconstruct "what did the table look like yesterday," which analysts and audits both need. On Kafka sinks the delete also produces a <strong>tombstone</strong> so compaction can reclaim the key.</p>
+  <h3>Updates &amp; the current-state problem</h3>
+  <p>Updates are why you can't just append. Ten updates to one order produce ten change events; the current-state table must reflect only the <em>latest</em>. That's the append-raw-then-MERGE pattern in the next section: keep every change in an append-only log, then upsert the latest into the serving table.</p>
+  <h3>Ordering &amp; out-of-order events</h3>
+  <p>Order is guaranteed <strong>per key within a Kafka partition</strong>, and CDC connectors key events by primary key so all changes to one row land in one partition in commit order. Across partitions there is no global order — which is fine, because rows are independent. The danger is reprocessing, retries, or a snapshot/stream overlap delivering an <em>older</em> version after a newer one. Defend with a <strong>monotonic version column</strong> (the LSN/offset, or <code>updated_at</code>) and only apply a change if its version is greater than the row's current version — a "last-writer-wins by log offset" rule.</p>
+  <h3>Exactly-once into the sink</h3>
+  <p>The log itself is at-least-once — a connector restart re-emits events after its last checkpoint. You do <strong>not</strong> chase distributed exactly-once; you make the sink <strong>idempotent</strong> so at-least-once becomes effectively-once. The MERGE keyed on primary key + version does exactly that: replaying the same event is a no-op because the version isn't newer.</p>
+  <h3>Schema changes</h3>
+  <p>DDL on the source (a new column, a widened type) surfaces in the log, and connectors publish the new schema to a <strong>schema registry</strong> (Avro/Protobuf/JSON Schema) with a compatibility mode. Additive changes are safe; drops and type narrowing are breaking. The platform decision — evolve the sink automatically, quarantine, or fail — belongs to schema evolution and data contracts, covered in <a href="09-data-modeling-and-governance.html">Chapter 09</a>.</p>
+  <div class="callout warn">
+    <span class="callout-label">Don't order by wall clock</span>
+    <p>Two events can share a millisecond, and clocks skew. Always resolve "which write wins" by the <strong>log offset / LSN</strong>, not <code>ts_ms</code>. Ordering CDC by wall-clock timestamp is a real production bug that silently resurrects deleted rows and reverts updates.</p>
+  </div>
+  <p>The mechanics of merging late or out-of-order changes into an incremental model — watermarks, reprocessing windows, idempotent merge keys — are the sibling guide's territory. See <a href="../production-data-pipelines/05-incremental-processing.html">Incremental Processing</a> and <a href="../production-data-pipelines/04-late-arriving-data.html">Late-Arriving Data</a> rather than re-deriving them here.</p>
+</section>
+
+<section id="landing">
+  <h2>Landing changes in the lake</h2>
+  <p>The canonical pattern is two layers. First, <strong>append the raw change events</strong> to an immutable log table (bronze) — never mutate it; it's your replayable source of truth and your audit trail. Then <strong>MERGE / upsert</strong> the latest change per key into a current-state table (silver) that BI and downstream models query.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>merge_orders_current.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- silver.orders = current state, upserted from the raw CDC change log.
+-- Deduplicate to the latest change per primary key using the log offset (LSN),
+-- then MERGE: update on match, insert new keys, soft-delete on op = 'd'.
+
+MERGE INTO silver.orders AS tgt
+USING (
+  SELECT *
+  FROM (
+    SELECT
+      after_order_id      AS order_id,
+      after_status        AS status,
+      after_total_cents   AS total_cents,
+      op,
+      source_lsn,
+      ROW_NUMBER() OVER (
+        PARTITION BY COALESCE(after_order_id, before_order_id)
+        ORDER BY source_lsn DESC          -- last writer wins by log offset
+      ) AS rn
+    FROM bronze.orders_cdc
+    WHERE ingest_batch_id = :batch_id     -- only the new micro-batch
+  )
+  WHERE rn = 1                            -- collapse many changes to the latest
+) AS chg
+ON tgt.order_id = chg.order_id
+WHEN MATCHED AND chg.op = 'd' THEN UPDATE
+  SET tgt.is_deleted = TRUE,
+      tgt.deleted_at = CURRENT_TIMESTAMP,
+      tgt._lsn       = chg.source_lsn
+WHEN MATCHED AND chg.op &lt;&gt; 'd' AND chg.source_lsn &gt; tgt._lsn THEN UPDATE
+  SET tgt.status      = chg.status,       -- guard: only apply strictly newer LSN
+      tgt.total_cents = chg.total_cents,
+      tgt.is_deleted  = FALSE,
+      tgt._lsn        = chg.source_lsn
+WHEN NOT MATCHED AND chg.op &lt;&gt; 'd' THEN INSERT
+  (order_id, status, total_cents, is_deleted, _lsn)
+  VALUES (chg.order_id, chg.status, chg.total_cents, FALSE, chg.source_lsn);</code></pre>
+  </div>
+  <p>Two things make this correct rather than just plausible: collapsing many changes per key to the latest by <code>source_lsn</code> <em>before</em> the MERGE (so a single micro-batch with multiple updates to one row applies cleanly), and the <code>source_lsn &gt; tgt._lsn</code> guard (so a replayed or out-of-order event is a no-op — the idempotency that turns at-least-once delivery into effectively-once state).</p>
+  <p>This is deliberately the <em>shape</em> of the merge, not a full tutorial. The mechanics — Iceberg/Delta MERGE performance, partition pruning, dbt incremental strategies, snapshotting for SCD2 history — live in <a href="../production-data-pipelines/05-incremental-processing.html">Production Data Pipelines · Incremental Processing</a>. In the interview, sketch this two-layer pattern and cross-reference; don't burn ten minutes on MERGE syntax.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why keep the raw log</span>
+    <p>The append-only bronze layer is what lets you rebuild the current-state table from scratch, reprocess after a logic bug, feed a second sink (a feature store, a search index) off the same events, and reconstruct history for SCD2. Throwing away the raw changes to "save space" is a decision you regret the first time a transform is wrong.</p>
+  </div>
+</section>
+
+<section id="outbox">
+  <h2>Dual writes &amp; the outbox</h2>
+  <p>CDC captures changes to a <em>database</em>. But sometimes the thing you want downstream isn't a row change — it's a business <em>event</em> ("OrderShipped") that a service wants to emit. The tempting implementation is a <strong>dual write</strong>: the service writes to its database <em>and</em> publishes to Kafka in the same request. This is a classic distributed-systems bug.</p>
+  <div class="callout warn">
+    <span class="callout-label">The dual-write problem</span>
+    <p>There is no shared transaction across the database and the message broker. If the DB commit succeeds but the Kafka publish fails (or the process crashes between them), the two systems disagree forever: the order is shipped in the DB but no event was emitted, or vice versa. Retries don't fix it — they create duplicates. You cannot make two independent systems atomic with application code.</p>
+  </div>
+  <p>The fix is the <strong>transactional outbox</strong>. The service writes the business event into an <code>outbox</code> table <em>in the same local transaction</em> as its business data. Because it's one transaction against one database, it's atomic — the event is persisted if and only if the state change commits. Then <strong>CDC reads the outbox table from the log</strong> and publishes those events to Kafka. The broker is now downstream of a durable, ordered, transactional record.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>outbox-write.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">BEGIN;
+  -- 1. the business state change
+  UPDATE orders SET status = 'shipped' WHERE order_id = 90210;
+
+  -- 2. the event, in the SAME transaction — atomic with the state change
+  INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload)
+  VALUES (gen_random_uuid(), 'order', '90210', 'OrderShipped',
+          '{"order_id": 90210, "shipped_at": "2026-09-12T15:00:00Z"}');
+COMMIT;
+-- Debezium tails the WAL, reads new outbox rows, and publishes OrderShipped to Kafka.
+-- No dual write: one commit, one source of truth, CDC does the delivery.</code></pre>
+  </div>
+  <p>Debezium ships an <strong>Outbox Event Router</strong> SMT that reshapes outbox rows into properly-keyed topic events, so this is a well-trodden pattern rather than bespoke plumbing. In a design discussion, reach for the outbox whenever a service needs to reliably emit events alongside a state change — it's the correct answer to "how do we publish events without losing or duplicating them?"</p>
+</section>
+
+<section id="tooling">
+  <h2>The tooling landscape</h2>
+  <p>Know the categories and a representative name in each; that's enough to make a build-vs-buy call (Chapter <a href="07-build-vs-buy.html">07</a>) without reciting a vendor catalog.</p>
+  <table>
+    <thead>
+      <tr><th>Category</th><th>Examples</th><th>Model</th><th>Fits when</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Log-based OSS engine</strong></td><td>Debezium on Kafka Connect</td><td>Self-hosted OSS; you run connectors + Kafka</td><td>Log-based CDC to Kafka, full control, many sources, willing to operate it</td></tr>
+      <tr><td><strong>Managed ELT / connectors</strong></td><td>Fivetran, Airbyte, Fivetran HVR</td><td>Managed SaaS (Airbyte also self-host)</td><td>Broad source coverage incl. SaaS APIs; buy your way past connector maintenance</td></tr>
+      <tr><td><strong>Cloud-native DB migration/replication</strong></td><td>AWS DMS, GCP Datastream, Azure Data Factory CDC</td><td>Managed, cloud-scoped</td><td>Already in one cloud; DB→lake/warehouse replication without running Debezium</td></tr>
+      <tr><td><strong>Streaming CDC-to-lake platforms</strong></td><td>Estuary Flow, Confluent + connectors</td><td>Managed streaming</td><td>Real-time CDC into a lakehouse/streaming sink with exactly-once-style delivery</td></tr>
+    </tbody>
+  </table>
+  <p>Rough guide: <strong>Debezium</strong> when you want open, log-based CDC feeding a Kafka backbone and you can operate connectors and replication slots. <strong>Fivetran / Airbyte</strong> when connector breadth and "don't make me maintain this" beat control and cost. <strong>Cloud DMS / Datastream</strong> when you're single-cloud and want the provider to own the replication. <strong>Estuary / Confluent</strong> when the requirement is genuinely low-latency streaming CDC into a lakehouse.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <p>The decision the interviewer is really after: <strong>query-based is fine until it isn't, and log-based is the answer when correctness or latency matters.</strong> Reach for the decision sentence — "Given [requirement], I'd choose [approach], because [fit]; I'd revisit if [condition]."</p>
+  <div class="callout tip">
+    <span class="callout-label">The CDC decision heuristic</span>
+    <ul>
+      <li><strong>Query-based / batch diff is enough when:</strong> the freshness SLA is hourly or looser, tables are small-to-medium, rows are append-mostly or updates-only with a trustworthy <code>updated_at</code>, and <strong>hard deletes don't matter</strong> (or don't happen). It's cheap, needs only SELECT, and there's no connector to operate. Don't over-engineer past it.</li>
+      <li><strong>You need log-based when:</strong> deletes must be captured (GDPR erasure, cancellations), the freshness SLA is minutes or seconds, tables are large (full scans hurt the source), you need complete history / every intermediate state, or you can't trust <code>updated_at</code>. This is the default for replicating a core OLTP database.</li>
+      <li><strong>Trigger-based only when:</strong> you cannot get log access (locked-down or ancient DB) and you already need an audit table anyway — otherwise avoid it for the write-path cost.</li>
+      <li><strong>Use the outbox when:</strong> a service must reliably emit business <em>events</em> alongside a state change. Never dual-write.</li>
+    </ul>
+  </div>
+  <p>The mature answer names the flip condition: "I'd start query-based on <code>updated_at</code> — it meets the hourly SLA at near-zero ops cost — but I'd move to log-based Debezium the moment we need to capture deletes for compliance, or the freshness bar drops below the poll interval, or the source scans start showing up on the DBA's radar." That's a decision with a boundary, which is what the rubric rewards.</p>
+  <details class="collapse-card">
+    <summary><strong>Optional: the CDC answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Knows CDC means syncing DB changes downstream; would poll <code>updated_at</code> nightly; doesn't yet flag the delete problem.</li>
+        <li><strong>L2 · Practitioner.</strong> Distinguishes query-based from log-based, knows Debezium reads the WAL/binlog, understands snapshot-then-stream at a high level, lands changes with a MERGE.</li>
+        <li><strong>L3 · Senior.</strong> Owns the correctness story — deletes/tombstones, ordering by LSN not wall clock, idempotent sink for effectively-once, snapshot/stream handoff consistency, schema-change surfacing — and defends query-vs-log against the requirements with a flip condition.</li>
+        <li><strong>L4 · Staff.</strong> Frames state as a log of changes, reasons about the dual-write problem and prescribes the transactional outbox, weighs Debezium-vs-managed on TCO and lock-in, plans replay/backfill from the raw change log, and connects CDC choices to downstream modeling (SCD2), governance (PII deletion propagation), and cost at scale.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the biggest architectural fork of them all — and the trade-off matrix that decides it: <a href="05-batch-vs-streaming.html">05 · Batch vs Streaming</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
