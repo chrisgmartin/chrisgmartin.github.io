@@ -494,10 +494,18 @@
     if (!hasChapterNav) layout.classList.add('no-sidebar');
   }
 
+  // ===== Tag chapter cards that carry a number so CSS can lay them out as number | body =====
+  function markNumberedCards() {
+    document.querySelectorAll('.guide-card').forEach(card => {
+      if (card.querySelector(':scope > .number')) card.classList.add('numbered');
+    });
+  }
+
   // ===== Boot =====
   document.addEventListener('DOMContentLoaded', () => {
     mountTopNav();
     collapseEmptySidebar();
+    markNumberedCards();
     reorderSidebarSections();
     injectBreadcrumb();
     initFilterBar();
