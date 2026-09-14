@@ -55,7 +55,7 @@ window.FG = (function () {
     options: [
       { label: 'GitHub Sponsors', note: 'monthly or one-time · 0% fees', href: 'HOME' },
       { label: 'Card · Apple Pay · Google Pay', note: 'one-time or monthly', href: 'HOME' },
-      { label: 'Ko-fi', note: 'buy a coffee', href: 'HOME' },
+      { label: 'Ko-fi', note: 'buy a coffee', href: 'https://ko-fi.com/christophermxyz' },
       { label: 'ETH · USDC', note: 'Ethereum · Base', address: '' }
     ]
   };
