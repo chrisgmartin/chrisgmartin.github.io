@@ -36,7 +36,7 @@ Run each check. Gather results into a single summary at the end.
 - Parse `SITE_NAV` from `assets/script.js`.
 - For each topic: confirm `<topic.folder>/index.html` exists.
 - For each guide nested under a topic: confirm `<topic.folder>/<guide.folder>/index.html` exists.
-- Walk the disk: for each top-level directory **not** in `{assets, .claude, compliance-mcp}` and not a registered topic folder, flag it as an orphan.
+- Walk the disk: for each top-level directory **not** in `{assets, .claude, compliance-mcp, tools, job-finder}` and not a registered topic folder, flag it as an orphan.
 - For each registered topic folder, list its subdirectories: any subdirectory not listed in the topic's `guides` array is an orphan guide.
 
 ### 2. Asset paths (depth-aware)
@@ -78,6 +78,23 @@ Every page with `<aside class="sidebar">` should also contain `<button class="th
 `grep` all HTML files for `href="..."` values that look like local relative HTML paths (ends in `.html`, no `http://` or `https://`, no `mailto:`). For each, resolve relative to the source file and confirm the target exists.
 
 Skip anchor-only hrefs (`#section`).
+
+### 7. Registrations agree
+
+- `DOMAINS` in `assets/nav.js` lists the same topics/guides as `SITE_NAV` (same folders, same order).
+- Every guide in `SITE_NAV` has a `CHAPTERS` entry whose chapter files exist on disk (`python3 tools/nav/build-chapters.py`
+  should produce no diff except intentional hand-maintained entries).
+- The homepage atlas `D` array has one entry per topic with the right `count`; the footer totals match.
+
+### 8. Shared-asset version is uniform
+
+All pages and the two loads in `script.js` reference the same `?v=N` for `style.css`, `script.js`, `nav.css`, `nav.js`.
+Flag any stragglers (`grep -rnE '\?v=[0-9]+' --include='*.html' . assets/script.js | grep -v 'v=<N>'`).
+
+### 9. Every hub has a plate
+
+Each guide hub (and `claude-skills/index.html`) contains `<figure class="plate">` inside `.hero.has-plate`. List hubs
+without one (fix: add a spec to `tools/plates/boards.js` and run `tools/plates/build.py`).
 
 ## Output format
 

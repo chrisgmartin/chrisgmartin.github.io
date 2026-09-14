@@ -107,6 +107,15 @@
         { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
         { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
+    },
+    {
+      name: 'Claude Skills',
+      folder: 'claude-skills',
+      guides: [
+        { name: 'Data Engineering Skills', folder: 'data-engineering-skills' },
+        { name: 'dbt Agent Skills', folder: 'dbt-agent-skills' },
+        { name: 'Astronomer Agents — Airflow skills', folder: 'astronomer-agents' }
+      ]
     }
   ];
 
@@ -463,11 +472,11 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=4';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=7';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
-      fonts.href = 'https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap';
+      fonts.href = 'https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&family=Patrick+Hand&display=swap';
       document.head.appendChild(fonts);
     }
     // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
@@ -477,7 +486,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=4';
+    s.src = root + 'assets/nav.js?v=7';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a

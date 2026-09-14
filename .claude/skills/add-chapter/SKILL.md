@@ -47,7 +47,11 @@ Ask via AskUserQuestion if not provided:
    ```
    Add `<span class="tags"><span class="badge …"></span></span>` only if the user requested specific badges.
 
-5. Verify with `grep`:
+5. Regenerate the chapter manifest so the guide sub-bar, "NN of M" eyebrow and prev/next cards pick the chapter up:
+   `python3 tools/nav/build-chapters.py`, then bump the shared-asset version (CLAUDE.md → *Shared-asset versioning*).
+   Update the topic page's `.c` length and `.r` read time for the guide, and the hero `.stat` chapter total.
+
+6. Verify with `grep`:
    - The hub references the new file.
    - The previous chapter's `Next:` link points at the new file.
    - The new chapter's `<aside>` contains both `<h2>Sections</h2>` and `<h2>Navigation</h2>`.
@@ -58,3 +62,5 @@ Ask via AskUserQuestion if not provided:
 - Don't add a breadcrumb in the chapter file — it's injected by JS.
 - Don't add a `<div class="site-nav">` panel — it's injected by JS.
 - Every chapter must have a single `<h1>` inside `<main>` (used by the breadcrumb injector to label the current page).
+- Chapter files are served as clean URLs on Cloudflare (`…/NN-slug`), so never rely on the `.html` suffix in links you
+  build with JS; plain relative `href`s are fine.

@@ -17,13 +17,18 @@ Ask via AskUserQuestion if not provided:
 
 ## Steps
 
-1. Create `<folder>/index.html`, using `ai-engineering/index.html` as the structural template. Update:
-   - `<title>` and `<h1>` to the new topic name.
-   - Breadcrumb: `← Home  ›  <Topic name>` (aria-current).
-   - Hero subtitle = description.
-   - `.topic-head` shows `<span class="count">0 guides</span>` and an empty `<div class="guide-grid">` (or with a "coming soon" note).
+1. Create `<folder>/index.html`, using `data-engineering/index.html` as the structural template (the **Catalog** layout:
+   `<main class="wrap topic">`, crumbs, `.hero` with eyebrow "Topic" / h1 / subtitle / `.stat` line, a `.dist` format bar
+   with legend, then `.catalog` with a `.cat-head`, one `.cat-group` per format and numbered `<li><a>` rows carrying
+   `.n .t .d`, a `.badge.format-*`, `.c` (length) and `.r` (read time = chapters × 8 min)). Update:
+   - `<title>` and `<h1>` to the new topic name; breadcrumb `← Home › <Topic name>` (aria-current).
+   - Hero subtitle = description; `.stat` = `0 guides · 0 chapters` until guides exist.
+   - Optionally a plate beside the hero: add a spec keyed by the topic folder in `tools/plates/boards.js`, register the
+     page in `EXTRA` in `tools/plates/build.py`, run the builder (see `tools/plates/README.md`).
 
-2. Append a SITE_NAV entry in `assets/script.js`:
+2. Append a SITE_NAV entry in `assets/script.js` **and** a matching `DOMAINS` entry in `assets/nav.js`
+   (`{ label: '<short>', name: '<Topic name>', folder: '<folder>', guides: [] }` — `label` is the global-bar text; keep it
+   short, the bar has nine items):
    ```js
    {
      name: '<Topic name>',
@@ -32,7 +37,10 @@ Ask via AskUserQuestion if not provided:
    }
    ```
 
-3. Add a topic card to root `/index.html` inside the existing `<div class="guide-grid">`:
+3. Add the domain to the homepage atlas: append an entry to the `D` array in `/index.html` (name, href, count, caption,
+   and an *accurate* nodes/edges diagram in the 640×360 viewBox — see the existing seven). Bump the hand-written totals
+   in the section heading ("Eight domains") and footer ("N guides across N domains"). The old catalog card markup below
+   is no longer used:
    ```html
    <a class="guide-card" href="<folder>/index.html">
      <span class="name"><Topic name></span>
@@ -53,3 +61,5 @@ Ask via AskUserQuestion if not provided:
 
 - Topic folder name and SITE_NAV `folder` must match exactly.
 - New topics start with `guides: []`. Use the `add-guide` skill to populate.
+- Bump the shared-asset version after editing `script.js`/`nav.js` (CLAUDE.md → *Shared-asset versioning*).
+- For local review, symlink the new folder into `~/field-guides-experiments/palettes/site/`.
