@@ -478,8 +478,45 @@
     const guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
     s.src = root + 'assets/nav.js';
-    s.onload = () => { if (window.FG) window.FG.mount({ base: root, guidePath, current }); };
+    s.onload = () => {
+      if (!window.FG) return;
+      window.FG.mount({ base: root, guidePath, current });
+      enhanceChapter(root, guidePath, current);
+    };
     document.head.appendChild(s);
+  }
+
+  // ===== Chapter pages: "NN of M" in the eyebrow, rail meta, support card, prev/next cards =====
+  // Driven by the chapter manifest nav.js ships (FG.CHAPTERS) — no per-page markup needed.
+  function enhanceChapter(root, guidePath, current) {
+    const g = guidePath && current && window.FG.CHAPTERS && window.FG.CHAPTERS[guidePath];
+    if (!g) return;
+    const all = [];
+    (g.sections || []).forEach(s => s.chapters.forEach(c => all.push(c)));
+    const idx = all.findIndex(c => c.f === current);
+    if (idx < 0) return;
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const num = all[idx].n, total = all.length, base = root + guidePath + '/';
+
+    const eyebrow = document.querySelector('main .hero .eyebrow');
+    if (eyebrow && !/\bof\s+\d+\s*$/.test(eyebrow.textContent)) eyebrow.appendChild(document.createTextNode(' · ' + num + ' of ' + total));
+
+    const rail = document.querySelector('.sidebar nav');
+    if (rail) { const m = document.createElement('p'); m.className = 'chapter-meta'; m.textContent = 'Chapter ' + num + ' of ' + total; rail.appendChild(m); }
+
+    const main = document.querySelector('main');
+    if (!main) return;
+    const wrap = document.createElement('div'); wrap.className = 'chapter-end';
+    const sup = document.createElement('div'); wrap.appendChild(sup);
+    if (window.FG.supportCard) window.FG.supportCard(sup, { base: root });
+    const prev = all[idx - 1], next = all[idx + 1];
+    const pnx = document.createElement('nav'); pnx.className = 'pnx'; pnx.setAttribute('aria-label', 'Chapter navigation');
+    pnx.innerHTML =
+      (prev ? `<a href="${base + prev.f}"><span class="k">← Previous · ${esc(prev.n)}</span><span class="t">${esc(prev.t)}</span></a>` : '<span></span>') +
+      (next ? `<a class="next" href="${base + next.f}"><span class="k">Next · ${esc(next.n)} →</span><span class="t">${esc(next.t)}</span></a>` : '<span></span>');
+    wrap.appendChild(pnx);
+    const footer = main.querySelector(':scope > footer');
+    footer ? main.insertBefore(wrap, footer) : main.appendChild(wrap);
   }
 
   // ===== Collapse the sidebar where it carries no chapter navigation =====
