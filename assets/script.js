@@ -107,6 +107,15 @@
         { name: 'Payments Rails Atlas', folder: 'payments-rails-atlas' },
         { name: 'Choosing a KYC Vendor', folder: 'choosing-a-kyc-vendor' }
       ]
+    },
+    {
+      name: 'Claude Skills',
+      folder: 'claude-skills',
+      guides: [
+        { name: 'Data Engineering Skills', folder: 'data-engineering-skills' },
+        { name: 'dbt Agent Skills', folder: 'dbt-agent-skills' },
+        { name: 'Astronomer Agents — Airflow skills', folder: 'astronomer-agents' }
+      ]
     }
   ];
 
