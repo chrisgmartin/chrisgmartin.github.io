@@ -482,9 +482,22 @@
     document.head.appendChild(s);
   }
 
+  // ===== Collapse the sidebar where it carries no chapter navigation =====
+  // Topic pages and guide hubs only ever held the (retired) site-nav panel or
+  // an "On this page" list the sub-bar now covers; chapter pages keep their
+  // Sections/Navigation rail. Detect by the hand-authored <h2>Navigation</h2>.
+  function collapseEmptySidebar() {
+    const layout = document.querySelector('.layout');
+    const nav = document.querySelector('.sidebar nav');
+    if (!layout || !nav) return;
+    const hasChapterNav = Array.from(nav.querySelectorAll('h2')).some(h => h.textContent.trim() === 'Navigation');
+    if (!hasChapterNav) layout.classList.add('no-sidebar');
+  }
+
   // ===== Boot =====
   document.addEventListener('DOMContentLoaded', () => {
     mountTopNav();
+    collapseEmptySidebar();
     reorderSidebarSections();
     injectBreadcrumb();
     initFilterBar();
