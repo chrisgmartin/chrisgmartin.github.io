@@ -39,11 +39,11 @@ Asset paths are relative and depth-aware: `assets/…` (root), `../assets/…` (
 
 Every page links `style.css?v=N` / `script.js?v=N`, and `script.js` loads `nav.css?v=N` / `nav.js?v=N`. Cloudflare
 serves static assets with `max-age=14400`, so **whenever `style.css`, `script.js`, `nav.css` or `nav.js` changes,
-bump N everywhere** (currently `v=8`):
+bump N everywhere** (currently `v=9`):
 
 ```
-grep -rl 'v=8' --include='*.html' . | xargs perl -pi -e 's/(style\.css|script\.js|nav\.css|nav\.js)\?v=8/$1?v=8/g'
-perl -pi -e 's/(nav\.css|nav\.js)\?v=8/$1?v=8/g' assets/script.js      # BSD grep's --include skips explicit files — do this separately
+grep -rl 'v=9' --include='*.html' . | xargs perl -pi -e 's/(style\.css|script\.js|nav\.css|nav\.js)\?v=9/$1?v=9/g'
+perl -pi -e 's/(nav\.css|nav\.js)\?v=9/$1?v=9/g' assets/script.js      # BSD grep's --include skips explicit files — do this separately
 ```
 
 ## Design system
