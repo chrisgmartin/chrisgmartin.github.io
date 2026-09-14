@@ -463,7 +463,7 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=3';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=4';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
@@ -475,11 +475,23 @@
     let current = null;
     if (parts.length && /\.html?$/i.test(parts[parts.length - 1])) current = parts.pop();
     if (current && /^index\.html?$/i.test(current)) current = null;
-    const guidePath = parts.length >= 2 ? parts.join('/') : null;
+    let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=3';
+    s.src = root + 'assets/nav.js?v=4';
     s.onload = () => {
       if (!window.FG) return;
+      // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a
+      // known guide but its parent is, the last segment is the chapter slug — resolve it.
+      const C = window.FG.CHAPTERS || {};
+      if (guidePath && !C[guidePath] && parts.length >= 3) {
+        const parent = parts.slice(0, -1).join('/');
+        if (C[parent]) {
+          const slug = parts[parts.length - 1];
+          const all = []; (C[parent].sections || []).forEach(sec => sec.chapters.forEach(c => all.push(c.f)));
+          current = all.find(f => f === slug || f.replace(/\.html?$/i, '') === slug) || (slug + '.html');
+          guidePath = parent;
+        }
+      }
       window.FG.mount({ base: root, guidePath, current });
       enhanceChapter(root, guidePath, current);
     };
