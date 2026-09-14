@@ -126,10 +126,10 @@
   // The CSS link is already correct for the current page's depth, so we
   // reuse it to derive how many "../" we need to reach the repo root.
   function getRootPrefix() {
-    const link = document.querySelector('link[href$="assets/style.css"]');
+    const link = document.querySelector('link[href*="assets/style.css"]');
     if (!link) return '';
     const href = link.getAttribute('href');
-    return href.replace(/assets\/style\.css$/, '');
+    return href.replace(/assets\/style\.css(\?.*)?$/, '');
   }
 
   // Identify the current guide folder (if any) from the URL path.
@@ -461,9 +461,9 @@
   // Replaces the old "Browse all guides" sidebar panel.
   function mountTopNav() {
     const root = getRootPrefix();
-    if (!document.querySelector('link[href$="assets/nav.css"]')) {
+    if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=3';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
@@ -477,7 +477,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     const guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js';
+    s.src = root + 'assets/nav.js?v=3';
     s.onload = () => {
       if (!window.FG) return;
       window.FG.mount({ base: root, guidePath, current });
