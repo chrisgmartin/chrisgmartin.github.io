@@ -456,9 +456,35 @@
     }
   }
 
+  // ===== Top navigation (global bar + guide sub-bar), shared with the home page =====
+  // Loads assets/nav.css + assets/nav.js and mounts the bars at the top of <body>.
+  // Replaces the old "Browse all guides" sidebar panel.
+  function mountTopNav() {
+    const root = getRootPrefix();
+    if (!document.querySelector('link[href$="assets/nav.css"]')) {
+      const css = document.createElement('link');
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css';
+      document.head.appendChild(css);
+      const fonts = document.createElement('link');
+      fonts.rel = 'stylesheet';
+      fonts.href = 'https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap';
+      document.head.appendChild(fonts);
+    }
+    // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
+    const parts = location.pathname.split('/').filter(Boolean);
+    let current = null;
+    if (parts.length && /\.html?$/i.test(parts[parts.length - 1])) current = parts.pop();
+    if (current && /^index\.html?$/i.test(current)) current = null;
+    const guidePath = parts.length >= 2 ? parts.join('/') : null;
+    const s = document.createElement('script');
+    s.src = root + 'assets/nav.js';
+    s.onload = () => { if (window.FG) window.FG.mount({ base: root, guidePath, current }); };
+    document.head.appendChild(s);
+  }
+
   // ===== Boot =====
   document.addEventListener('DOMContentLoaded', () => {
-    injectSiteNav();
+    mountTopNav();
     reorderSidebarSections();
     injectBreadcrumb();
     initFilterBar();
