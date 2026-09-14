@@ -46,11 +46,12 @@ Ask via AskUserQuestion if not provided:
 
 3. Generate `<topic-folder>/<guide-folder>/00-START-HERE.html` via the `add-chapter` conventions. Asset paths are `../../assets/...`. No manual breadcrumb (auto-injected).
 
-4. Register in `assets/script.js` SITE_NAV. Locate the topic entry and append to its `guides` array:
-   ```js
-   { name: '<Guide display name>', folder: '<guide-folder>' }
-   ```
-   Watch comma placement when an entry already exists.
+4. Register the guide in **three** places:
+   - `assets/script.js` SITE_NAV — append to the topic's `guides` array: `{ name: '<Guide display name>', folder: '<guide-folder>' }`.
+   - `assets/nav.js` DOMAINS — append `['<Guide display name>', '<guide-folder>']` to the same topic (this is what the
+     global-bar dropdown shows).
+   - `assets/nav.js` CHAPTERS — run `python3 tools/nav/build-chapters.py` (reads the hub's section labels + chapter cards).
+   Then bump the shared-asset version (CLAUDE.md → *Shared-asset versioning*).
 
 5. Add a card to `<topic-folder>/index.html`:
    - Append a new `<a class="guide-card" href="<guide-folder>/index.html">` inside the existing `<div class="guide-grid">` with name, description, format badge, and tag chips. (Topic page is at depth 1; guide is its direct child, so href is just the guide folder.)
@@ -67,3 +68,6 @@ Ask via AskUserQuestion if not provided:
 - The topic name in the breadcrumb must exactly match the `name` field in the SITE_NAV topic entry (the auto-injected breadcrumb on chapter pages uses this string).
 - SITE_NAV only stores the topic folder + the guide folder name. The full path is reconstructed at runtime as `<topic.folder>/<guide.folder>/`.
 - Guide hubs are 2 levels deep — asset paths use `../../assets/...`, not `../assets/...`.
+- Hub heroes are wrapped by the plate builder as `.hero.has-plate > .hero-text + figure.plate`; write the hero normally
+  and let `build.py` do the wrapping.
+- Format badges are filled chips coloured by `--f-*` tokens; pick the right `format-*` class, never a colour.
