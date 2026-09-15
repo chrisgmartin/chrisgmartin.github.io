@@ -133,7 +133,7 @@ window.FG = (function () {
         h += '<div class="sp-row sp-crypto"><span class="sp-l"><span class="sp-name">' + esc(o.label) + '</span><span class="sp-note">' + esc(o.note) + '</span></span>' +
              '<button class="sp-copy" type="button" data-copy="' + esc(o.address) + '" title="Copy address"><code>' + esc(o.address) + '</code><span class="sp-copied" aria-live="polite"></span></button></div>';
       } else if (o.href) {
-        h += '<a class="sp-row" href="' + esc(resolve(o.href, base)) + '"' + (/^https?:/.test(o.href) ? ' target="_blank" rel="noopener"' : '') + '"><span class="sp-l"><span class="sp-name">' + esc(o.label) + '</span><span class="sp-note">' + esc(o.note) + '</span></span><span class="sp-arr">→</span></a>';
+        h += '<a class="sp-row" href="' + esc(resolve(o.href, base)) + '"' + (/^https?:/.test(o.href) ? ' target="_blank" rel="noopener"' : '') + '><span class="sp-l"><span class="sp-name">' + esc(o.label) + '</span><span class="sp-note">' + esc(o.note) + '</span></span><span class="sp-arr">→</span></a>';
       }
     });
     return h;
