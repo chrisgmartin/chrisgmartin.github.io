@@ -472,7 +472,7 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=9';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=10';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
@@ -486,7 +486,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=9';
+    s.src = root + 'assets/nav.js?v=10';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a
