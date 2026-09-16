@@ -91,7 +91,12 @@ Skip anchor-only hrefs (`#section`).
 All pages and the two loads in `script.js` reference the same `?v=N` for `style.css`, `script.js`, `nav.css`, `nav.js`.
 Flag any stragglers (`grep -rnE '\?v=[0-9]+' --include='*.html' . assets/script.js | grep -v 'v=<N>'`).
 
-### 9. Every hub has a plate
+### 9. Home page Latest is current
+
+`python3 tools/home/build-latest.py --check` exits 0 when the `<!-- LATEST:… -->` blocks match git history and the
+manifest. Flag a non-zero exit (fix: run the tool without `--check`).
+
+### 10. Every hub has a plate
 
 Each guide hub (and `claude-skills/index.html`) contains `<figure class="plate">` inside `.hero.has-plate`. List hubs
 without one (fix: add a spec to `tools/plates/boards.js` and run `tools/plates/build.py`).

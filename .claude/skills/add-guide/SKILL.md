@@ -51,6 +51,8 @@ Ask via AskUserQuestion if not provided:
    - `assets/nav.js` DOMAINS — append `['<Guide display name>', '<guide-folder>']` to the same topic (this is what the
      global-bar dropdown shows).
    - `assets/nav.js` CHAPTERS — run `python3 tools/nav/build-chapters.py` (reads the hub's section labels + chapter cards).
+   - Home page **Latest** — run `python3 tools/home/build-latest.py` (the new guide is the newest entry; it
+     derives recency from the hub's first commit, so run it again after committing if the order looks off).
    Then bump the shared-asset version (CLAUDE.md → *Shared-asset versioning*).
 
 5. Add a card to `<topic-folder>/index.html`:
