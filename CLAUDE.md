@@ -70,10 +70,13 @@ perl -pi -e 's/(nav\.css|nav\.js)\?v=11/$1?v=11/g' assets/script.js      # BSD g
 
 ## Workflow
 
-- Branch → commit → PR → merge; never commit design experiments. Experiments live outside the repo in
-  `~/field-guides-experiments/` (palette studies, plate gallery, review server).
-- **Local review**: `python3 ~/field-guides-experiments/palettes/serve-daemon.py` serves the repo's working tree at
-  `http://localhost:8765/` (a `site/` of symlinks — add a symlink when a new top-level folder appears).
+- Branch → commit → PR → merge; never commit design experiments. They live in **`experiments/`**, which is
+  gitignored — mocks, palette studies, plate galleries and the review server. Nothing under it is ever published,
+  and the project stays self-contained rather than scattering work outside the repo.
+- **Local review**: `python3 experiments/palettes/serve-daemon.py` serves the repo's working tree at
+  `http://localhost:8765/` — `experiments/palettes/site/` is a farm of *relative* symlinks back to the repo root, so
+  add one when a new top-level folder appears. Mock pages sit beside them (`latest.html`, `plates.html`,
+  `gallery.html`); each generator lives at `experiments/<topic>/gen.py` and derives its paths from `__file__`.
   Headless Chrome renders (`--headless=new --screenshot`) are the reliable way to check pages; the Chrome extension
   cannot screenshot localhost.
 - Run the `audit` skill before a PR. Keep `job-finder/` (ignored) and any personal material out of commits.
