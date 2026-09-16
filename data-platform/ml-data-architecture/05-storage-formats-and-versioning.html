@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Storage for ML: Lakehouse, Formats &amp; Dataset Versioning</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why storage is an ML problem</a>
+    <a href="#formats">Table formats for ML</a>
+    <a href="#unstructured">Tensors, images &amp; text</a>
+    <a href="#layout">Object-storage layout</a>
+    <a href="#versioning">Dataset versioning</a>
+    <a href="#griddp">Worked example: GridDP</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-feature-store.html">← Previous</a>
+    <a href="06-streaming-features.html">Next: Streaming Features &amp; Real-Time Inference Data →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The data</span>
+  <h1>Storage for ML: Lakehouse, Formats &amp; Dataset Versioning</h1>
+  <p class="subtitle">Where training data actually lives, which file and table formats earn their keep for ML workloads, how to lay out object storage so GPUs don't starve, and the one rule that makes a model reproducible a year later: a dataset is an immutable artifact.</p>
+</header>
+
+<section id="why">
+  <h2>Why storage is an ML problem, not a storage problem</h2>
+  <p>Analytics storage is judged on one axis: how cheaply can a query engine scan it. ML storage is judged on three. The training loop needs <strong>throughput</strong> — a GPU node reading Parquet at 200 MB/s will sit idle while the accelerator waits for the next batch. The feature pipeline needs <strong>time travel</strong> — "the value of <code>host_reliability_7d</code> as of March 1st" is a storage question before it is a join question. And the model needs <strong>reproducibility</strong> — six months after a fraud model ships, a regulator or an incident review will ask what rows it trained on, and "roughly the March extract" is not an answer.</p>
+  <p>The good news is that the lakehouse stack most platforms already run — columnar files on object storage, governed by a table format — gets you two of the three for free. This chapter is about the third axis, the places where ML diverges from analytics (unstructured data, tensor-shaped records, random-access reads), and the discipline of versioning that turns a pile of Parquet into a dataset.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>A <em>table</em> is a mutable thing that answers "what is true now". A <em>dataset</em> is an immutable thing that answers "what did the model see". The whole storage design for ML is about producing the second from the first — cheaply, repeatably, and with a name you can put in a model registry.</p>
+  </div>
+</section>
+
+<section id="formats">
+  <h2>Table formats for ML: Parquet, Iceberg, Delta, Hudi</h2>
+  <p>Start with the file layer. <strong>Parquet</strong> is the default for a reason: columnar, compressed, with per-row-group statistics so a reader can skip whole chunks. For tabular features — which is what ranking, fraud, churn, forecasting and pricing at GridDP all consume — nothing beats it for scan-heavy training reads. Its weaknesses show up at the edges: it is append-only at the file level (no in-place update), row-group granularity makes random access to a single record expensive, and it has no opinion about how many files make a table.</p>
+  <p>That last gap is what <strong>table formats</strong> fill. Iceberg, Delta Lake and Hudi all sit on top of Parquet and add a transaction log: which files belong to the table, what schema they carry, what snapshot they represent. For ML the three features that matter are snapshot isolation (a training job reads a consistent view while pipelines keep writing), <strong>time travel</strong> (query a past snapshot by ID or timestamp), and schema evolution (add a feature column without rewriting history).</p>
+  <table>
+    <thead>
+      <tr><th>Dimension</th><th>Apache Iceberg</th><th>Delta Lake</th><th>Apache Hudi</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Time travel</strong></td><td>Snapshot ID or timestamp; snapshots retained until expired explicitly</td><td>Version number or timestamp; retention via <code>VACUUM</code></td><td>Commit time; incremental queries between commits</td></tr>
+      <tr><td><strong>Engine neutrality</strong></td><td>Best — Spark, Trino, Flink, DuckDB, Snowflake, BigQuery all read/write</td><td>Spark-first; broad read support, narrower write support outside Databricks</td><td>Spark/Flink; narrower ecosystem</td></tr>
+      <tr><td><strong>Row-level updates</strong></td><td>Merge-on-read (v2 delete files, v3 deletion vectors)</td><td>Copy-on-write by default, deletion vectors optional</td><td>Copy-on-write or merge-on-read tables, chosen at creation</td></tr>
+      <tr><td><strong>Streaming upserts</strong></td><td>Good with Flink; compaction is your job</td><td>Good with Structured Streaming</td><td>Designed for it (record-level index, incremental pulls)</td></tr>
+      <tr><td><strong>Partition evolution</strong></td><td>Yes — hidden partitioning, change spec without rewrite</td><td>Liquid clustering replaces partitions</td><td>Manual</td></tr>
+      <tr><td><strong>Best for ML when</strong></td><td>Multi-engine platform, long snapshot retention, Stack A</td><td>Databricks-centric platform, Stack B</td><td>CDC-heavy upsert workloads feeding features</td></tr>
+    </tbody>
+  </table>
+  <p>The honest recommendation: pick the format your platform already governs with, and lean on its time travel for datasets. The mistake is not choosing "wrong" between these three; it is training from a table with no snapshot pinned at all, so that "the training set" silently changes every night the pipeline runs.</p>
+  <div class="callout warn">
+    <span class="callout-label">Snapshot expiry eats datasets</span>
+    <p>Every table format expires old snapshots to reclaim storage — Iceberg's <code>expire_snapshots</code>, Delta's <code>VACUUM</code>. Default retention is days, not years. A model registry that points at a snapshot the platform deleted in week two is a reproducibility promise you cannot keep. Either tag training snapshots (Iceberg branches/tags, Delta <code>CLONE</code>) or export the dataset to its own immutable location. Decide this before the first model ships, not at the first audit.</p>
+  </div>
+</section>
+
+<section id="unstructured">
+  <h2>Tensors, images &amp; text: when Parquet stops fitting</h2>
+  <p>Tabular features are the easy case. The moment a model consumes images (a GPU benchmark screenshot classifier), long text (support-ticket embeddings), or pre-computed vectors, Parquet's row-group access pattern becomes a tax. A training loader wants to fetch row 4,183,022 and its 1,536-dimensional embedding in one seek; Parquet wants to hand you a 128 MB row group and let you find it.</p>
+  <p><strong>Lance</strong> exists for exactly this. It is a columnar format with a fixed-size-list encoding for vectors, page-level random access, and a versioned dataset abstraction built in — you can append, add a column, and read any prior version without the table-format-on-top layer. LanceDB adds ANN indexes on the same files, which is why it shows up again in <a href="07-embeddings-and-vector-data.html">chapter 07</a>. For multimodal training sets — image bytes alongside labels and metadata — the alternatives are <strong>WebDataset</strong> (tar shards streamed sequentially to GPU workers), TFRecord, or the "Parquet for metadata, object-store URIs for blobs" split.</p>
+  <table>
+    <thead>
+      <tr><th>Data shape</th><th>Store it as</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Tabular features, labels</td><td>Parquet under Iceberg/Delta</td><td>Scan throughput, time travel, SQL-native</td></tr>
+      <tr><td>Embeddings (fixed-width vectors)</td><td>Lance, or Parquet fixed-size-list + external ANN</td><td>Random access, native vector encoding, index co-location</td></tr>
+      <tr><td>Images / audio / documents</td><td>Object store blobs + Parquet/Iceberg manifest of URIs and labels; WebDataset shards for training</td><td>Blobs don't belong in row groups; shards stream sequentially to workers</td></tr>
+      <tr><td>Telemetry time series</td><td>Parquet partitioned by time, or ClickHouse for serving</td><td>Range scans dominate; sort by (gpu_id, ts)</td></tr>
+      <tr><td>Event sequences (sessions, bids)</td><td>Parquet with nested list columns, one row per session</td><td>Keeps a sequence model's input contiguous</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="layout">
+  <h2>Object-storage layout: feeding GPUs without starving them</h2>
+  <p>S3, GCS and Azure Blob all have the same personality: high aggregate throughput, high per-request latency (tens of milliseconds), and a per-prefix request-rate ceiling. A training job that opens ten thousand 2 MB files will spend its life in request overhead; one that opens forty 512 MB files will saturate the network. The layout rules follow directly.</p>
+  <ul>
+    <li><strong>File size.</strong> Target 128–512 MB per Parquet file for training reads; compact small files produced by streaming writers before they reach a dataset. Table formats ship compaction jobs — schedule them.</li>
+    <li><strong>Partitioning.</strong> Partition by what the training query filters on (usually event date and maybe entity type), never by high-cardinality keys. Over-partitioning recreates the small-file problem one directory at a time.</li>
+    <li><strong>Sort within files.</strong> Sort by the entity key used in point-in-time joins (<code>account_id</code>, <code>host_id</code>) so row-group statistics prune, and so a loader reading one entity's history touches few pages.</li>
+    <li><strong>Sharding for parallel loaders.</strong> A distributed training job with 8 workers wants at least 8×N roughly equal shards it can claim without coordination. WebDataset and Lance both make shard = file.</li>
+    <li><strong>Locality and egress.</strong> Keep the dataset in the same region as the GPUs. Cross-region egress at training scale costs more than the storage; for a neocloud renting GPUs in several regions, replicate the dataset once per active region rather than pulling it per job.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>griddp-ml-bucket-layout.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">s3://griddp-lake/                      ← governed lakehouse (Iceberg catalog)
+  silver/fct_telemetry_hourly/         ← mutable tables, snapshots expire in 7d
+  silver/fct_rental/
+  features/host_reliability_7d/        ← offline feature store, SCD2, snapshots kept 400d
+
+s3://griddp-ml-datasets/               ← IMMUTABLE datasets (object lock / no delete role)
+  fraud-signup/v2026.03.01-a1f9c/      ← one prefix per dataset version
+    manifest.json                       ← snapshot ids, feature versions, row counts, splits
+    train/part-000{0..63}.parquet       ← 64 shards × ~300 MB, sorted by account_id
+    valid/part-000{0..07}.parquet
+    test/part-000{0..07}.parquet
+  ticket-embeddings/v2026.02.14-77bd0/
+    data.lance                          ← vectors + metadata, versioned in-format
+
+s3://griddp-ml-datasets-eu/            ← replica for EU GPU region, synced once per version
+</code></pre>
+  </div>
+</section>
+
+<section id="versioning">
+  <h2>Dataset versioning: the immutable-artifact rule</h2>
+  <p>Here is the rule, and it is not negotiable for anything that ships: <strong>a model trains from a named, immutable dataset version, and the model registry records that name.</strong> Not "the features table", not "last night's run" — a version with a manifest. There are four ways to get there, and they differ mostly in where the version lives.</p>
+  <table>
+    <thead>
+      <tr><th>Approach</th><th>How a version is expressed</th><th>Strengths</th><th>Watch out for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Table-format snapshots</strong> (Iceberg tags/branches, Delta versions)</td><td>Snapshot ID / version number on the governed table</td><td>Zero copy, SQL-native, same access control as the table</td><td>Retention policy; snapshots on a hot table accumulate; cross-table consistency is on you</td></tr>
+      <tr><td><strong>Exported dataset</strong> (copy to an immutable prefix)</td><td>A prefix + manifest listing sources and snapshot IDs</td><td>Survives table churn, cheap to replicate to GPU regions, trivial to audit</td><td>Storage cost per version; must record provenance in the manifest or it's just a copy</td></tr>
+      <tr><td><strong>LakeFS</strong> (Git semantics over object storage)</td><td>Branch / commit hash over the bucket</td><td>Atomic multi-table commits, branches for experiments, zero-copy</td><td>Another service in the path of every read; teams must adopt the branch workflow</td></tr>
+      <tr><td><strong>DVC / Git-tracked pointers</strong></td><td>Content hash in Git alongside code</td><td>Code + data versioned together; fine for research-scale data</td><td>Does not scale to lakehouse tables; duplicates the platform's catalog</td></tr>
+    </tbody>
+  </table>
+  <p>For a platform team the pragmatic pattern is the first two combined: pin snapshots for the point-in-time join, then <em>export</em> the joined, split training set to an immutable prefix with a manifest. The export is what the trainer reads (fast, sharded, regional) and what the registry names; the snapshot IDs in the manifest are what let you regenerate it if the export is ever lost.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>manifest.json</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-json">{
+  "dataset": "fraud-signup",
+  "version": "v2026.03.01-a1f9c",
+  "created_at": "2026-03-01T04:12:09Z",
+  "built_by": "pipelines/fraud_training_set@9e1d2c",
+  "sources": {
+    "features.acct_payment_age":   {"iceberg_snapshot": 6019873321, "registry_version": 4},
+    "features.device_ip_velocity": {"iceberg_snapshot": 6019873402, "registry_version": 2},
+    "labels.fraud_confirmed":      {"iceberg_snapshot": 6019870115, "label_delay_days": 45}
+  },
+  "point_in_time": {"prediction_ts_column": "signup_ts", "join": "asof"},
+  "splits": {"train": {"rows": 4183022, "end": "2026-01-31"},
+             "valid": {"rows":  512340, "start": "2026-02-01", "end": "2026-02-14"},
+             "test":  {"rows":  498115, "start": "2026-02-15", "end": "2026-02-28"}},
+  "schema_hash": "sha256:3c9f…",
+  "immutable": true
+}
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Time-based splits, recorded in the manifest</span>
+    <p>Random splits leak for any problem with a time dimension — and at GridDP every problem has one. Split by time (train on January, validate on early February, test on late February) and write the boundaries into the manifest so nobody has to guess later whether validation rows post-date training rows. The manifest is also where the label delay lives: a fraud label confirmed 45 days after signup means the last 45 days of any window are unlabeled, and the split boundaries must respect that.</p>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: GridDP's four models, four storage shapes</h2>
+  <p>Map the storage decisions onto the models from <a href="00-START-HERE.html">the case study</a>:</p>
+  <ul>
+    <li><strong>Ranking.</strong> Tabular features (DLPerf, reliability, price-vs-market) from Iceberg feature tables; nightly export of ~40 M offer-impression rows to a sharded Parquet dataset, sorted by <code>offer_id</code>. Snapshots tagged <code>rank-train-2026-03-01</code> so the point-in-time join can be re-run.</li>
+    <li><strong>Fraud.</strong> Smaller (a few million signups) but the manifest matters most here — a regulator may ask. Exported dataset with the label-delay window recorded; Iceberg snapshots retained 400 days on the feature tables that feed it.</li>
+    <li><strong>Capacity forecasting.</strong> Trains on <code>fct_telemetry_hourly</code> — the firehose rolled up. This is the one place file layout dominates: partition by day, sort by <code>(gpu_model, region, ts)</code>, compact to 256 MB files, and the forecaster reads two years of hourly rows in minutes instead of hours.</li>
+    <li><strong>Dynamic pricing.</strong> Bid-event sequences as nested lists in Parquet, one row per market-hour, so a sequence model gets contiguous input. Lance for the market-state embeddings the pricing team experiments with, versioned in-format.</li>
+  </ul>
+  <p>Four models, one governed lakehouse, one immutable-dataset bucket, one manifest schema. The variety is in the file layout, not in the process.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The storage-for-ML heuristic</span>
+    <ul>
+      <li><strong>Tabular features, any scale:</strong> Parquet under whichever table format your platform governs. Use its time travel; tag the snapshots you train on.</li>
+      <li><strong>Vectors or random-access records:</strong> Lance. Parquet if you must, with fixed-size lists and an external index.</li>
+      <li><strong>Images, audio, documents:</strong> blobs in object storage, a governed manifest table of URIs, WebDataset shards for the trainer.</li>
+      <li><strong>Reproducibility bar is "audit":</strong> export each training set to an immutable prefix with a provenance manifest; do not rely on snapshot retention alone.</li>
+      <li><strong>Several teams need atomic multi-table versions and branch-style experiments:</strong> LakeFS. Otherwise it is one more system to run.</li>
+      <li><strong>GPUs in more than one region:</strong> replicate the dataset per version, never per job.</li>
+    </ul>
+  </div>
+  <p>The mature answer names the seam: "Features live in Iceberg with SCD2 history and long snapshot retention; a training set is a point-in-time join pinned to snapshot IDs, exported as sharded Parquet to an immutable bucket with a manifest, and the manifest's version string is what the model registry records." Everything in the next nine chapters assumes that sentence.</p>
+  <details class="collapse-card">
+    <summary><strong>Optional: the storage answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Knows training data is Parquet on S3; trains from "the features table" as it exists today; splits randomly.</li>
+        <li><strong>L2 · Practitioner.</strong> Uses a table format and can query a past snapshot; splits by time; knows small files hurt throughput and compacts them.</li>
+        <li><strong>L3 · Senior.</strong> Exports named, immutable dataset versions with a provenance manifest; records label delay and split boundaries; lays out files and partitions for the trainer's access pattern; picks Lance/WebDataset for non-tabular data.</li>
+        <li><strong>L4 · Staff.</strong> Treats dataset versioning as a platform contract — registry names a dataset version, snapshot retention is set per table class, regional replication is part of the dataset lifecycle — and can explain the cost/reproducibility trade-off of each versioning approach to a finance partner and a regulator in the same meeting.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: the features that cannot wait for a nightly batch — <a href="06-streaming-features.html">06 · Streaming Features &amp; Real-Time Inference Data</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

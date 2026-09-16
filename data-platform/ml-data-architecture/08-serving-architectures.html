@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serving Architectures &amp; Training/Serving Skew</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Three ways a prediction reaches the product</a>
+    <a href="#paths">The three data paths, compared</a>
+    <a href="#budget">The latency budget</a>
+    <a href="#online-store">Choosing the online store</a>
+    <a href="#assembly">Input assembly &amp; caching</a>
+    <a href="#skew">Training/serving skew: the four sources</a>
+    <a href="#killing">Killing skew</a>
+    <a href="#griddp">Worked example: GridDP</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="07-embeddings-and-vector-data.html">← Previous</a>
+    <a href="09-lineage-and-reproducibility.html">Next: Lineage, Metadata &amp; Reproducibility →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Moving &amp; serving</span>
+  <h1>Serving Architectures &amp; Training/Serving Skew</h1>
+  <p class="subtitle">Batch scoring, online inference and streaming inference are three different data paths with three different failure modes. This chapter sizes the latency budget, picks the online store, assembles the model input — and then hunts the skew that makes a 0.94 model score 0.85 in production.</p>
+</header>
+
+<section id="why">
+  <h2>Three ways a prediction reaches the product</h2>
+  <p>Every ML serving question starts with one decision that is usually made by accident: <em>when</em> is the prediction computed relative to when it is used? Compute it ahead of time for every entity and you have <strong>batch scoring</strong> — cheap, simple, and stale by construction. Compute it on request and you have <strong>online inference</strong> — fresh, but now every millisecond of feature retrieval is on the product's critical path. Compute it as events arrive and you have <strong>streaming inference</strong> — the prediction is ready before anyone asks, at the cost of a stateful pipeline that never stops.</p>
+  <p>GridDP needs all three. Churn scores are batch — nobody needs a churn probability faster than the daily retention campaign that consumes it. Ranking is online — the offers must be scored for <em>this</em> search, with <em>these</em> filters, inside the page load. Fraud is streaming-then-online — velocity features stream continuously, the score is computed on the signup request. Capacity forecasts are batch with an hourly cadence; dynamic pricing is streaming, republished every minute per market. Matching the path to the decision is the first job; the second is keeping the features the model sees at serving time identical to the ones it trained on.</p>
+</section>
+
+<section id="paths">
+  <h2>The three data paths, compared</h2>
+  <table>
+    <thead>
+      <tr><th>Dimension</th><th>Batch scoring</th><th>Online inference</th><th>Streaming inference</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>When computed</strong></td><td>On a schedule, for all entities</td><td>On request, for one entity or a candidate set</td><td>On each event, continuously</td></tr>
+      <tr><td><strong>Feature source</strong></td><td>Offline store (lakehouse) directly</td><td>Online store + on-demand features from the request</td><td>Stream state + online store</td></tr>
+      <tr><td><strong>Latency of a prediction</strong></td><td>Hours (age of the batch)</td><td>Tens of ms</td><td>Seconds from event</td></tr>
+      <tr><td><strong>Where predictions land</strong></td><td>A table; pushed to the product via reverse ETL or read at request time as a "feature"</td><td>Returned in the response; logged</td><td>A topic / an online table the product reads</td></tr>
+      <tr><td><strong>Cost shape</strong></td><td>One big job; scales with entities, not requests</td><td>Serving fleet; scales with QPS and candidate-set size</td><td>Always-on stateful job; scales with event rate</td></tr>
+      <tr><td><strong>Skew risk</strong></td><td>Low — same store for training and scoring</td><td>High — two stores, two code paths, request-time features</td><td>High — windowed features (ch. 06)</td></tr>
+      <tr><td><strong>GridDP</strong></td><td>churn, capacity forecast</td><td>ranking, fraud decision</td><td>fraud velocity, dynamic pricing</td></tr>
+    </tbody>
+  </table>
+  <div class="callout insight">
+    <span class="callout-label">Batch scoring is underrated</span>
+    <p>If a prediction can be an hour old, precompute it and serve it as a lookup. The model runs once against the offline store — the same data it trained on — so the biggest class of skew simply cannot occur, and the serving path is a key-value read with no model in it. The strong architect's first question is always "can this be batch?", and the answer is yes more often than product teams expect.</p>
+  </div>
+</section>
+
+<section id="budget">
+  <h2>The latency budget</h2>
+  <p>Online inference lives inside a budget set by the product, and the model gets a slice of it. GridDP's search page allows ~50 ms server-side for ranking. A realistic split: 5 ms candidate retrieval (the ~80 offers that match the filters), 10 ms feature retrieval, 20 ms model inference across the candidate set, 5 ms post-processing and logging, 10 ms headroom for p99. Ten milliseconds of feature retrieval means <strong>one round trip</strong> to a store that answers in single-digit milliseconds, with all features for all candidates fetched in a batch — not a query per feature, and certainly not a query to the lakehouse.</p>
+  <ul>
+    <li><strong>Batch the reads.</strong> One multi-get for 80 offer keys × the feature vector each, not 80 × 12 single reads. Store all of an entity's features in one value (a hash or a serialized row) so the read count equals the entity count.</li>
+    <li><strong>Precompute joins.</strong> If the ranking model needs host features for each offer, materialize them onto the offer key at write time. Joins at request time are the budget's enemy.</li>
+    <li><strong>Bound the candidate set.</strong> Score 80 offers, not 8,000. Candidate generation (filters, a cheap first-stage model) is a data-architecture decision as much as a modeling one.</li>
+    <li><strong>Measure p99, budget for it.</strong> A store with 2 ms p50 and 40 ms p99 blows the budget one request in a hundred, which at search volume is constantly.</li>
+  </ul>
+</section>
+
+<section id="online-store">
+  <h2>Choosing the online store</h2>
+  <p>The online store holds the latest feature values per entity and answers key lookups fast. Everything else — durability, TTLs, multi-region, cost per read — is what distinguishes the options.</p>
+  <table>
+    <thead>
+      <tr><th>Store</th><th>p99 read</th><th>Strengths for features</th><th>Watch out for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Redis</strong> (or Valkey, managed variants)</td><td>&lt;1–2 ms</td><td>Fastest; hashes hold a whole feature vector; native TTL for streamed features; pipelining for batch reads</td><td>Memory-bound — cost scales with dataset size; persistence and failover need care; hot-key skew</td></tr>
+      <tr><td><strong>DynamoDB</strong></td><td>~5–10 ms</td><td>Serverless, durable, TTL, DAX cache in front if needed; pay per read</td><td>Item size limit (400 KB); cost at very high read rates; partition-key design</td></tr>
+      <tr><td><strong>Cassandra / ScyllaDB</strong></td><td>~2–5 ms</td><td>Huge keyspaces, tunable consistency, multi-region writes</td><td>Operational weight; compaction; you run it</td></tr>
+      <tr><td><strong>Bigtable</strong></td><td>~5 ms</td><td>Wide rows for time-versioned features; scales linearly</td><td>GCP-only; row-key design is everything</td></tr>
+      <tr><td><strong>Managed feature-store online tables</strong> (Databricks, Snowflake, Tecton, Vertex)</td><td>~5–20 ms</td><td>Materialization from the offline store is built in; one registry</td><td>Latency ceilings; cost; lock-in to the platform's serving path</td></tr>
+    </tbody>
+  </table>
+  <p>The rule: Redis when the working set fits in memory and the budget is single-digit milliseconds (ranking, fraud); DynamoDB or Bigtable when the keyspace is large and durable and 5–10 ms is fine (per-account features for a product surface with a looser budget); the managed online table when the platform team is small and the latency ceiling is acceptable. Whichever it is, the materialization from the offline store must be <em>the same job</em> that builds training features — that is where consistency is won.</p>
+</section>
+
+<section id="assembly">
+  <h2>Input assembly &amp; caching</h2>
+  <p>Between the store and the model sits input assembly: fetch precomputed features, compute on-demand features from the request, apply the same transformations the training pipeline applied (scaling, encoding, imputation), and lay it all out in the column order the model expects. This code path is where skew is born, so treat it as data infrastructure, not glue: the transformation code should be the <em>same artifact</em> the training pipeline used (a versioned preprocessing module shipped with the model), and the assembled vector should be logged.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>rank_request.py (input assembly, logged)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def score_search(request, candidates):                      # ~80 offers
+    keys = [f"offer:{c.offer_id}" for c in candidates]
+    precomputed = online_store.mget(keys)                    # ONE round trip; hash per offer holds host + offer feats
+
+    rows = []
+    for c, feats in zip(candidates, precomputed):
+        feats = feats or DEFAULTS                            # missing key → training-time defaults, never None
+        feats["price_vs_search_max"] = c.price_hr / request.max_price   # on-demand: depends on the request
+        feats["region_match"]        = int(c.region == request.region)
+        rows.append(feats)
+
+    X = preprocess(rows, spec=model.preprocess_spec)         # SAME versioned transform used in training
+    scores = model.predict(X)
+
+    feature_log.emit(request.id, model.version, rows, scores)   # log what the model actually saw
+    return rank(candidates, scores)
+</code></pre>
+  </div>
+  <p>Caching helps in two places and hurts in one. Cache assembled feature vectors for hot entities (the same 500 popular offers appear in most searches) with a TTL shorter than the feature freshness SLA. Cache model outputs for identical (entity, context) pairs when the context is coarse. Do not cache across a materialization boundary without invalidation — a cached vector that outlives the nightly refresh is a stale feature with a fast read time.</p>
+</section>
+
+<section id="skew">
+  <h2>Training/serving skew: the four sources</h2>
+  <p>Skew is any difference between the feature values a model saw in training and the values it sees in serving. It is the most common reason a model that evaluated well performs badly, and it comes from four distinct places, each with a distinct fix.</p>
+  <ol>
+    <li><strong>Definition skew.</strong> The feature is computed by different code offline and online — SQL in the training pipeline, Python in the service, a Flink job for the streamed version. Values disagree in edge cases: null handling, time-zone, window boundaries, integer division. The second-definition problem from <a href="06-streaming-features.html">chapter 06</a> is this.</li>
+    <li><strong>Freshness skew.</strong> Training used point-in-time-correct values (the feature as of the prediction time); serving reads the online store, which was materialized N hours ago. The model learned on values that were, on average, fresher or staler than what it sees live.</li>
+    <li><strong>Transformation skew.</strong> Scaling parameters, category encodings, imputation defaults computed on the training set and re-implemented — or recomputed — at serving. A new category ("B200") encodes as unknown offline and as a fresh index online.</li>
+    <li><strong>Leakage-induced skew.</strong> The training set contained information unavailable at serving time (a future label, a post-decision field). Offline the model leaned on it; online the field is missing or default. Strictly a training-data bug (<a href="02-training-data-pipelines.html">chapter 02</a>), but it presents as serving skew.</li>
+  </ol>
+  <div class="callout warn">
+    <span class="callout-label">Skew has no error message</span>
+    <p>Nothing throws. The service returns predictions, the dashboard shows traffic, offline evaluation still says 0.94. The only symptom is business metrics drifting weeks later and a label-lagged accuracy curve that eventually catches up. Skew must be <em>measured</em>, continuously, or it will be discovered by a product manager.</p>
+  </div>
+</section>
+
+<section id="killing">
+  <h2>Killing skew</h2>
+  <ul>
+    <li><strong>Log served features; train on the log.</strong> The single highest-leverage practice. The inference service records the assembled feature vector (and model version) for every scored request. Training sets are built by joining labels to <em>these logs</em>, not by recomputing features from the warehouse. Definition, freshness and transformation skew all vanish, because training data <em>is</em> serving data. Cost: log volume (sample if needed) and no backfill for brand-new features (bootstrap those from the offline store, then switch).</li>
+    <li><strong>One transform artifact.</strong> Preprocessing is a versioned module packaged with the model; the training pipeline and the serving path import the same one. Encodings and scaling parameters are fitted once and serialized into it.</li>
+    <li><strong>Materialize from the same definition.</strong> The offline feature table and the online store are written by the same feature pipeline; the online value is the latest row of the offline history, nothing else.</li>
+    <li><strong>Skew monitoring.</strong> Daily, for a sample of served requests: recompute the features from the offline store as of the request time, compare to the logged served values, report per-feature disagreement rate and magnitude. Alert at a tolerance. This catches definition and freshness skew within a day.</li>
+    <li><strong>Shadow before switch.</strong> A new model or feature pipeline runs in shadow, logging its would-be outputs against the live one; disagreement beyond expectation blocks the cut-over.</li>
+  </ul>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: GridDP ranking</h2>
+  <p>Ranking is GridDP's hardest serving problem because it is online, high-QPS and scores a candidate set. The design: offer and host features are materialized nightly and hourly into Redis hashes keyed by <code>offer_id</code> (host features denormalized onto the offer at write time, so a search needs one multi-get); a streamed <code>last_heartbeat_age</code> gates availability; two on-demand features come from the request. The service logs every assembled vector at 100% sampling to a Kafka topic that lands in Iceberg; the ranking training set is built from that log joined to click and rental outcomes. Preprocessing ships inside the MLflow model artifact. A daily skew job recomputes a 1% sample from the offline store and reports disagreement per feature — the tolerance is 1% of rows for any feature, and the day it fired was a Redis materialization job that silently failed for one region, leaving stale <code>price_vs_market</code> values: caught in 20 hours instead of at the next quarterly model review.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The serving heuristic</span>
+    <ul>
+      <li><strong>Can the prediction be an hour old?</strong> Batch-score against the offline store and serve a lookup. Most skew cannot happen.</li>
+      <li><strong>Must it use this request's context?</strong> Online inference: one batched read from the online store, on-demand features from the request, the training transform artifact, everything logged.</li>
+      <li><strong>Must it react to each event?</strong> Streaming inference; treat the windowed features with chapter 06's consistency discipline.</li>
+      <li><strong>Online store:</strong> Redis for single-digit ms and in-memory working sets; DynamoDB/Bigtable for large durable keyspaces at 5–10 ms; the platform's managed online table when the team is small and the ceiling fits.</li>
+      <li><strong>Skew:</strong> log served features and train on the log; one transform artifact; daily skew monitoring with a tolerance; shadow before switch.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the serving answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Puts the model behind an API that queries the warehouse per request; recomputes features in the service.</li>
+        <li><strong>L2 · Practitioner.</strong> Uses an online store with batched reads; knows batch vs online; has heard of training/serving skew.</li>
+        <li><strong>L3 · Senior.</strong> Sizes the latency budget and designs the read pattern to fit it; separates precomputed and on-demand features; ships one transform artifact; logs served features and trains from the log; monitors skew.</li>
+        <li><strong>L4 · Staff.</strong> Pushes every prediction that can be batch into batch; names the four skew sources and the mitigation for each; sets tolerances and shadow gates; can explain the cost curve of Redis vs DynamoDB vs a managed online table at the company's QPS and why the fraud path is streaming-then-online rather than either alone.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: how you prove, a year later, exactly which data and features produced a model — <a href="09-lineage-and-reproducibility.html">09 · Lineage, Metadata &amp; Reproducibility</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

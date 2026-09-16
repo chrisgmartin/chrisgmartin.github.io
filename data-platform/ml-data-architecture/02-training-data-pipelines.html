@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Training-Data Pipelines &amp; Point-in-Time Correctness</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why the join is the whole problem</a>
+    <a href="#spine">The spine: entity, prediction time, label</a>
+    <a href="#pit">The point-in-time join</a>
+    <a href="#splits">Splits, dedup and sampling</a>
+    <a href="#artifact">The dataset is an artifact</a>
+    <a href="#griddp">Worked example: the fraud set on each stack</a>
+    <a href="#heuristic">When to choose what</a>
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="01-the-ml-data-lifecycle.html">← Previous</a>
+    <a href="03-labels-and-feedback-loops.html">Next: Labels, Ground Truth &amp; Feedback Loops →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The data</span>
+  <h1>Training-Data Pipelines &amp; Point-in-Time Correctness</h1>
+  <p class="subtitle">How a training set is actually built — the entity-timestamp spine, the point-in-time join that keeps the future out, the split and dedup rules that keep validation honest, and why a dataset is a versioned artifact rather than a query.</p>
+</header>
+
+<section id="why">
+  <h2>Why the join is the whole problem</h2>
+  <p>Building a training set sounds like the easy part: take the labels, join the features, write Parquet. In practice it is where the most expensive ML bugs are born, because the join has a dimension analytics joins don't: <strong>time, as it was known to the system at a moment in the past</strong>. A fraud training row for a payment made on 3 March may only use feature values that existed on 3 March. Not the account's chargeback count as of today — that includes the very chargeback you are trying to predict.</p>
+  <p>Get this wrong and you get <em>leakage</em>: the training set contains information that would not have been available at prediction time. Leakage produces a model that looks superb offline (it is reading the answer) and useless in production (the answer isn't there). It is the single most common reason a model's offline AUC of 0.97 becomes a production precision of 0.4, and it is almost always a data-pipeline bug, not a modeling one.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>A training set is not a table. It is a <strong>set of snapshots</strong>: for each (entity, prediction time), the state of the world as of that instant, plus an outcome measured after it. Build it as a snapshot machine and leakage becomes structurally impossible rather than something you hope to catch in review.</p>
+  </div>
+</section>
+
+<section id="spine">
+  <h2>The spine: entity, prediction time, label</h2>
+  <p>Every training set starts from a <strong>spine</strong> — the list of examples, before any features. Each row is an entity key, a prediction timestamp, and (once known) a label. Everything else is joined <em>onto</em> the spine, never the other way round.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>spine — fraud model</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- One row per decision the model would have made: a payment attempt.
+-- prediction_ts is the instant the API would have called the model.
+CREATE TABLE ml.fraud_spine_v14 AS
+SELECT
+  p.payment_id                         AS entity_id,
+  p.account_id,
+  p.attempted_at                       AS prediction_ts,
+  -- label: a chargeback within 90 days. NULL if the 90d window hasn't closed yet.
+  CASE WHEN p.attempted_at &lt; now() - INTERVAL '90 days'
+       THEN COALESCE(cb.chargeback_id IS NOT NULL, FALSE) END AS label_chargeback_90d
+FROM  gold.fct_payment p
+LEFT JOIN gold.fct_chargeback cb
+       ON cb.payment_id = p.payment_id
+      AND cb.filed_at &lt;= p.attempted_at + INTERVAL '90 days'
+WHERE p.attempted_at BETWEEN DATE '2025-01-01' AND DATE '2026-06-01'
+  AND p.decision = 'approved';           -- ⚠ see ch. 03: declined payments have no label</code></pre>
+  </div>
+  <p>Three decisions are baked into those twenty lines and each is an architectural choice: the <strong>grain</strong> (one row per payment attempt, not per account), the <strong>prediction time</strong> (attempt time, not settlement time), and the <strong>label window</strong> (90 days, and rows whose window hasn't closed are unlabeled, not negative). Write these down in the dataset's registry entry. They are the definition of the problem.</p>
+</section>
+
+<section id="pit">
+  <h2>The point-in-time join</h2>
+  <p>With the spine fixed, every feature is joined <em>as of</em> <code>prediction_ts</code>. The offline store (ch. 04) keeps feature history as intervals — each value with a <code>valid_from</code> and <code>valid_to</code> — so the join is "find the last value whose <code>valid_from ≤ prediction_ts</code>". Modern engines have an <code>ASOF JOIN</code> for exactly this; where they don't, it is a window over a union.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>point-in-time join (DuckDB / Snowflake ASOF syntax)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">SELECT
+  s.entity_id, s.account_id, s.prediction_ts, s.label_chargeback_90d,
+  f1.value AS acct_chargebacks_lifetime,     -- as of prediction_ts, NOT today
+  f2.value AS acct_payment_velocity_1h,
+  f3.value AS bin_country
+FROM ml.fraud_spine_v14 s
+ASOF JOIN fs.acct_chargebacks_lifetime f1
+     MATCH_CONDITION (s.prediction_ts &gt;= f1.valid_from) ON s.account_id = f1.account_id
+ASOF JOIN fs.acct_payment_velocity_1h f2
+     MATCH_CONDITION (s.prediction_ts &gt;= f2.valid_from) ON s.account_id = f2.account_id
+ASOF JOIN fs.card_bin_country f3
+     MATCH_CONDITION (s.prediction_ts &gt;= f3.valid_from) ON s.card_bin = f3.card_bin;
+
+-- Spark / Trino without ASOF: window over the feature history
+-- SELECT ... FROM spine s JOIN feat f ON keys AND f.valid_from &lt;= s.prediction_ts
+-- QUALIFY ROW_NUMBER() OVER (PARTITION BY s.entity_id, feature ORDER BY f.valid_from DESC) = 1</code></pre>
+  </div>
+  <p>Two subtleties that separate a correct join from a plausible one:</p>
+  <ul>
+    <li><strong>Availability time vs event time.</strong> A feature computed nightly from yesterday's rentals is not <em>known</em> until the batch finishes at 06:00. Its <code>valid_from</code> must be the time the value became available to the online store, not the end of the window it summarises. Otherwise you train on a value the API could not have seen for six hours. Feature stores call this the <em>materialisation timestamp</em>; if yours doesn't track it, add a lag equal to the pipeline's cadence.</li>
+    <li><strong>Late-arriving source data.</strong> If a telemetry sample for 09:00 lands at 09:40, a feature recomputed at 10:00 will differ from the one served at 09:05. Decide once whether the offline value reflects "as computed at the time" (correct for training) or "as recomputed with full data" (correct for analytics). For training, prefer the former — log the served value (ch. 08) and use it.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Classic leaks, by name</span>
+    <ul>
+      <li><strong>Target leak:</strong> a feature derived from the label (chargeback count including this one; "account status = banned").</li>
+      <li><strong>Future leak:</strong> a feature computed over a window that ends after <code>prediction_ts</code> (a 7-day rolling sum aligned to calendar days).</li>
+      <li><strong>Availability leak:</strong> a nightly feature joined by event time rather than availability time (the six-hour problem above).</li>
+      <li><strong>Split leak:</strong> the same account in train and validation with a random split; the model memorises accounts.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="splits">
+  <h2>Splits, dedup and sampling</h2>
+  <p>A random 80/20 split is the right answer for i.i.d. tabular data and the wrong answer for nearly everything at GridDP, where rows are correlated by entity and by time.</p>
+  <table>
+    <thead><tr><th>Strategy</th><th>Use when</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Time-based split</strong> (train ≤ T, validate T…T+Δ)</td><td>Fraud, pricing, forecasting — anything deployed into the future</td><td>Mimics production: validation is literally "the next period". Reveals drift and label delay honestly.</td></tr>
+      <tr><td><strong>Group split by entity</strong></td><td>Ranking (many rows per renter), any model with repeated entities</td><td>Stops the model memorising an account/host and calling it generalisation.</td></tr>
+      <tr><td><strong>Time + group</strong></td><td>The default for request-path models</td><td>Both leaks at once are the norm, not the exception.</td></tr>
+      <tr><td><strong>Random split</strong></td><td>Genuinely independent rows; one-off experiments</td><td>Fine, but say why.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Dedup</strong> before splitting, keyed on <code>(entity_id, prediction_ts)</code>; duplicate spine rows (a payment retried three times) will land on both sides of any split. <strong>Sampling</strong> is a cost lever — the 150 M-samples-a-day telemetry firehose cannot be a training set — but must be documented and, for rare positives like fraud (≈0.3% of payments), stratified: downsample negatives, keep every positive, and record the sampling weight so the model's calibration can be corrected.</p>
+</section>
+
+<section id="artifact">
+  <h2>The dataset is an artifact</h2>
+  <p>The output of all this is not "a query you can re-run". Source tables change (late data, backfills, GDPR deletions), feature definitions get fixed, and a re-run six weeks later produces a different table with the same name. A training set must be <strong>materialised, immutable, hashed and registered</strong>, exactly like a model binary.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>dataset manifest — fraud_train_v14.yaml</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">name: fraud_train
+version: 14
+spine: ml.fraud_spine_v14            # snapshot id: iceberg 7f3a…  (ch. 05)
+prediction_window: [2025-01-01, 2026-06-01]
+label: label_chargeback_90d          # censored after 2026-03-03 (window not closed)
+features:                            # registry names + definition versions (ch. 04)
+  - acct_chargebacks_lifetime@3
+  - acct_payment_velocity_1h@2
+  - card_bin_country@1
+split: time; train &lt; 2026-01-01; valid 2026-01-01..2026-03-01; group_by: account_id
+sampling: negatives 1:20 stratified; weight column: sample_weight
+rows: {train: 4_812_330, valid: 1_106_912}
+storage: s3://griddp-ml/datasets/fraud_train/v14/   # parquet, immutable
+sha256: 9c1e…                        # of the file list + manifest
+built_by: dataset-builder 1.7.2, commit a41c0f, 2026-06-02T04:12Z</code></pre>
+  </div>
+  <p>The model registry entry for <code>fraud-xgb:2026-06-02</code> points at <code>fraud_train@14</code>, which points at Iceberg snapshot IDs and feature-definition versions. That chain — model → dataset → snapshots → definitions → code — is what "reproducible" means (ch. 09), and it is only possible because the dataset was frozen.</p>
+  <div class="callout tip">
+    <span class="callout-label">Tests that catch leakage before training does</span>
+    <ul>
+      <li>For every feature, assert <code>valid_from ≤ prediction_ts</code> on the joined result (a leak shows up as a violation, not as a suspiciously high AUC).</li>
+      <li>Train a trivial model on each feature alone; any single feature with near-perfect separation is a target leak until proven otherwise.</li>
+      <li>Assert no <code>account_id</code> appears in both train and valid when the split is grouped.</li>
+      <li>Diff the label rate and feature means between the last dataset version and this one; a jump is a pipeline change or a world change, and you want to know which before training.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: the fraud set on each stack</h2>
+  <p>On <strong>Stack A</strong>, the dataset builder is a Python job that reads the spine and feature tables from Iceberg via Spark, runs the window-based point-in-time join, writes Parquet to S3 and pins the Iceberg snapshot IDs it read in the manifest; Feast's <code>get_historical_features()</code> does the same join if the features are registered there. On <strong>Stack B</strong>, <code>FeatureEngineeringClient.create_training_set()</code> performs the point-in-time lookup against Delta feature tables with <code>timestamp_lookup_key</code>, and the Delta version is the snapshot. On <strong>Stack C</strong>, Snowflake's feature store generates the ASOF-joined dataset as a versioned <code>Dataset</code> object backed by an immutable stage. The primitives are the same everywhere: spine, interval-keyed feature history, as-of join, frozen output with a pointer back to what it read.</p>
+  <p>At GridDP's scale the fraud set is small (millions of rows). The capacity-forecasting set is not: 17,000 GPUs × hourly rollups × 18 months ≈ 220 M spine rows before features. That one is built incrementally — new months appended as new dataset versions that share earlier partitions — which is why chapter 05 cares so much about partition layout and snapshot semantics.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The training-data decision heuristic</span>
+    <ul>
+      <li><strong>Spine first, always.</strong> If you cannot state the grain, prediction time and label window in one sentence, you are not ready to join.</li>
+      <li><strong>ASOF join from interval-keyed history</strong> whenever a feature changes over time — which is every feature except static attributes. Join by availability time, not event time.</li>
+      <li><strong>Time-based split by default</strong>; add a group split when entities repeat. Random splits need a justification.</li>
+      <li><strong>Freeze the output.</strong> Manifest + hash + snapshot IDs. If rebuilding it is a notebook, it is not a dataset.</li>
+      <li><strong>Use the served vector when you have it</strong> (ch. 08): logging what the model actually saw sidesteps availability and late-data problems entirely for request-path models.</li>
+    </ul>
+  </div>
+  <p>The mature answer names the flip condition: "For the nightly forecaster, a scheduled SQL job with interval-keyed rollups is enough. The moment a request-path model uses a feature refreshed more often than daily, I move dataset assembly onto logged served vectors, because reconstructing 'what the API knew at 09:05' from batch tables is a losing game."</p>
+  <details class="collapse-card">
+    <summary><strong>Optional: the training-data answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Joins today's feature table to historical labels; random split; the notebook is the dataset.</li>
+        <li><strong>L2 · Practitioner.</strong> Knows leakage exists and time-splits; joins on event time; versions the model but rebuilds the data from live tables.</li>
+        <li><strong>L3 · Senior.</strong> Builds from a spine with an as-of join on availability time, group + time splits, stratified sampling with weights, and freezes the dataset with a manifest and snapshot pointers.</li>
+        <li><strong>L4 · Staff.</strong> Designs assembly around logged served vectors for online models and incremental partitioned datasets for the firehose; puts leakage tests in CI; can explain censoring and label delay to a data scientist and a lawyer.</li>
+      </ul>
+    </div>
+  </details>
+  <p>The label column deserves its own chapter, because "when is the truth known?" is a design question: <a href="03-labels-and-feedback-loops.html">03 · Labels, Ground Truth &amp; Feedback Loops</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

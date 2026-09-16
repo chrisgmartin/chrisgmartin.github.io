@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Governance, Privacy &amp; Compliance for ML Data</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why models change the rules</a>
+    <a href="#pii">PII in training data</a>
+    <a href="#purpose">Consent &amp; purpose limitation</a>
+    <a href="#deletion">Retention &amp; the deletion problem</a>
+    <a href="#access">Access tiers &amp; isolation</a>
+    <a href="#audit">Audit for models</a>
+    <a href="#dp">Differential privacy &amp; synthetic data, practically</a>
+    <a href="#griddp">GridDP: KYC, crypto rails &amp; payouts</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="10-data-quality-and-drift.html">← Previous</a>
+    <a href="12-cost-and-scale.html">Next: Cost, Scale &amp; Feeding the GPUs →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Governance, Privacy &amp; Compliance for ML Data</h1>
+  <p class="subtitle">A model is a derived dataset that has been compressed into weights — every governance obligation on the data follows it there. This chapter is what that means in practice: which data may train which model, how you honour a deletion request against something you can't delete from, who may read what, and how you prove all of it to an auditor.</p>
+</header>
+
+<section id="why">
+  <h2>Why models change the rules</h2>
+  <p>Governance on an analytics platform is about <em>tables</em>: who can read them, how long they are kept, which columns are sensitive. Governance for ML has to cover two more things. The first is <strong>derived artifacts</strong>: a training set is a copy of governed data, a feature table is a transformation of it, a model is a lossy compression of it, and each of those inherits the obligations of its source. The second is <strong>purpose</strong>: the same rental history that is legitimately used for billing may not be legitimately used to train a model that prices a customer differently, depending on what that customer consented to and what the regulator thinks a marketplace may do.</p>
+  <p>The practical consequence is that the ML data plane needs the same four instruments the rest of the platform has — <em>classification</em>, <em>access control</em>, <em>lineage</em>, and <em>retention</em> — applied one level further, to datasets, features, and models. The bad version of this chapter is a compliance checklist. The good version is a set of structural decisions that make the compliant thing the default thing.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Think of a trained model as a <em>materialized view over its training set</em> with an unknown refresh function. Anything you would have to do to a materialized view when its source changes — rebuild it, restrict it, retire it — you have to be <em>able</em> to do to the model. Design the plane so those operations exist.</p>
+  </div>
+</section>
+
+<section id="pii">
+  <h2>PII in training data</h2>
+  <p>Start from classification, because nothing else works without it. Every column in silver and every feature in the registry carries a sensitivity tag — <code>public</code>, <code>internal</code>, <code>confidential</code>, <code>pii</code>, <code>pii-special</code> (financial account numbers, government IDs, KYC documents). Tags are set at the source contract and propagate through lineage, so a feature derived from a PII column is PII until someone explicitly declassifies it with a justification.</p>
+  <p>Then apply <strong>minimization at the feature boundary</strong>. Models rarely need the raw identifier; they need a signal derived from it. The pattern that keeps most training sets clean:</p>
+  <table>
+    <thead>
+      <tr><th>Raw field</th><th>Why the model wants it</th><th>What to store instead</th><th>Technique</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Email address</td><td>Disposable-domain signal, account linking</td><td><code>email_domain_risk_tier</code>, <code>accounts_sharing_email_hash</code></td><td>Derive, then salted hash for the join key</td></tr>
+      <tr><td>IP address</td><td>Velocity, geo mismatch</td><td><code>ip_velocity_24h</code>, <code>ip_country_matches_billing</code>, /24 prefix</td><td>Aggregate; truncate; drop raw after 30 d</td></tr>
+      <tr><td>Card number / wallet address</td><td>Reuse across accounts</td><td>Tokenized reference from the payment vault</td><td>Tokenization — the platform never sees the PAN</td></tr>
+      <tr><td>KYC document, name, DOB</td><td>Verification outcome</td><td><code>kyc_outcome</code>, <code>kyc_vendor_score</code>, <code>age_bucket</code></td><td>Keep only the vendor's outcome; documents never enter the lake</td></tr>
+      <tr><td>Support-ticket text</td><td>Complaint / churn signal</td><td>Redacted text or topic embedding</td><td>Presidio-style PII redaction before embedding</td></tr>
+    </tbody>
+  </table>
+  <p>Two enforcement points make this real. The feature registry <strong>refuses to register</strong> a feature whose source columns are tagged <code>pii-special</code> unless a declassification review is attached. And the training-set builder <strong>refuses to run</strong> if any selected feature carries a tag above the model's approved tier. Both are simple policy checks against metadata you already have; they turn a memo into a build failure.</p>
+  <div class="callout warn">
+    <span class="callout-label">Embeddings are PII if the text was</span>
+    <p>An embedding of a support ticket that contains a name and an address is a transformation of PII, not an anonymization of it — inversion and membership-inference attacks are real. Redact <em>before</em> embedding, tag the vector table with the highest tag of its inputs, and put it under the same retention as the source text.</p>
+  </div>
+</section>
+
+<section id="purpose">
+  <h2>Consent &amp; purpose limitation</h2>
+  <p>GDPR, CCPA/CPRA, and most modern regimes tie data use to a <em>purpose</em>. Billing a rental is one purpose; training a dynamic-pricing model that may charge that customer more is a different one, and "improving our services" in a privacy policy does not automatically cover it. The engineering translation: <strong>consent is a feature of the entity</strong>, stored and versioned like any other, and it is a filter in every training-set builder.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>training_set_builder.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Purpose-limited training set: only accounts whose consent state, AS OF the prediction time,
+-- permitted use of their data for this model's registered purpose.
+WITH consent_asof AS (
+  SELECT l.account_id, l.prediction_ts, c.allows_model_training, c.jurisdiction
+  FROM ml.churn_labels l
+  ASOF JOIN silver.account_consent_history c
+    MATCH_CONDITION (l.prediction_ts &gt;= c.valid_from) ON l.account_id = c.account_id
+)
+SELECT ...
+FROM consent_asof
+WHERE allows_model_training = TRUE
+  AND jurisdiction NOT IN (SELECT jurisdiction FROM policy.model_training_exclusions
+                           WHERE model_purpose = 'churn_prediction');
+-- The builder records: purpose, consent version, exclusion list version → model registry metadata.
+</code></pre>
+  </div>
+  <p>Notice the join is point-in-time, like every other join in this guide. A customer who withdrew consent last week still legitimately appears in a training row from last year — the question is what was permitted <em>then</em>. And the builder records the consent-policy version it applied, so the model card can state exactly which population the model was allowed to learn from.</p>
+</section>
+
+<section id="deletion">
+  <h2>Retention &amp; the deletion problem</h2>
+  <p>A deletion request (GDPR Art. 17, CCPA deletion) is straightforward against tables: delete the rows, propagate through the lineage graph, expire the snapshots that still contain them. Against a model it is not: the account's data has been folded into weights and cannot be surgically removed. <strong>Machine unlearning</strong> exists as a research field and is not something you should promise a regulator. What you can do is architectural:</p>
+  <ul>
+    <li><strong>Bounded retention on training data.</strong> Training sets and feature history are kept for a declared window (say 24 months for behavioural features, 90 days for raw events). Every model trained on data past its window is retrained or retired. This bounds the exposure of any individual's data in any model.</li>
+    <li><strong>Deletion propagates to derived sets on a clock.</strong> The deletion job removes the entity from silver, feature tables, the offline store, the online store, the served-feature log, and the vector store — then expires lakehouse snapshots older than the deletion so time travel cannot resurrect it. Iceberg and Delta both support this; you must actually schedule <code>expire_snapshots</code> or the data is still there.</li>
+    <li><strong>Retrain cadence as the deletion SLA.</strong> If the fraud model is retrained monthly on a rolling window, an account deleted today is absent from every model within a month. Write that cadence down as the SLA and monitor it.</li>
+    <li><strong>Exclusion lists for the interim.</strong> Between deletion and the next retrain, the entity is on a hard exclusion list at inference — no predictions are made about it and no features are read for it.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Lakehouse time travel is a liability here</span>
+    <p>The same snapshot history that gives you reproducible training sets (<a href="05-storage-formats-and-versioning.html">chapter 05</a>) keeps deleted people alive. Pair every deletion job with a snapshot-expiry policy and a check that no <em>pinned</em> training snapshot older than the retention window is still referenced by a registered model. The tension between reproducibility and erasure is resolved by retention windows, not by hoping.</p>
+  </div>
+</section>
+
+<section id="access">
+  <h2>Access tiers &amp; isolation</h2>
+  <p>Access for ML follows the medallion tiers with two additions. Data scientists read gold and the feature store freely, silver with justification, bronze almost never — raw events are where the unredacted PII lives. The additions are <strong>per-feature access</strong> in the registry (a feature tagged <code>pii</code> is visible in the catalog to everyone but readable only by approved models and roles) and <strong>tenant isolation</strong>, which matters at GridDP because providers are businesses whose fleet telemetry is commercially sensitive.</p>
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>Who reads</th><th>Mechanism</th><th>ML-specific rule</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Bronze (raw)</td><td>Platform engineers; break-glass</td><td>Object-store IAM + catalog grants</td><td>Never a training source directly</td></tr>
+      <tr><td>Silver</td><td>Analytics engineers; ML engineers by domain</td><td>Catalog RBAC, column masking on PII tags</td><td>Feature pipelines run as a service identity with least privilege</td></tr>
+      <tr><td>Gold / feature store</td><td>Data scientists, models</td><td>Catalog RBAC + registry ACLs per feature</td><td>Models get a service identity; reads are logged to the served-feature log</td></tr>
+      <tr><td>Online store</td><td>Inference services only</td><td>Network policy + per-model credentials</td><td>No human read path in production</td></tr>
+      <tr><td>Provider telemetry</td><td>Aggregated for ML; raw only to the owning provider and supply ops</td><td>Row-level security on <code>host_id</code></td><td>Cross-provider features must be aggregated to ≥ k providers</td></tr>
+    </tbody>
+  </table>
+  <p>Column masking and row-level security are catalog features in all three reference stacks (Unity Catalog, Snowflake Horizon, Polaris/Nessie + engine policies); the ML-specific work is making the feature registry and the model registry <em>enforce</em> the same tags rather than merely display them.</p>
+</section>
+
+<section id="audit">
+  <h2>Audit for models</h2>
+  <p>The auditor's questions are always the same four: what data trained this model, was that data permitted, who can read the outputs, and can you reproduce the decision it made for this person on this date. Answering them from memory is not an option; answer them from artifacts the platform produces automatically:</p>
+  <ul>
+    <li><strong>Dataset card</strong> — generated by the training-set builder: source tables and snapshot IDs, feature list with sensitivity tags, consent-policy version, row count, class balance, retention window, builder commit hash.</li>
+    <li><strong>Model card</strong> — from the registry: dataset card reference, training code version, evaluation metrics by segment, intended purpose, approved tier, known limitations, the drift baseline.</li>
+    <li><strong>Lineage</strong> — the graph from source column to feature to dataset to model to serving endpoint (<a href="09-lineage-and-reproducibility.html">chapter 09</a>), queryable both ways: "which models used <code>kyc_outcome</code>?" and "what fed <code>ranking_v14</code>?".</li>
+    <li><strong>Decision log</strong> — the served-feature log plus the prediction, request ID, model version and timestamp, retained for the regulatory window (five years for financial decisions is common). This is what lets you explain a specific fraud decline.</li>
+  </ul>
+  <p>When these are produced by the pipeline rather than written by hand, an audit is a query. When they are not, an audit is a month.</p>
+</section>
+
+<section id="dp">
+  <h2>Differential privacy &amp; synthetic data, practically</h2>
+  <p>Two techniques get invoked as magic words; both are useful in narrow places. <strong>Differential privacy</strong> adds calibrated noise so that any single individual's presence in a dataset has a bounded effect on the output. It is excellent for <em>released aggregates</em> — GridDP publishing regional utilization statistics to providers, or an internal dashboard exposed widely — and workable for training via DP-SGD when the model is small and the accuracy cost (which can be large) is acceptable. It is not something to bolt onto the ranking model to satisfy a policy; the utility loss on a high-cardinality tabular model is usually unacceptable, and a mis-set epsilon provides no real guarantee.</p>
+  <p><strong>Synthetic data</strong> — generated to match the statistics of a real dataset — earns its keep for <em>development environments</em> (engineers build pipelines against realistic data without PII access), for <em>sharing with vendors</em>, and for augmenting rare classes. It does not earn its keep as a privacy substitute for training on the real thing: a generator overfit to a small population can reproduce real records. Rule of thumb: synthetic for non-production and for augmentation; real, minimized, purpose-checked data for the production model.</p>
+</section>
+
+<section id="griddp">
+  <h2>GridDP: KYC, crypto rails &amp; payouts</h2>
+  <p>GridDP's specifics sharpen every point above. <strong>KYC</strong> data — identity documents, vendor decisions — is <code>pii-special</code>; only the vendor outcome and score enter the platform, and the fraud model's dataset card must show it trained on outcomes, never documents. <strong>Crypto rails</strong> bring the Travel Rule and sanctions screening: wallet addresses are tokenized, screening results are features, and the transaction-monitoring model's decision log is retained for the AML window (five years) and queryable by transaction — that log is a regulatory record, not an ML convenience. <strong>Provider payouts</strong> make the fleet-telemetry isolation rule concrete: a capacity-forecasting feature like <code>region_free_gpu_hours_7d</code> is fine; a feature that reveals one identifiable provider's utilization to another is a commercial breach, so cross-provider features aggregate to at least k=5 hosts.</p>
+  <p>And the deletion story: an account requests erasure. The job removes it from silver and gold, the feature store (both stores), the served-feature log, the ticket-embedding vector store, and expires older snapshots; the account goes on the inference exclusion list; the next monthly retrain of churn, ranking and fraud drops it from the weights. Ledger entries and AML records are <em>retained</em> under the legal-hold exception and documented as such. The dataset cards for the next models show the deletion-list version they honoured.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The governance-for-ML heuristic</span>
+    <ul>
+      <li><strong>Always:</strong> sensitivity tags on every column and feature, propagated by lineage; minimize at the feature boundary; a retention window on training data with a retrain cadence that doubles as the deletion SLA; dataset and model cards generated by the pipeline.</li>
+      <li><strong>When a model affects money or access (fraud, pricing, KYC):</strong> purpose-limited builders with consent as a point-in-time feature; a decision log retained for the regulatory window; feature-level ACLs enforced by the registry.</li>
+      <li><strong>When you share data or aggregates externally:</strong> differential privacy on the aggregates; synthetic data for vendors and dev environments.</li>
+      <li><strong>When someone proposes unlearning:</strong> say no; bound retention and retrain instead.</li>
+      <li><strong>Multi-tenant supply data:</strong> row-level security on the owning entity and k-anonymity on cross-tenant features.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>The answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Knows PII shouldn't be in training data; would drop obvious columns; treats deletion as a table operation.</li>
+        <li><strong>L2 · Practitioner.</strong> Classifies columns, masks PII in silver, derives features instead of using raw identifiers, keeps a model registry with basic metadata, knows deletion must reach the feature store.</li>
+        <li><strong>L3 · Senior.</strong> Propagates tags through lineage into the feature and model registries and enforces them at build time; purpose-limits training sets with point-in-time consent; bounds retention and ties deletion to retrain cadence with interim exclusion lists; expires lakehouse snapshots; generates dataset/model cards and a decision log; applies row-level isolation to tenant data.</li>
+        <li><strong>L4 · Staff.</strong> Designs the plane so compliance is a build failure rather than a review — the registry, the builder and the deletion job share one policy engine; knows where DP and synthetic data genuinely help and where they are theatre; resolves the reproducibility-vs-erasure tension with explicit retention windows; can walk an auditor from a single fraud decline back to the source columns and consent version in one query.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: what all of this costs, and how to keep the GPUs busy without setting money on fire — <a href="12-cost-and-scale.html">12 · Cost, Scale &amp; Feeding the GPUs</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

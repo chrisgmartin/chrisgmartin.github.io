@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The ML Data Lifecycle &amp; Where It Breaks</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#stages">Eight stages, one loop</a>
+    <a href="#two-speeds">The two-speed problem</a>
+    <a href="#roles">Who owns which stage</a>
+    <a href="#where-it-breaks">Where each stage breaks</a>
+    <a href="#griddp">Worked example: the fraud model's first outage</a>
+    <a href="#heuristic">When to choose what</a>
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-training-data-pipelines.html">Next: Training-Data Pipelines &amp; Point-in-Time Correctness →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Orient</span>
+  <h1>The ML Data Lifecycle &amp; Where It Breaks</h1>
+  <p class="subtitle">The eight stages data passes through on its way to and from a model, the two speeds they run at, the roles that own them, and the specific place in each stage where production ML quietly goes wrong.</p>
+</header>
+
+<section id="stages">
+  <h2>Eight stages, one loop</h2>
+  <p>Analytics data has a direction: sources flow into a warehouse and out to dashboards. ML data has a <em>loop</em>, and the loop is why it needs its own architecture. Here are the stages, in the order data meets them at GridDP, with the artifact each one produces. Every later chapter is about one or two of these boxes.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>lifecycle.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  stage        produces                       GridDP example                         chapter
+  ─────────    ───────────────────────────    ────────────────────────────────────   ───────
+  1 collect    raw events, CDC, telemetry     fct_rental, bid events, GPU samples     (DPE 04)
+  2 label      ground truth per entity/time   chargeback? churned? clearing price     03
+  3 features   named, typed, timestamped      host_reliability_7d, bid_depth_5m       04, 06
+               values per entity
+  4 assemble   versioned training dataset     fraud_train_v14 (rows = payment,        02, 05
+               with point-in-time joins       prediction_ts, label, features)
+  5 train      model artifact + lineage       fraud-xgb:2026-09-01 in the registry    09, 12
+  6 serve      feature vector + prediction    &lt;100 ms P(fraud) on /payments           04, 07, 08
+  7 observe    predictions, outcomes, drift   score distribution, PSI, skew alerts    10
+  8 feed back  new labels + behaviour → 1     approved payments become next month's   03, 09
+                                              training rows (with survivorship bias)</code></pre>
+  </div>
+  <p>Two things to notice. First, stages 1–5 are <strong>batch-shaped</strong> — they care about throughput and correctness across history — while stage 6 is <strong>request-shaped</strong> — it cares about milliseconds and freshness. Second, stage 8 closes the loop back to stage 1, which is the difference between a data pipeline and a control system. A model that ranks listings changes which listings get clicked, which changes the clicks that train the next ranker. Ignore the loop and you will train on your own predictions.</p>
+</section>
+
+<section id="two-speeds">
+  <h2>The two-speed problem</h2>
+  <p>The defining architectural tension is that the same feature must exist at two speeds. Take <code>bid_depth_5m</code> — the number of interruptible bids on a GPU class in the last five minutes, used by both the pricing model and the fraud model.</p>
+  <table>
+    <thead><tr><th>Dimension</th><th>Offline (training)</th><th>Online (inference)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Question</strong></td><td>What was <code>bid_depth_5m</code> for every (GPU class, timestamp) in the last 18 months?</td><td>What is <code>bid_depth_5m</code> for H100-80GB <em>right now</em>?</td></tr>
+      <tr><td><strong>Shape</strong></td><td>Hundreds of millions of rows, window-aggregated over a history table</td><td>One key lookup</td></tr>
+      <tr><td><strong>Latency budget</strong></td><td>Minutes to hours</td><td>&lt; 10 ms for the lookup, so the whole request stays &lt; 100 ms</td></tr>
+      <tr><td><strong>Freshness</strong></td><td>Whatever the batch cadence is — the value as of each historical timestamp</td><td>Seconds — computed from the live bid stream</td></tr>
+      <tr><td><strong>Computed by</strong></td><td>SQL / Spark window over <code>fct_bid_event</code></td><td>Flink job keyed by GPU class, sliding window</td></tr>
+      <tr><td><strong>Stored in</strong></td><td>Lakehouse (Iceberg / Delta), full history</td><td>Redis / DynamoDB, latest value with a TTL</td></tr>
+    </tbody>
+  </table>
+  <p>Two engines, two stores, two codepaths — and the model was trained on the left column and is served from the right. If the SQL window counts bids with <code>status IN ('open','matched')</code> and the Flink job counts only <code>'open'</code>, the model sees a systematically different world in production than it was trained on. That is <strong>training/serving skew</strong>, and it is invisible in every offline metric. Every architecture in this guide is, in part, a strategy for collapsing the two columns into one definition. Chapters 04 and 06 are the mechanics.</p>
+  <div class="callout warn">
+    <span class="callout-label">The skew you can't see</span>
+    <p>Skew never fails loudly. The API returns valid floats, the model returns valid scores, and precision drifts down 4 points over a quarter. The only defence is measurement: log the served feature vector alongside the prediction, replay the offline pipeline for the same entities and timestamps, and compare. Chapter 10 builds that comparison; chapter 08 explains why you must log the vector, not recompute it.</p>
+  </div>
+</section>
+
+<section id="roles">
+  <h2>Who owns which stage</h2>
+  <p>ML data architecture fails at seams between teams as often as at seams between systems. A workable division at a company of GridDP's size (tens to low hundreds of internal data users):</p>
+  <table>
+    <thead><tr><th>Role</th><th>Owns</th><th>Their contract with the rest</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Data platform engineering</strong></td><td>Collect, the lakehouse, CDC/streaming, storage, governance, the feature store <em>infrastructure</em></td><td>Freshness and quality SLOs on silver/gold tables; the registry, offline/online stores and their SLAs</td></tr>
+      <tr><td><strong>ML platform engineering</strong></td><td>Feature pipeline framework, training-data assembly, registry, serving infrastructure, monitoring</td><td>"Define a feature here and it will be served consistently"; reproducible training datasets</td></tr>
+      <tr><td><strong>Data scientists / ML engineers</strong></td><td>Feature <em>definitions</em>, labels, models, evaluation</td><td>Features registered with owner, entity, TTL, tests; labels documented with their delay</td></tr>
+      <tr><td><strong>Product / domain teams</strong></td><td>Source events and their schemas (data contracts)</td><td>Don't change an event's meaning without a version bump; the ranker depends on it</td></tr>
+    </tbody>
+  </table>
+  <p>The failure pattern is when the middle row is missing: data scientists each build their own feature pipelines from raw tables, the platform team has no idea what depends on <code>fct_rental</code>, and the first schema change breaks three models. The feature registry (ch. 04) is as much an organisational device as a technical one — it is the place where a feature acquires an owner.</p>
+</section>
+
+<section id="where-it-breaks">
+  <h2>Where each stage breaks</h2>
+  <p>Each stage has a characteristic failure. Knowing them lets you diagnose a "the model is wrong" report in minutes instead of days, because you know which stage to interrogate first.</p>
+  <table>
+    <thead><tr><th>Stage</th><th>Characteristic failure</th><th>How it presents</th><th>Defence (chapter)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Collect</strong></td><td>Silent schema or semantic change upstream (a field's unit changes from seconds to ms)</td><td>Feature distribution shifts on a deploy date</td><td>Data contracts, schema registry, freshness/volume monitors (10; DPE 09–10)</td></tr>
+      <tr><td><strong>Label</strong></td><td>Delayed or censored labels; label leakage into features</td><td>Offline AUC 0.97, production precision collapses</td><td>Explicit label delay, censoring windows, leakage tests (02, 03)</td></tr>
+      <tr><td><strong>Features</strong></td><td>Two implementations of one feature (skew); features computed from data not yet available at prediction time</td><td>Offline/online value mismatch; step change in score distribution</td><td>Single definition, point-in-time semantics, skew monitoring (04, 06, 10)</td></tr>
+      <tr><td><strong>Assemble</strong></td><td>Non-reproducible training set; duplicate rows across splits; random split on time-series data</td><td>Can't rebuild last quarter's model; wildly optimistic validation</td><td>Datasets as versioned artifacts, time-based splits, dedup by entity (02, 05)</td></tr>
+      <tr><td><strong>Train</strong></td><td>Data loading starves GPUs; wrong dataset version picked up</td><td>10% GPU utilisation; "it was fine on my run"</td><td>Sharded, streaming loaders; registry links model → dataset hash (09, 12)</td></tr>
+      <tr><td><strong>Serve</strong></td><td>Stale or missing online features; feature assembly recomputes logic in the API</td><td>Defaults (zeros) served silently; p99 blows the latency budget</td><td>Online store SLAs, null-rate alerts, served-vector logging (08, 10)</td></tr>
+      <tr><td><strong>Observe</strong></td><td>Monitoring the model but not the data; no baseline</td><td>Drift discovered by a customer</td><td>Feature-level drift + skew + quality SLOs (10)</td></tr>
+      <tr><td><strong>Feed back</strong></td><td>Survivorship bias; training on own predictions</td><td>Model reinforces its own decisions; fraud model never sees fraud it blocked</td><td>Hold-out / exploration traffic, delayed-label design, bias-aware sampling (03)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: the fraud model's first outage</h2>
+  <p>Six weeks after GridDP's fraud model ships, chargebacks on approved payments double. The model's offline metrics are unchanged. The on-call ML engineer walks the stages:</p>
+  <ol>
+    <li><strong>Collect.</strong> Volume and schema monitors on <code>payments</code> are green. The upstream payments provider did, however, start returning <code>card_bin</code> as an integer instead of a zero-padded string on 1 September.</li>
+    <li><strong>Features.</strong> <code>bin_country</code> is derived from a lookup on <code>card_bin</code>. Offline, the batch pipeline casts to string and pads — the lookup still works. Online, the Flink enrichment does a raw string match on <code>"0412…"</code> vs <code>412…</code> — the lookup misses and the feature is served as <code>null</code>, which the model's imputer turns into "unknown country", a low-risk bucket.</li>
+    <li><strong>Serve.</strong> The null-rate on <code>bin_country</code> went from 0.3% to 41% on 1 September. There was no alert, because the null-rate monitor watched the offline table, which was fine.</li>
+  </ol>
+  <p>Nothing about the model was wrong. The feature had two implementations (two-speed problem), the upstream contract changed (collect), and monitoring watched the wrong side of the seam (observe). Three chapters of this guide exist because of exactly this story.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>"The model is wrong" is almost never a modeling statement. It is a hypothesis to be falsified stage by stage, starting from the seams: offline vs online, then vs now, features vs labels. Build the plane so those comparisons are cheap.</p>
+  </div>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">How much of this plane do you need?</span>
+    <ul>
+      <li><strong>One batch model, scored nightly</strong> (capacity forecasting alone): you need stages 1–5 and 7. No online store, no streaming. A lakehouse, point-in-time-correct SQL, versioned datasets and a drift check are enough. Don't buy a feature store yet.</li>
+      <li><strong>A request-path model with batch features</strong> (ranking with daily-refreshed features): add stage 6 with a materialised online store. Batch → KV sync is the whole "streaming" story.</li>
+      <li><strong>A request-path model with fresh features</strong> (fraud with velocity features, pricing): now you need the streaming path, a registry that enforces one definition across engines, and skew monitoring. This is where a feature store earns its keep.</li>
+      <li><strong>Several models sharing features across teams:</strong> the registry becomes organisational infrastructure; invest in discovery, ownership and tests (ch. 04, 09).</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the lifecycle answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Describes ML data as "collect, clean, train, deploy"; doesn't distinguish offline from online; would recompute features in the API.</li>
+        <li><strong>L2 · Practitioner.</strong> Names the offline/online split and training/serving skew; has hit leakage once; monitors model metrics but not feature distributions.</li>
+        <li><strong>L3 · Senior.</strong> Walks the eight stages with the characteristic failure of each; designs the seams to be measurable (served-vector logging, replay); assigns ownership per stage.</li>
+        <li><strong>L4 · Staff.</strong> Treats the loop as a control system — feedback, survivorship bias, exploration traffic — and sizes how much of the plane a given product needs, with the flip conditions for adding streaming and a registry.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the stage where the most expensive mistakes hide: <a href="02-training-data-pipelines.html">02 · Training-Data Pipelines &amp; Point-in-Time Correctness</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -57,7 +57,9 @@
         { name: 'Capstone Labs', folder: 'capstone-labs', group: DPE_CURRICULUM },
         { name: 'Career & Getting the Job', folder: 'career', group: DPE_CURRICULUM },
         { name: 'Glossary & Cheat Sheets', folder: 'glossary', group: DPE_CURRICULUM },
-        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' }
+        { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' },
+        { name: 'ML Data Architecture', folder: 'ml-data-architecture' },
+        { name: 'ML Data Architecture — Interview Prep', folder: 'ml-data-architecture-interview-prep' }
       ]
     },
     {
@@ -472,7 +474,7 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=10';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=11';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
@@ -486,7 +488,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=10';
+    s.src = root + 'assets/nav.js?v=11';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a

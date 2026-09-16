@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drill: Embedding &amp; RAG Data Infrastructure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#prompt">The prompt</a>
+    <a href="#clarify">Clarifying questions</a>
+    <a href="#moves">The five moves, applied</a>
+    <a href="#board">The whiteboard</a>
+    <a href="#tradeoffs">Trade-offs table</a>
+    <a href="#listening">What they're listening for</a>
+    <a href="#probes">Follow-up probes</a>
+    <a href="#levels">The answer at four levels</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-design-real-time-features.html">← Previous</a>
+    <a href="07-design-quality-and-drift.html">Next: Drill: Data Quality &amp; Drift Monitoring →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Drills</span>
+  <h1>Drill: Embedding &amp; RAG Data Infrastructure</h1>
+  <p class="subtitle">The 2024-onward classic: design the data plane that turns a corpus into embeddings, keeps them fresh, and serves retrieval for a product feature — with the freshness, cost and evaluation questions that separate a demo from a platform.</p>
+</header>
+
+<section id="prompt">
+  <h2>The prompt</h2>
+  <p>As the interviewer would say it:</p>
+  <div class="callout insight">
+    <span class="callout-label">Prompt</span>
+    <p>"We have a knowledge base of about two million documents — support articles, product manuals, internal runbooks — that changes daily. Product wants an assistant that answers customer questions grounded in that content, and later wants the same retrieval to power search and recommendations. Design the data infrastructure: how the documents become embeddings, how they stay current, how retrieval is served at scale, and how you'd know it's working. Assume you can call any embedding model."</p>
+  </div>
+  <p>Notice what the prompt is <em>not</em>: it isn't "pick a vector database". A candidate who opens with "I'd use Pinecone" has skipped four of the five moves. The interviewer wants to see the pipeline as a pipeline — sources, chunking, embedding as a versioned transformation, an index that is a <em>derived artifact</em> of a model version, serving with a latency budget, and an evaluation loop. The deep-dive treatment is in <a href="../ml-data-architecture/07-embeddings-and-vector-data.html">07 · Embeddings &amp; Vector Data</a>; this chapter is how you say it in the room.</p>
+</section>
+
+<section id="clarify">
+  <h2>Clarifying questions</h2>
+  <p>Spend two minutes here. Each question below moves a real design decision, and saying <em>why</em> you're asking is part of the score.</p>
+  <ul>
+    <li><strong>Corpus shape.</strong> "Two million documents — what's the size distribution? A 400-word article chunks very differently from a 90-page manual." <em>Drives chunking strategy and index size.</em></li>
+    <li><strong>Change rate and freshness.</strong> "What fraction changes per day, and how quickly must an edit be reflected — minutes, or is next-day fine?" <em>Drives batch vs incremental embedding and whether you need CDC on the source.</em></li>
+    <li><strong>Query load and latency.</strong> "Peak QPS on the assistant, and the retrieval budget inside the end-to-end response — say 50 ms of a 2 s budget?" <em>Drives index type, replication, caching.</em></li>
+    <li><strong>Access control.</strong> "Are any documents restricted — internal runbooks visible only to staff, per-tenant content?" <em>Drives metadata filtering and whether you need per-tenant indexes. This is the one most candidates forget.</em></li>
+    <li><strong>Modalities and languages.</strong> "Text only? Tables, images, PDFs with layout? Multiple languages?" <em>Drives the parsing layer and model choice.</em></li>
+    <li><strong>Model ownership.</strong> "Hosted embedding API or self-hosted? Any constraint on sending content to a third party?" <em>Drives cost, throughput and the compliance answer.</em></li>
+  </ul>
+  <p>Pin assumptions if they say "you decide": 2M docs averaging 1,500 tokens → ~6M chunks at ~500 tokens with overlap; 2% daily churn (~40k docs); 200 QPS peak; 50 ms retrieval budget; some content is tenant-restricted. Say the numbers back so everything after is anchored.</p>
+</section>
+
+<section id="moves">
+  <h2>The five moves, applied</h2>
+  <p>Run the method from <a href="02-the-method.html">02 · The Method</a> out loud. The order matters: requirements and signal first, then data, then the offline path, then the online path, then how you operate it.</p>
+
+  <h3>1 · Requirements &amp; signal</h3>
+  <p>The signal you're optimising is <em>retrieval quality for a downstream generator</em>, not vector similarity. Name the functional requirements (grounded answers with citations; freshness within an hour for edited articles; per-tenant isolation; three consumers — assistant, search, recs) and the non-functional ones (p95 retrieval ≤ 50 ms; 200 QPS peak with 5× headroom; cost ceiling; audit trail of which version of which document answered a question). Then estimate: 6M chunks × 1,536-dim float32 ≈ 6M × 6 KB ≈ <strong>37 GB of raw vectors</strong>; with int8 quantisation ~9 GB; an HNSW index adds ~1.5–2× overhead. That's one large node or a small cluster — not a "big data" problem, which changes the conversation about tooling.</p>
+
+  <h3>2 · Sources &amp; labels</h3>
+  <p>Sources: a CMS with an API and change events, a document store of PDFs, a wiki. Each needs a <em>parser</em> (HTML → text, PDF with layout awareness, tables preserved as tables) and a stable <strong>document identity</strong> plus a content hash — the hash is what makes incremental re-embedding cheap. The "labels" in a RAG system are the <strong>evaluation set</strong>: a few hundred real questions with known good passages and answers, built from support tickets and curated by the people who own the content. Say early that you'd build this set in week one, because without it every later tuning decision is a guess. Deep dive: <a href="../ml-data-architecture/03-labels-and-feedback-loops.html">03 · Labels &amp; Feedback Loops</a>.</p>
+
+  <h3>3 · The offline path</h3>
+  <p>Ingest → parse → chunk → embed → index, as a versioned pipeline:</p>
+  <ul>
+    <li><strong>Land raw documents</strong> in object storage with metadata (source, tenant, ACL, updated_at, content hash). This is the system of record for "what did the assistant know at time T".</li>
+    <li><strong>Chunk deterministically</strong> — a chunker version is part of the lineage. Semantic or heading-aware chunking beats fixed windows for manuals; fixed windows with overlap are fine for articles. Store chunks as rows in a lakehouse table (<a href="../ml-data-architecture/05-storage-formats-and-versioning.html">Lance or Iceberg</a>) keyed by <code>(doc_id, chunk_idx, chunker_version)</code>.</li>
+    <li><strong>Embed in batch</strong> with the embedding-model version in the key. Throughput math: 6M chunks on a hosted API at ~1,000 chunks/s aggregate is ~100 minutes for a full rebuild; a self-hosted model on one GPU does ~200–500 chunks/s. Incremental daily load is ~120k chunks — trivial either way. The <em>full rebuild</em> is the scenario you size for, because a model upgrade forces it.</li>
+    <li><strong>Build the index as a derived artifact</strong> — the vector index is to the chunk table what a warehouse mart is to bronze data. It has a version, it can be rebuilt from the table, and you swap it atomically (blue/green) rather than mutating it in place during a model migration.</li>
+  </ul>
+
+  <h3>4 · The online path</h3>
+  <p>Query → embed the query (same model version as the index, non-negotiable) → ANN search with metadata filters (tenant, ACL, doc type) → optional rerank with a cross-encoder on the top 50 → return top-k with citations. Latency budget: query embedding 10–15 ms, ANN 5–15 ms, rerank 20–30 ms — it fits in 50 ms only if the reranker is small or skipped for search. Filters are the design trap: post-filtering after ANN destroys recall for small tenants, so you either pre-filter (partitioned index per tenant when tenants are large and few) or use an engine that filters during traversal. Serving detail lives in <a href="../ml-data-architecture/08-serving-architectures.html">08 · Serving Architectures</a>.</p>
+
+  <h3>5 · Operate</h3>
+  <p>Freshness: CDC or webhooks from the CMS feed a small streaming job that re-parses, re-chunks and re-embeds changed documents within minutes, and <em>tombstones</em> deleted ones — a stale-but-present chunk is worse than a missing one when the answer is a citation. Evaluation: retrieval recall@k and answer faithfulness on the golden set, run on every model/chunker change and nightly against a sampled live traffic replay. Monitoring: index size, embed lag, filter-hit ratios, share of queries with low top-1 similarity (the "we don't know" signal). Cost: embedding calls and reranking dominate the API bill; vectors are cheap to store.</p>
+</section>
+
+<section id="board">
+  <h2>The whiteboard</h2>
+  <p>Draw the offline path left to right on the top half, the online path on the bottom, and the index in the middle where they meet. Label the versions — that's what makes it look like you've run one.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>rag-data-plane.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">OFFLINE (versioned pipeline)
+ CMS ─┐   ┌─────────┐  ┌──────────┐  ┌───────────────┐  ┌──────────────────────┐
+ PDFs ├──▶│ parse   │─▶│ chunk    │─▶│ embed         │─▶│ chunks table (Lance)  │
+ wiki ┘   │ (v3)    │  │ (v2,     │  │ model=e5-v2   │  │ doc_id, chunk_idx,    │
+ CDC/     └─────────┘  │  512±64) │  │ batch: 6M     │  │ text, vec, tenant,    │
+ webhooks              └──────────┘  │ incr: 120k/d  │  │ acl, hash, versions   │
+   │ deletes → tombstones             └───────────────┘  └──────────┬───────────┘
+   │                                                                │ build (blue/green)
+   ▼                                                                ▼
+ raw docs (object store, system of record)              ┌───────────────────────┐
+                                                        │ ANN index (HNSW)      │
+ONLINE                                                  │ + metadata filters     │
+ query ─▶ embed (same model) ─▶ pre-filter tenant/acl ─▶│ top-50                │─▶ rerank ─▶ top-5 + citations
+            ~12 ms                                       └───────────────────────┘   ~25 ms
+                                                                    ▲
+ eval loop: golden set (300 Q/A) → recall@k, faithfulness ── nightly + on every version change
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Say the seam out loud</span>
+    <p>"The index is a derived artifact of the chunk table and a model version. When we upgrade the embedding model, we rebuild into a second index, run the golden set against both, and cut over — we never query an index with a mismatched model." That sentence answers three follow-ups before they're asked.</p>
+  </div>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs table</h2>
+  <table>
+    <thead><tr><th>Fork</th><th>Option A</th><th>Option B</th><th>Pick A when</th><th>Flip to B when</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Embedding model</strong></td><td>Hosted API</td><td>Self-hosted open model</td><td>Small team, corpus &lt; ~10M chunks, no data-residency constraint</td><td>Content can't leave the boundary, rebuilds are frequent, or API cost passes a GPU's monthly cost</td></tr>
+      <tr><td><strong>Chunking</strong></td><td>Fixed window + overlap</td><td>Structure-aware (headings, sections)</td><td>Homogeneous short articles</td><td>Manuals, contracts, anything where a heading carries meaning</td></tr>
+      <tr><td><strong>Vector store</strong></td><td>Extension in an existing DB (pgvector)</td><td>Dedicated engine (Qdrant, Weaviate, Milvus, managed)</td><td>&lt; ~5M vectors, modest QPS, team already runs Postgres</td><td>Tens of millions of vectors, filtered search at high QPS, multi-tenant isolation needs</td></tr>
+      <tr><td><strong>Freshness</strong></td><td>Nightly batch re-embed of changed docs</td><td>Streaming incremental via CDC/webhooks</td><td>Next-day staleness is acceptable</td><td>Edits must show within minutes (support content during an incident)</td></tr>
+      <tr><td><strong>Filtering</strong></td><td>Single index + filter during search</td><td>Index per tenant/segment</td><td>Many small tenants, engine supports filtered HNSW</td><td>Few large tenants or strict isolation/audit requirements</td></tr>
+      <tr><td><strong>Reranking</strong></td><td>None (ANN top-k straight through)</td><td>Cross-encoder rerank of top-50</td><td>Latency-critical search, good enough recall</td><td>Answer quality matters more than 20 ms; assistant use case</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="listening">
+  <h2>What the interviewer is listening for</h2>
+  <ul>
+    <li><strong>Versioning discipline.</strong> Chunker version, model version, index version — and that a model change means a rebuild and a cut-over, not an in-place mutation.</li>
+    <li><strong>Deletes and ACLs.</strong> Tombstoning removed content and enforcing tenant/ACL filters at retrieval. Leaking a restricted runbook into a customer answer is the failure that ends a project.</li>
+    <li><strong>An evaluation loop that exists before tuning starts.</strong> A golden set, recall@k and faithfulness, run automatically.</li>
+    <li><strong>Sizing that shows the problem is small.</strong> 37 GB of vectors is a node, not a cluster — a candidate who reaches for a distributed system reflexively has not done the arithmetic.</li>
+    <li><strong>The reuse story.</strong> Search and recommendations reuse the chunk table and index, not a second pipeline.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Follow-up probes</h2>
+  <p>Expect three or four of these. Each strong answer is a sentence or two, then an offer to go deeper.</p>
+  <ul>
+    <li><strong>"The embedding model vendor releases a better model. Walk me through the migration."</strong> — Full re-embed into a new index version (about 100 minutes for 6M chunks at 1k/s), evaluate both on the golden set plus a shadow read on live traffic, cut over behind a flag, keep the old index for a week for rollback. Query embedding and index version are pinned together in config so they can't drift.</li>
+    <li><strong>"A customer asks a question and gets an answer from a document that was deleted yesterday."</strong> — Deletion path is broken or too slow: the source emits deletes as tombstones, the incremental job removes the chunks and the index entries, and there's an alert on "deleted docs still present in index" reconciled nightly against the source. I'd also add the document's <code>updated_at</code> to the citation so staleness is visible.</li>
+    <li><strong>"How do you know retrieval is good enough — not the LLM, the retrieval?"</strong> — Separate metrics: recall@k and MRR on the golden set for retrieval; faithfulness and answer correctness for generation. Track them separately so a regression is attributable.</li>
+    <li><strong>"Multi-tenant: one index or many?"</strong> — Depends on tenant size distribution. Filtered search in one index for many small tenants; partitioned indexes for a handful of large ones or where isolation must be provable. Never post-filter after ANN for small tenants — recall collapses.</li>
+    <li><strong>"Costs are 3× projection. Where's the money?"</strong> — Almost always embedding and rerank API calls, not storage: cache query embeddings for repeated questions, batch offline work, quantise vectors, skip reranking for the search surface, and check for a re-embed loop caused by hash instability.</li>
+    <li><strong>"Tables and images inside the manuals?"</strong> — Parse tables into a structured text form or embed them separately with a table-aware model; images get captions or a multimodal embedding, stored as their own chunk type with a modality field so retrieval can route.</li>
+  </ul>
+</section>
+
+<section id="levels">
+  <h2>The answer at four levels</h2>
+  <details class="collapse-card">
+    <summary><strong>How the same design reads at L1 → L4</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Chunk documents, embed them, put them in a vector DB, do similarity search. Names a tool; no versions, no freshness story, no ACLs.</li>
+        <li><strong>L2 · Practitioner.</strong> Adds a real pipeline: parsing, overlap chunking, batch embedding, a nightly refresh, metadata filters, and top-k with a reranker. Knows recall@k exists.</li>
+        <li><strong>L3 · Senior.</strong> Sizes the corpus and shows it's one node; treats the index as a derived, versioned artifact with blue/green cut-over; incremental freshness via CDC with tombstones; pre-filtering for tenants; a golden set built before tuning; separates retrieval and generation metrics.</li>
+        <li><strong>L4 · Staff.</strong> Frames it as a platform serving three consumers from one chunk table; reasons about cost drivers and when to self-host; designs the migration and rollback path; anticipates the ACL leak and the stale-citation failure as the two incidents that would kill trust, and puts monitors on both; knows when a plain Postgres + pgvector is the right answer.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next drill: the operating side of every system you've designed so far — <a href="07-design-quality-and-drift.html">07 · Drill: Data Quality &amp; Drift Monitoring</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drill: Training Data with Point-in-Time Correctness</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#prompt">The prompt</a>
+    <a href="#clarify">Clarifying questions</a>
+    <a href="#requirements">Move 1 · Requirements &amp; estimate</a>
+    <a href="#leakage">Where leakage comes from</a>
+    <a href="#architecture">The board</a>
+    <a href="#spine">The spine and the as-of join</a>
+    <a href="#versioning">Versioning the dataset</a>
+    <a href="#splits">Splits, sampling &amp; the label delay</a>
+    <a href="#tradeoffs">Trade-offs</a>
+    <a href="#listening">What the interviewer is listening for</a>
+    <a href="#probes">Follow-up probes</a>
+    <a href="#levels">The answer at four levels</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="03-design-a-feature-store.html">← Previous</a>
+    <a href="05-design-real-time-features.html">Next: Drill: Real-Time Features for Fraud &amp; Ranking →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Drills</span>
+  <h1>Drill: Training Data with Point-in-Time Correctness</h1>
+  <p class="subtitle">"Our churn model looks great offline and falls over in production." Designing the pipeline that builds an honest training set — the spine, the as-of join, availability time, versioning, splits — and how to defend every part of it.</p>
+</header>
+
+<section id="prompt">
+  <h2>The prompt</h2>
+  <div class="callout insight">
+    <span class="callout-label">As the interviewer says it</span>
+    <p>"We're a subscription business. Our churn model has 0.92 AUC offline and does nothing useful in production. Data science thinks it's the model. I think it's the data. Design the training-data pipeline for this model so that what we evaluate offline is what we'd get online."</p>
+  </div>
+  <p>The interviewer has told you the answer is leakage. Your job is to find <em>where</em>, design it out, and show that the design generalises to the next model.</p>
+</section>
+
+<section id="clarify">
+  <h2>Clarifying questions</h2>
+  <ul>
+    <li><strong>What exactly is the prediction and when is it made?</strong> "On the 1st of each month, for every active subscriber: will they cancel within the next 30 days?" → Prediction time is fixed and periodic; label window is [t, t+30d].</li>
+    <li><strong>How is churn recorded?</strong> "A <code>cancelled_at</code> on the subscription row, set when they cancel; sometimes backdated on refund." → Labels arrive up to 30 days late and can be revised.</li>
+    <li><strong>What features do they use?</strong> "Usage in the last 30/90 days, support tickets, payment failures, plan, tenure, and a 'days since last login'." → Rolling windows over event data plus slowly-changing attributes.</li>
+    <li><strong>Where do the features come from today?</strong> "A notebook querying the warehouse's current tables." → Almost certainly joins to <em>current</em> attribute values — the leak.</li>
+    <li><strong>Scale?</strong> "2M subscribers, ~40 features, 24 months of history." → Small; correctness dominates, not throughput.</li>
+    <li><strong>Retrain cadence?</strong> "Monthly." → The pipeline must produce a new versioned dataset each month with fully-matured labels.</li>
+  </ul>
+</section>
+
+<section id="requirements">
+  <h2>Move 1 · Requirements &amp; estimate</h2>
+  <table>
+    <thead><tr><th>Requirement</th><th>Value</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr><td>Prediction time</td><td>Monthly, at 00:00 on the 1st, per active subscriber</td><td>The spine is (subscriber_id, month_start); every feature must be as-of that instant</td></tr>
+      <tr><td>Label</td><td>cancelled within (t, t+30d]; recorded up to 30d late; revisable</td><td>Only months whose window closed ≥ 30 days ago are fully labelled; store label version</td></tr>
+      <tr><td>Rows</td><td>2M × 24 months ≈ 48M rows × 40 features × 4 B ≈ 8 GB</td><td>Trivial volume — design for correctness and reproducibility, not scale</td></tr>
+      <tr><td>Features</td><td>Rolling windows over events + SCD attributes (plan, region)</td><td>Need event-time window computation and attribute history (SCD2), not current values</td></tr>
+      <tr><td>Cadence</td><td>Monthly retrain, weekly scoring</td><td>Dataset build is a scheduled, idempotent job producing dataset v(YYYY-MM)</td></tr>
+      <tr><td>Consumers</td><td>One model now; the same pattern for three more planned</td><td>Build the spine-and-join as a reusable step, not a churn-specific script</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="leakage">
+  <h2>Where leakage comes from</h2>
+  <p>Name the specific mechanisms; each is a place the current notebook is probably wrong.</p>
+  <ul>
+    <li><strong>Current-state joins.</strong> Joining the training row for January to the subscriber's plan <em>today</em>. A subscriber who churned in February and downgraded to "free" in March now has "plan = free" as a feature for their January row. The model learns "free plan → churned" — which is the label, encoded.</li>
+    <li><strong>Windows that cross the prediction time.</strong> "Usage in the last 30 days" computed over a calendar month that straddles the 1st — including days after the prediction. Or a feature refreshed daily at 06:00 used for a 00:00 prediction.</li>
+    <li><strong>Label-derived features.</strong> <code>days_since_last_login</code> computed as of the dataset build date, not the prediction date: a churned user's last login is by definition before their cancel. Perfect predictor, zero value.</li>
+    <li><strong>Immature labels.</strong> Including the most recent month, where most churn hasn't been recorded yet — the model learns that recent months don't churn.</li>
+    <li><strong>Random splits on time-series.</strong> Training on March to predict February.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">The tell</span>
+    <p>0.92 AUC offline on a churn problem is itself the evidence. Say so: "That number is too good; something in the features knows the future." Interviewers rate candidates who can smell leakage from the metric.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>The board</h2>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>training-data-board.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  RAW (immutable)              HISTORY (time-aware)                     DATASET BUILD (per run)
+  ┌───────────────┐   CDC    ┌──────────────────────┐
+  │ subscriptions │────────▶ │ subscription_history │  SCD2: plan, status, valid_from/valid_to
+  │ (Postgres)    │          └──────────┬───────────┘
+  ├───────────────┤   stream ┌──────────▼───────────┐     ┌──────────────────┐   ┌─────────────────┐
+  │ usage events  │────────▶ │ feature_history      │     │ SPINE            │   │ as-of join      │
+  │ tickets       │          │ (entity, feature_ts, │────▶│ (sub_id, t,      │──▶│ feature_ts <= t │──▶ dataset
+  │ payments      │          │  available_ts, value)│     │  label, label_v) │   │ avail_ts <= t   │    v2026-09
+  └───────────────┘          └──────────────────────┘     └────────▲─────────┘   │ ttl bound       │    (Iceberg
+        │                                                          │             └─────────────────┘     snapshot +
+        │  labels: cancelled_at (T+≤30d, revisable) ───────────────┘                                     manifest)
+        │                                                                                                     │
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────── ▼
+   GATES: label maturity ≥ 30d ◆  leakage checks (feature ⟂ future) ◆  schema/dist ◆  time-based split ◆  registry → model vN
+</code></pre>
+  </div>
+</section>
+
+<section id="spine">
+  <h2>The spine and the as-of join</h2>
+  <p>The design's centre is a <strong>spine</strong>: one row per (entity, prediction_time, label). Everything else is joined <em>to</em> the spine, as of its timestamp. Attributes come from an SCD2 history (what was the plan on the 1st of January), windows are computed from events with <code>event_ts &lt; t</code>, and each feature carries two timestamps — when it was <em>true</em> (event time) and when it became <em>available</em> to the system (the job that produced it). The join uses the stricter of the two.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>build_training_set.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- 1. spine: subscribers active at t, with a matured label
+WITH spine AS (
+  SELECT h.subscriber_id, m.month_start AS t,
+         CASE WHEN h2.cancelled_at &gt; m.month_start
+               AND h2.cancelled_at &lt;= m.month_start + INTERVAL '30 days' THEN 1 ELSE 0 END AS label
+  FROM months m
+  JOIN subscription_history h
+    ON h.valid_from &lt;= m.month_start AND m.month_start &lt; h.valid_to      -- state as of t (SCD2)
+   AND h.status = 'active'
+  LEFT JOIN subscription_current h2 ON h2.subscriber_id = h.subscriber_id
+  WHERE m.month_start + INTERVAL '60 days' &lt;= CURRENT_DATE                 -- label maturity gate
+),
+-- 2. windowed features from events strictly before t
+usage AS (
+  SELECT s.subscriber_id, s.t,
+         COUNT(*) FILTER (WHERE e.event_ts &gt;= s.t - INTERVAL '30 days') AS sessions_30d,
+         COUNT(*) FILTER (WHERE e.event_ts &gt;= s.t - INTERVAL '90 days') AS sessions_90d,
+         s.t - MAX(e.event_ts)                                             AS days_since_login   -- as of t, not today
+  FROM spine s LEFT JOIN usage_events e
+    ON e.subscriber_id = s.subscriber_id AND e.event_ts &lt; s.t
+  GROUP BY 1,2
+)
+-- 3. slowly-changing attributes as of t, precomputed features as of availability
+SELECT s.*, u.sessions_30d, u.sessions_90d, u.days_since_login,
+       h.plan, h.region,
+       f.payment_failures_90d
+FROM spine s
+JOIN usage u USING (subscriber_id, t)
+JOIN subscription_history h
+  ON h.subscriber_id = s.subscriber_id AND h.valid_from &lt;= s.t AND s.t &lt; h.valid_to
+ASOF JOIN feature_history f
+  MATCH_CONDITION (s.t &gt;= f.available_ts)                                -- what the system KNEW at t
+  ON s.subscriber_id = f.subscriber_id
+WHERE s.t - f.feature_ts &lt;= INTERVAL '7 days';                            -- staleness bound</code></pre>
+  </div>
+  <p>Three lines carry the whole answer: the SCD2 range predicate, <code>event_ts &lt; s.t</code>, and <code>available_ts</code> in the as-of join. Point at them. Depth: <a href="../ml-data-architecture/02-training-data-pipelines.html">Deep dive 02</a>.</p>
+</section>
+
+<section id="versioning">
+  <h2>Versioning the dataset</h2>
+  <p>A training set is an artifact, not a query. The build job writes an immutable dataset — an Iceberg table snapshot, or Parquet files plus a manifest of paths and content hashes — tagged with the run (<code>churn/v2026-09</code>), the feature-definition versions, the label version, the code commit and the raw-partition watermarks it read. The model registry entry points at that tag. This is what makes "rebuild model v14" a command rather than an archaeology project, and what lets you diff two datasets when a metric moves. Because labels are revisable, the dataset records the <em>label snapshot</em> too; a later rebuild with corrected labels is a new version, never an in-place edit.</p>
+  <div class="callout insight">
+    <span class="callout-label">Why the raw layer must be immutable</span>
+    <p>Every guarantee above rests on being able to re-read the same raw partitions later. If the raw events table is compacted, deduplicated or "cleaned" in place, the dataset's watermarks point at data that no longer exists. Keep raw append-only; do all cleaning downstream and versioned.</p>
+  </div>
+</section>
+
+<section id="splits">
+  <h2>Splits, sampling &amp; the label delay</h2>
+  <ul>
+    <li><strong>Time-based split.</strong> Train on months 1–18, validate on 19–21, test on 22–24. Never random. Report the gap between validation and test performance — that gap is the drift you will see in production.</li>
+    <li><strong>Entity leakage across splits.</strong> The same subscriber appears in many months. Fine for a churn model where each month is a real prediction; wrong for a model that should generalise to unseen entities — then split by entity.</li>
+    <li><strong>Label maturity.</strong> The last two months are excluded or held out with the caveat that labels are partial. Say the number: "fully-matured labels lag by 30 days, so the freshest training month is two months back."</li>
+    <li><strong>Class balance.</strong> Monthly churn ~3%; keep all positives, sample negatives to a ratio, record the weights so probabilities can be recalibrated.</li>
+    <li><strong>Leakage tests as gates.</strong> Automatically flag any feature with implausible univariate power, any feature whose max event time exceeds <em>t</em>, and any feature whose distribution differs between labelled and unlabelled rows.</li>
+  </ul>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs</h2>
+  <table>
+    <thead><tr><th>Fork</th><th>Options</th><th>Decision here, and why</th><th>Flip condition</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Compute features at build time vs precompute history</strong></td><td>Recompute windows from raw events in the build; maintain a feature_history table</td><td>Precompute daily feature snapshots (cheap at 2M entities), keep raw recompute as the backfill path</td><td>Windows that must be exact to the second → compute from events at build</td></tr>
+      <tr><td><strong>Attribute history</strong></td><td>SCD2 tables via CDC; daily snapshots of current tables</td><td>SCD2 from CDC — exact validity ranges, small</td><td>No CDC available → daily snapshots and accept day-granularity</td></tr>
+      <tr><td><strong>Dataset storage</strong></td><td>Warehouse table per version; Iceberg snapshots; Parquet + manifest in object storage</td><td>Iceberg table with tagged snapshots: time travel for free, open format for training clusters</td><td>Training entirely inside the warehouse → warehouse tables suffice</td></tr>
+      <tr><td><strong>Split strategy</strong></td><td>Random; time-based; entity-disjoint</td><td>Time-based; each month is a real prediction</td><td>Model must generalise to new entities → entity-disjoint</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="listening">
+  <h2>What the interviewer is listening for</h2>
+  <ul>
+    <li>That you diagnosed the leak from the metric and named the mechanism before designing.</li>
+    <li>The spine as the organising idea; every feature joined <em>as of</em> the spine timestamp.</li>
+    <li>SCD2 for attributes, event-time windows strictly before <em>t</em>, availability time in the as-of join, a staleness bound.</li>
+    <li>Label maturity as a gate with a number; revisable labels versioned.</li>
+    <li>The dataset as an immutable, addressable artifact linked from the model registry.</li>
+    <li>Time-based splits and automated leakage checks — and the reusable step for the next three models.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Follow-up probes</h2>
+  <ul>
+    <li><strong>"Data science wants to add a feature that needs 24 months of history. Tomorrow."</strong> — Backfill from raw events by month partition, idempotent, writing feature_history with correct feature_ts and an available_ts equal to the backfill time — <em>and</em> flag that the backfilled availability is a fiction: the model would not have had it then. Either accept the optimism knowingly, or set available_ts = feature_ts + normal job latency.</li>
+    <li><strong>"Cancellations get backdated on refund. Does that break anything?"</strong> — It changes labels after the fact. Store the label snapshot per dataset version; rebuild as a new version; compare. Report label-revision rate as a metric.</li>
+    <li><strong>"How would you prove to the scientists it was the data?"</strong> — Rebuild the dataset with the as-of pipeline, retrain the same model, show AUC drop to a plausible ~0.75 and the feature-importance shift away from the leaking columns. Then show that number holds in production. Evidence, not argument.</li>
+    <li><strong>"This is 8 GB. Why not just do it in pandas?"</strong> — You can; the value is the discipline, not the engine. Do it in SQL on the warehouse so the same job runs monthly, is versioned, and the next model reuses the spine step.</li>
+  </ul>
+</section>
+
+<section id="levels">
+  <h2>The answer at four levels</h2>
+  <details class="collapse-card" open>
+    <summary><strong>Training data, L1 → L4</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> "Join features to labels and train." Random split. Suggests "more regularisation" for the production gap.</li>
+        <li><strong>L2 · Practitioner.</strong> Recognises leakage when prompted, adds a time-based split, computes windows before the prediction date — but still joins current attributes and includes immature months.</li>
+        <li><strong>L3 · Senior.</strong> Diagnoses the leak from the metric; spine + as-of join with SCD2, event-time windows, availability time and staleness bounds; label-maturity gate; immutable versioned dataset linked from the registry; automated leakage checks; a reusable build step.</li>
+        <li><strong>L4 · Staff.</strong> All of L3, plus: the backfill-availability caveat; label revision as a tracked metric; the dataset build as a platform capability shared across models with contracts on feature history; cost and retention policy for dataset versions; and the evidence-based path to convincing the scientists.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the other half of the correctness problem — keeping features fresh and consistent when predictions happen in milliseconds: <a href="05-design-real-time-features.html">05 · Drill: Real-Time Features for Fraud &amp; Ranking</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

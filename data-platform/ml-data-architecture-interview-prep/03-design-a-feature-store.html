@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drill: Design a Feature Store</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#prompt">The prompt</a>
+    <a href="#clarify">Clarifying questions</a>
+    <a href="#requirements">Move 1 · Requirements &amp; estimate</a>
+    <a href="#sources">Move 2 · Sources &amp; labels</a>
+    <a href="#architecture">The board</a>
+    <a href="#components">The components, and what each is for</a>
+    <a href="#pit">Point-in-time retrieval</a>
+    <a href="#tradeoffs">Trade-offs</a>
+    <a href="#listening">What the interviewer is listening for</a>
+    <a href="#probes">Follow-up probes</a>
+    <a href="#levels">The answer at four levels</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-the-method.html">← Previous</a>
+    <a href="04-design-training-data-pipeline.html">Next: Drill: Training Data with Point-in-Time Correctness →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Drills</span>
+  <h1>Drill: Design a Feature Store</h1>
+  <p class="subtitle">The question you will almost certainly get in some form. Worked end to end with the five moves: the prompt, the clarifying questions, the estimate, the board, the components and what each is actually for, point-in-time retrieval, the trade-offs, the probes, and the answer at four levels.</p>
+</header>
+
+<section id="prompt">
+  <h2>The prompt</h2>
+  <div class="callout insight">
+    <span class="callout-label">As the interviewer says it</span>
+    <p>"We're a marketplace. We have a handful of models — search ranking, a recommendations model on the home page, and a seller-risk model — and each team is computing its own features in its own notebooks and pipelines. Training-serving mismatches keep biting us. Design a feature store for us."</p>
+  </div>
+  <p>Notice what the prompt contains: multiple models, multiple teams, an explicit pain (mismatch), and no numbers. Your first job is to convert it into requirements; your second is to resist saying "Feast" for at least ten minutes.</p>
+</section>
+
+<section id="clarify">
+  <h2>Clarifying questions</h2>
+  <p>Ask these, in roughly this order, and write the answers on the board as you get them.</p>
+  <ul>
+    <li><strong>Which predictions are online?</strong> "Ranking and recommendations are in the request path; seller risk runs nightly." → Two models need an online store; one doesn't.</li>
+    <li><strong>Latency budget?</strong> "Search has 100 ms end to end." → Feature retrieval gets a slice, say ≤ 15 ms p99.</li>
+    <li><strong>Freshness?</strong> "Ranking wants the last few clicks; most other features can be a day old." → A small set of streaming features, a large set of batch features.</li>
+    <li><strong>Scale?</strong> "10M active buyers, 500k sellers, 50M listings; ~2,000 search requests/s peak." → Sizes the online store and the retrieval fan-out.</li>
+    <li><strong>Who defines features today, and who should?</strong> "Each team; we want sharing." → Feature definitions are a shared, owned artifact — a registry with ownership is a requirement, not a nicety.</li>
+    <li><strong>What does the training side look like?</strong> "Nightly retrains from the warehouse, weekly for risk." → The offline store lives beside the warehouse; point-in-time retrieval is needed.</li>
+    <li><strong>Where is data today?</strong> "Snowflake plus Kafka for events." → Build the offline store on the warehouse; streaming features from Kafka.</li>
+  </ul>
+</section>
+
+<section id="requirements">
+  <h2>Move 1 · Requirements &amp; estimate</h2>
+  <table>
+    <thead><tr><th>Requirement</th><th>Value</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr><td>Online predictions</td><td>~2,000 req/s peak (search) + ~500 req/s (recs); nightly batch for risk</td><td>Online store with ~2,500 lookups/s, each fetching several entities</td></tr>
+      <tr><td>Retrieval latency</td><td>≤ 15 ms p99 for the feature slice</td><td>In-memory KV store, single-digit-ms, batched multi-get; no warehouse in the request path</td></tr>
+      <tr><td>Freshness</td><td>Seconds for ~10 behavioural features; daily for ~300 others</td><td>Two computation paths: a stream job for the few, batch for the many</td></tr>
+      <tr><td>Entities</td><td>10M buyers, 500k sellers, 50M listings</td><td>Online store: (10M + 0.5M + 50M) entities × ~50–100 hot features × ~8 B × 2.5 overhead ≈ 60–120 GB — fits a Redis cluster</td></tr>
+      <tr><td>Training</td><td>Nightly / weekly; ~90-day windows; labels are clicks (seconds) and purchases (hours), risk labels T+14d</td><td>Offline store with full history and point-in-time joins; label-delay-aware windows</td></tr>
+      <tr><td>Organisation</td><td>Three teams; sharing wanted</td><td>Registry with owners, versions, and discoverability; features as contracts</td></tr>
+    </tbody>
+  </table>
+  <p>Say the consequence column out loud. It is the argument for everything you draw next.</p>
+</section>
+
+<section id="sources">
+  <h2>Move 2 · Sources &amp; labels</h2>
+  <p>Sources: the listings and orders databases via CDC (Postgres → Debezium → Kafka), clickstream and search events from the web/mobile clients (Kafka), and a seller-verification service. Labels: for ranking, clicks and purchases joined to the search request id (delay seconds to hours); for recommendations, the same; for seller risk, chargebacks and policy actions (delay ~14 days, revised on appeal). Draw the label delay next to each model. The feature store does not own labels, but the training-set builder that sits on top of it does the join, so the entity keys and timestamps must line up.</p>
+</section>
+
+<section id="architecture">
+  <h2>The board</h2>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>feature-store-board.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">                     ┌─────────────────────────────────────────────────────────┐
+                     │  FEATURE REGISTRY  (definitions · entity · owner ·      │  ◆ build vs buy
+                     │  event-time semantics · version · SLA)  ── the spine    │
+                     └───────────────┬───────────────────────┬─────────────────┘
+        batch definitions ───────────┘                       └───────── streaming definitions
+                 │                                                             │
+  Snowflake ──▶ ┌▼─────────────────┐  materialise (hourly/daily)  ┌────────────▼──────────┐
+  (CDC'd tables)│ OFFLINE STORE    │ ───────────────────────────▶ │ ONLINE STORE (Redis)  │◀── Flink jobs ◀── Kafka
+                │ feature history  │                              │ latest value / entity │     (clicks, views)
+                │ (Iceberg/Snowflk)│                              │ TTL · multi-get       │
+                └┬─────────────────┘                              └────────────┬──────────┘
+                 │ as-of join with labels                               get_online_features(entity keys)
+                 ▼                                                             │
+          ┌──────────────┐   dataset vN     ┌────────────┐          ┌──────────▼─────────┐
+          │ training-set │ ───────────────▶ │ registry / │          │ ranking / recs     │──▶ response
+          │ builder (PIT)│                  │ model vN   │          │ service            │
+          └──────────────┘                  └────────────┘          └──────────┬─────────┘
+                 ▲                                                             │ feature log (request_id, vector)
+                 └─────────────────────────────────────────────────────────────┘
+  ────────────────────────────────────────────────────────────────────────────────────────
+   OPERATE: schema+distribution gates ◆  offline↔online reconciliation ◆  freshness SLOs ◆  lineage ◆  cost
+</code></pre>
+  </div>
+</section>
+
+<section id="components">
+  <h2>The components, and what each is for</h2>
+  <p>Weak answers list the boxes; strong answers say the problem each box exists to solve.</p>
+  <ul>
+    <li><strong>Registry.</strong> The shared definition of every feature: name, entity, source, transformation, event-time semantics, owner, version, freshness SLA. It exists so that "buyer_7d_purchases" means one thing in the ranking model and the risk model, and so that two teams don't compute it twice. It is also the thing that compiles to both paths — the same definition drives the batch job and the stream job. Without it a feature store is just two databases.</li>
+    <li><strong>Offline store.</strong> Full feature <em>history</em> — every value with the timestamp it became true — in the warehouse or lakehouse. Exists for point-in-time training sets and backfills. Big, cheap, columnar.</li>
+    <li><strong>Online store.</strong> The <em>latest</em> value per entity, in memory, with a TTL. Exists for the request path. Small, fast, expensive per byte. It holds only the features online models read — a subset of the registry.</li>
+    <li><strong>Materialisation.</strong> The scheduled push of batch features from offline to online, and the stream jobs writing fresh features straight to online. Exists so the model reads yesterday's batch values and this second's streaming values through one interface.</li>
+    <li><strong>Training-set builder.</strong> Takes a labelled "spine" (entity, timestamp, label) and joins features <em>as of</em> each timestamp. Exists to prevent leakage. Output is a versioned dataset artifact.</li>
+    <li><strong>Serving SDK / API.</strong> <code>get_online_features(entity_keys, feature_list)</code> with batched multi-get, and <code>get_historical_features(spine, feature_list)</code> for training. Exists so consumers never touch the stores directly.</li>
+    <li><strong>Feature logging.</strong> The vector the model actually saw, keyed by request id. Exists for skew measurement, debugging, and cheap training-set construction.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Say the sentence</span>
+    <p>"A feature store is a registry plus two stores plus the code that keeps them consistent. The registry is the product; the stores are implementation." Interviewers who have run one will nod; the ones who haven't will learn something.</p>
+  </div>
+</section>
+
+<section id="pit">
+  <h2>Point-in-time retrieval</h2>
+  <p>This is where the round is won. The training-set builder must, for each labelled row at time <em>t</em>, fetch the feature value that was current at <em>t</em> — not the latest, not the value at the end of the day. In SQL that is an as-of join against the feature history:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>point_in_time_join.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- spine: one row per (buyer_id, search_ts, label)
+-- fh:    feature history, one row per (buyer_id, feature_ts) with values valid from feature_ts
+SELECT s.buyer_id, s.search_ts, s.label,
+       f.buyer_7d_purchases, f.buyer_30d_gmv
+FROM spine s
+ASOF JOIN feature_history f
+  MATCH_CONDITION (s.search_ts >= f.feature_ts)     -- the latest value at or before the search
+  ON s.buyer_id = f.buyer_id;
+
+-- engines without ASOF: window over the union, or a lateral "latest row where ts <= t"
+-- Either way the invariant is the same: feature_ts <= search_ts, and strictly the newest such row.</code></pre>
+  </div>
+  <p>Two refinements mark a senior answer. First, <strong>a maximum staleness</strong>: a value from 40 days ago should not be "the latest" for a 7-day feature — enforce <code>search_ts − feature_ts ≤ ttl</code> and treat the rest as null. Second, <strong>event time vs availability time</strong>: if a feature computed at 02:00 describes yesterday, its value was not knowable until 02:00, so the as-of comparison must use the time it became <em>available</em>, or the training set will contain values the model could not have had. Depth: <a href="../ml-data-architecture/04-feature-store.html">Deep dive 04</a>.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs</h2>
+  <table>
+    <thead><tr><th>Fork</th><th>Options</th><th>Decision here, and why</th><th>Flip condition</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Build vs buy</strong></td><td>Feast / open source on your stores; managed (Tecton, Databricks, Vertex, SageMaker); build on warehouse + Redis</td><td>Open-source registry on Snowflake + Redis: the stores exist, the team is small, the win is the shared definition</td><td>Many streaming features with exactly-once needs, or &gt;10 teams — buy the managed compute</td></tr>
+      <tr><td><strong>Online store</strong></td><td>Redis, DynamoDB, Cassandra, Bigtable</td><td>Redis cluster: ~100 GB, sub-ms multi-get, TTLs; simplest ops at this size</td><td>&gt;1 TB hot set or multi-region durability → DynamoDB/Bigtable</td></tr>
+      <tr><td><strong>Batch vs streaming per feature</strong></td><td>Hourly/daily batch; Flink stream</td><td>Stream only the ~10 behavioural features with a seconds-level SLA; batch the rest</td><td>A feature's freshness SLA drops below the batch cadence</td></tr>
+      <tr><td><strong>Offline store location</strong></td><td>Warehouse tables; lakehouse (Iceberg) on object storage</td><td>Snowflake now (data is there); Iceberg when training moves to Spark/GPU clusters and egress cost bites</td><td>Training reads exceed warehouse compute budget, or need open formats</td></tr>
+      <tr><td><strong>Consistency mechanism</strong></td><td>One definition compiled to both; same UDF in both engines; reconciliation only</td><td>Definitions compiled to both paths <em>and</em> a daily reconciliation job on logged features</td><td>Never drop the reconciliation — it's the alarm</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="listening">
+  <h2>What the interviewer is listening for</h2>
+  <ul>
+    <li>That you separated the <em>registry</em> (the product) from the <em>stores</em> (the implementation).</li>
+    <li>The as-of join, unprompted, with the staleness bound and the availability-time subtlety.</li>
+    <li>An online-store size and a latency budget with numbers.</li>
+    <li>Only the features that need it are streamed; the rest are batch. No cargo-cult Flink.</li>
+    <li>Feature logging at serving time, and a reconciliation job that turns "training-serving mismatch" from an anecdote into a metric.</li>
+    <li>A build-vs-buy decision with a flip condition, and an honest "you might not need this yet" for the nightly risk model.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Follow-up probes</h2>
+  <ul>
+    <li><strong>"A team adds a new feature and needs two years of history. What happens?"</strong> — A backfill: run the definition over raw history partition by partition, idempotently, writing to the offline store with the correct event timestamps; flag the rows as backfilled; do <em>not</em> push to online until the live job is producing. Cost is the raw scan; cap it by computing from curated entity tables where possible.</li>
+    <li><strong>"How do you know online and offline agree?"</strong> — Log the served vector by request id; nightly, recompute the same features offline as-of the request time and diff; alert on drift above a per-feature threshold. Root causes are almost always time-window edges or a UDF that diverged between engines.</li>
+    <li><strong>"Redis goes down."</strong> — The model service degrades: default values or last-known from a local cache for batch features, skip streaming features, and log that it did. Ranking gets worse, not broken. Rehydrate from the offline store's latest snapshot; streaming features catch up from Kafka offsets.</li>
+    <li><strong>"Two teams want different definitions of buyer_7d_purchases."</strong> — They get two names, or one versioned definition; the registry enforces uniqueness and ownership. This is a governance question wearing a technical hat.</li>
+    <li><strong>"Why not just query Snowflake at request time?"</strong> — Latency and cost: warehouse queries are hundreds of ms to seconds and priced per scan; 2,500 req/s would be ruinous. The online store is a cache with a contract.</li>
+  </ul>
+</section>
+
+<section id="levels">
+  <h2>The answer at four levels</h2>
+  <details class="collapse-card" open>
+    <summary><strong>Feature store, L1 → L4</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> "Put features in a feature store so teams can share them." Names Feast. No stores distinguished, no time semantics.</li>
+        <li><strong>L2 · Practitioner.</strong> Offline store in the warehouse, online store in Redis, nightly materialisation, a Python SDK. Training sets built by joining current features to labels — the leakage bug, until prompted.</li>
+        <li><strong>L3 · Senior.</strong> Registry as the spine; as-of joins with staleness bounds and availability time; streaming for only the features that need it, sized and budgeted; feature logging and a reconciliation job; build-vs-buy with a flip condition; degradation story for the online store.</li>
+        <li><strong>L4 · Staff.</strong> All of L3, plus: definitions as owned contracts with SLAs and deprecation; cost per feature per team; a migration path from notebooks to the registry (adapters first, enforcement later); the honest scoping — nightly risk stays on warehouse tables; and the platform's metric: mismatch incidents per quarter, trending to zero.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the mechanism this drill leaned on, as its own question: <a href="04-design-training-data-pipeline.html">04 · Drill: Training Data with Point-in-Time Correctness</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

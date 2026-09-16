@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lineage, Metadata &amp; Reproducibility</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">The question every incident asks</a>
+    <a href="#chain">The reproducibility chain</a>
+    <a href="#tracking">Experiment tracking: what to record</a>
+    <a href="#registry">The model registry as the join point</a>
+    <a href="#lineage">Lineage graphs that reach the model</a>
+    <a href="#reproduce">Reproducing a run a year later</a>
+    <a href="#griddp">Worked example: "why did ranking change on Tuesday?"</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="08-serving-architectures.html">← Previous</a>
+    <a href="10-data-quality-and-drift.html">Next: Data Quality, Validation &amp; Drift Monitoring →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Lineage, Metadata &amp; Reproducibility</h1>
+  <p class="subtitle">A model you cannot retrain on its original data is a model you cannot debug, audit or roll back. This chapter builds the chain — model run → feature versions → dataset version → table snapshots → sources — and the lineage graph that lets you walk it in either direction.</p>
+</header>
+
+<section id="why">
+  <h2>The question every incident asks</h2>
+  <p>Three very different people ask the same question. The on-call engineer, at 2 a.m., when ranking quality drops: <em>what changed?</em> The auditor, six months later, about a fraud decision: <em>what did the model know when it decided?</em> The data scientist, trying to beat last quarter's model: <em>what exactly did the baseline train on?</em> All three are asking for the same artifact — a complete, versioned description of the inputs to a training run — and most platforms cannot produce it, because the pieces live in five systems that never learned each other's identifiers.</p>
+  <p>Analytics lineage stops at the mart. ML lineage has to go two hops further: from the feature tables into the dataset version a model consumed, and from that dataset into the model run itself. This chapter is about making those two hops first-class, so the reproducibility promise from <a href="05-storage-formats-and-versioning.html">chapter 05</a> is something the platform enforces rather than something a diligent engineer remembers.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Reproducibility is not "save the notebook". It is a <em>join</em> across four registries — code, data, features, models — on identifiers each of them was told to record. Design the identifiers and the join, and reproducibility falls out. Skip it, and no amount of diligence recovers a run.</p>
+  </div>
+</section>
+
+<section id="chain">
+  <h2>The reproducibility chain</h2>
+  <p>Five links, each with a versioning mechanism that already exists on a well-run platform. The work is connecting them.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>reproducibility-chain.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  ┌─────────────┐   git sha       ┌───────────────────┐   registry version   ┌──────────────────┐
+  │  CODE       │ ──────────────▶ │  FEATURE DEFS      │ ───────────────────▶ │  FEATURE TABLES   │
+  │  training   │                 │  host_reliability  │                      │  (Iceberg, SCD2)  │
+  │  pipeline,  │                 │  _7d  v3           │                      │  snapshot 60198…  │
+  │  preprocess │                 └───────────────────┘                      └─────────┬────────┘
+  └──────┬──────┘                                                                      │ point-in-time join
+         │                                                                             ▼
+         │                        ┌───────────────────┐   manifest           ┌──────────────────┐
+         │                        │  LABELS            │ ───────────────────▶ │  DATASET VERSION  │
+         │                        │  fraud_confirmed   │                      │  fraud-signup/    │
+         │                        │  snapshot 60198…   │                      │  v2026.03.01-a1f9c│
+         │                        └───────────────────┘                      └─────────┬────────┘
+         │                                                                             │
+         ▼                                                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │  MODEL RUN  (MLflow run 7c2e…)                                                            │
+  │    params · metrics · artifact (model + preprocess spec) · code sha · dataset version ·   │
+  │    feature registry versions · label snapshot · env (container digest, CUDA, seed)         │
+  └───────────────────────────────────┬──────────────────────────────────────────────────────┘
+                                      │ promote
+                                      ▼
+  ┌──────────────────────────────────┐        ┌────────────────────────────────────┐
+  │  MODEL REGISTRY  fraud-signup v14 │ ─────▶ │  SERVING  (feature log carries v14) │
+  └──────────────────────────────────┘        └────────────────────────────────────┘
+</code></pre>
+  </div>
+  <p>Read it top to bottom and it is a build. Read it bottom to top and it is an investigation: from a served prediction (logged with the model version) to the registry entry, to the run, to the dataset version, to the snapshots and feature definitions, to the source tables and the code. Every arrow is an identifier stored on the downstream side. That storage is the entire design.</p>
+</section>
+
+<section id="tracking">
+  <h2>Experiment tracking: what to record</h2>
+  <p>Experiment trackers — MLflow, Weights &amp; Biases, Neptune, Vertex/SageMaker experiments — record parameters, metrics and artifacts per run. Most teams log the first two carefully and the inputs casually ("dataset: features_v2"). The platform's job is to make the inputs precise and automatic, so a run cannot be logged without them.</p>
+  <table>
+    <thead>
+      <tr><th>What</th><th>Identifier to record</th><th>Why it matters</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Dataset</strong></td><td>Dataset name + version string (the manifest from ch. 05), plus its content hash</td><td>The run's actual input; the manifest carries the snapshot IDs and splits</td></tr>
+      <tr><td><strong>Feature definitions</strong></td><td>Feature registry versions for every feature view used</td><td>"reliability_7d" changed meaning in v4; the model used v3</td></tr>
+      <tr><td><strong>Labels</strong></td><td>Label table snapshot + labeling policy version + label delay</td><td>Labels get corrected; the run saw a specific state</td></tr>
+      <tr><td><strong>Code</strong></td><td>Git sha of the training pipeline and the preprocessing module; dirty-tree flag</td><td>The transform is part of the model (ch. 08)</td></tr>
+      <tr><td><strong>Environment</strong></td><td>Container image digest, framework and CUDA versions, hardware class, random seeds</td><td>Nondeterminism lives here; a different cuDNN can shift metrics</td></tr>
+      <tr><td><strong>Outputs</strong></td><td>Model artifact hash, preprocess spec, evaluation metrics per split, eval dataset version</td><td>What was promoted and on what evidence</td></tr>
+    </tbody>
+  </table>
+  <p>Automate it. The training pipeline's entry point should resolve the dataset version, read feature versions off the manifest, capture the git sha and image digest, and attach all of it as run tags before a single epoch runs. A data scientist should be unable to produce an untraceable run from the platform's tooling; the notebook path is for exploration, and its runs are not promotable.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>train.py (provenance captured before training)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">manifest = load_manifest("s3://griddp-ml-datasets/fraud-signup/v2026.03.01-a1f9c/manifest.json")
+
+with mlflow.start_run(run_name="fraud-signup-xgb") as run:
+    mlflow.set_tags({
+        "dataset.name":        manifest["dataset"],
+        "dataset.version":     manifest["version"],
+        "dataset.schema_hash": manifest["schema_hash"],
+        "features.versions":   json.dumps({k: v["registry_version"] for k, v in manifest["sources"].items()}),
+        "labels.snapshot":     str(manifest["sources"]["labels.fraud_confirmed"]["iceberg_snapshot"]),
+        "code.sha":            git_sha(), "code.dirty": str(git_dirty()),
+        "env.image":           os.environ["IMAGE_DIGEST"], "env.cuda": cuda_version(),
+        "seed":                str(SEED),
+    })
+    mlflow.log_input(mlflow.data.from_pandas(train_df, source=manifest["version"]), context="training")
+    model = fit(train_df, params)                      # deterministic given seed + env
+    mlflow.log_params(params); mlflow.log_metrics(evaluate(model, valid_df, test_df))
+    mlflow.sklearn.log_model(model, "model", code_paths=["preprocess/"])   # transform ships with the model
+</code></pre>
+  </div>
+</section>
+
+<section id="registry">
+  <h2>The model registry as the join point</h2>
+  <p>The registry (MLflow Model Registry, SageMaker/Vertex registries, Unity Catalog models) is where a run becomes a versioned, deployable thing with a lifecycle — staging, production, archived. It is also the natural join point for the chain: the registry version is what the serving path logs with every prediction, and the run it points to carries every upstream identifier. Two rules make it work.</p>
+  <ul>
+    <li><strong>Promotion requires provenance.</strong> A run without a dataset version, feature versions and a code sha cannot be registered. Enforce it in the promotion step, not in a wiki.</li>
+    <li><strong>Serving logs the registry version.</strong> Every prediction, every logged feature vector (<a href="08-serving-architectures.html">chapter 08</a>) carries <code>model=fraud-signup:v14</code>. This is the link from a business outcome back into the chain.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Aliases hide history</span>
+    <p>"Production" is a pointer, not a version. If the serving path logs <code>fraud-signup:production</code> instead of <code>v14</code>, the log is useless the moment v15 is promoted — you can no longer tell which model made which decision. Log the resolved version; use the alias only for routing.</p>
+  </div>
+</section>
+
+<section id="lineage">
+  <h2>Lineage graphs that reach the model</h2>
+  <p>Data catalogs (DataHub, OpenMetadata, Unity Catalog, Atlan) build lineage graphs from job metadata: this dbt model reads those tables, that Spark job writes this one. The open standard for emitting those events is <strong>OpenLineage</strong> — a run-level event with input and output datasets, supported natively by Airflow, Dagster, Spark, Flink and dbt. The gap on most platforms is that the graph ends at the last table. Extend it two hops:</p>
+  <ul>
+    <li><strong>Dataset builds emit lineage.</strong> The training-set job is a run whose inputs are the feature tables (at snapshot IDs) and the label table, and whose output is the dataset version. Emit the OpenLineage event with the snapshot IDs as facets.</li>
+    <li><strong>Training runs emit lineage.</strong> Input: the dataset version. Output: the model version. MLflow and the catalogs have integrations; if yours does not, a twenty-line emitter at the end of <code>train.py</code> is enough.</li>
+    <li><strong>Serving emits lineage.</strong> Input: the model version and the online feature tables. Output: the prediction log. Now the graph runs from source CDC topic to business decision.</li>
+  </ul>
+  <p>With the graph complete, impact analysis works in both directions. Upstream: a schema change to <code>host_agent.telemetry</code> highlights every feature, dataset, model and product surface downstream — before the change ships. Downstream: a bad ranking decision traces to a model version, its dataset, and the specific telemetry rollup snapshot it trained on.</p>
+</section>
+
+<section id="reproduce">
+  <h2>Reproducing a run a year later</h2>
+  <p>The test of the chain is running it. Reproduction has three levels, and it is worth being precise about which one you promise.</p>
+  <table>
+    <thead>
+      <tr><th>Level</th><th>What you can do</th><th>What it requires</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Retrieve</strong></td><td>Fetch the exact model artifact, its metrics, and the dataset it trained on</td><td>Registry + immutable dataset storage with retention ≥ model lifetime</td></tr>
+      <tr><td><strong>Rebuild</strong></td><td>Regenerate the dataset from source snapshots and get byte-identical (or hash-identical) rows</td><td>Table snapshots retained (or the dataset export kept), feature registry versions retrievable, deterministic join</td></tr>
+      <tr><td><strong>Retrain</strong></td><td>Train again and get equivalent (not bit-identical) metrics</td><td>Code sha, container digest, seeds, same hardware class; accept small nondeterminism from GPU kernels</td></tr>
+    </tbody>
+  </table>
+  <p>Most audit and incident needs are met at <em>retrieve</em> and <em>rebuild</em>. <em>Retrain</em> matters when you must prove the process, not just the artifact — and it is the level where environment capture (image digest, CUDA version) stops being pedantry. Set retention policies from the level you promise: a fraud model with a seven-year regulatory tail needs its dataset exports kept seven years, which is a storage line item to budget, not an afterthought.</p>
+  <div class="callout tip">
+    <span class="callout-label">Rehearse it</span>
+    <p>Once a quarter, pick a production model at random and rebuild its dataset from the manifest. If the hashes match, the chain works. If a snapshot has expired or a feature version is gone, you have found the break on your schedule instead of the auditor's. This is a data-platform SLO, and it belongs on the same dashboard as freshness.</p>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: "why did ranking change on Tuesday?"</h2>
+  <p>Tuesday 09:40, the marketplace team notices offers from one region ranking lower than Monday. The investigation, with the chain in place: the search service logs show <code>ranking:v22</code> — promoted Monday 18:00. Its MLflow run points at dataset <code>rank-train/v2026.04.06-c81e</code>; the manifest lists feature snapshots; the lineage graph shows <code>features.price_vs_market</code> at that snapshot was built from <code>fct_offer_snapshot</code>, which had a schema change on Sunday: the pricing service began emitting <code>price_hr</code> in the customer's currency instead of USD for one region. The feature was computed correctly on wrong inputs; v22 learned that region's offers were expensive. Fix: revert serving to v21 (registry alias), correct the source, rebuild the dataset from corrected snapshots, retrain, compare metrics against v22's run, promote. Elapsed: two hours. Without the chain the same investigation is a week of "what changed?" across five teams.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The reproducibility heuristic</span>
+    <ul>
+      <li><strong>Identifiers first:</strong> dataset version, feature registry version, label snapshot, code sha, image digest, model registry version. Store each on the downstream artifact, automatically.</li>
+      <li><strong>Experiment tracker:</strong> whichever your team uses — but the platform's training entry point tags the inputs, not the scientist.</li>
+      <li><strong>Registry promotion gated on provenance;</strong> serving logs the resolved model version.</li>
+      <li><strong>Lineage:</strong> emit OpenLineage from dataset builds, training runs and serving, into the catalog you already have. Do not buy an ML-specific lineage tool to get a graph the catalog can hold.</li>
+      <li><strong>Promise a reproduction level</strong> (retrieve / rebuild / retrain) per model class, set retention to match, and rehearse quarterly.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the reproducibility answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Saves the model file and the notebook; "the data is in the warehouse".</li>
+        <li><strong>L2 · Practitioner.</strong> Logs params and metrics to a tracker; records a dataset name; registers models.</li>
+        <li><strong>L3 · Senior.</strong> Records dataset version, feature versions, label snapshot, code sha and environment on every run; gates promotion on it; logs the model version at serving; extends lineage through datasets and models.</li>
+        <li><strong>L4 · Staff.</strong> Designs the identifier scheme as a platform contract, sets reproduction levels and retention per model class with their cost, rehearses rebuilds as an SLO, and can walk an incident from a served decision to a source schema change in one sitting.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: the monitoring that catches bad inputs before they become bad models — <a href="10-data-quality-and-drift.html">10 · Data Quality, Validation &amp; Drift Monitoring</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

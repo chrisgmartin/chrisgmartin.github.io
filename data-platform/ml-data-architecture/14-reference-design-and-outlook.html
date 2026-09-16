@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reference Design for GridDP, Anti-patterns &amp; Outlook</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#journey">The plane, in one breath</a>
+    <a href="#architecture">The reference architecture</a>
+    <a href="#flow">One fraud decision, end to end</a>
+    <a href="#stack">Stack choices, defended</a>
+    <a href="#team">The team that runs it</a>
+    <a href="#roadmap">Crawl → walk → run</a>
+    <a href="#capacity">Capacity &amp; cost math</a>
+    <a href="#antipatterns">Anti-patterns</a>
+    <a href="#outlook">Where this is heading</a>
+    <a href="#next">What to read next</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="13-reference-architectures.html">← Previous</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · Putting it together</span>
+  <h1>Reference Design for GridDP, Anti-patterns &amp; Outlook</h1>
+  <p class="subtitle">The capstone: the entire GridDP ML data plane on one canvas, one fraud decision traced from a payment event to a served score and back into a training row, the stack defended layer by layer, the team, the roadmap, the capacity math — then the mistakes that sink these systems and where the field is going.</p>
+</header>
+
+<section id="journey">
+  <h2>The plane, in one breath</h2>
+  <p>We began with the <a href="01-the-ml-data-lifecycle.html">lifecycle</a> and its two-speed problem: an offline path that must be correct and reproducible, an online path that must be fast and fresh, and the requirement that the two agree. We built <a href="02-training-data-pipelines.html">training sets</a> as point-in-time-correct, snapshot-pinned artifacts; treated <a href="03-labels-and-feedback-loops.html">labels</a> as delayed, versioned data with their own pipelines; put a <a href="04-feature-store.html">feature store</a> — registry, offline history, online latest — at the centre; chose <a href="05-storage-formats-and-versioning.html">open formats with snapshots</a> as the substrate; added a <a href="06-streaming-features.html">streaming lane</a> for the few features that need seconds; gave <a href="07-embeddings-and-vector-data.html">embeddings</a> the same discipline as tabular features; assembled <a href="08-serving-architectures.html">serving</a> so the model sees one feature vector regardless of path; made <a href="09-lineage-and-reproducibility.html">lineage</a> the connective tissue; and wrapped it in <a href="10-data-quality-and-drift.html">quality</a>, <a href="11-governance-privacy.html">governance</a>, and <a href="12-cost-and-scale.html">cost discipline</a>. <a href="13-reference-architectures.html">Chapter 13</a> settled the shape: lakehouse-centric with a streaming lane. This chapter draws it.</p>
+</section>
+
+<section id="architecture">
+  <h2>The reference architecture</h2>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>griddp-ml-data-plane.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          GRIDDP ML DATA PLANE  (lakehouse-centric + streaming lane)             │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+ SOURCES (DPE ch.01)     ANALYTICS PLATFORM (DPE)       ML DATA PLANE (this guide)          CONSUMERS
+ ──────────────────      ────────────────────────       ──────────────────────────          ─────────
+ marketplace-api ─┐                                     ┌────────────────────────────┐
+ billing-service ─┤ CDC   ┌──────────────────┐  batch   │ FEATURE REGISTRY (ch.04)   │
+ orchestrator ────┼──────▶│ LAKEHOUSE        │─────────▶│ name·entity·dtype·TTL·tag  │
+ ranking-service ─┤       │ Iceberg on S3    │ dbt/Spark│ owner·consumers·cost       │
+ trust-safety ────┘       │ bronze→silver→   │ features └─────┬──────────────┬───────┘
+                          │ gold (SCD2)      │                │ governs      │
+ mkt-events ──────┐ Kafka │                  │      ┌─────────▼────────┐ ┌───▼──────────────┐
+ payments ────────┼──────▶│  ◀── history ────┼──────│ OFFLINE STORE    │ │ ONLINE STORE     │
+ support ─────────┘       └──────────────────┘      │ feature history  │ │ Redis (inference │
+                                ▲                   │ (Iceberg, PIT)   │ │ region) ≤ 5 ms   │
+ host-agent ⚡FIREHOSE ──▶ ClickHouse rollups ───────│                  │ └───▲──────▲───────┘
+   ~150M/day               (per-GPU-hour)           └───┬──────────────┘     │      │
+                                                        │ PIT join          materialize   │ stream
+ STREAMING LANE (ch.06)                                 ▼ + labels (ch.03)   (hourly)  │ writes
+ Kafka ─▶ Flink: bid_depth_5m, device_velocity_24h ─────┼──────────────────────────────┘
+          ip_velocity_1h, session_recency … ─▶ history to lake ──▶ (offline store, same defs)
+                                                        │
+                    ┌───────────────────────────────────▼───────────────────────────────┐
+                    │ TRAINING-SET BUILDER (ch.02)  purpose/consent filter (ch.11)      │
+                    │ → snapshot-pinned, sharded Parquet/MDS in s3://griddp-ml/datasets │
+                    │ → dataset card · Pandera contract · drift baseline (ch.10)        │
+                    └───────────────┬───────────────────────────────────────────────────┘
+                                    ▼ shards streamed to GPU region (ch.12)
+                    ┌───────────────────────────────┐   ┌──────────────────────────────┐
+                    │ TRAINING (GPUs) + MLflow      │──▶│ MODEL REGISTRY               │
+                    │ dataset snapshot ↔ model ver  │   │ model card · baseline · tier │
+                    └───────────────────────────────┘   └───────────────┬──────────────┘
+                                                                        ▼ deploy
+ LINEAGE (ch.09) DataHub: column → feature → dataset → model → endpoint   ┌──────────────────┐
+ MONITORING (ch.10): freshness · volume · skew · PSI · matured-label AUC  │ INFERENCE        │──▶ ranking
+ GOVERNANCE (ch.11): tags · consent · retention · decision log · RLS      │ services         │──▶ fraud
+ ORCHESTRATION: Dagster runs features, builders, retrains, expiry         │ served-feature   │──▶ pricing
+                                                                          │ log ─▶ lake      │──▶ forecast
+                                                                          └──────────────────┘──▶ churn
+</code></pre>
+  </div>
+  <p>Read it as three horizontal bands. The <strong>analytics platform</strong> (left-centre) is the DPE guide's design and is the ML plane's upstream — every feature is derived from silver/gold or from the same Kafka topics. The <strong>ML data plane</strong> (centre-right) is this guide: registry, two stores, streaming lane, builder, training, model registry. The <strong>cross-cutting rail</strong> (bottom) — lineage, monitoring, governance, orchestration — wraps every box. The two structural decisions, visible as shapes: the <em>streaming lane</em> is a narrow lane for six features, not a second platform; and the <em>served-feature log</em> flows back into the lake, closing the loop that makes skew checks, audits and the next training set possible.</p>
+</section>
+
+<section id="flow">
+  <h2>One fraud decision, end to end</h2>
+  <p>Account <code>acct_7a</code> adds a new payment method and attempts a $1,800 reserved rental. Follow the data:</p>
+  <ol>
+    <li><strong>T0 — events.</strong> <code>payment_method.added</code> and <code>rental.requested</code> land on Kafka; the payments webhook delivers the vendor's tokenized card reference and risk score.</li>
+    <li><strong>T0 + 200 ms — streaming features.</strong> Flink updates <code>device_velocity_24h</code> (3 → 4 accounts on this device fingerprint), <code>ip_velocity_1h</code>, and <code>payment_method_age_d</code> (0.0) in Redis, and appends the same values with event time to the lake.</li>
+    <li><strong>T0 + 250 ms — inference.</strong> The fraud service assembles the vector: streaming features from Redis; batch features (<code>chargebacks_90d</code>, <code>kyc_outcome</code>, <code>acct_tenure_d</code>) from Redis, materialized hourly from the offline store; two on-demand features computed from request context. Schema-validated by the Pandera contract. Model <code>fraud_v22</code> scores 0.83 → <em>review</em>. The full vector, score, model version and request ID go to the served-feature log.</li>
+    <li><strong>T0 + 1 h — batch.</strong> The hourly Dagster run recomputes account aggregates from silver, materializes to Redis, and appends history to the offline store. Freshness and volume monitors pass; PSI on <code>device_velocity_24h</code> is 0.08.</li>
+    <li><strong>T0 + 1 d — skew check.</strong> The daily job recomputes yesterday's served vectors from the offline store: 99.4% match; the mismatch is entirely <code>ip_velocity_1h</code> late-arriving events, within the 2% SLO.</li>
+    <li><strong>T0 + 45 d — label.</strong> A chargeback arrives via the payments webhook → <code>label_fraud_30d = 1</code> for the prediction at T0, written by the label pipeline with its own event time.</li>
+    <li><strong>T0 + 60 d — training.</strong> The monthly builder assembles the fraud training set: labels joined point-in-time to feature history (only values known at T0), consent and jurisdiction filters applied, the deletion list honoured, contract validated, dataset card written, shards streamed to the GPU region. <code>fraud_v23</code> trains at 84% GPU utilization, is registered with its dataset snapshot and drift baseline, passes champion/challenger on matured labels, and deploys.</li>
+    <li><strong>T0 + 60 d + audit.</strong> A regulator asks why <code>acct_7a</code> was sent to review. The decision log returns the exact vector and model version; lineage walks each feature to its source columns; the dataset card for <code>fraud_v22</code> shows the consent policy it was trained under. One query each.</li>
+  </ol>
+</section>
+
+<section id="stack">
+  <h2>Stack choices, defended</h2>
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>Choice</th><th>Why (and what we rejected)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Feature history</td><td>Iceberg on S3 (the analytics lakehouse)</td><td>One source of truth shared with analytics; snapshots give free dataset versioning. Rejected: a separate ML lake (two truths), warehouse-only (cost per experiment, poor dataloader).</td></tr>
+      <tr><td>Batch features</td><td>dbt on Spark/Trino, incremental</td><td>Same tooling as the marts, same tests, same lineage. Rejected: notebook pipelines (no contracts).</td></tr>
+      <tr><td>Streaming features</td><td>Flink, one job, six features</td><td>Only where seconds pay: pricing and fraud. Rejected: streaming everything (always-on cost, ops load).</td></tr>
+      <tr><td>Registry / store</td><td>Feast (Stack A) or Databricks Feature Store (Stack B)</td><td>Thin over the lake; registry enforces tags and consumers. Rejected: bespoke — the registry is the hard part.</td></tr>
+      <tr><td>Online store</td><td>Redis in the inference region</td><td>Single-key reads at ≤ 5 ms; TTL per feature. Rejected: reading the lake online; cross-region KV.</td></tr>
+      <tr><td>Training data</td><td>Snapshot-pinned, sharded MDS/Parquet in the GPU region</td><td>Streams straight to the trainer, resumable on preemption. Rejected: warehouse queries per epoch.</td></tr>
+      <tr><td>Experiment / model registry</td><td>MLflow</td><td>Dataset snapshot ↔ model version link; model cards. Rejected: spreadsheets, which is what "we'll add it later" means.</td></tr>
+      <tr><td>Vectors</td><td>Lance tables in the lake + a small serving index</td><td>Embeddings governed like features. Rejected: a standalone vector DB as source of truth.</td></tr>
+      <tr><td>Lineage / catalog</td><td>DataHub (Stack A) / Unity (Stack B)</td><td>Column → feature → dataset → model → endpoint, both directions. Rejected: none — this is non-negotiable.</td></tr>
+      <tr><td>Orchestration</td><td>Dagster</td><td>Asset-aware: features, datasets and retrains are assets with freshness policies. Airflow acceptable.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="team">
+  <h2>The team that runs it</h2>
+  <p>The plane at GridDP scale is run by a small team with sharp boundaries. An <strong>ML platform engineer</strong> (one, later two) owns the registry, the stores, the builder, the loading path and the monitors — they are the DPE of the ML plane and sit with the data platform team. <strong>Data scientists / ML engineers</strong> (five-ish) own feature definitions, labels and models for their domain, and consume the platform through the registry and the builder; they never write to the online store directly. The <strong>data platform team</strong> owns everything upstream — silver, gold, Kafka, ClickHouse — and the contracts the ML plane depends on. <strong>Trust &amp; safety and finance</strong> own label semantics (what counts as fraud, what counts as churn) and sign the model cards for their models. The failure mode to design against is the ML engineer who, under deadline, builds a private feature pipeline in a notebook; the platform's job is to make the registry path faster than the shortcut.</p>
+</section>
+
+<section id="roadmap">
+  <h2>Crawl → walk → run</h2>
+  <table>
+    <thead>
+      <tr><th>Stage</th><th>Months</th><th>Build</th><th>Exit criterion</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Crawl</strong></td><td>0–3</td><td>Feature tables as dbt models on the lakehouse; training sets as snapshot-pinned queries written to Parquet; MLflow; schema + freshness checks; batch scoring only for churn and forecasting</td><td>Two models in production from reproducible datasets; no notebook pipelines feeding prod</td></tr>
+      <tr><td><strong>Walk</strong></td><td>3–9</td><td>Feature registry + online store (Redis) with hourly materialization; ranking and fraud online; served-feature log; skew checks; PSI drift on tier-1; dataset/model cards; consent-filtered builders; cost tags and expiry</td><td>Offline/online mismatch ≤ 2%; every deployed model has a baseline and a card; a deletion request completes end to end</td></tr>
+      <tr><td><strong>Run</strong></td><td>9–18</td><td>Flink streaming lane for pricing/fraud; sharded streaming datasets in the GPU region; embeddings for tickets and offers in the lake; matured-label evaluation with champion/challenger; utilization gates; DP on external aggregates</td><td>Pricing on seconds-fresh features; GPU utilization ≥ 80% on training; audit answered in one query</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip">
+    <span class="callout-label">Sequence by risk, not by ambition</span>
+    <p>Reproducible training sets before a feature store; a feature store before streaming; monitoring before every one of them. Teams that start with the streaming lane end up with real-time features feeding a model nobody can retrain.</p>
+  </div>
+</section>
+
+<section id="capacity">
+  <h2>Capacity &amp; cost math</h2>
+  <p>Order-of-magnitude sizing for the plane described, at 17,000 GPUs, 200k accounts, five production models:</p>
+  <ul>
+    <li><strong>Offline store:</strong> ~40 tier-1 features × hourly grain × (17k GPUs + 200k accounts + 60k offers) ≈ 2.4B feature-rows/year ≈ 0.9 TB/year in Iceberg; 3-year retention ≈ 3 TB warm.</li>
+    <li><strong>Online store:</strong> ~280k entities × ~40 features × ~80 bytes ≈ 1 GB; a small Redis with replicas. Peak reads: ranking at ~2k req/s × 20 features = 40k key reads/s — pipeline them, 5 ms budget.</li>
+    <li><strong>Streaming lane:</strong> ~30M events/day on the relevant topics; one Flink job, 8–12 task slots, ~50 GB state; always-on cost ≈ $1.5–2.5k/month.</li>
+    <li><strong>Training:</strong> monthly retrains of five models + experiments ≈ 900 GPU-hours/month at ≥ 80% utilization; datasets replicated once per version to the GPU region (~2 TB/month egress ≈ $150).</li>
+    <li><strong>Served-feature log:</strong> ~5M predictions/day × ~2 KB ≈ 10 GB/day ≈ 3.6 TB/year; warm for 90 days, cool thereafter, decision records for money models archived five years.</li>
+    <li><strong>Total ML data plane run-rate:</strong> roughly $8–12k/month excluding GPU time, dominated by the streaming lane and materialization compute; the GPU line is 3–4× that and is where the optimisation effort belongs.</li>
+  </ul>
+</section>
+
+<section id="antipatterns">
+  <h2>Anti-patterns</h2>
+  <ul>
+    <li><strong>The notebook feature pipeline.</strong> A feature computed in a notebook for training and re-implemented in a service for serving. The whole guide is the antidote.</li>
+    <li><strong>Training on "now."</strong> Joining current feature values to historical labels. Every offline metric is a lie until the join is point-in-time.</li>
+    <li><strong>The warehouse dataloader.</strong> Querying the warehouse per epoch. Pay once, write shards.</li>
+    <li><strong>Streaming everything.</strong> An always-on Flink job for a churn feature that changes weekly.</li>
+    <li><strong>A model with no baseline.</strong> If you did not record the training distribution, you cannot detect drift; you are waiting for a complaint.</li>
+    <li><strong>The unowned label.</strong> Nobody can say precisely what "fraud" means in the label table, so the model learns the label pipeline's bugs.</li>
+    <li><strong>Vector DB as source of truth.</strong> Embeddings that cannot be regenerated because the text was deleted and the model version was not recorded.</li>
+    <li><strong>Deletion that stops at the tables.</strong> Erasure that never reaches the feature store, the served log, the vector index or the snapshots.</li>
+    <li><strong>Two truths.</strong> A separate "ML lake" that drifts from the analytics lake until the churn feature and the churn dashboard disagree in a board meeting.</li>
+    <li><strong>Unmeasured GPUs.</strong> Training jobs at 35% utilization for a year because nobody plotted dataloader wait time.</li>
+  </ul>
+</section>
+
+<section id="outlook">
+  <h2>Where this is heading</h2>
+  <p><strong>Lakehouse-native ML.</strong> The gap between "the lake" and "the ML plane" is closing: table formats are growing vector and tensor types, catalogs are absorbing the feature and model registries, and the training-set builder is becoming a catalog operation rather than a separate tool. Expect the W-vs-L distinction to blur as warehouses adopt open formats and lakehouses adopt warehouse ergonomics.</p>
+  <p><strong>Real-time by default, priced honestly.</strong> Streaming engines are getting cheaper to operate (serverless Flink, RisingWave, Materialize-style incremental views), so the "S lane" widens — but the discipline of asking which features actually pay for seconds will matter more, not less, as the default gets easier.</p>
+  <p><strong>LLM and RAG data.</strong> The same architecture applies to retrieval corpora: chunk pipelines are feature pipelines, embeddings are features with a model version, retrieval logs are served-feature logs, and eval sets are training sets with point-in-time discipline. The teams treating RAG data as a side project are rebuilding this guide badly; the ones treating it as ML data are reusing it.</p>
+  <p><strong>Agents as consumers and producers.</strong> Agentic systems will both consume the plane (feature and metric lookups as tools, governed by the same registry ACLs) and produce data for it (action logs, tool-call traces as training signal). The decision log becomes the central artifact — for audit, for training, and for the next generation of models learning from the last generation's decisions.</p>
+  <p>The constant through all of it is the thesis of this guide: a model is only as good as the data plane's ability to say, for any prediction, <em>exactly what the model saw, why it was allowed to see it, and how to see it again</em>.</p>
+</section>
+
+<section id="next">
+  <h2>What to read next</h2>
+  <p>This guide is the reference. If you are preparing to <em>defend</em> these designs in a room — a systems-design loop for an ML platform, ML data engineering, or staff data role — the companion guide turns each chapter into a drill: <a href="../ml-data-architecture-interview-prep/index.html">ML Data Architecture — Interview Prep</a>. It assumes you have read this one.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

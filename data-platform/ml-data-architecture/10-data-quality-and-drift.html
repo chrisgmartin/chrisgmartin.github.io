@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Quality, Validation &amp; Drift Monitoring</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why ML data fails differently</a>
+    <a href="#boundaries">Validation at the boundaries</a>
+    <a href="#monitors">Schema, volume &amp; freshness monitors</a>
+    <a href="#skew">Training–serving skew</a>
+    <a href="#drift">Drift: feature, prediction, concept</a>
+    <a href="#slos">Data SLOs &amp; incident response</a>
+    <a href="#griddp">Worked example: the fraud model goes quiet</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="09-lineage-and-reproducibility.html">← Previous</a>
+    <a href="11-governance-privacy.html">Next: Governance, Privacy &amp; Compliance →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Data Quality, Validation &amp; Drift Monitoring</h1>
+  <p class="subtitle">A model never throws an exception when its data goes bad — it just gets quietly worse. This chapter is the discipline of noticing: expectations at every boundary, monitors on the pipes, skew checks between offline and online, and drift detection on features and predictions, wired into SLOs that page a human.</p>
+</header>
+
+<section id="why">
+  <h2>Why ML data fails differently</h2>
+  <p>Analytics pipelines fail loudly. A broken join produces a dashboard nobody believes, someone files a ticket, the number is fixed by Friday. ML pipelines fail <strong>silently and continuously</strong>: a feature pipeline that starts emitting nulls for 4% of accounts doesn't crash training — it produces a model that is 0.7 AUC points worse, and that model ships, and it ranks offers slightly wrong for three weeks until a product manager asks why conversion dipped. The system stays green the entire time.</p>
+  <p>Three properties of ML data make this worse than the analytics case. First, <strong>the consumer is a function, not a person</strong> — there is no human in the loop to raise an eyebrow at an implausible value. Second, <strong>the failure surface is statistical</strong>: nothing is <em>wrong</em> with any single row, the distribution just moved. Third, <strong>there are two pipelines that must agree</strong> — the offline path that trained the model and the online path that feeds it — and they are usually written by different people in different languages.</p>
+  <p>So quality for ML has four layers, and mature platforms run all four: <em>validation</em> (is this batch well-formed?), <em>monitoring</em> (are the pipes flowing?), <em>skew detection</em> (do offline and online agree?), and <em>drift detection</em> (has the world moved since we trained?). Each catches a class of failure the others cannot.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Treat every dataset a model consumes as an <em>API with a contract</em>. A training table has a schema, a row-count envelope, a freshness bound, and per-column distributions the model was fit against. Anything that violates the contract is a breaking change — even if every row is individually valid.</p>
+  </div>
+</section>
+
+<section id="boundaries">
+  <h2>Validation at the boundaries</h2>
+  <p>Validation is the deterministic layer: assertions you can state up front and check on every batch. The mistake is to put them in one place. Put them at <strong>every boundary where ownership changes hands</strong> — source → bronze, silver → feature table, feature table → training set, training set → model. A check that lives only at training time catches the problem months after it entered the lake.</p>
+  <table>
+    <thead>
+      <tr><th>Boundary</th><th>What to assert</th><th>Typical tool</th><th>On failure</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Source → bronze</strong></td><td>Schema matches the contract; required keys non-null; enum values in the allowed set</td><td>Schema registry, dbt <code>source</code> tests, Great Expectations on landing</td><td>Quarantine the batch; page the producing team, not the platform</td></tr>
+      <tr><td><strong>Silver → feature table</strong></td><td>Uniqueness on (entity, event_time); value ranges; null rate within envelope; referential integrity to dims</td><td>dbt tests, Great Expectations suites, Soda</td><td>Block downstream materialization; keep last-good version served</td></tr>
+      <tr><td><strong>Feature table → training set</strong></td><td>Point-in-time correctness (no feature timestamps after prediction_ts); label leakage checks; class balance in bounds</td><td>Pandera / custom Spark checks in the dataset builder</td><td>Fail the training run — never train on a suspect set</td></tr>
+      <tr><td><strong>Training set → model</strong></td><td>Feature-distribution snapshot recorded as the <em>baseline</em> for drift; row count vs previous run ±X%</td><td>MLflow-logged statistics, TFDV / whylogs profiles</td><td>Fail if baseline can't be produced — you'll need it to monitor</td></tr>
+      <tr><td><strong>Online request → model</strong></td><td>Feature vector schema and dtypes; null/default substitution rate; feature age vs TTL</td><td>Pydantic / Pandera at the inference API</td><td>Fall back to a default, log the substitution, alert on rate</td></tr>
+    </tbody>
+  </table>
+  <p>The three tools most teams end up with divide cleanly. <strong>dbt tests</strong> are the right home for anything expressible as SQL over a warehouse table — uniqueness, not-null, accepted values, relationships, and custom singular tests. <strong>Great Expectations</strong> (or Soda) is for richer, versioned <em>suites</em> with distributional expectations (quantiles, value sets, regex on strings) and human-readable data docs. <strong>Pandera</strong> is for in-process DataFrame validation inside Python pipelines — the dataset builder, the batch scorer, the feature-transform step — where a round trip to the warehouse is the wrong shape.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>training_set_schema.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import pandera as pa
+from pandera import Column, Check
+
+# The contract for the fraud training set, checked every time the builder runs.
+fraud_training_schema = pa.DataFrameSchema(
+    {
+        "account_id":            Column(str, nullable=False),
+        "prediction_ts":         Column("datetime64[ns, UTC]", nullable=False),
+        "label_fraud_30d":       Column(int, Check.isin([0, 1])),
+        "payment_method_age_d":  Column(float, Check.ge(0), nullable=True),
+        "device_velocity_24h":   Column(int, Check.between(0, 500)),
+        "kyc_outcome":           Column(str, Check.isin(["pass", "review", "fail", "unknown"])),
+        "chargebacks_90d":       Column(int, Check.ge(0)),
+    },
+    checks=[
+        # No feature may be observed after the prediction timestamp (point-in-time correctness).
+        Check(lambda df: (df["feature_max_event_ts"] &lt;= df["prediction_ts"]).all(),
+              error="feature values observed after prediction_ts — leakage"),
+        # Class balance must stay inside the envelope the model was designed for.
+        Check(lambda df: 0.002 &lt;= df["label_fraud_30d"].mean() &lt;= 0.03,
+              error="fraud base rate outside [0.2%, 3%] — check label pipeline"),
+    ],
+    unique=["account_id", "prediction_ts"],
+    strict=True,   # any unexpected column is a failure, not a warning
+)
+
+df = fraud_training_schema.validate(build_training_frame(as_of="2026-09-01"))
+</code></pre>
+  </div>
+  <div class="callout tip">
+    <span class="callout-label">Strict mode is the point</span>
+    <p><code>strict=True</code> — reject unknown columns — is the single most valuable line in that schema. The classic silent failure is a feature pipeline that adds a column which happens to leak the label (<code>chargeback_flag</code> joined from a table that is updated <em>after</em> the fraud is confirmed). A permissive schema waves it through; a strict one makes someone explain it.</p>
+  </div>
+</section>
+
+<section id="monitors">
+  <h2>Schema, volume &amp; freshness monitors</h2>
+  <p>Validation asks "is this batch right?"; monitoring asks "did the batch arrive at all, on time, at the expected size?" These are cheap, table-level signals and they catch the majority of production incidents — because most incidents are not subtle statistical drift, they are a pipeline that stopped, doubled, or changed shape.</p>
+  <ul>
+    <li><strong>Freshness.</strong> Max <code>event_time</code> (not load time) per feature table versus now, against a declared SLA. A feature with a 1-hour SLA that is 6 hours old is serving stale values to every online request, and the model happily consumes them.</li>
+    <li><strong>Volume.</strong> Row count per partition against a seasonal envelope — a 7-day rolling median ± tolerance, not a fixed number. GridDP's telemetry rollup drops 40% every weekend as interruptible instances get preempted; a naive threshold pages every Saturday.</li>
+    <li><strong>Schema.</strong> Column set, dtypes, and nullability compared to the registered contract. Upstream services rename fields constantly; the failure mode is a feature that silently becomes all-null because <code>kyc_result</code> became <code>kyc_outcome</code>.</li>
+    <li><strong>Null and default rates.</strong> Per column, the share of nulls and of <em>sentinel defaults</em> (0, -1, "unknown"). A jump in defaults is an upstream outage wearing a disguise.</li>
+  </ul>
+  <p>Tooling here is a spectrum: dbt <code>source freshness</code> and simple metric queries scheduled by the orchestrator at the cheap end; Monte Carlo, Elementary, Bigeye, or Datadog data monitors when you want anomaly detection and lineage-aware alert routing without writing it yourself. The platform-engineering answer is to emit every monitor as a metric (freshness seconds, row count, null rate) into the same observability stack that watches the services, so an ML data incident and a service incident are visible on one pane.</p>
+</section>
+
+<section id="skew">
+  <h2>Training–serving skew</h2>
+  <p>Skew is the failure that is unique to ML: the model was trained on features computed one way and is served features computed another way. The same feature name, two implementations, drifting apart. Classic sources:</p>
+  <ul>
+    <li><strong>Two codebases.</strong> A dbt model computed <code>acct_rentals_30d</code> for training; a Go service computes it for serving with a different definition of "30 days" (calendar vs rolling, inclusive vs exclusive of today).</li>
+    <li><strong>Time semantics.</strong> Offline features are point-in-time joined at <code>prediction_ts</code>; online features are read <em>now</em> — and "now" includes events that arrived in the last few minutes that the training data never saw at that horizon.</li>
+    <li><strong>Missing-value handling.</strong> Training imputed nulls with the column median; serving substitutes 0.</li>
+    <li><strong>Encoding.</strong> A categorical feature's vocabulary is frozen at training time; a new GPU model (<code>B300</code>) appears in production and maps to "unknown" — or worse, to an index that collides.</li>
+  </ul>
+  <p>The structural fix is the one <a href="04-feature-store.html">chapter 04</a> built: one feature definition, materialized to both stores from the same transformation. But definition-level unity is not enough; you still need a <strong>skew check</strong> in production. The pattern is to <strong>log the exact feature vector the model saw at inference time</strong> (the "served features" log), then periodically recompute the same features offline for the same entities and timestamps and compare — per feature, a match rate for categoricals and a distribution distance for numerics. That log is also what makes the next chapter's audit story possible.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>skew_check.sql</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Compare what the ranking model was SERVED with what the offline pipeline says it SHOULD have seen.
+WITH served AS (
+  SELECT offer_id, served_at, feature_json:host_reliability_7d::FLOAT AS served_rel
+  FROM ml.served_features_log
+  WHERE model = 'ranking_v14' AND served_at &gt;= DATEADD('day', -1, CURRENT_TIMESTAMP)
+),
+recomputed AS (
+  SELECT s.offer_id, s.served_at, f.value AS offline_rel
+  FROM served s
+  ASOF JOIN feature_store.host_reliability_7d f
+    MATCH_CONDITION (s.served_at &gt;= f.valid_from) ON s.offer_id = f.offer_id
+)
+SELECT
+  COUNT(*)                                                     AS n,
+  AVG(ABS(served_rel - offline_rel))                           AS mean_abs_diff,
+  AVG(CASE WHEN ABS(served_rel - offline_rel) &gt; 0.05 THEN 1 ELSE 0 END) AS share_mismatch
+FROM served JOIN recomputed USING (offer_id, served_at);
+-- Alert if share_mismatch &gt; 2%: something in the two paths has diverged.
+</code></pre>
+  </div>
+</section>
+
+<section id="drift">
+  <h2>Drift: feature, prediction, concept</h2>
+  <p>Drift is the world changing after training. Three kinds, and they need different detectors and different responses:</p>
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>What moved</th><th>How you see it</th><th>Detector</th><th>Response</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Feature (covariate) drift</strong></td><td>Input distributions</td><td>Compare live feature distributions to the training baseline</td><td>PSI, KS test, Jensen–Shannon per feature; embedding-space distance for vectors</td><td>Investigate cause (upstream change vs real world); retrain if real</td></tr>
+      <tr><td><strong>Prediction drift</strong></td><td>Output distribution</td><td>Score histogram shifts; positive rate changes</td><td>PSI on score buckets; positive-rate control chart</td><td>Often the first visible symptom; trace back to features</td></tr>
+      <tr><td><strong>Concept drift</strong></td><td>The relationship P(y | x)</td><td>Only visible once labels arrive — accuracy/AUC on recent labelled data decays</td><td>Delayed-label evaluation; champion/challenger on a holdout stream</td><td>Retrain on recent data; revisit features</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Population Stability Index</strong> is the workhorse for tabular features because it is bucketed, cheap, and has conventional thresholds (below 0.1: stable; 0.1–0.25: investigate; above 0.25: significant shift). For each feature, bucket the training baseline into deciles, count the live population into the same buckets, and compute <code>Σ (live% − base%) · ln(live% / base%)</code>. The <strong>Kolmogorov–Smirnov</strong> test is the alternative for continuous features when you want a statistic that doesn't depend on binning. For <strong>embeddings</strong> — the ranking model's offer embedding, the support-ticket text embedding — bucketing is meaningless; monitor the distribution of distances to a reference centroid, or train a small domain classifier (baseline vs live) and alarm when it can separate them.</p>
+  <div class="callout warn">
+    <span class="callout-label">Drift is not a bug report</span>
+    <p>A drift alert says the distribution moved. It does not say why, and the two causes require opposite responses. If <code>device_velocity_24h</code> shifted because the device-fingerprinting vendor changed its algorithm, retraining just teaches the model the vendor's bug. If it shifted because a real fraud ring arrived, retraining is exactly right. Every drift alert needs a lineage lookup (did an upstream change ship?) before it triggers a retrain.</p>
+  </div>
+  <p>Delayed labels are the hard part of concept drift. GridDP's fraud label — a chargeback or confirmed abuse — arrives 30–90 days after the prediction. So the fraud model's real accuracy is always a quarter old, and feature/prediction drift are the only <em>leading</em> indicators you have. Design for that: the monitoring dashboard shows leading signals (drift) beside the lagging one (AUC on matured labels), and the retrain cadence is decided on both.</p>
+</section>
+
+<section id="slos">
+  <h2>Data SLOs &amp; incident response</h2>
+  <p>None of the above matters unless it pages the right person with enough context to act. Treat ML data like a service with SLOs: declare them per feature table and per model, measure them continuously, and run incidents when they're breached. A workable set for a tier-1 model:</p>
+  <ul>
+    <li><strong>Freshness SLO:</strong> 99% of online feature reads served with feature age ≤ TTL (e.g. 15 min for <code>bid_depth_5m</code>, 24 h for <code>host_reliability_7d</code>).</li>
+    <li><strong>Completeness SLO:</strong> ≤ 0.5% of inference requests fall back to default values for any single feature.</li>
+    <li><strong>Skew SLO:</strong> served-vs-offline mismatch ≤ 2% per feature, checked daily.</li>
+    <li><strong>Drift budget:</strong> no tier-1 feature above PSI 0.25 for more than 24 h without an open investigation.</li>
+    <li><strong>Baseline SLO:</strong> every deployed model has a recorded training-distribution baseline; a model without one cannot be promoted.</li>
+  </ul>
+  <p>Incident response for data incidents has one difference from service incidents: <strong>the blast radius is in the past</strong>. When a feature pipeline is found to have been wrong for nine days, the fix is not just to repair the pipeline — it is to decide whether the model trained during those nine days is contaminated, whether the served-feature log needs annotating so future skew analysis excludes the window, and whether downstream metrics (conversion, fraud loss) need restating. The runbook should force those three questions explicitly.</p>
+  <div class="callout tip">
+    <span class="callout-label">Route to the producer</span>
+    <p>Most ML data incidents originate upstream — a product team renamed a field, a vendor changed a format. Lineage (<a href="09-lineage-and-reproducibility.html">chapter 09</a>) lets you route the page to the team that broke the contract rather than the ML engineer who noticed. That routing is what turns a monitoring stack from a smoke alarm into an operating model.</p>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: the fraud model goes quiet</h2>
+  <p>Week one: GridDP's KYC vendor ships an API change. The field <code>result</code>, previously <code>pass | review | fail</code>, now returns <code>PASS | REVIEW | FAIL | PENDING</code>. The ingestion job lands the new strings. The feature pipeline's mapping to <code>kyc_outcome</code> matches none of them and falls through to <code>"unknown"</code>. Nothing errors.</p>
+  <p>What each layer would have caught:</p>
+  <ol>
+    <li><strong>Boundary validation</strong> at source → bronze — an accepted-values test on <code>result</code> — fails on the first batch. Incident opened in minutes, routed to the integration owner. <em>This is where it should stop.</em></li>
+    <li>Without that, the <strong>null/default-rate monitor</strong> on <code>kyc_outcome</code> sees "unknown" jump from 1% to 100% within an hour.</li>
+    <li>Without that, <strong>feature drift</strong> on <code>kyc_outcome</code> shows PSI &gt; 1.0 at the next daily run.</li>
+    <li>Without that, <strong>prediction drift</strong>: the fraud score distribution compresses toward the middle because a strong signal became uninformative — visible the same day.</li>
+    <li>Without any of it, <strong>concept drift</strong> shows up 60 days later as a fraud-loss spike in finance's reconciliation, and the model has meanwhile been retrained on a quarter of "unknown" KYC.</li>
+  </ol>
+  <p>The costs escalate by roughly an order of magnitude per layer skipped. That is the argument for spending on the boring, deterministic checks first.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The quality-stack heuristic</span>
+    <ul>
+      <li><strong>Day one, every model:</strong> schema + accepted-values tests at ingestion, freshness/volume monitors on every feature table, a recorded training baseline. Cheap, deterministic, catches most incidents.</li>
+      <li><strong>Once a model is in the product's critical path (ranking, fraud, pricing):</strong> add the served-feature log and daily skew checks, PSI on tier-1 features, prediction-drift control charts, and written SLOs with an on-call rotation.</li>
+      <li><strong>When labels are delayed:</strong> build the matured-label evaluation job and put leading and lagging indicators on one dashboard; decide retrain cadence from both.</li>
+      <li><strong>For embeddings and unstructured inputs:</strong> replace bucketed PSI with centroid-distance or domain-classifier drift.</li>
+      <li><strong>Buy vs build:</strong> build validation (it's mostly SQL and a schema file); buy or adopt an OSS observability layer once you have more than ~20 feature tables and someone is spending a day a week on alert plumbing.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>The answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Adds not-null and uniqueness tests to the training table; checks accuracy on a holdout at training time; would notice a problem when someone complains.</li>
+        <li><strong>L2 · Practitioner.</strong> Validates at ingestion and before training with dbt tests / Great Expectations; monitors freshness and row counts; computes PSI on a few key features; knows drift and skew are different things.</li>
+        <li><strong>L3 · Senior.</strong> Puts checks at every ownership boundary with strict schemas; logs served features and runs daily skew comparison; separates feature, prediction and concept drift with the right detector for each including embeddings; declares SLOs and routes alerts to producing teams via lineage; handles delayed labels explicitly.</li>
+        <li><strong>L4 · Staff.</strong> Designs the whole thing as one contract system — the training baseline, the served-feature log, and the lineage graph are first-class platform artifacts; drift alerts trigger a lineage lookup before any retrain; data incidents have a blast-radius-in-the-past runbook that decides on model contamination and metric restatement; cost and coverage are tiered by model criticality.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: the data you are allowed to train on at all, and what you owe the people it describes — <a href="11-governance-privacy.html">11 · Governance, Privacy &amp; Compliance for ML Data</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

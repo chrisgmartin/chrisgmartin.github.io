@@ -470,6 +470,30 @@
 
 
 
+
+  B['data-platform/ml-data-architecture']=function(d){
+    d.title('Two paths, one loop');
+    d.text(110,52,'offline',{size:11});d.text(300,52,'online',{size:11});d.line(200,44,200,270,{dash:1,faint:1});
+    var raw=d.cyl(20,62,70,50,'raw data',{}),tr=d.box(110,70,80,36,'training\nset',{size:10.5,wash:1}),fs=d.box(110,140,80,36,'feature\nstore',{size:10.5});
+    d.connect(raw,tr);d.arrow(60,112,60,150,{});var lab=d.round(20,150,74,32,'labels',{size:11});d.connect(lab,tr,{faint:1});d.connect(lab,fs,{faint:1});
+    var mdl=d.box(110,210,80,36,'model',{size:11});d.connect(tr,mdl,{});d.text(140,262,'train',{size:10.5});
+    var os=d.box(250,140,80,36,'online\nstore',{size:10.5,wash:1});d.connect(fs,os,{label:'same\nfeatures',lx:220,ly:130});
+    var sv=d.box(250,210,80,36,'serving',{size:11});d.connect(os,sv);d.connect(mdl,sv,{dash:1});
+    var req=d.round(330,70,60,32,'request',{size:10.5});d.arrow(360,102,300,138,{});d.arrow(300,228,330,228,{});d.text(366,232,'score',{size:10.5});
+    d.ring(200,130,140,60);d.note(340,190,'skew\nlives here',{size:10});
+    d.route([[360,246],[360,290],[56,290],[56,116]],{dash:1});d.text(200,304,'outcomes → new labels → the next training set',{size:10.5});
+  };
+  B['data-platform/ml-data-architecture-interview-prep']=function(d){
+    d.title('Five moves for any ML data question');
+    var m=d.flow(66,['1 signal &\nrequirements','2 sources\n& labels','3 offline\npath'],{w:96,h:44,gap:22,size:11});
+    var m2=[d.box(148,150,96,44,'5 operate',{size:11}),d.box(266,150,96,44,'4 online\npath',{size:11,wash:1})];
+    d.connect(m[2],m2[1]);d.connect(m2[1],m2[0]);
+    d.ring(256,140,116,64);d.note(158,232,'skew · latency\n· freshness',{size:10});d.arrow(238,226,278,208,{red:1});
+    d.note(24,210,'estimate first:\nQPS · features\n· freshness · $',{size:10});
+    d.bubble(236,220,150,52,'"how would you know\nit\'s wrong in prod?"',{tail:'left',size:10.5});
+    d.note(30,300,'45–60 min · whiteboard · defend the fork');
+  };
+
   // ===== CLAUDE SKILLS (collection hubs) =====
   B['claude-skills/data-engineering-skills']=function(d){
     d.title('One operator per technology');
