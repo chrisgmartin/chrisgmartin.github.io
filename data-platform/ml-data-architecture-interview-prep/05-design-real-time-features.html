@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drill: Real-Time Features for Fraud &amp; Ranking</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#prompt">The prompt</a>
+    <a href="#clarify">Clarifying questions</a>
+    <a href="#requirements">Move 1 · Requirements &amp; estimate</a>
+    <a href="#classes">Three classes of feature</a>
+    <a href="#architecture">The board</a>
+    <a href="#semantics">Event time, windows &amp; lateness</a>
+    <a href="#consistency">Keeping stream and batch consistent</a>
+    <a href="#failure">Failure modes &amp; degradation</a>
+    <a href="#tradeoffs">Trade-offs</a>
+    <a href="#listening">What the interviewer is listening for</a>
+    <a href="#probes">Follow-up probes</a>
+    <a href="#levels">The answer at four levels</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="04-design-training-data-pipeline.html">← Previous</a>
+    <a href="06-design-embedding-infrastructure.html">Next: Drill: Embedding &amp; RAG Data Infrastructure →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Drills</span>
+  <h1>Drill: Real-Time Features for Fraud &amp; Ranking</h1>
+  <p class="subtitle">When the prediction has 50 milliseconds and the feature is "what happened in the last two minutes." Streaming feature computation, the online store, event-time semantics, the consistency contract with batch, and what to do when the stream is late.</p>
+</header>
+
+<section id="prompt">
+  <h2>The prompt</h2>
+  <div class="callout insight">
+    <span class="callout-label">As the interviewer says it</span>
+    <p>"We run a payments platform. Our fraud model scores every transaction synchronously; today all its features are computed nightly, so a card that was stolen at 09:00 looks fine until tomorrow. Design the real-time feature path — and make sure the model is trained on the same thing it sees in production."</p>
+  </div>
+  <p>Two requirements in one sentence: freshness in seconds, and offline/online consistency. Both must appear on your board.</p>
+</section>
+
+<section id="clarify">
+  <h2>Clarifying questions</h2>
+  <ul>
+    <li><strong>Latency budget for the score?</strong> "150 ms end to end for the authorisation; the model gets 50, feature retrieval must fit in ~10." → In-memory store, multi-get, no stream query at request time.</li>
+    <li><strong>Which features need to be fresh?</strong> "Velocity features — transactions and amount in the last 1, 5, 60 minutes per card, per device, per merchant; new-device flags; distance from last transaction." → A small set of windowed aggregates over a few entities, plus request-time computations.</li>
+    <li><strong>Volume?</strong> "~3,000 transactions/s peak; ~8 events per transaction across auth, device, and session." → ~25k events/s into the stream jobs.</li>
+    <li><strong>Entities?</strong> "200M cards, 50M devices, 5M merchants." → Online store sized by hot entities, not all — most cards are idle; TTL and lazy population matter.</li>
+    <li><strong>Labels?</strong> "Chargebacks, T+30–90 days; confirmed fraud from the ops team sooner." → Training uses matured labels; evaluation lag is months; velocity features need logged values for training.</li>
+    <li><strong>What exists?</strong> "Kafka, Flink for another team, a warehouse, Redis somewhere." → Build on it.</li>
+  </ul>
+</section>
+
+<section id="requirements">
+  <h2>Move 1 · Requirements &amp; estimate</h2>
+  <table>
+    <thead><tr><th>Requirement</th><th>Value</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr><td>Freshness</td><td>Seconds for velocity features (target: event visible in features ≤ 5 s p99)</td><td>Stream processing with per-key state; no micro-batch &gt; a few seconds</td></tr>
+      <tr><td>Retrieval latency</td><td>≤ 10 ms p99 for ~30 features across card, device, merchant</td><td>Redis multi-get over 3 keys; co-locate or pipeline; feature vector assembled in the service</td></tr>
+      <tr><td>Event rate</td><td>~25k events/s peak, keyed by card/device/merchant</td><td>Flink with keyed state, ~10–20 parallel tasks; checkpointed state in the low GBs</td></tr>
+      <tr><td>Online store size</td><td>Hot set: ~20M cards active/30d × ~30 features × ~8 B × 2.5 ≈ 12 GB, plus devices/merchants</td><td>Redis cluster ~30 GB with TTLs on idle keys; not 200M × everything</td></tr>
+      <tr><td>Consistency</td><td>Offline value for (card, t) must equal what the model saw at t within tolerance</td><td>Feature logging at serving time; definitions shared between Flink and the batch engine; nightly reconciliation</td></tr>
+      <tr><td>Labels</td><td>T+30–90 days</td><td>Training sets built from logged features joined to matured labels; no recomputation of streaming features offline unless reconciled</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="classes">
+  <h2>Three classes of feature</h2>
+  <p>Before drawing, sort the features. Each class has its own path, and mixing them up is where designs get expensive.</p>
+  <ul>
+    <li><strong>Batch features (most of them).</strong> Card age, historical chargeback rate, merchant category risk, 90-day spend profile. Computed nightly in the warehouse, materialised to the online store. Staleness of a day is fine.</li>
+    <li><strong>Streaming features (the velocity set).</strong> Count and sum over the last 1/5/60 minutes per card, device, merchant; time since last transaction; distinct merchants in the last hour. Computed by a stream job holding per-key windowed state, written to the online store on every update.</li>
+    <li><strong>Request-time features (computed in the scoring call).</strong> Amount vs the card's average (needs the average from the store), distance between this transaction's location and the last one (needs the last location from the store), "is this device new for this card" (a membership check). Cheap, derived from retrieved values plus the request itself. They are never stored — they are logged.</li>
+  </ul>
+  <div class="callout tip">
+    <span class="callout-label">Say the ratio</span>
+    <p>"Of the ~100 features the model uses, about 15 are streaming and 5 are request-time; the rest are batch. I'll stream only the 15." Interviewers are wary of candidates who put everything on Flink.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>The board</h2>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>real-time-features-board.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">   EVENTS (Kafka, keyed)              STREAM FEATURES                     ONLINE STORE              SCORING (150 ms)
+  ┌────────────────┐               ┌──────────────────────┐            ┌─────────────────┐       ┌──────────────────┐
+  │ auth_events    │──▶ by card ──▶│ Flink job            │ upsert ──▶ │ Redis cluster   │◀──────│ fraud scorer     │
+  │ device_events  │──▶ by device─▶│  keyed state         │            │ card:{id}   TTL │ mget  │  1 assemble vec  │
+  │ session_events │──▶ by merch ─▶│  windows 1m/5m/60m   │            │ device:{id} TTL │ 10ms  │  2 request-time  │
+  └───────┬────────┘               │  event-time+watermark│            │ merch:{id}  TTL │       │  3 model 50ms    │
+          │                        │  checkpoints (RocksDB)│           └────────▲────────┘       └────────┬─────────┘
+          │                        └──────────┬───────────┘                     │ nightly materialise    │ feature log
+          │ same events                       │ same definitions                │                        │ (txn_id, vector,
+          ▼                                   ▼                                 │                        │  feature ts)
+  ┌────────────────┐               ┌──────────────────────┐            ┌─────────────────┐                ▼
+  │ raw lake       │──────────────▶│ batch features       │───────────▶│ offline store   │◀──────── logged features
+  │ (Iceberg)      │               │ (warehouse, nightly) │            │ (history)       │          + labels (T+30–90d)
+  └────────────────┘               └──────────────────────┘            └────────┬────────┘
+                                                                                ▼
+                       RECONCILE nightly: recompute velocity features from raw as-of txn ts  vs  logged ── alert on Δ
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   OPERATE: consumer lag SLO ◆  watermark lateness ◆  store hit-rate ◆  degradation mode ◆  cost (Redis GB, Flink slots)
+</code></pre>
+  </div>
+</section>
+
+<section id="semantics">
+  <h2>Event time, windows &amp; lateness</h2>
+  <p>The streaming features are windowed aggregates, and the correctness of a windowed aggregate depends on <em>which clock</em> you use. Say "event time" before the interviewer does.</p>
+  <ul>
+    <li><strong>Event time, not processing time.</strong> "Transactions in the last 5 minutes" means 5 minutes of the card's timeline, not 5 minutes of wall clock at the Flink task. Events are stamped at the source; the job orders and windows by that stamp.</li>
+    <li><strong>Watermarks and lateness.</strong> Events arrive out of order (mobile clients, retries). A watermark says "I've seen everything up to time <em>w</em>, probably." Choose the allowed lateness from the data: if 99.9% of events arrive within 3 s, a 5 s watermark delay trades 5 s of freshness for near-complete windows. Late events beyond that are applied as corrections or counted in a side output — say which, and why (fraud: apply corrections; the cost of a missed velocity spike is high).</li>
+    <li><strong>Window type.</strong> Sliding windows with a 1-second slide are expensive at 25k events/s; use <em>continuous</em> aggregation over keyed state — keep a ring buffer or a small sorted set of recent timestamps per key and compute the 1/5/60-minute counts on each event. State per key is tiny; the 60-minute window bounds it.</li>
+    <li><strong>State and checkpoints.</strong> Keyed state in RocksDB, checkpointed to object storage every 30–60 s; on failure the job restores and replays from Kafka offsets. Writes to Redis are idempotent (last-write-wins with the event timestamp as a version), so replay is safe.</li>
+  </ul>
+  <p>Depth: <a href="../ml-data-architecture/06-streaming-features.html">Deep dive 06 · Streaming Features &amp; Real-Time Inference Data</a>.</p>
+</section>
+
+<section id="consistency">
+  <h2>Keeping stream and batch consistent</h2>
+  <p>The second half of the prompt. There are three mechanisms; a senior answer uses all three and knows which one is the safety net.</p>
+  <ol>
+    <li><strong>One definition, two engines.</strong> The feature "card_txn_count_5m" is defined once (in the registry, as a declarative spec or a shared library) and compiled or reused in both the Flink job and the batch backfill. Where engines differ (Flink SQL vs warehouse SQL), keep the definitions in the narrowest shared dialect and test them with the same fixtures.</li>
+    <li><strong>Log what was served.</strong> The scorer logs the full feature vector with the transaction id and the feature timestamps. The training set is built <em>from the log</em> joined to matured labels — so the model trains on exactly what production saw, including its lateness and its bugs. This is the strongest guarantee available and it costs one Kafka topic.</li>
+    <li><strong>Reconcile.</strong> Nightly, recompute the velocity features from raw events as-of each logged transaction's timestamp and diff against the logged values. Report the distribution of deltas per feature; alert when the p95 delta crosses a threshold. This is how you catch a watermark that is too aggressive, a UDF that diverged, or a Redis TTL eating a feature.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">Log-and-train beats recompute</span>
+    <p>Recomputing streaming features offline for training <em>should</em> give the same values, but "should" is the word that hides every skew bug. Training on the logged vector removes the question. Use recomputation for backfills and for the reconciliation check, not as the training path.</p>
+  </div>
+</section>
+
+<section id="failure">
+  <h2>Failure modes &amp; degradation</h2>
+  <ul>
+    <li><strong>Flink falls behind (consumer lag).</strong> Features go stale silently. Expose lag as a metric; the scorer reads the feature timestamp from the store and, if it is older than the SLA, treats the velocity features as missing and lets the model's missing-value handling take over (train with that dropout so it's a known state). Page at lag &gt; 30 s.</li>
+    <li><strong>Redis unavailable.</strong> Score with batch features from a local fallback cache or defaults; flag the decision as degraded; lower the auto-approve threshold if policy allows. Never fail the authorisation on a feature-store outage.</li>
+    <li><strong>Hot keys.</strong> A merchant doing 500 txn/s concentrates on one Flink key. Pre-aggregate per merchant per second at the source, or split the key with a salt and merge on read.</li>
+    <li><strong>Backfilling a new streaming feature.</strong> Replay Kafka (if retention allows) or compute from the raw lake with the same definition; write history to the offline store; only then switch the live job on. The online store starts empty for the feature and warms as events arrive — say the warm-up window.</li>
+    <li><strong>Schema change on the event.</strong> Schema registry with compatibility checks; the Flink job pins a schema version; a breaking change is a new topic, not a surprise.</li>
+  </ul>
+</section>
+
+<section id="tradeoffs">
+  <h2>Trade-offs</h2>
+  <table>
+    <thead><tr><th>Fork</th><th>Options</th><th>Decision here, and why</th><th>Flip condition</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Stream processor</strong></td><td>Flink; Spark Structured Streaming; Kafka Streams; a managed feature platform's streaming</td><td>Flink: true event-time semantics, keyed state, exactly-once to Kafka; the team runs it already</td><td>No streaming expertise and few features → managed platform; latency tolerance in the minutes → Spark micro-batch</td></tr>
+      <tr><td><strong>Compute at request vs precompute</strong></td><td>Query recent events at scoring time; precompute in the stream</td><td>Precompute: 10 ms budget can't afford a range scan; request-time only for derivations of retrieved values</td><td>Budget ≥ 100 ms and a store that does range scans cheaply</td></tr>
+      <tr><td><strong>Online store</strong></td><td>Redis; DynamoDB; Aerospike; Cassandra</td><td>Redis: ~30 GB hot set, sub-ms mget, TTL — simplest</td><td>Hot set &gt; 1 TB, multi-region, or durability required → DynamoDB/Aerospike</td></tr>
+      <tr><td><strong>Lateness handling</strong></td><td>Drop late; apply as correction; side output</td><td>Correction: fraud is asymmetric — a late spike must still count</td><td>Features where a correction would flip a completed decision anyway → side output + audit</td></tr>
+      <tr><td><strong>Training path</strong></td><td>Recompute streaming features offline; train from logged vectors</td><td>Logged vectors, with reconciliation as the check</td><td>No logging possible (regulatory) → recompute, and invest in reconciliation</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="listening">
+  <h2>What the interviewer is listening for</h2>
+  <ul>
+    <li>The three feature classes, and that only the velocity set goes on the stream.</li>
+    <li>"Event time" and "watermark" unprompted, with a lateness number derived from the data.</li>
+    <li>A latency budget broken into slices and an online store sized by the hot set, not the universe.</li>
+    <li>Feature logging as the training path; reconciliation as the alarm.</li>
+    <li>Degradation modes that keep the authorisation flowing.</li>
+    <li>Idempotent writes and replay from offsets — the reason failures are boring.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Follow-up probes</h2>
+  <ul>
+    <li><strong>"Ranking wants the same thing: the last five clicks. Same design?"</strong> — Same spine, different tolerances: click features tolerate loss (drop late events, shorter TTLs), the store holds a small list per user rather than counts, and the budget is shared with retrieval of candidates. Reuse the Flink pattern and the registry; don't reuse the fraud job.</li>
+    <li><strong>"What's your freshness SLO and how do you measure it?"</strong> — End-to-end: event source timestamp → visible in Redis, sampled by writing a canary event per second per partition and reading it back. Target p99 ≤ 5 s; alert at 15 s.</li>
+    <li><strong>"Exactly-once?"</strong> — Kafka → Flink is exactly-once with checkpoints; Flink → Redis is at-least-once made idempotent by versioned upserts. Say that you don't chase distributed exactly-once into the store.</li>
+    <li><strong>"Cost?"</strong> — Flink: ~15 slots ≈ a handful of nodes; Redis: 30 GB ×3 replicas; the feature log topic at 3,000 msg/s × 2 KB ≈ 500 GB/day raw → compact to the lake nightly. Name the log as the surprising line item.</li>
+  </ul>
+</section>
+
+<section id="levels">
+  <h2>The answer at four levels</h2>
+  <details class="collapse-card" open>
+    <summary><strong>Real-time features, L1 → L4</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> "Run the nightly job more often" or "query the database at scoring time." No stream, no store.</li>
+        <li><strong>L2 · Practitioner.</strong> Kafka → Flink → Redis for all features; processing-time windows; training recomputes features in the warehouse and hopes they match.</li>
+        <li><strong>L3 · Senior.</strong> Three feature classes with only velocity streamed; event time with watermarks and a lateness policy; continuous keyed aggregation; sized store and budget; idempotent upserts and replay; logged vectors as the training path with nightly reconciliation; degradation modes.</li>
+        <li><strong>L4 · Staff.</strong> All of L3, plus: the registry compiling one definition to both engines; freshness SLOs with canaries; hot-key mitigation; the feature log's cost and retention policy; a reusable pattern for ranking with different tolerances; and the argument for when a managed feature platform beats running Flink.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, a different kind of feature — vectors, corpora and the pipelines that keep them fresh: <a href="06-design-embedding-infrastructure.html">06 · Drill: Embedding &amp; RAG Data Infrastructure</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

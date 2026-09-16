@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streaming Features &amp; Real-Time Inference Data</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Which features actually need to stream</a>
+    <a href="#freshness">Freshness SLAs, in numbers</a>
+    <a href="#engines">Computing features on a stream</a>
+    <a href="#windows">Windows, watermarks &amp; late data</a>
+    <a href="#write-path">The online-store write path</a>
+    <a href="#consistency">Stream–batch consistency</a>
+    <a href="#griddp">Worked example: fraud velocity at GridDP</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="05-storage-formats-and-versioning.html">← Previous</a>
+    <a href="07-embeddings-and-vector-data.html">Next: Embeddings, Vector Data &amp; RAG Pipelines →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Moving &amp; serving</span>
+  <h1>Streaming Features &amp; Real-Time Inference Data</h1>
+  <p class="subtitle">The minority of features that must be seconds fresh, what it costs to compute them on a stream, how windows and watermarks keep them correct, and the discipline that stops your streaming features from disagreeing with the batch features the model trained on.</p>
+</header>
+
+<section id="why">
+  <h2>Which features actually need to stream</h2>
+  <p>Streaming is the most over-prescribed component in ML data architecture. The reflex is "real-time inference needs real-time features", and it is wrong for most features: a ranking model scoring offers in 50 ms does not need <code>host_reliability_7d</code> recomputed since the last heartbeat — a value materialized an hour ago is indistinguishable from a live one. What it needs is <em>fast reads</em>, which is the online store's job (<a href="08-serving-architectures.html">chapter 08</a>), not a streaming pipeline's.</p>
+  <p>A feature earns a streaming pipeline when <strong>the value changes materially inside the batch interval and the model's decision depends on that change</strong>. At GridDP that is a short list: device/IP signup velocity in the last five minutes (fraud), live bid depth per GPU model (pricing), a host's last-heartbeat age (ranking's availability gate), and an account's actions in the current session (fraud, churn). Everything else — tenure, spend trends, benchmark scores, 30-day aggregates — is batch, and forcing it through Flink buys you cost and a second definition of the same feature to keep in sync.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Freshness is a property of a <em>feature</em>, not of a system. Ask per feature: what is the cost of the model seeing a value that is N minutes stale? If the answer is "nothing" for N = 60, it is a batch feature served online. If the answer is "we approve a fraudulent signup" for N = 2, it streams.</p>
+  </div>
+</section>
+
+<section id="freshness">
+  <h2>Freshness SLAs, in numbers</h2>
+  <p>Write the SLA down before choosing the engine, because the engine follows from it. Freshness is measured end to end — event occurs → feature value visible to the model — and it has three components: transport lag (producer to Kafka), compute lag (window close plus processing), and write lag (to the online store). A "sub-second feature" that sits behind a five-minute tumbling window is a five-minute feature.</p>
+  <table>
+    <thead>
+      <tr><th>Freshness band</th><th>Typical GridDP features</th><th>Mechanism</th><th>What it costs</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Daily</strong></td><td>host tenure, 90-day spend, DLPerf score</td><td>Nightly dbt/Spark → offline store → materialize to online</td><td>Cheapest; one definition</td></tr>
+      <tr><td><strong>Hourly</strong></td><td>utilization rollups, reliability_7d, price_vs_market</td><td>Hourly batch; incremental models</td><td>Cheap; backfills trivial</td></tr>
+      <tr><td><strong>Minutes</strong></td><td>bid depth, fill rate by region</td><td>Micro-batch (Spark Structured Streaming, 1–5 min triggers) or Flink windows</td><td>A streaming job to operate; state to checkpoint</td></tr>
+      <tr><td><strong>Seconds</strong></td><td>signup velocity per IP/device, last-heartbeat age</td><td>Flink / Kafka Streams with keyed state; direct online-store writes</td><td>Highest — exactly-once semantics, state size, second feature definition</td></tr>
+      <tr><td><strong>Request time</strong></td><td>distance to requested region, price vs this search's filters</td><td>On-demand feature in the serving path</td><td>Latency budget, not infrastructure</td></tr>
+    </tbody>
+  </table>
+  <p>The table has a shape worth noticing: cost climbs a step per band, and the top band is where you stop having one feature definition. That is the real price of streaming, and it is paid in <a href="#consistency">consistency</a>, not in cloud spend.</p>
+</section>
+
+<section id="engines">
+  <h2>Computing features on a stream</h2>
+  <p>Three engine families cover nearly every streaming-feature pipeline. The choice is about state and latency, not brand.</p>
+  <ul>
+    <li><strong>Apache Flink.</strong> True event-at-a-time processing with keyed state, event-time windows, watermarks and exactly-once sinks. The right tool when latency is seconds, windows are sliding or session-shaped, and state (per-account counters, per-IP sets) must survive restarts. Flink SQL makes many feature definitions declarative.</li>
+    <li><strong>Spark Structured Streaming.</strong> Micro-batches on a trigger; same API as the batch job, which is its superpower — the hourly feature and the two-minute feature can share code. Latency floors at the trigger interval; state handling is coarser than Flink's. The default in Stack B.</li>
+    <li><strong>Kafka Streams / ksqlDB.</strong> Library-in-your-service model, no cluster to run. Good for a fraud service that owns its own velocity counters; awkward when the feature must also land in the lakehouse for training.</li>
+  </ul>
+  <p>Managed offerings (Confluent Flink, Databricks streaming tables, Snowflake Dynamic Tables at minute lag, Tecton's streaming feature views) shift the operations, not the semantics. Whatever runs the job, the feature must be defined once — a name, an entity key, an aggregation over a window — and materialized to two places: the online store for inference and the offline store for training.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>signup_velocity_5m.sql (Flink SQL)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">-- Feature: signups from the same device fingerprint in the trailing 5 minutes.
+-- Entity key: device_id. Event time from the producer, watermark tolerates 30s of lateness.
+CREATE TABLE signup_events (
+  device_id      STRING,
+  account_id     STRING,
+  ip_prefix      STRING,
+  event_ts       TIMESTAMP(3),
+  WATERMARK FOR event_ts AS event_ts - INTERVAL '30' SECOND
+) WITH ('connector' = 'kafka', 'topic' = 'marketplace.signups', ...);
+
+INSERT INTO online_features_signup_velocity   -- Redis sink, keyed by device_id, TTL 15m
+SELECT
+  device_id,
+  COUNT(*)                        AS signups_5m,
+  COUNT(DISTINCT ip_prefix)       AS distinct_ip_prefixes_5m,
+  HOP_END(event_ts, INTERVAL '30' SECOND, INTERVAL '5' MINUTE) AS feature_ts
+FROM signup_events
+GROUP BY device_id,
+         HOP(event_ts, INTERVAL '30' SECOND, INTERVAL '5' MINUTE);  -- sliding: 5m window, 30s slide
+</code></pre>
+  </div>
+</section>
+
+<section id="windows">
+  <h2>Windows, watermarks &amp; late data</h2>
+  <p>A streaming feature is an aggregate over a window, and every correctness question reduces to: which events are in the window, and when is the window's value final? Three window shapes cover the feature catalogue — <strong>tumbling</strong> (fixed, non-overlapping: bids per market per minute), <strong>sliding/hopping</strong> (overlapping: signups in the trailing 5 minutes, updated every 30 s), and <strong>session</strong> (gap-based: an account's actions until 20 minutes of silence). Sliding windows are the common choice for velocity features and the expensive one — each event lands in several windows, so state multiplies by window ÷ slide.</p>
+  <p>Event time versus processing time is the trap. The fraud feature must count signups by <em>when they happened</em>, not when the message reached the job — otherwise a Kafka partition that lags by two minutes makes a burst look spread out. Event-time processing needs a <strong>watermark</strong>: the job's declaration that "I have now seen everything up to time T, give or take my tolerance". Events arriving after the watermark passed their window are <em>late</em>, and the design decision is what to do with them: drop (simplest; fine for velocity counters where a 30-second-late event barely matters), update the emitted value (correct; requires the sink to accept upserts and consumers to tolerate change), or side-output to a reconciliation table (auditable; the batch path picks them up).</p>
+  <div class="callout warn">
+    <span class="callout-label">The watermark tolerance is a business decision</span>
+    <p>A 30-second watermark means a 5-minute feature is emitted ~30 seconds after the window closes. A 5-minute tolerance handles more late data and adds 5 minutes of latency to every value. There is no free setting — pick it from the producer's measured lateness distribution (p99 of event_ts vs arrival) and write it next to the feature definition, because the model's training data must be built with the same rule.</p>
+  </div>
+</section>
+
+<section id="write-path">
+  <h2>The online-store write path</h2>
+  <p>Where the streamed value lands is half the design. The batch path materializes latest values into the online store on a schedule; the streaming job writes directly, continuously. The two paths meet in the same keyspace, which creates three rules:</p>
+  <ul>
+    <li><strong>Key by entity, version by time.</strong> Every write carries <code>feature_ts</code>. A slower batch materialization must not overwrite a fresher streamed value; compare timestamps on write (Redis Lua, DynamoDB condition expressions) or namespace the two paths and resolve at read.</li>
+    <li><strong>TTL streamed features.</strong> A 5-minute velocity feature for a device that never signs up again should not live in Redis forever. Set TTLs to the window length plus margin; a missing key reads as zero, which is correct.</li>
+    <li><strong>Dual-write to the offline store.</strong> The same job that writes Redis must append the emitted values (entity, feature_ts, value) to the lakehouse — Iceberg via Flink's sink, Delta via Structured Streaming — because that history is the only way to build a leakage-free training set for a streamed feature. Skip this and the feature is untrainable.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>streaming-feature-topology.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  Kafka: marketplace.signups ──▶ Flink job: signup_velocity_5m
+                                    │ keyed state (device_id), hop window, watermark 30s
+                                    ├──▶ Redis  (online)   key device:{id}:signup_velocity_5m  TTL 15m
+                                    │                      value {signups_5m, distinct_ips, feature_ts}
+                                    └──▶ Iceberg (offline) features.signup_velocity_5m
+                                                           (device_id, feature_ts, signups_5m, …)  append-only
+                                                           ▲
+  Nightly batch (dbt/Spark) ───────────────────────────────┘ reconciliation: recompute the same window
+                                                             from raw events, diff vs streamed values,
+                                                             alert if p99 |Δ| > tolerance
+</code></pre>
+  </div>
+</section>
+
+<section id="consistency">
+  <h2>Stream–batch consistency: the second-definition problem</h2>
+  <p>Here is the failure that actually ships. The training set for the fraud model is built in SQL over raw signup events, in batch, with a clean 5-minute window. The serving feature is computed in Flink, with a 30-second watermark, a hop of 30 seconds, and late events dropped. Same name, two definitions. Offline the feature is slightly "too complete" (it saw the late events); online it is slightly sparse. The model learns thresholds on the complete version and applies them to the sparse one. AUC drops from 0.94 offline to 0.85 in production, and nobody can find a bug because there isn't one — there are two correct implementations of different things.</p>
+  <p>Four ways out, in rising order of rigor:</p>
+  <ol>
+    <li><strong>Log the served value.</strong> Have the inference service record the exact feature vector it scored; build the training set from those logs rather than recomputing. Cheapest fix, trains only on what the model would have seen, but you cannot backfill a new feature.</li>
+    <li><strong>One code path, two triggers.</strong> Structured Streaming lets the same query run as a micro-batch job and as a nightly batch over the lakehouse. Latency floors at the trigger, but the definition is shared.</li>
+    <li><strong>Replay the streaming job over history.</strong> Run the Flink job against the Kafka retention (or a lakehouse-backed replay) to produce the offline history with the exact same windowing and watermark. Needs long retention or Tiered Storage, and takes as long as the stream is long unless the job is parallelized.</li>
+    <li><strong>Reconcile continuously.</strong> Keep both paths but recompute the batch version of every streamed feature nightly, diff it against the streamed history, and alert on drift beyond a tolerance. This does not prevent the skew; it makes it visible within a day instead of at the next model review.</li>
+  </ol>
+  <div class="callout tip">
+    <span class="callout-label">Say the number</span>
+    <p>"How do you guarantee the streaming feature matches training?" is the question that separates people who have run this from people who have read about it. The strong answer has a mechanism <em>and</em> a tolerance: "the serving path logs feature vectors, training reads those logs, and a nightly reconciliation recomputes the window from raw events and pages us if p99 disagreement exceeds 2%." Mechanism without tolerance is a hope; tolerance without mechanism is a dashboard.</p>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: fraud velocity at GridDP</h2>
+  <p>GridDP's fraud model scores every signup and every new listing. Its batch features (payment-method age, KYC outcome, chargeback history) come from the nightly materialization. Its two streamed features — <code>signup_velocity_5m</code> keyed by device fingerprint and <code>listing_velocity_15m</code> keyed by host — run in one Flink job reading the marketplace event topics with a 30-second watermark. The job writes Redis with a 15-minute TTL and appends to Iceberg. The nightly reconciliation recomputes both windows from the raw topic mirrored in the lake and diffs; tolerance is 2% at p99, and the one time it fired it caught a producer that had switched from event time to send time after a deploy.</p>
+  <p>Cost shape: the Flink job is two task managers and about 4 GB of keyed state; the Redis keyspace stays under a million entries because of the TTL; the Iceberg append is ~2 GB/day before compaction. The point is not that this is small — it is that it is small <em>because only two features stream</em>. The first design had eleven.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The streaming-feature heuristic</span>
+    <ul>
+      <li><strong>Default:</strong> batch-compute, materialize to the online store. Fast reads are not a streaming problem.</li>
+      <li><strong>Stream only when</strong> a feature changes inside the batch interval <em>and</em> the decision depends on it. Write the freshness SLA in seconds next to the feature name.</li>
+      <li><strong>Seconds and stateful:</strong> Flink (or a managed Flink). <strong>Minutes and shared code:</strong> Spark Structured Streaming micro-batches. <strong>Inside one service:</strong> Kafka Streams.</li>
+      <li><strong>Always:</strong> event time with an explicit watermark; TTL the online keys; dual-write history to the offline store.</li>
+      <li><strong>Consistency:</strong> log served feature vectors for training and reconcile nightly with a stated tolerance. Add replay when you need to backfill new streamed features.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the streaming-features answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> "Real-time models need real-time features"; would stream everything; computes on processing time.</li>
+        <li><strong>L2 · Practitioner.</strong> Separates fast reads from fresh values; uses event-time windows and knows what a watermark is; writes the online store from a streaming job.</li>
+        <li><strong>L3 · Senior.</strong> Classifies features by freshness SLA and streams only the few that need it; picks the window shape and watermark from measured lateness; dual-writes history; has a concrete plan for stream–batch consistency.</li>
+        <li><strong>L4 · Staff.</strong> Treats the second-definition problem as the central risk and designs around it (feature logging or shared code path), sets reconciliation tolerances, sizes state and TTLs, and can show the cost delta of moving a feature from hourly to seconds — and say no when the model gain doesn't cover it.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the features that are not numbers at all: <a href="07-embeddings-and-vector-data.html">07 · Embeddings, Vector Data &amp; RAG Pipelines</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

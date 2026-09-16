@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Embeddings, Vector Data &amp; RAG Pipelines</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">An embedding is a feature with a model inside it</a>
+    <a href="#pipeline">The embedding pipeline: batch and incremental</a>
+    <a href="#chunking">Chunking &amp; the document model</a>
+    <a href="#stores">Where vectors live</a>
+    <a href="#hybrid">Hybrid search &amp; filters</a>
+    <a href="#refresh">Refresh, re-embedding &amp; drift</a>
+    <a href="#griddp">Worked example: GridDP</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="06-streaming-features.html">← Previous</a>
+    <a href="08-serving-architectures.html">Next: Serving Architectures &amp; Training/Serving Skew →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Moving &amp; serving</span>
+  <h1>Embeddings, Vector Data &amp; RAG Pipelines</h1>
+  <p class="subtitle">Embeddings are features whose definition is a model. That single fact drives everything — how the pipeline runs, why re-embedding is a migration, where vectors should live, and why "just add a vector database" is usually the wrong first move.</p>
+</header>
+
+<section id="why">
+  <h2>An embedding is a feature with a model inside it</h2>
+  <p>A tabular feature like <code>acct_rentals_30d</code> has a definition you can read: count rentals, trailing 30 days. An embedding's definition is <em>the weights of the model that produced it</em>. Two vectors are only comparable if the same model, at the same version, with the same preprocessing, produced both. Change the model and every stored vector is silently obsolete — not wrong in a way a test catches, just no longer in the same space as the new queries.</p>
+  <p>That is the whole architecture in one sentence. An embedding pipeline is a feature pipeline where the "feature version" includes a model version; a vector store is an online store whose index must be rebuilt when that version changes; and retrieval quality is a data-quality problem, monitored like drift. At GridDP the honest starting point is that <strong>most models don't need this at all</strong> — ranking, fraud, forecasting and pricing are tabular problems where gradient-boosted trees win. Embeddings earn their place for three jobs: semantic search over free-text workload descriptions ("fine-tune a 70B model" → suitable GPU configurations), similarity over behavior (hosts whose telemetry signature looks alike, for reliability and fraud rings), and retrieval for the AI interfaces that answer questions over docs, runbooks and metric definitions.</p>
+  <div class="callout insight">
+    <span class="callout-label">The reframe</span>
+    <p>Treat <code>(embedding_model, version, preprocessing_hash)</code> as part of the vector's schema. Store it on every row. A vector store that mixes two model versions in one index is returning garbage with high confidence, and nothing downstream can tell.</p>
+  </div>
+</section>
+
+<section id="pipeline">
+  <h2>The embedding pipeline: batch and incremental</h2>
+  <p>The pipeline has four stages, and the interesting decisions are in how it runs, not what it does: <strong>select</strong> the rows or documents that need vectors → <strong>preprocess</strong> (clean, chunk, normalize) → <strong>embed</strong> (a hosted model, an API, or a GPU batch job) → <strong>write</strong> vectors plus metadata to the store and the lakehouse.</p>
+  <ul>
+    <li><strong>Batch (backfill and re-embed).</strong> Everything, once. This is a GPU job — a 7B-parameter embedding model over ten million support tickets is hours on a handful of GPUs, not minutes. Shard the input, checkpoint progress by shard, write to a <em>new</em> index version, and cut over atomically. At a neocloud this is the one ML data pipeline that competes with customers for the same hardware; schedule it on the marketplace's own idle capacity.</li>
+    <li><strong>Incremental (steady state).</strong> New and changed rows only, driven by CDC or an event stream (<a href="06-streaming-features.html">chapter 06</a>'s machinery). Latency is usually minutes; a new listing should be findable soon, not instantly. Idempotent upsert keyed by <code>(entity_id, chunk_id)</code>.</li>
+    <li><strong>Deletes.</strong> The forgotten stage. A deleted listing, an erased account (GDPR), a retracted document must leave the index. CDC delete events → tombstone in the metadata table → delete from the vector store. Vector stores vary wildly in how cheaply they delete; check before choosing one.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>embed_listings.py (incremental, idempotent)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># Incremental embedding of changed listings. Driven by the CDC topic; runs every 5 minutes.
+MODEL_ID  = "bge-m3"                # embedding model
+MODEL_VER = "2025-11"               # weights version — part of the vector schema
+PREP_HASH = preprocess_hash()       # hash of chunking + cleaning code
+
+changed = read_cdc("marketplace.listings", since=last_checkpoint())      # inserts, updates, deletes
+docs    = [prepare(l) for l in changed if l.op != "delete"]              # title + description + specs
+vecs    = embed_batch(docs, model=MODEL_ID, version=MODEL_VER)           # GPU or API, batched
+
+rows = [dict(entity_id=d.listing_id, chunk_id=0, vector=v,
+             model=MODEL_ID, model_version=MODEL_VER, prep_hash=PREP_HASH,
+             gpu_model=d.gpu_model, region=d.region, price_hr=d.price_hr,  # filterable metadata
+             embedded_at=now())
+        for d, v in zip(docs, vecs)]
+
+upsert("listings_v3", rows, key=("entity_id", "chunk_id"))               # vector store, index version v3
+append_lakehouse("features.listing_embeddings", rows)                    # offline history for training/eval
+tombstone([l.listing_id for l in changed if l.op == "delete"], "listings_v3")
+commit_checkpoint()
+</code></pre>
+  </div>
+</section>
+
+<section id="chunking">
+  <h2>Chunking &amp; the document model</h2>
+  <p>For RAG the unit of retrieval is a chunk, not a document, and chunking is where most retrieval quality is won or lost — before any vector store is involved. The decisions: chunk size (a few hundred tokens for Q&amp;A over runbooks; larger for narrative docs), overlap (so a fact split across a boundary survives), structure-awareness (split on headings and tables, not on character counts), and what metadata rides along (source, section title, last-updated, access class). Each chunk is a row: <code>(doc_id, chunk_id, text, vector, metadata)</code>. Store the text alongside the vector — a store that returns only IDs forces a second lookup in the latency path.</p>
+  <p>The document model also has to answer "what is the source of truth?" For GridDP's metric definitions the answer is the semantic layer, not a copied paragraph; for runbooks it is the wiki page at a version. Record it, because the AI interface will be asked "where did this come from?" and a chunk without provenance cannot answer.</p>
+  <div class="callout warn">
+    <span class="callout-label">Access control lives on the chunk</span>
+    <p>A vector index flattens every permission boundary you had in the source systems. If finance runbooks and public docs share an index, a retrieval query from an unprivileged user will happily surface the finance chunk. Carry the access class as filterable metadata and apply it as a pre-filter on every query. Post-filtering after retrieval is not enough — the sensitive chunk already left the store.</p>
+  </div>
+</section>
+
+<section id="stores">
+  <h2>Where vectors live</h2>
+  <p>The choice is about scale, filters and how many systems you want to run. Nearly every option now offers HNSW or IVF-style approximate-nearest-neighbour indexes; the differences are in what surrounds the index.</p>
+  <table>
+    <thead>
+      <tr><th>Option</th><th>Shape</th><th>Best at</th><th>Watch out for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>pgvector</strong></td><td>Postgres extension</td><td>Up to low millions of vectors; vectors next to the relational rows they describe; one database to run</td><td>Index build time and memory at scale; HNSW recall tuning is manual; one Postgres to protect</td></tr>
+      <tr><td><strong>Lance / LanceDB</strong></td><td>Columnar files on object storage with built-in ANN and versioning</td><td>Embeddings as a dataset — versioned, cheap, GPU-loader friendly; serverless retrieval at moderate QPS</td><td>Not a high-QPS OLTP store; index refresh is a rebuild</td></tr>
+      <tr><td><strong>Warehouse-native</strong> (Snowflake VECTOR, Databricks Vector Search, BigQuery)</td><td>Vector type + index in the governed platform</td><td>One access-control plane; SQL alongside vectors; Stacks B and C</td><td>Latency and QPS ceilings; cost per query at serving scale</td></tr>
+      <tr><td><strong>OpenSearch / Elasticsearch</strong></td><td>Search engine with k-NN plugin</td><td>Hybrid lexical + vector in one query; you already run it for search</td><td>Cluster operations; vector memory footprint</td></tr>
+      <tr><td><strong>Dedicated</strong> (Milvus, Qdrant, Weaviate, Pinecone)</td><td>Purpose-built vector service</td><td>Tens of millions+ vectors, high QPS, recall/latency tuning as first-class knobs</td><td>Another system (or vendor) in the serving path; data duplicated from the lakehouse; deletes and filters vary</td></tr>
+    </tbody>
+  </table>
+  <p>Whatever serves queries, the lakehouse keeps the history. Vectors written only to a vector database are unreproducible the day the index is rebuilt with a new model; the append to <code>features.listing_embeddings</code> in the pipeline above is what lets you evaluate old versus new retrieval on the same corpus.</p>
+</section>
+
+<section id="hybrid">
+  <h2>Hybrid search &amp; filters</h2>
+  <p>Pure vector similarity is a poor search engine. It has no notion of exact match — a query for "H100 SXM 80GB" should not rank an "H100 PCIe 80GB" listing as its nearest neighbour just because the words are similar — and it cannot enforce hard constraints like region or price ceiling. Production retrieval is hybrid: a lexical component (BM25) for exact terms, a vector component for semantics, fused by rank (reciprocal rank fusion is the workhorse) or by a learned reranker; plus <strong>metadata pre-filters</strong> applied inside the index so the top-k is computed over eligible rows only. The GridDP semantic search pre-filters on region and GPU memory, fuses BM25 over specs with the vector score over the free-text description, then reranks the top 50 with a cross-encoder. The vector store contributed one of four stages.</p>
+</section>
+
+<section id="refresh">
+  <h2>Refresh, re-embedding &amp; drift</h2>
+  <p>Three things change under an embedding index, and each needs a plan.</p>
+  <ul>
+    <li><strong>The data changes.</strong> Handled by the incremental pipeline; measure the lag from source change to index visibility as a freshness SLA, like any feature.</li>
+    <li><strong>The model changes.</strong> A new embedding model is a <em>migration</em>, not an update: re-embed the full corpus into a new index version, evaluate retrieval quality on a held-out query set (recall@k against labeled relevant chunks, plus an LLM-judged answer quality if it feeds RAG), then cut queries over and retire the old index. Never embed new rows with the new model into the old index.</li>
+    <li><strong>The world changes.</strong> Query distribution drifts — a new GPU generation ships and nobody searched for "B200" during evaluation. Monitor the distribution of query embeddings and of top-k similarity scores over time; a falling median top-1 score means queries are landing in sparse regions of the index. Feed sampled queries back into the evaluation set monthly.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>retrieval-eval.txt</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  eval set: 400 labeled queries → relevant chunk ids   (refreshed monthly from sampled production queries)
+
+  index      model          recall@5   recall@20   p50 latency   notes
+  ---------  -------------  ---------  ----------  ------------  -------------------------------
+  listings_v2 bge-large 2025-03  0.71      0.88        18 ms       current
+  listings_v3 bge-m3    2025-11  0.79      0.93        21 ms       candidate — cut over ✔
+  listings_v3 + hybrid BM25       0.86      0.95        26 ms       ship with hybrid on
+
+  drift monitor (weekly): median top-1 cosine 0.62 → 0.55 after B200 launch  ⚠ add queries to eval set
+</code></pre>
+  </div>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: GridDP</h2>
+  <p>GridDP runs two embedding pipelines and, deliberately, no dedicated vector database. Listing embeddings (a few hundred thousand vectors, refreshed incrementally from the listings CDC topic) live in pgvector beside the listings table that marketplace search already queries — the pre-filters on region and GPU memory are ordinary SQL predicates, and hybrid search fuses pgvector similarity with Postgres full-text search. Internal-knowledge chunks for the AI interface (docs, runbooks, the semantic layer's metric definitions) live in LanceDB on object storage: low QPS, cheap, versioned per re-embedding, and readable directly by the evaluation notebooks. Both pipelines append to the lakehouse. The host-behavior embeddings for fraud-ring detection are computed weekly in batch and consumed as ordinary tabular features by the fraud model — they never see a vector index at all, because the consumer is a model, not a search box.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The vector-data heuristic</span>
+    <ul>
+      <li><strong>Do you have a similarity or retrieval problem?</strong> If the consumer is a tabular model, embeddings are features — store them as columns, no index needed.</li>
+      <li><strong>Under a few million vectors, already on Postgres:</strong> pgvector. <strong>Embeddings as a versioned dataset, moderate QPS:</strong> Lance. <strong>Governed platform, SQL users:</strong> warehouse-native. <strong>You already run OpenSearch for search:</strong> its k-NN. <strong>Tens of millions of vectors at high QPS with tight recall targets:</strong> a dedicated store — and only then.</li>
+      <li><strong>Always:</strong> model version on every row, history in the lakehouse, access class as a pre-filter, hybrid retrieval, a labeled eval set, and re-embedding as an index-version migration.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the embeddings answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> "Embed everything, put it in a vector DB, query nearest neighbours"; no notion of model versioning or deletes.</li>
+        <li><strong>L2 · Practitioner.</strong> Runs an incremental pipeline with metadata filters; knows chunking matters; picks a store by scale.</li>
+        <li><strong>L3 · Senior.</strong> Versions the model with the vectors, treats re-embedding as a migration with an eval gate, does hybrid retrieval with pre-filters and access control, keeps history in the lakehouse, monitors query drift.</li>
+        <li><strong>L4 · Staff.</strong> Says no to the vector database until there is a retrieval problem; designs the eval set and the cut-over process before the first index; can show the recall/latency/cost curve for each store option and explain why the fraud team's embeddings are features, not an index.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next: the path from a feature value to a prediction, and the skew that opens up along it — <a href="08-serving-architectures.html">08 · Serving Architectures &amp; Training/Serving Skew</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

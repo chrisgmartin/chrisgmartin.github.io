@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Labels, Ground Truth &amp; Feedback Loops</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Labels are data with latency and bias</a>
+    <a href="#sources">Where labels come from</a>
+    <a href="#delay">Delay, censoring and the label window</a>
+    <a href="#bias">Survivorship bias and the feedback loop</a>
+    <a href="#hitl">Human-in-the-loop and weak supervision</a>
+    <a href="#store">The label store</a>
+    <a href="#griddp">Worked example: the ranker's labels</a>
+    <a href="#heuristic">When to choose what</a>
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="02-training-data-pipelines.html">← Previous</a>
+    <a href="04-feature-store.html">Next: Feature Engineering at Scale &amp; the Feature Store →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The data</span>
+  <h1>Labels, Ground Truth &amp; Feedback Loops</h1>
+  <p class="subtitle">Where labels come from, how late they arrive, what they systematically fail to include, and how to design the label pipeline so the model learns from the world rather than from its own decisions.</p>
+</header>
+
+<section id="why">
+  <h2>Labels are data with latency and bias</h2>
+  <p>Features get most of the architectural attention; labels get a column name. Yet the label pipeline decides what the model can learn at all, and it has two properties features don't. <strong>Latency:</strong> the truth about a prediction arrives later — a click within seconds, a rental's actual duration in hours, a chargeback in up to 120 days, "did the forecast hold" in a week. <strong>Bias:</strong> you only observe outcomes for the actions you took. GridDP's fraud model sees chargebacks only on payments it <em>approved</em>; the ranker sees clicks only on listings it <em>showed</em>. The model's own decisions carve the shape of tomorrow's training data.</p>
+  <p>Treating labels as "whatever column happens to be there" produces models that are confidently wrong about the part of the world they never see. Treating them as a pipeline with an explicit delay, a censoring rule and a bias-correction strategy is what this chapter is about.</p>
+</section>
+
+<section id="sources">
+  <h2>Where labels come from</h2>
+  <table>
+    <thead><tr><th>Source</th><th>GridDP example</th><th>Delay</th><th>Quality</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Implicit outcome</strong> (the system observes it)</td><td>Click, rental started, instance preempted, forecast vs actual utilisation</td><td>Seconds to days</td><td>High volume, noisy meaning (a click ≠ satisfaction)</td><td>Free</td></tr>
+      <tr><td><strong>Delayed business event</strong></td><td>Chargeback filed, dispute resolved, payout reversed</td><td>Weeks to months, censored</td><td>Authoritative but late and partial</td><td>Free, but you wait</td></tr>
+      <tr><td><strong>Human review</strong> (HITL)</td><td>Trust &amp; safety analyst marks an account fraudulent</td><td>Hours to days</td><td>High precision, low recall, reviewer drift</td><td>Expensive per label; use for the uncertain band</td></tr>
+      <tr><td><strong>Weak / programmatic</strong></td><td>Heuristics: "3+ cards in 10 min" → likely fraud; distant supervision from bans</td><td>Immediate</td><td>Noisy, correlated errors; needs de-noising (Snorkel-style label models)</td><td>Cheap, scales</td></tr>
+      <tr><td><strong>Synthetic / simulated</strong></td><td>Replayed market ticks for pricing; augmented telemetry</td><td>Immediate</td><td>Only as good as the simulator's realism</td><td>Compute</td></tr>
+    </tbody>
+  </table>
+  <p>Most real models blend these: authoritative delayed labels for training, implicit signals for fast proxy metrics, human review to label the band where the model is unsure, and weak labels to bootstrap a cold-start. The architecture question is how those blend without contaminating each other — which needs a label store with provenance, below.</p>
+</section>
+
+<section id="delay">
+  <h2>Delay, censoring and the label window</h2>
+  <p>Chargebacks can be filed up to 120 days after a payment, with most arriving in the first 45. A payment from 20 days ago has no chargeback <em>yet</em>; calling it a negative is the most common label bug in fraud systems, and it biases the model toward approving recent-looking behaviour. The row is <strong>censored</strong>, not negative.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>label maturity — fraud</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">  payment at T                                             today
+  │◀────────────── label window (90 d) ──────────────▶│
+  │                                                    │
+  ├─ chargeback filed at T+31 ─▶ label = 1 (known at T+31)
+  ├─ no chargeback by T+90     ─▶ label = 0 (known only at T+90)
+  ├─ today &lt; T+90              ─▶ label = NULL (censored; exclude or model survival)
+  │
+  practical rule: a row is trainable only when  now() ≥ prediction_ts + window
+  → the newest 90 days of the spine are unlabeled, always. Design for it.</code></pre>
+  </div>
+  <p>Three consequences for the pipeline. The label table must be <strong>append-only with a <code>known_at</code></strong> timestamp, so a training set built on 1 June and one built on 1 September can both be reproduced (a label that flipped from 0 to 1 on 15 July is two rows, not an update). The training window must <strong>end at least one label-window before the build date</strong>, and the validation split should be the most recent <em>mature</em> period, not the most recent period. And for models where waiting 90 days is unacceptable, use a <strong>shorter proxy label</strong> (chargeback within 30 days captures ~70% of eventual chargebacks at GridDP) and track its correlation with the true label so you know when the proxy drifts.</p>
+  <div class="callout warn">
+    <span class="callout-label">Don't backfill labels in place</span>
+    <p>Updating <code>label = 1</code> on the original payment row destroys the ability to rebuild the dataset as of any earlier date and hides how label maturity behaves. Append <code>(payment_id, label, known_at, source)</code>; derive the current label with a window. The extra rows are trivial; the reproducibility is not.</p>
+  </div>
+</section>
+
+<section id="bias">
+  <h2>Survivorship bias and the feedback loop</h2>
+  <p>The fraud model approves 97% of payments and declines 3%. Chargebacks — the only fraud signal — exist only for the 97%. The declined 3% have <em>no label ever</em>. Retrain on this and the model learns that the patterns it already declines are "not fraud" (it never sees them lose money), and it slowly drifts toward approving them. Rankers have the same problem in mirror image: a listing that is never shown is never clicked, so it looks unattractive forever.</p>
+  <table>
+    <thead><tr><th>Correction</th><th>Mechanism</th><th>Cost</th><th>Use at GridDP</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Exploration / hold-out traffic</strong></td><td>Approve a small random fraction of would-be declines (or show random listings) and label them</td><td>Real fraud loss / worse ranking on ε% of traffic</td><td>Fraud: ~0.5% of declines approved with a lower limit; ranking: ε-greedy slots</td></tr>
+      <tr><td><strong>Inverse propensity weighting</strong></td><td>Weight rows by 1 / P(action taken) so under-observed regions count more</td><td>High variance if propensities are tiny; needs logged propensities</td><td>Ranking (log the position and the score)</td></tr>
+      <tr><td><strong>Human review of declines</strong></td><td>Analysts label a sample of declines</td><td>Analyst time</td><td>Weekly sample of 200 declines</td></tr>
+      <tr><td><strong>Delayed independent signal</strong></td><td>Later evidence not caused by the decision (a KYC failure, a confirmed-stolen card list)</td><td>Coverage is partial</td><td>Join the card-compromise feed by BIN + last4</td></tr>
+    </tbody>
+  </table>
+  <p>Whichever you use, the requirement on the data plane is the same: <strong>log the decision, the score, the policy version and the propensity alongside every prediction</strong>. Without that log, no correction is possible after the fact. This is the same served-vector log that chapter 08 needs for skew analysis — one table, several consumers.</p>
+</section>
+
+<section id="hitl">
+  <h2>Human-in-the-loop and weak supervision</h2>
+  <p>Human labels are the most accurate and the most expensive, so route them where the model is least certain. A review queue that pulls payments with scores in the 0.35–0.65 band and returns labels within 24 hours gives you high-value examples at the decision boundary and a fast proxy for delayed chargebacks. Engineering requirements: a queue with assignment and SLA, a labeling UI that shows the served feature vector (so the reviewer and the model see the same thing), <strong>reviewer identity and rubric version on every label</strong> (reviewers disagree, rubrics change), and periodic double-labeling to measure inter-annotator agreement — if two analysts agree on 80% of cases, your label noise floor is 20%, and the model's precision can't be trusted above it.</p>
+  <p>Weak supervision goes the other way: many cheap, noisy labeling functions ("more than three distinct cards in ten minutes", "IP in a known proxy range", "email domain created this week") combined by a label model that estimates each function's accuracy from their agreements. It is the right tool for cold starts and for classes too rare to review, and the wrong tool as a permanent replacement for ground truth — its errors are correlated, and the model will learn the heuristics rather than the fraud.</p>
+</section>
+
+<section id="store">
+  <h2>The label store</h2>
+  <p>The pipeline above needs a home. A <em>label store</em> is a small, opinionated table family, not a product:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>label store — DDL</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">CREATE TABLE ml.labels (
+  task          STRING,      -- 'fraud_chargeback_90d', 'ranking_click', 'capacity_actual_7d'
+  entity_id     STRING,      -- payment_id, (session_id, listing_id), (region, gpu_model, hour)
+  prediction_ts TIMESTAMP,   -- the decision moment this label belongs to
+  label         DOUBLE,      -- 0/1, a value, or a rank position
+  known_at      TIMESTAMP,   -- when this label became known — append-only
+  source        STRING,      -- 'chargeback_feed' | 'reviewer' | 'weak:lf_card_velocity' | 'exploration'
+  source_ref    STRING,      -- chargeback_id, reviewer_id + rubric@v, labeling-function version
+  weight        DOUBLE       -- propensity / sampling weight, 1.0 by default
+) PARTITIONED BY (task, days(known_at));
+
+-- current label for a task, as of a build date (reproducible):
+SELECT entity_id, prediction_ts, label
+FROM ml.labels
+WHERE task = 'fraud_chargeback_90d' AND known_at &lt;= :build_date
+QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY known_at DESC, source_rank(source)) = 1;</code></pre>
+  </div>
+  <p><code>source</code> is the column that keeps blends honest: a training set can choose "authoritative only", "authoritative + reviewer", or "everything with weights", and the manifest (ch. 02) records which. When a reviewer rubric changes, the old labels keep their <code>source_ref</code> and can be excluded or re-weighted rather than silently mixed.</p>
+</section>
+
+<section id="griddp">
+  <h2>Worked example: the ranker's labels</h2>
+  <p>GridDP's ranker predicts which listings a renter will rent. The implicit label is "rented after being shown". The spine is (search_id, listing_id, position, shown_at); the label is <code>rented_within_24h</code>, known at most 24 hours later — fast, plentiful, and biased three ways: position (row 1 gets clicked more regardless of quality), exposure (unshown listings have no rows), and the loop (the current ranker decides what's shown). The label pipeline therefore logs <code>position</code> and the ranker's <code>score</code> and <code>policy_version</code> with every impression, reserves two of the ten slots on 5% of searches for randomly sampled eligible listings (exploration), and stores the label with <code>weight = 1/propensity</code> for those slots. Offline evaluation uses the exploration slice only; training uses everything with weights. Nothing about this is a modeling trick — it is table design plus a serving-side logging contract, which is why it lives in this guide.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The label decision heuristic</span>
+    <ul>
+      <li><strong>Always:</strong> append-only labels with <code>known_at</code> and <code>source</code>; train only on mature rows; validate on the most recent <em>mature</em> period.</li>
+      <li><strong>Delayed labels (weeks+):</strong> add a short-horizon proxy label and track its agreement with the true one; alert when it drifts.</li>
+      <li><strong>Your decisions filter the labels</strong> (fraud, ranking, lending): exploration traffic or propensity logging from day one — it cannot be added retroactively.</li>
+      <li><strong>Uncertain band or rare class:</strong> a HITL queue with rubric versioning and agreement measurement.</li>
+      <li><strong>Cold start:</strong> weak supervision to bootstrap, with a plan to replace it.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>Optional: the label answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Uses whatever outcome column exists; treats missing outcomes as negatives; overwrites labels in place.</li>
+        <li><strong>L2 · Practitioner.</strong> Knows about label delay and drops recent rows; has a review queue; hasn't logged propensities.</li>
+        <li><strong>L3 · Senior.</strong> Append-only label store with <code>known_at</code>/<code>source</code>, censoring-aware windows, proxy labels with tracked agreement, rubric-versioned HITL, inter-annotator agreement.</li>
+        <li><strong>L4 · Staff.</strong> Designs the decision log and exploration policy as part of the serving contract, reasons about survivorship bias per model, and can quantify the cost of exploration against the cost of a blind model.</li>
+      </ul>
+    </div>
+  </details>
+  <p>With spine and labels in hand, the columns that do the work: <a href="04-feature-store.html">04 · Feature Engineering at Scale &amp; the Feature Store</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

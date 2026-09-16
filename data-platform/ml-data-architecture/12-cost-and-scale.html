@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cost, Scale &amp; Feeding the GPUs</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<link rel="stylesheet" href="../../assets/style.css?v=11">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<script defer src="../../assets/script.js?v=11"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#anatomy">Where the money goes</a>
+    <a href="#storage">Storage tiers &amp; the math</a>
+    <a href="#loading">The training data-loading path</a>
+    <a href="#throughput">Throughput to the GPU</a>
+    <a href="#features">Feature-computation cost</a>
+    <a href="#locality">Egress &amp; locality</a>
+    <a href="#governance">Cost governance</a>
+    <a href="#griddp">GridDP by the numbers</a>
+    <a href="#heuristic">When to choose what</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All guides</a>
+    <a href="11-governance-privacy.html">← Previous</a>
+    <a href="13-reference-architectures.html">Next: Reference Architectures Compared →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Operating it</span>
+  <h1>Cost, Scale &amp; Feeding the GPUs</h1>
+  <p class="subtitle">In an ML data plane the expensive resource is not storage or compute in the warehouse — it is a GPU waiting for data. This chapter does the arithmetic: storage tiers, the data-loading path from object store to accelerator, feature-computation cost, egress, and the governance that stops any of it from surprising finance.</p>
+</header>
+
+<section id="anatomy">
+  <h2>Where the money goes</h2>
+  <p>Ask a team where their ML data budget goes and they will say "storage". Measure it and the answer is usually different. For a platform at GridDP's scale the cost stack, roughly in descending order, is: <strong>GPU hours lost to input starvation</strong> (the training job runs but the accelerator sits at 30% utilization because the dataloader can't keep up); <strong>feature computation</strong> (recomputing large aggregations on a schedule regardless of whether anything changed); <strong>warehouse compute for training-set builds</strong> (point-in-time joins over years of history, run per experiment); <strong>egress</strong> (moving datasets between the lake's region and wherever the GPUs are); and only then <strong>storage</strong>, which is cheap per byte but compounds through copies — bronze, silver, feature history, per-experiment training snapshots, served-feature logs.</p>
+  <p>That ordering dictates the priorities. The first engineering hour goes to the loading path, not to Parquet compression settings.</p>
+  <div class="callout insight">
+    <span class="callout-label">The unit that matters</span>
+    <p>Price everything in <strong>GPU-hour equivalents</strong>. An H100 hour costs on the order of $2–4 on a neocloud and $6–10 on a hyperscaler; a terabyte-month of object storage costs about the same as <em>seven minutes</em> of one H100. If a design choice saves storage but adds a minute of GPU idle per epoch, it loses. This single conversion settles most arguments in this chapter.</p>
+  </div>
+</section>
+
+<section id="storage">
+  <h2>Storage tiers &amp; the math</h2>
+  <p>Storage is cheap but not free, and the lever is <em>tiering by access pattern</em>, not compression heroics. Four tiers cover an ML data plane:</p>
+  <table>
+    <thead>
+      <tr><th>Tier</th><th>What lives there</th><th>Access pattern</th><th>Medium</th><th>Order-of-magnitude cost</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Hot</strong></td><td>Online feature store, current training shards being consumed</td><td>ms reads, high QPS</td><td>Redis / DynamoDB; local NVMe on trainers</td><td>$$$$ per GB — keep it tiny</td></tr>
+      <tr><td><strong>Warm</strong></td><td>Feature history (offline store), gold marts, last N training sets, served-feature log (recent)</td><td>Scans, point-in-time joins, daily</td><td>Object store standard tier, Parquet/Iceberg</td><td>~$20/TB-month</td></tr>
+      <tr><td><strong>Cool</strong></td><td>Older training snapshots, bronze beyond 90 d, decision logs past 1 y</td><td>Rare, audit, backfill</td><td>Infrequent-access object tier</td><td>~$10/TB-month + retrieval</td></tr>
+      <tr><td><strong>Archive</strong></td><td>Regulatory retention (ledger, AML decision logs)</td><td>Almost never</td><td>Glacier-class</td><td>~$1–4/TB-month, hours to restore</td></tr>
+    </tbody>
+  </table>
+  <p>The math for GridDP's dominant source, the telemetry firehose: ~150M samples/day at ~120 bytes compressed ≈ 18 GB/day ≈ 6.5 TB/year in bronze. Keep 90 days hot-ish in the lake (1.6 TB), the hourly rollup forever (~2% of raw), and tier the rest. Feature history for the ~40 tier-1 features across 17,000 GPUs and 200k accounts at hourly grain is another ~1 TB/year. The <em>copies</em> are the surprise: if every experiment materializes its own training set and nobody expires them, a team of eight data scientists produces several TB a quarter. The fix is snapshot-based training sets (<a href="05-storage-formats-and-versioning.html">chapter 05</a>) — a training set is a query plus a snapshot ID, not a copy — with a 90-day expiry on any physical materialization not referenced by a registered model.</p>
+</section>
+
+<section id="loading">
+  <h2>The training data-loading path</h2>
+  <p>The path from object store to GPU memory is where ML data architecture differs most from analytics. A warehouse query returns a result set; a training job needs a <strong>continuous, shuffled, sharded stream of samples</strong> delivered faster than the model consumes them, resumable mid-epoch, across many workers. Tabular models at GridDP scale (tens of millions of rows) are easy — the whole set fits on one trainer's NVMe. The firehose-derived forecasting model and the ticket-text models are not, and any multimodal or embedding work is decidedly not.</p>
+  <p>The proven shape is <strong>sharded sequential files</strong> plus a <strong>streaming dataset library</strong>:</p>
+  <ul>
+    <li><strong>Shard the dataset</strong> into files of 64–512 MB — Parquet row groups for tabular, WebDataset tar shards for images/audio/text, or the library's native format (MosaicML Streaming's MDS, Ray Data blocks). Sequential reads of large objects are what object storage is good at; millions of small files are what it is terrible at.</li>
+    <li><strong>Pre-shuffle at write time</strong> so that reading shards in order is already random enough; then shuffle within a buffer at read time. A global shuffle at read time over object storage is a random-I/O disaster.</li>
+    <li><strong>Stream, don't stage</strong> — libraries like MosaicML Streaming, WebDataset, or Ray Data read shards directly from S3/GCS with prefetch and a local cache, so a 5 TB dataset trains on a node with 1 TB of disk and the first step starts in seconds rather than after a copy.</li>
+    <li><strong>Deterministic resumption</strong> — the loader records shard index and offset per worker so a preempted job (interruptible GPUs are GridDP's own product) resumes mid-epoch without replaying or skipping samples.</li>
+  </ul>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>train_loader.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from streaming import StreamingDataset          # MosaicML Streaming
+from torch.utils.data import DataLoader
+
+# Shards were written pre-shuffled, 256 MB each, to s3://griddp-ml/datasets/ticket_intent/v7/
+dataset = StreamingDataset(
+    remote="s3://griddp-ml/datasets/ticket_intent/v7/",
+    local="/nvme/cache/ticket_intent_v7",   # local shard cache, evicted LRU
+    shuffle=True, shuffle_seed=42,           # deterministic across restarts
+    batch_size=256,
+    predownload=8 * 256,                     # keep 8 batches ahead of the GPU
+    cache_limit="400gb",
+)
+loader = DataLoader(dataset, batch_size=256, num_workers=8, pin_memory=True,
+                    prefetch_factor=4, persistent_workers=True)
+
+# On preemption: StreamingDataset.state_dict() captures (epoch, sample offset) per rank;
+# the job checkpoints it with the model and resumes exactly where it stopped.
+</code></pre>
+  </div>
+</section>
+
+<section id="throughput">
+  <h2>Throughput to the GPU</h2>
+  <p>The loader has to deliver bytes faster than the model eats them; everything else is secondary. Work the numbers before the first run:</p>
+  <ol>
+    <li><strong>Samples per second the GPU can process</strong> — from a short profiling run with synthetic data: say 3,000 samples/s for the ticket-text model on one H100.</li>
+    <li><strong>Bytes per sample</strong> after decoding: 2 KB tokenized → 6 MB/s per GPU. Trivial. For an image model at 150 KB/sample and 800 samples/s it is 120 MB/s per GPU — with 8 GPUs, ~1 GB/s per node, which is where object-store throughput, NIC bandwidth, and decode CPU all start to matter.</li>
+    <li><strong>CPU decode budget</strong> — JPEG decode and augmentation are usually the real bottleneck; count cores per GPU (8–16 is typical) or move decode to the GPU (NVIDIA DALI).</li>
+    <li><strong>Object-store parallelism</strong> — a single S3 stream tops out around 50–100 MB/s; you reach 1 GB/s with 16–32 concurrent shard reads, which is what prefetch and multiple workers give you.</li>
+  </ol>
+  <p>Then measure the only metric that matters: <strong>GPU utilization during training</strong> (and its cousin, dataloader wait time per step). Below 80% sustained, the money is going into idle silicon and the fix is in the data path, not the model. GridDP sells GPU-hours; it should be the last company to waste them.</p>
+  <div class="callout warn">
+    <span class="callout-label">The warehouse is not a dataloader</span>
+    <p>Pulling training data through a SQL warehouse at train time — a Snowflake or BigQuery query per epoch — is the most common expensive mistake. Warehouse compute is priced for interactive analytics, its throughput to a single client is modest, and re-running the point-in-time join per experiment multiplies cost. Build the training set once, write it to sharded files in the lake with a snapshot reference, and let the trainer read those.</p>
+  </div>
+</section>
+
+<section id="features">
+  <h2>Feature-computation cost</h2>
+  <p>Feature pipelines are the quiet budget line: they run on a schedule whether or not anything changed, and windowed aggregations over long histories are expensive to recompute from scratch. Three levers:</p>
+  <ul>
+    <li><strong>Incremental, not full recompute.</strong> <code>host_reliability_7d</code> should update from the last hour's events plus a sliding-window subtraction, not rescan seven days of telemetry every hour. dbt incremental models with a lookback window, or Flink windowed aggregates, make this the default.</li>
+    <li><strong>Materialize by demand.</strong> A feature computed for 200k accounts hourly, of which 4k are scored per day, is 98% waste. Compute batch features for the active population; compute on-demand features at request time from the online store's raw inputs.</li>
+    <li><strong>Stream when freshness pays for it.</strong> Streaming features (<a href="06-streaming-features.html">chapter 06</a>) cost a permanently running job; batch costs a burst. <code>bid_depth_5m</code> for pricing needs the stream; <code>acct_spend_trend_30d</code> for churn does not. Put each feature on the cheapest path that meets its freshness SLA.</li>
+  </ul>
+  <p>Tag every feature pipeline with its cost per run and its consumers. A feature with no consuming model in the registry for 60 days gets its pipeline paused automatically — the registry knows, so let it act.</p>
+</section>
+
+<section id="locality">
+  <h2>Egress &amp; locality</h2>
+  <p>Egress is the cost line that teams discover on the invoice. Cloud providers charge ~$0.05–0.09 per GB to move data out of a region; a 5 TB dataset pulled to GPUs in another cloud costs $250–450 <em>per training run</em>, and teams run many. Two rules keep it bounded:</p>
+  <ul>
+    <li><strong>Put the training data where the GPUs are, once.</strong> Replicate the sharded dataset to a bucket in the GPU region (or in the neocloud's object storage) and pin the trainer's cache there. Pay egress once per dataset version, not per experiment.</li>
+    <li><strong>Move the feature store's online tier to the inference region</strong>, and keep the offline store next to the warehouse. Cross-region reads on the hot path are both slow and metered.</li>
+  </ul>
+  <p>This is the natural bridge to the sibling guide <a href="../../data-engineering/data-engineering-for-neoclouds/index.html">Data Engineering for Neoclouds</a>: the cheapest GPU-hour is worthless if the data lives three regions away.</p>
+</section>
+
+<section id="governance">
+  <h2>Cost governance</h2>
+  <p>Governance is not a spreadsheet; it is attribution built into the plane. Tag every dataset, feature pipeline, training job, and online-store namespace with an <em>owner</em> and a <em>model</em>, export cost by tag into the same gold marts that hold everything else, and show it back on a dashboard per team and per model. Then three policies with teeth:</p>
+  <ul>
+    <li><strong>Budgets per model tier.</strong> Tier-1 models (ranking, fraud, pricing) get a budget and an on-call; experiments get a per-scientist monthly cap with a soft warning at 80%.</li>
+    <li><strong>Expiry as the default.</strong> Training materializations, experiment artifacts, and unpinned snapshots expire on a clock unless referenced by a registered model.</li>
+    <li><strong>Utilization gates.</strong> A training job whose GPU utilization stays below 60% for ten minutes is flagged; repeat offenders are blocked from the shared queue until the loader is fixed.</li>
+  </ul>
+  <p>The reporting side reuses the semantic layer: <code>ml_cost_per_model</code> and <code>gpu_idle_hours</code> are metrics defined once, beside <code>gmv</code>, in the same governed layer (<a href="../data-platform-systems-design/08-serving-and-semantic-layer.html">DPE guide, chapter 08</a>).</p>
+</section>
+
+<section id="griddp">
+  <h2>GridDP by the numbers</h2>
+  <p>A plausible monthly cost profile for GridDP's ML data plane, at 17,000 GPUs on the fleet and five production models, after the fixes in this chapter:</p>
+  <table>
+    <thead>
+      <tr><th>Line</th><th>Before</th><th>After</th><th>What changed</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GPU hours for training (all models, monthly retrains + experiments)</td><td>~1,900 h @ 45% util</td><td>~900 h @ 85% util</td><td>Sharded streaming datasets, prefetch, DALI decode for the image-quality model</td></tr>
+      <tr><td>Warehouse compute for training-set builds</td><td>~$9k</td><td>~$2k</td><td>Build once per dataset version to the lake; experiments read shards</td></tr>
+      <tr><td>Feature pipelines</td><td>~$6k</td><td>~$2.5k</td><td>Incremental windows; pipelines for unused features paused; two features moved off streaming</td></tr>
+      <tr><td>Egress</td><td>~$4k</td><td>~$0.6k</td><td>Datasets replicated once to the GPU region</td></tr>
+      <tr><td>Storage (lake + online + logs)</td><td>~$2.2k</td><td>~$1.4k</td><td>Tiering; 90-day expiry on unpinned materializations</td></tr>
+    </tbody>
+  </table>
+  <p>Storage was the smallest line before and after. The thousand GPU-hours were the story — and at neocloud prices that line alone is the salary of the engineer who fixed it.</p>
+</section>
+
+<section id="heuristic">
+  <h2>When to choose what</h2>
+  <div class="callout tip">
+    <span class="callout-label">The cost-and-scale heuristic</span>
+    <ul>
+      <li><strong>Measure GPU utilization first.</strong> If it is below 80%, nothing else in this chapter matters until the loader is fixed.</li>
+      <li><strong>Dataset fits on one node's NVMe (&lt; ~1 TB):</strong> copy once, train locally, don't over-engineer.</li>
+      <li><strong>Larger, or many workers:</strong> pre-shuffled shards of 64–512 MB + a streaming dataset library with prefetch and resumable state.</li>
+      <li><strong>Never</strong> pull training data through the warehouse at train time; build once to the lake with a snapshot reference.</li>
+      <li><strong>Features:</strong> incremental by default; stream only where the freshness SLA demands it; pause pipelines with no consumers.</li>
+      <li><strong>Egress:</strong> one replica of each dataset version in the GPU region; online store in the inference region.</li>
+      <li><strong>Governance:</strong> tag, show back, expire by default, gate on utilization.</li>
+    </ul>
+  </div>
+  <details class="collapse-card">
+    <summary><strong>The answer at four levels</strong></summary>
+    <div class="collapse-card-body">
+      <ul>
+        <li><strong>L1 · Foundational.</strong> Thinks cost means storage; would compress Parquet harder; loads training data with a warehouse query per run.</li>
+        <li><strong>L2 · Practitioner.</strong> Knows GPU idle is the real cost; uses a PyTorch DataLoader with workers and prefetch; materializes training sets to Parquet; tiers old data.</li>
+        <li><strong>L3 · Senior.</strong> Does the throughput math (samples/s × bytes/sample vs object-store and decode limits); sharded, pre-shuffled, streaming datasets with resumable state; incremental feature pipelines routed batch vs stream by SLA; datasets replicated to the GPU region; cost attribution by model with expiry policies.</li>
+        <li><strong>L4 · Staff.</strong> Prices every decision in GPU-hour equivalents; designs the plane so the cheap path is the default (snapshot-referenced datasets, registry-driven pipeline pausing, utilization gates on the shared queue); co-locates storage with compute across clouds deliberately; puts ML cost metrics in the semantic layer beside revenue so finance and ML argue from the same numbers.</li>
+      </ul>
+    </div>
+  </details>
+  <p>Next, the three ways the whole plane can be assembled, and how to pick one — <a href="13-reference-architectures.html">13 · Reference Architectures Compared</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
