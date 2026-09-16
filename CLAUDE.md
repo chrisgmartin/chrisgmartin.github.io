@@ -20,6 +20,7 @@ reference list of Claude Skills.
 /claude-skills/<collection>/     reference hubs listing Agent Skills collections (no chapters; links out to SKILL.md)
 /tools/plates/                   plate (whiteboard sketch) specs + builder      → tools/plates/README.md
 /tools/nav/build-chapters.py     regenerates the CHAPTERS manifest in nav.js from the hubs
+/tools/home/build-latest.py      regenerates the home page's Latest strip + list (git history + manifest)
 /.claude/skills/                 add-topic, add-guide, add-chapter, audit — follow them for structural changes
 ```
 
@@ -33,7 +34,10 @@ Asset paths are relative and depth-aware: `assets/…` (root), `../assets/…` (
    Regenerate with `python3 tools/nav/build-chapters.py` after adding chapters/guides. Hand-maintained entries may
    set `unit` (e.g. `"skills"`) and give chapters an absolute `href`.
 4. Homepage atlas `D` array in `index.html` — one entry per domain (name, href, count, caption, nodes, edges; optional
-   `unit`). Update `count` when guides are added; the footer totals ("55 guides across 8 domains") are hand-written.
+   `unit`). Update `count` when guides are added; the footer totals ("57 guides across 8 domains") are hand-written.
+5. Homepage **Latest** blocks — regenerate with `python3 tools/home/build-latest.py` (run it after the chapter
+   manifest). It rewrites the two `<!-- LATEST:… -->` blocks in `index.html` from git history plus the manifest;
+   `--check` fails if they are stale. Never hand-edit inside the markers.
 
 ## Shared-asset versioning (important)
 
