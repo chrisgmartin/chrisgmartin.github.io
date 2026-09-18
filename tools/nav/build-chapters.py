@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Regenerate the CHAPTERS manifest embedded in assets/nav.js from the guide hubs.
 
-Usage:  python3 tools/nav/build-chapters.py
+Usage:  python3 tools/nav/build-chapters.py [--check]
 
 For every guide in SITE_NAV (assets/script.js) it reads the hub's section labels and chapter cards
 (`.section-label` + `.guide-card` with a numbered chapter link) and rewrites the `var CHAPTERS = {...};`
 line. Entries whose hub has no chapter cards (e.g. the Claude Skills collection hubs, which set
 `unit` and link out with absolute `href`s) are preserved as they are. Run after adding a chapter or a
-guide, then bump the asset version (see CLAUDE.md).
+guide, then bump the asset version (see CLAUDE.md). `--check` writes nothing and exits non-zero if the manifest is stale.
+Hand-maintained entries must use https:// hrefs and a plain lowercase `unit`, or the script refuses to run.
 """
 import html, json, os, re, sys
 
@@ -39,6 +40,16 @@ def parse_hub(path):
             cur["chapters"].append({"f": f, "n": html.unescape(re.sub("<[^>]+>", "", n.group(1))).strip(), "t": html.unescape(re.sub("<[^>]+>", "", t.group(1))).strip()})
     return [x for x in sections if x["chapters"]]
 
+def checked(key, entry):
+    """Hand-maintained entries are copied verbatim into nav.js, whose runtime sinks assume safe values: every absolute
+    href must be https://, and `unit` a plain lowercase word. Refuse anything else rather than publish it."""
+    unit = entry.get("unit", "chapters")
+    if not re.fullmatch(r"[a-z]+", unit): sys.exit(f"  ! {key}: unit {unit!r} must match [a-z]+")
+    for s in entry.get("sections", []):
+        for c in s.get("chapters", []):
+            if "href" in c and not c["href"].startswith("https://"): sys.exit(f"  ! {key}: href {c['href']!r} must start with https://")
+    return entry
+
 def main():
     navp = os.path.join(ROOT, "assets", "nav.js"); nav = open(navp, encoding="utf-8").read()
     m = re.search(r"var CHAPTERS = (\{.*?\});\n", nav, re.S); old = json.loads(m.group(1)); new = {}
@@ -49,10 +60,13 @@ def main():
             if not os.path.exists(hub): print("  ! missing hub", key); continue
             secs = parse_hub(hub)
             if secs: new[key] = {"domain": tname, "name": gname, "sections": secs}
-            elif key in old: new[key] = old[key]           # hand-maintained entry (unit / absolute hrefs)
+            elif key in old: new[key] = checked(key, old[key])  # hand-maintained entry (unit / absolute hrefs)
             else: print("  ! no chapters found in", key)
-    nav = nav[:m.start(1)] + json.dumps(new, ensure_ascii=False, separators=(",", ":")) + nav[m.end(1):]
-    open(navp, "w", encoding="utf-8").write(nav)
+    out = nav[:m.start(1)] + json.dumps(new, ensure_ascii=False, separators=(",", ":")) + nav[m.end(1):]
+    if "--check" in sys.argv:                       # read-only mode for the audit skill: report staleness, write nothing
+        if out != nav: sys.exit("CHAPTERS: OUT OF DATE — run python3 tools/nav/build-chapters.py")
+        print("CHAPTERS: up to date"); return
+    open(navp, "w", encoding="utf-8").write(out)
     print(f"CHAPTERS: {len(new)} guides, {sum(len(c['chapters']) for g in new.values() for c in g['sections'])} chapters")
 
 if __name__ == "__main__":

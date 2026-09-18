@@ -28,12 +28,20 @@ Ask via AskUserQuestion if not provided:
 - **Format badge** (optional): one of `format-prep`, `format-build`, `format-deepdive`, `format-reference`, `format-notes`.
 - **Tag chips** (optional): zero to four short labels.
 
+**Validate before writing anything.** These values are pasted into JS string literals, HTML and shell commands, so
+reject (and re-ask) rather than escape:
+- Folder name must match `^[a-z0-9]+(-[a-z0-9]+)*$`.
+- Display name, description and tag chips must not contain `'`, `"`, `\`, `<`, `>`, `$` or a backtick. Use typographic
+  quotes (’ “ ”) instead of straight ones.
+
 ## Steps
 
 1. Create the folder `<topic-folder>/<guide-folder>/` (inside the topic).
 
 2. Generate `<topic-folder>/<guide-folder>/index.html` (the guide hub). Use `ai-engineering/ai-engineer-compliance/index.html` as the structural template. Required pieces:
    - Assets at `../../assets/style.css` and `../../assets/script.js` (guide hubs are 2 levels deep).
+   - The two security `<meta>` tags (Content-Security-Policy, referrer) immediately after `<meta charset>`, copied
+     verbatim from the template. No inline `<script>` code or `on*=` handlers — the CSP blocks them.
    - `<div class="layout layout-wide">` wrapping `<aside class="sidebar" id="sidebar">` (with the standard mobile-toc-toggle button + an `On this page` `<h2>` whose `<a>` items target section anchors below) and `<main>`.
    - Hand-authored `<nav class="crumbs">` breadcrumb at the top of `<main>`:
      - `← Home` → `../../index.html`

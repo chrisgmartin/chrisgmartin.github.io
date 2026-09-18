@@ -63,25 +63,28 @@ window.FG = (function () {
   var SPONSOR = { enabled: false, label: 'Supported by', name: '', tagline: '', href: 'HOME', cta: 'Learn more' };
 
   var CHEV = '<svg class="chev" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 L6 8 L9.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+  // Hrefs from the manifest are author data; allow only http(s), mailto and relative/root paths so a stray scheme can never execute.
+  function safeHref(u){u=String(u);var bare=u.replace(/[\x00-\x20]/g,'');return /^(https?|mailto):/i.test(bare)||!/^[a-z][a-z0-9+.-]*:/i.test(bare)?u:'#';}
+  function units(n,u){return n===1&&/s$/.test(u)?u.slice(0,-1):u;}  // '1 skill', not '1 skills'
   function guideCount(d){return d.guides.filter(function(g){return Array.isArray(g);}).length;}
-  function resolve(href, base){ if (href === 'HOME') return base + 'index.html'; if (/^(https?:|mailto:|\/)/.test(href)) return href; return base + href; }
+  function resolve(href, base){ if (href === 'HOME') return base + 'index.html'; if (/^(https?:|mailto:|\/)/.test(href)) return safeHref(href); return safeHref(base + href); }
 
   function globalNav(el, opts) {
     opts = opts || {}; var base = opts.base || '';
-    var h = '<a class="wordmark" href="' + base + 'index.html">Field <em>Guides</em></a><div class="nav-links">';
+    var h = '<a class="wordmark" href="' + esc(base + 'index.html') + '">Field <em>Guides</em></a><div class="nav-links">';
     DOMAINS.forEach(function (d) {
       h += '<div class="nav-item domain' + (d.right ? ' right' : '') + '"><button class="nav-btn" type="button" aria-expanded="false">' + esc(d.label) + ' ' + CHEV + '</button>' +
            '<div class="dropdown' + (d.two ? ' two' : '') + '" role="menu" aria-label="' + esc(d.name) + ' guides">' +
-           '<a class="dd-head" href="' + base + d.folder + '/index.html"><span>' + esc(d.name) + '</span><span><b>' + guideCount(d) + '</b> guides →</span></a>';
+           '<a class="dd-head" href="' + esc(base + d.folder + '/index.html') + '"><span>' + esc(d.name) + '</span><span><b>' + guideCount(d) + '</b> guides →</span></a>';
       d.guides.forEach(function (g) {
         if (!Array.isArray(g)) { h += '<span class="dd-sub">' + esc(g.sub) + '</span>'; return; }
-        h += '<a class="dd-g" role="menuitem" href="' + base + d.folder + '/' + g[1] + '/index.html">' + esc(g[0]) + '</a>';
+        h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/' + g[1] + '/index.html') + '">' + esc(g[0]) + '</a>';
       });
       h += '</div></div>';
     });
     h += '<div class="nav-item mobile right"><button class="nav-btn" type="button" aria-expanded="false">Menu ' + CHEV + '</button><div class="dropdown" role="menu" aria-label="Domains">';
-    DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + base + d.folder + '/index.html">' + esc(d.name) + '</a>'; });
+    DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/index.html') + '">' + esc(d.name) + '</a>'; });
     h += '</div></div>';
     h += supportItem(base);
     h += '</div>';
@@ -95,30 +98,30 @@ window.FG = (function () {
     var all = []; (guide.sections || []).forEach(function (s) { s.chapters.forEach(function (c) { all.push(c); }); });
     var idx = -1; all.forEach(function (c, i) { if (c.f === current) idx = i; });
     var h = '<div class="wrap"><nav class="subnav" aria-label="This guide">' +
-      '<div class="guide"><span class="crumb">' + esc(guide.domain) + ' /</span><a class="gname" href="' + esc(guide.href) + '">' + esc(guide.name) + '</a></div>';
+      '<div class="guide"><span class="crumb">' + esc(guide.domain) + ' /</span><a class="gname" href="' + esc(safeHref(guide.href)) + '">' + esc(guide.name) + '</a></div>';
     if (all.length) {
       h += '<div class="sections">';
       guide.sections.forEach(function (s) {
         var isCur = s.chapters.some(function (c) { return c.f === current; });
         h += '<div class="nav-item"><button class="nav-btn" type="button" aria-expanded="false"' + (isCur ? ' style="color:var(--ink)"' : '') + '>' + esc(s.label) + ' ' + CHEV + '</button>' +
-             '<div class="dropdown" role="menu" aria-label="' + esc(s.label) + ' ' + (guide.unit || 'chapters') + '">';
+             '<div class="dropdown" role="menu" aria-label="' + esc(s.label) + ' ' + esc(guide.unit || 'chapters') + '">';
         s.chapters.forEach(function (c) {
-          h += '<a class="dd-g' + (c.f === current ? ' on' : '') + '" role="menuitem" href="' + esc(c.href || base + c.f) + '"' + (c.f === current ? ' aria-current="page"' : '') + '><span class="num">' + esc(c.n) + '</span>' + esc(c.t) + '</a>';
+          h += '<a class="dd-g' + (c.f === current ? ' on' : '') + '" role="menuitem" href="' + esc(safeHref(c.href || base + c.f)) + '"' + (c.f === current ? ' aria-current="page"' : '') + '><span class="num">' + esc(c.n) + '</span>' + esc(c.t) + '</a>';
         });
         h += '</div></div>';
       });
       h += '</div>';
       h += '<div class="nav-item mobile right"><button class="nav-btn" type="button" aria-expanded="false">Contents ' + CHEV + '</button><div class="dropdown" role="menu" aria-label="Chapters">';
-      guide.sections.forEach(function (s) { h += '<span class="dd-sub">' + esc(s.label) + '</span>'; s.chapters.forEach(function (c) { h += '<a class="dd-g' + (c.f === current ? ' on' : '') + '" href="' + esc(c.href || base + c.f) + '"><span class="num">' + esc(c.n) + '</span>' + esc(c.t) + '</a>'; }); });
+      guide.sections.forEach(function (s) { h += '<span class="dd-sub">' + esc(s.label) + '</span>'; s.chapters.forEach(function (c) { h += '<a class="dd-g' + (c.f === current ? ' on' : '') + '" href="' + esc(safeHref(c.href || base + c.f)) + '"><span class="num">' + esc(c.n) + '</span>' + esc(c.t) + '</a>'; }); });
       h += '</div></div>';
     }
     if (idx >= 0) {
       var p = all[idx - 1], n = all[idx + 1];
-      h += '<div class="pn">' + (p ? '<a href="' + esc(p.href || base + p.f) + '">← <span class="lbl">' + esc(p.n) + '</span></a>' : '') +
+      h += '<div class="pn">' + (p ? '<a href="' + esc(safeHref(p.href || base + p.f)) + '">← <span class="lbl">' + esc(p.n) + '</span></a>' : '') +
            (p && n ? '<span class="sep">|</span>' : '') +
-           (n ? '<a href="' + esc(n.href || base + n.f) + '"><span class="lbl">' + esc(n.n) + '</span> →</a>' : '') + '</div>';
+           (n ? '<a href="' + esc(safeHref(n.href || base + n.f)) + '"><span class="lbl">' + esc(n.n) + '</span> →</a>' : '') + '</div>';
     } else if (all.length) {
-      h += '<span class="count"><b>' + all.length + '</b> ' + (guide.unit || 'chapters') + '</span>';
+      h += '<span class="count"><b>' + all.length + '</b> ' + esc(units(all.length, guide.unit || 'chapters')) + '</span>';
     }
     h += '</nav></div>';
     el.className = 'subnav-wrap'; el.innerHTML = h;
@@ -142,7 +145,7 @@ window.FG = (function () {
     base = base || '';
     return '<div class="nav-item support right"><button class="nav-btn sp-btn" type="button" aria-expanded="false"><span class="sp-heart" aria-hidden="true">♡</span> Support</button>' +
            '<div class="dropdown sp-panel" role="dialog" aria-label="' + esc(SUPPORT.title) + '"><div class="sp-head">' + esc(SUPPORT.title) + '</div><p class="sp-intro">' + esc(SUPPORT.intro) + '</p>' + supportRows(base) +
-           '<a class="sp-foot" href="' + resolve(SPONSOR.href, base) + '">For companies: sponsor a guide →</a></div></div>';
+           '<a class="sp-foot" href="' + esc(resolve(SPONSOR.href, base)) + '">For companies: sponsor a guide →</a></div></div>';
   }
   function supportCard(el, opts) {
     opts = opts || {}; var base = opts.base || '';

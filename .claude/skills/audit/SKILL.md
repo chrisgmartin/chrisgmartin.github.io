@@ -36,7 +36,9 @@ Run each check. Gather results into a single summary at the end.
 - Parse `SITE_NAV` from `assets/script.js`.
 - For each topic: confirm `<topic.folder>/index.html` exists.
 - For each guide nested under a topic: confirm `<topic.folder>/<guide.folder>/index.html` exists.
-- Walk the disk: for each top-level directory **not** in `{assets, .claude, compliance-mcp, tools, job-finder}` and not a registered topic folder, flag it as an orphan.
+- Walk the **tracked** top-level directories (`git ls-files | cut -d/ -f1 | sort -u`) — never untracked or gitignored
+  ones such as `experiments/`, `job-finder/`, `.wrangler/` or `compliance-mcp/`, whose names must not appear in the
+  report. For each tracked directory **not** in `{assets, .claude, tools}` and not a registered topic folder, flag it as an orphan.
 - For each registered topic folder, list its subdirectories: any subdirectory not listed in the topic's `guides` array is an orphan guide.
 
 ### 2. Asset paths (depth-aware)
@@ -82,14 +84,16 @@ Skip anchor-only hrefs (`#section`).
 ### 7. Registrations agree
 
 - `DOMAINS` in `assets/nav.js` lists the same topics/guides as `SITE_NAV` (same folders, same order).
-- Every guide in `SITE_NAV` has a `CHAPTERS` entry whose chapter files exist on disk (`python3 tools/nav/build-chapters.py`
-  should produce no diff except intentional hand-maintained entries).
-- The homepage atlas `D` array has one entry per topic with the right `count`; the footer totals match.
+- Every guide in `SITE_NAV` has a `CHAPTERS` entry whose chapter files exist on disk (`python3 tools/nav/build-chapters.py
+  --check` exits 0; it writes nothing).
+- The homepage atlas data (`<script type="application/json" id="atlas-data">` in `index.html`) parses as JSON and has one
+  entry per topic with the right `count`; the footer totals match.
 
 ### 8. Shared-asset version is uniform
 
-All pages and the two loads in `script.js` reference the same `?v=N` for `style.css`, `script.js`, `nav.css`, `nav.js`.
-Flag any stragglers (`grep -rnE '\?v=[0-9]+' --include='*.html' . assets/script.js | grep -v 'v=<N>'`).
+All pages and the loads in `script.js` reference the same `?v=N` for `style.css`, `script.js`, `nav.css`, `nav.js`,
+`fonts.css`, `home.js` and `404.js`. Flag any stragglers
+(`git ls-files '*.html' assets/script.js | xargs grep -nE '\?v=[0-9]+' | grep -v 'v=<N>'`).
 
 ### 9. Home page Latest is current
 
@@ -100,6 +104,17 @@ manifest. Flag a non-zero exit (fix: run the tool without `--check`).
 
 Each guide hub (and `claude-skills/index.html`) contains `<figure class="plate">` inside `.hero.has-plate`. List hubs
 without one (fix: add a spec to `tools/plates/boards.js` and run `tools/plates/build.py`).
+
+### 11. Security baseline
+
+- Every tracked HTML page outside `tools/` carries, right after `<meta charset>`, the Content-Security-Policy `<meta>`
+  (identical to the `_headers` policy minus `frame-ancestors`) and `<meta name="referrer">`.
+- No page outside `tools/` has an inline `<script>` without `src` (JSON data blocks `type="application/json"` are fine)
+  or an `on*=` event-handler attribute.
+- The only cross-origin resource is `cdn.jsdelivr.net`, and every such `<script>`/`<link>` has `integrity` + `crossorigin`.
+  Fonts are self-hosted (`assets/fonts.css`); no page references `fonts.googleapis.com`.
+- `_redirects` covers `/CLAUDE.md`, `/_config.yml`, `/.gitignore`, `/.claude/*`, `/tools/*`, and `_config.yml` excludes
+  `CLAUDE.md` and `tools/`, so repo tooling is never published.
 
 ## Output format
 
@@ -120,5 +135,5 @@ End with a single-line summary: `N checks passed, M issues found.`
 
 ## Notes
 
-- This skill does NOT fix anything. If the user wants fixes, propose them and confirm before editing.
+- This skill does NOT fix anything and runs nothing that writes (every tool is invoked with `--check`). If the user wants fixes, propose them and confirm before editing.
 - Skip `compliance-mcp/` — it's a separate Python project, not part of the HTML catalog.

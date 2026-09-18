@@ -229,6 +229,14 @@
     d.note(60,258,'founding analytics hire at a GPU compute marketplace');
   };
   // ===== DATA PLATFORM (curriculum) =====
+  B['data-platform/becoming-a-data-platform-engineer']=function(d){
+    d.title('A ladder from SQL to a platform job');
+    d.stack(120,46,172,26,['7 · career → offer',{l:'6 · capstone: mini-GridDP',wash:1},'5 · tooling & the stack','4 · the DE craft',
+      '3 · foundations','2 · orientation & setup','1 · start here: roadmap'],{gap:6,size:10});
+    d.ring(110,72,192,40);d.arrow(96,262,96,54,{red:1});d.note(18,150,'six-month\nschedule',{size:10.5});
+    d.box(308,134,82,40,'8 · glossary\n& cheat sheets',{size:9.5});d.note(312,190,'open beside\nevery course',{size:10});
+    d.note(24,300,'start: basic SQL + Python  ·  finish: design, build, run a real platform');
+  };
   B['data-platform/becoming-a-data-platform-engineer/capstone-labs']=function(d){
     d.title('Build mini-GridDP, end to end');
     var f1=d.flow(60,['generator','bronze','silver / gold\n(dbt)','telemetry\nrollup'],{w:72,h:38,gap:12,size:10});

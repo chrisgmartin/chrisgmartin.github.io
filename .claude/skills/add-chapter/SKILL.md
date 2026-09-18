@@ -26,6 +26,9 @@ Ask via AskUserQuestion if not provided:
 
 2. Generate `<topic>/<guide>/<NN>-<slug>.html`:
    - Assets: `../../assets/style.css` and `../../assets/script.js`. Include the hljs CDN `<link>` + `<script>` if the chapter contains code blocks.
+   - Keep the two security `<meta>` tags (Content-Security-Policy, referrer) right after `<meta charset>`, verbatim from
+     the template. The hljs tags must keep their `integrity` and `crossorigin` attributes. No inline `<script>` code or
+     `on*=` handlers — the CSP blocks them.
    - `<div class="layout">` → `<aside class="sidebar" id="sidebar">` with `<button class="mobile-toc-toggle">` + `<nav>`.
    - Inside `<nav>`, **two** `<h2>` blocks in this order:
      - `<h2>Sections</h2>` followed by `<a href="#anchor">` for each outline item.
