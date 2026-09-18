@@ -111,7 +111,9 @@ without one (fix: add a spec to `tools/plates/boards.js` and run `tools/plates/b
   (identical to the `_headers` policy minus `frame-ancestors`) and `<meta name="referrer">`.
 - No page outside `tools/` has an inline `<script>` without `src` (JSON data blocks `type="application/json"` are fine)
   or an `on*=` event-handler attribute.
-- The only cross-origin resource is `cdn.jsdelivr.net`, and every such `<script>`/`<link>` has `integrity` + `crossorigin`.
+- The only cross-origin resource a page references is `cdn.jsdelivr.net`, and every such `<script>`/`<link>` has
+  `integrity` + `crossorigin`. (The CSP also allows `static.cloudflareinsights.com` / `cloudflareinsights.com` for the
+  Web Analytics beacon Cloudflare injects at the edge — no page should reference them directly.)
   Fonts are self-hosted (`assets/fonts.css`); no page references `fonts.googleapis.com`.
 - `_redirects` covers `/CLAUDE.md`, `/_config.yml`, `/.gitignore`, `/.claude/*`, `/tools/*`, and `_config.yml` excludes
   `CLAUDE.md` and `tools/`, so repo tooling is never published.
