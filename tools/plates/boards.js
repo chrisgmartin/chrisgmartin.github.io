@@ -523,6 +523,36 @@
     d.note(20,300,'works with open-source Airflow — set AIRFLOW_API_URL');
   };
 
+  B['claude-skills/skillspector']=function(d){
+    d.title('Two review lines, one verdict');
+    var sk=d.box(14,66,104,44,'a skill you\nhaven\'t run yet',{size:10.5});
+    d.note(16,122,'treat it as\nuntrusted input',{size:10});
+    var stat=d.box(152,42,116,42,'static scan\n71 patterns · AST',{size:10.5,wash:1});
+    var sem=d.box(152,118,116,42,'read the source\nintent · permission fit',{size:10});
+    d.connect(sk,stat);d.connect(sk,sem);
+    var v=d.box(300,74,86,52,'APPROVE\nCAUTION\nREJECT',{size:10.5});
+    d.connect(stat,v);d.connect(sem,v);d.ring(292,66,102,68);
+    d.text(214,200,'score = verdict',{size:11});d.strike(156,196,272,196);
+    d.note(152,222,'a security skill scores CRITICAL for\ndiscussing exploits — read the finding',{size:10});
+    d.note(20,300,'skillspector scan ./skill/ --no-llm');
+  };
+
+  B['claude-skills/security-audit']=function(d){
+    d.title('The finder never confirms the finding');
+    var cx=[158,226,294];
+    d.cyl(14,64,86,48,'coverage\nledger',{size:10.5});
+    d.route([[100,88],[118,88],[118,56],[294,56]],{faint:1});
+    cx.forEach(function(x,i){d.box(x-28,70,56,30,'hunter',{size:10});d.arrow(x,56,x,68,{faint:1});});
+    d.box(130,122,192,30,'candidates',{size:10.5});
+    cx.forEach(function(x){d.arrow(x,100,x,120,{faint:1});});
+    d.box(130,166,192,40,'a fresh agent tries\nto disprove each one',{size:10.5,wash:1});
+    d.arrow(226,152,226,164);d.ring(122,158,208,56);
+    ['confirmed','needs\nvalidation','rejected'].forEach(function(l,i){
+      d.box(cx[i]-28,226,56,34,l,{size:9.5});d.arrow(cx[i],206,cx[i],224,{faint:1});});
+    d.note(14,140,'the agent that\nchecks is never\nthe agent that\nfound it',{size:10});
+    d.note(20,300,'severity = likelihood × impact, not deviation from a checklist');
+  };
+
   // ===== TOPIC: CLAUDE SKILLS =====
   B['claude-skills']=function(d){
     d.title('A skill loads when the prompt matches');
