@@ -81,9 +81,12 @@ perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=13/$1?v=14/g' assets/script.js  
 - `_headers` does not change Cloudflare's asset caching — the `?v=` bump is the real mechanism.
 - **Content-Security-Policy.** Every page carries the CSP `<meta>` (plus `<meta name="referrer">`) right after
   `<meta charset>`, because GitHub Pages ignores `_headers`; `_headers` sends the same policy plus `frame-ancestors`.
-  Scripts may come only from the site and `cdn.jsdelivr.net` (SRI-pinned highlight.js): **no inline `<script>` code, no
-  `on*=` handlers, no new third-party origins** — put code in `assets/*.js` and data in `type="application/json"`
-  blocks. Inline styles are allowed. Change the policy in both places together; the `audit` skill checks it.
+  Scripts may come only from the site, `cdn.jsdelivr.net` (SRI-pinned highlight.js) and `static.cloudflareinsights.com`
+  (the Web Analytics beacon Cloudflare injects on christopherm.xyz; it reports to `cloudflareinsights.com`, hence
+  `connect-src`): **no inline `<script>` code, no `on*=` handlers, no new third-party origins** — put code in
+  `assets/*.js` and data in `type="application/json"` blocks. Inline styles are allowed. Change the policy in both
+  places together; the `audit` skill checks it. Cloudflare's Bot "JavaScript detections" injects an inline script the
+  CSP must block, so keep that setting off for the zone.
 - **Repo tooling is not published.** `CLAUDE.md`, `tools/`, `.claude/`, `.gitignore` and `_config.yml` live in the served
   root, so `_redirects` (Cloudflare) and `_config.yml` + Jekyll's dot/underscore rule (GitHub Pages) keep them off the
   sites. Add new repo-only paths to both files.
