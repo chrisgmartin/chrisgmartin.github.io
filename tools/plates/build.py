@@ -16,7 +16,8 @@ CHROME = next((c for c in [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/usr/bin/google-chrome", "/usr/bin/chromium"] if os.path.exists(c)), None)
-EXTRA = {"claude-skills": "claude-skills/index.html"}   # topic pages that also carry a plate
+EXTRA = {"claude-skills": "claude-skills/index.html",   # pages outside CHAPTERS that also carry a plate
+         "data-platform/becoming-a-data-platform-engineer": "data-platform/becoming-a-data-platform-engineer/index.html"}
 
 def targets():
     nav = open(os.path.join(ROOT, "assets", "nav.js"), encoding="utf-8").read()

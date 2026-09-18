@@ -66,6 +66,7 @@ window.FG = (function () {
   function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
   // Hrefs from the manifest are author data; allow only http(s), mailto and relative/root paths so a stray scheme can never execute.
   function safeHref(u){u=String(u);var bare=u.replace(/[\x00-\x20]/g,'');return /^(https?|mailto):/i.test(bare)||!/^[a-z][a-z0-9+.-]*:/i.test(bare)?u:'#';}
+  function units(n,u){return n===1&&/s$/.test(u)?u.slice(0,-1):u;}  // '1 skill', not '1 skills'
   function guideCount(d){return d.guides.filter(function(g){return Array.isArray(g);}).length;}
   function resolve(href, base){ if (href === 'HOME') return base + 'index.html'; if (/^(https?:|mailto:|\/)/.test(href)) return safeHref(href); return safeHref(base + href); }
 
@@ -120,7 +121,7 @@ window.FG = (function () {
            (p && n ? '<span class="sep">|</span>' : '') +
            (n ? '<a href="' + esc(safeHref(n.href || base + n.f)) + '"><span class="lbl">' + esc(n.n) + '</span> →</a>' : '') + '</div>';
     } else if (all.length) {
-      h += '<span class="count"><b>' + all.length + '</b> ' + esc(guide.unit || 'chapters') + '</span>';
+      h += '<span class="count"><b>' + all.length + '</b> ' + esc(units(all.length, guide.unit || 'chapters')) + '</span>';
     }
     h += '</nav></div>';
     el.className = 'subnav-wrap'; el.innerHTML = h;

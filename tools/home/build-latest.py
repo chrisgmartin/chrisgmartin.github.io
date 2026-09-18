@@ -29,6 +29,10 @@ MON = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
        "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"}
 E = html.escape
 
+def units(n, unit):
+    """'1 skills' reads wrong: singularize a plural unit (skills, chapters, guides) when the count is one."""
+    return unit[:-1] if n == 1 and unit.endswith("s") else unit
+
 
 def guides():
     nav = open(os.path.join(ROOT, "assets", "nav.js"), encoding="utf-8").read()
@@ -86,7 +90,7 @@ def render(rows, total, n):
         f'<div class="wrap latestbar"><a href="{E(top["key"])}/index.html">'
         f'<span class="tag">{label}</span>'
         f'<span class="nm">{E(top["name"])}</span><span class="sep">·</span>'
-        f'<span class="dm">{E(str(top["n"]))} {E(top["unit"])} · {E(top["domain"])}</span>'
+        f'<span class="dm">{E(str(top["n"]))} {E(units(top["n"], top["unit"]))} · {E(top["domain"])}</span>'
         f'<span class="go">Read →</span></a></div>'
     )
     li = ""
@@ -96,7 +100,7 @@ def render(rows, total, n):
                f'<time class="dt" datetime="{E(r["date"])}">{pretty(r["date"], show_year)}</time>'
                f'<span class="dm">{E(r["domain"])}</span>'
                f'<span class="tt">{E(r["name"])}<small>{E(clause(r["sub"]))}</small></span>'
-               f'<span class="len">{E(str(r["n"]))} {E(r["unit"])} · {read_time(r)}</span></a></li>\n')
+               f'<span class="len">{E(str(r["n"]))} {E(units(r["n"], r["unit"]))} · {read_time(r)}</span></a></li>\n')
     lst = (f'<section class="wrap latest" aria-label="Latest guides">\n'
            f'    <div class="lhead"><h2>Latest</h2>'
            f'<a class="all" href="#domains">Browse all {total} guides →</a></div>\n'

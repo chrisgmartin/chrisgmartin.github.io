@@ -6,6 +6,8 @@
   // ---- Architecture data: one accurate diagram per domain (viewBox 640x360) ----
   // Architecture data lives in index.html as <script type="application/json" id="atlas-data"> (one entry per domain).
   var D=JSON.parse(document.getElementById('atlas-data').textContent);
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+  function units(n,u){return n===1&&/s$/.test(u)?u.slice(0,-1):u;}  // '1 guide', not '1 guides'
 
   // Reverse a path made of M / L / C commands (for bidirectional pulses)
   function reversePath(d){
@@ -64,7 +66,7 @@
       });
     });
     capText.textContent=d.caption;capLink.textContent='';capLink.setAttribute('href',d.href);
-    capLink.innerHTML='<b>'+d.count+'</b> '+(d.unit||'guides')+' →';
+    capLink.innerHTML='<b>'+esc(d.count)+'</b> '+esc(units(d.count,d.unit||'guides'))+' →';
     Array.prototype.forEach.call(index.children,function(li,j){li.classList.toggle('on',j===i);});
   }
 
@@ -84,7 +86,7 @@
 
   D.forEach(function(d,i){
     var li=document.createElement('li'),b=document.createElement('a');b.href=d.href;
-    b.innerHTML='<span class="n">'+String(i+1).padStart(2,'0')+'</span><span class="nm">'+d.name+'</span><span class="ct"><b>'+d.count+'</b> '+(d.unit||'guides')+'</span>';
+    b.innerHTML='<span class="n">'+String(i+1).padStart(2,'0')+'</span><span class="nm">'+esc(d.name)+'</span><span class="ct"><b>'+esc(d.count)+'</b> '+esc(units(d.count,d.unit||'guides'))+'</span>';
     b.addEventListener('focus',function(){show(i,true);});
     b.addEventListener('mouseenter',function(){show(i,true);});
     li.appendChild(b);index.appendChild(li);
