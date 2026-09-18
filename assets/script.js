@@ -117,7 +117,8 @@
         { name: 'Data Engineering Skills', folder: 'data-engineering-skills' },
         { name: 'dbt Agent Skills', folder: 'dbt-agent-skills' },
         { name: 'Astronomer Agents — Airflow skills', folder: 'astronomer-agents' },
-        { name: 'SkillSpector', folder: 'skillspector' }
+        { name: 'SkillSpector', folder: 'skillspector' },
+        { name: 'Cloudflare security-audit', folder: 'security-audit' }
       ]
     }
   ];

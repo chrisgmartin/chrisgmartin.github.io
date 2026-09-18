@@ -537,6 +537,22 @@
     d.note(20,300,'skillspector scan ./skill/ --no-llm');
   };
 
+  B['claude-skills/security-audit']=function(d){
+    d.title('The finder never confirms the finding');
+    var cx=[158,226,294];
+    d.cyl(14,64,86,48,'coverage\nledger',{size:10.5});
+    d.route([[100,88],[118,88],[118,56],[294,56]],{faint:1});
+    cx.forEach(function(x,i){d.box(x-28,70,56,30,'hunter',{size:10});d.arrow(x,56,x,68,{faint:1});});
+    d.box(130,122,192,30,'candidates',{size:10.5});
+    cx.forEach(function(x){d.arrow(x,100,x,120,{faint:1});});
+    d.box(130,166,192,40,'a fresh agent tries\nto disprove each one',{size:10.5,wash:1});
+    d.arrow(226,152,226,164);d.ring(122,158,208,56);
+    ['confirmed','needs\nvalidation','rejected'].forEach(function(l,i){
+      d.box(cx[i]-28,226,56,34,l,{size:9.5});d.arrow(cx[i],206,cx[i],224,{faint:1});});
+    d.note(14,140,'the agent that\nchecks is never\nthe agent that\nfound it',{size:10});
+    d.note(20,300,'severity = likelihood × impact, not deviation from a checklist');
+  };
+
   // ===== TOPIC: CLAUDE SKILLS =====
   B['claude-skills']=function(d){
     d.title('A skill loads when the prompt matches');
