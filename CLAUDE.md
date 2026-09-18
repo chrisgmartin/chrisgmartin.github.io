@@ -85,8 +85,10 @@ perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=13/$1?v=14/g' assets/script.js  
   (the Web Analytics beacon Cloudflare injects on christopherm.xyz; it reports to `cloudflareinsights.com`, hence
   `connect-src`): **no inline `<script>` code, no `on*=` handlers, no new third-party origins** — put code in
   `assets/*.js` and data in `type="application/json"` blocks. Inline styles are allowed. Change the policy in both
-  places together; the `audit` skill checks it. Cloudflare's Bot "JavaScript detections" injects an inline script the
-  CSP must block, so keep that setting off for the zone.
+  places together; the `audit` skill checks it. Bot Fight Mode is deliberately left on for the zone: its
+  "JavaScript detections" inline snippet (`window.__CF$cv$params`, per-request, unhashable) is blocked by design, so
+  one refused inline script per page on christopherm.xyz (logged twice: header + meta) is expected — do not loosen
+  `script-src` for it.
 - **Repo tooling is not published.** `CLAUDE.md`, `tools/`, `.claude/`, `.gitignore` and `_config.yml` live in the served
   root, so `_redirects` (Cloudflare) and `_config.yml` + Jekyll's dot/underscore rule (GitHub Pages) keep them off the
   sites. Add new repo-only paths to both files.
