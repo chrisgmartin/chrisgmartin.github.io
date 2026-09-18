@@ -40,12 +40,13 @@ def render(key):
         while time.time() < deadline:
             time.sleep(0.25)
             text = open(out.name, encoding="utf-8", errors="replace").read()
-            if "END&gt;&gt;&gt;" in text or "<<<END>>>" in text or "NONE" in text or p.poll() is not None:
+            # Only the escaped markers count: render.html's own script source contains the raw <<<…>>> literals.
+            if "&lt;&lt;&lt;END&gt;&gt;&gt;" in text or "&lt;&lt;&lt;NONE&gt;&gt;&gt;" in text or p.poll() is not None:
                 break
         try: os.killpg(os.getpgid(p.pid), 9)
         except Exception: pass
     os.unlink(out.name)
-    m = re.search(r"&lt;&lt;&lt;SVG&gt;&gt;&gt;(.*?)&lt;&lt;&lt;END&gt;&gt;&gt;", text, re.S) or re.search(r"<<<SVG>>>(.*?)<<<END>>>", text, re.S)
+    m = re.search(r"&lt;&lt;&lt;SVG&gt;&gt;&gt;(.*?)&lt;&lt;&lt;END&gt;&gt;&gt;", text, re.S)
     return html.unescape(m.group(1)) if m else None
 
 def inject(page, svg, name):
@@ -74,7 +75,7 @@ def main(argv):
         if not svg:
             print(f"  no board for {k}", flush=True); miss += 1; continue
         name = re.search(r"<h1[^>]*>(.*?)</h1>", open(page, encoding="utf-8").read(), re.S)
-        name = re.sub("<[^>]+>", "", name.group(1)).strip() if name else k
+        name = html.unescape(re.sub("<[^>]+>", "", name.group(1))).strip() if name else k   # inject() re-escapes
         if inject(page, svg, name):
             ok += 1; print(f"  ✓ {k}", flush=True)
         else:

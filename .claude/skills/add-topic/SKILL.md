@@ -15,6 +15,12 @@ Ask via AskUserQuestion if not provided:
 - **Description**: one-line text for the root catalog card and the topic-page subtitle.
 - **Tag chips** (optional): three to four short labels summarizing the area, for the catalog card.
 
+**Validate before writing anything.** These values are pasted into JS string literals, JSON, HTML and shell commands,
+so reject (and re-ask) rather than escape:
+- Folder name must match `^[a-z0-9]+(-[a-z0-9]+)*$`.
+- Display name, description and tag chips must not contain `'`, `"`, `\`, `<`, `>`, `$` or a backtick. Use typographic
+  quotes (’ “ ”) instead of straight ones.
+
 ## Steps
 
 1. Create `<folder>/index.html`, using `data-engineering/index.html` as the structural template (the **Catalog** layout:
@@ -37,8 +43,10 @@ Ask via AskUserQuestion if not provided:
    }
    ```
 
-3. Add the domain to the homepage atlas: append an entry to the `D` array in `/index.html` (name, href, count, caption,
-   and an *accurate* nodes/edges diagram in the 640×360 viewBox — see the existing seven). Bump the hand-written totals
+3. Add the domain to the homepage atlas: append an entry to the JSON array in `<script type="application/json"
+   id="atlas-data">` in `/index.html` (name, href, count, caption, and an *accurate* nodes/edges diagram in the 640×360
+   viewBox — see the existing entries). It is strict JSON (double-quoted keys and strings, no trailing commas); the code
+   that draws it is `assets/home.js`. Bump the hand-written totals
    in the section heading ("Eight domains") and footer ("N guides across N domains"). The old catalog card markup below
    is no longer used:
    ```html
@@ -62,4 +70,7 @@ Ask via AskUserQuestion if not provided:
 - Topic folder name and SITE_NAV `folder` must match exactly.
 - New topics start with `guides: []`. Use the `add-guide` skill to populate.
 - Bump the shared-asset version after editing `script.js`/`nav.js` (CLAUDE.md → *Shared-asset versioning*).
-- For local review, symlink the new folder into `~/field-guides-experiments/palettes/site/`.
+- For local review, add a *relative* symlink for the new folder in `experiments/palettes/site/` (see CLAUDE.md →
+  *Local review*); never write outside the repo.
+- Keep the two security `<meta>` tags (Content-Security-Policy, referrer) the template carries right after `<meta charset>`.
+  Pages may not contain inline `<script>` code or `on*=` handlers — the CSP blocks them; put code in `assets/*.js`.

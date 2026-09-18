@@ -354,11 +354,20 @@
     });
   }
 
+  // ===== Namespaced, fault-tolerant localStorage =====
+  // Keys live under 'fg:' (chrisgmartin.github.io is an origin shared with other project sites). Legacy unprefixed
+  // keys are still read so readers keep their progress; a corrupt value falls back instead of aborting page setup.
+  const store = {
+    get(k) { try { const v = localStorage.getItem('fg:' + k); return v !== null ? v : localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem('fg:' + k, v); } catch (e) { /* storage full or blocked */ } },
+    json(k) { try { const v = JSON.parse(store.get(k) || '{}'); return v && typeof v === 'object' ? v : {}; } catch (e) { return {}; } },
+  };
+
   // ===== Checklist with localStorage =====
   function initChecklist() {
     document.querySelectorAll('.checklist').forEach(list => {
       const key = list.dataset.storageKey || 'checklist-default';
-      const saved = JSON.parse(localStorage.getItem(key) || '{}');
+      const saved = store.json(key);
       list.querySelectorAll('li').forEach(li => {
         const k = li.dataset.key;
         if (!k) return;
@@ -366,7 +375,7 @@
         li.addEventListener('click', () => {
           li.classList.toggle('checked');
           saved[k] = li.classList.contains('checked');
-          localStorage.setItem(key, JSON.stringify(saved));
+          store.set(key, JSON.stringify(saved));
         });
       });
     });
@@ -401,7 +410,7 @@
   function initTheme() {
     const toggle = document.getElementById('themeToggle');
     if (!toggle) return;
-    const savedTheme = localStorage.getItem('prep-theme') || 'light';
+    const savedTheme = store.get('prep-theme') || 'light';
     document.documentElement.setAttribute('data-theme', savedTheme);
     toggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
     toggle.addEventListener('click', () => {
@@ -409,7 +418,7 @@
       const next = current === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
       toggle.textContent = next === 'dark' ? '☀️' : '🌙';
-      localStorage.setItem('prep-theme', next);
+      store.set('prep-theme', next);
     });
   }
 
@@ -417,7 +426,7 @@
   function initDrillMode() {
     const checkbox = document.getElementById('drillToggle');
     if (!checkbox) return;
-    const saved = localStorage.getItem('drill-mode') === 'true';
+    const saved = store.get('drill-mode') === 'true';
     checkbox.checked = saved;
     if (saved) document.body.classList.add('drill-mode');
     checkbox.addEventListener('change', () => {
@@ -426,7 +435,7 @@
       if (checkbox.checked) {
         document.querySelectorAll('.reveal:not([data-force-open])').forEach(r => r.removeAttribute('open'));
       }
-      localStorage.setItem('drill-mode', checkbox.checked);
+      store.set('drill-mode', checkbox.checked);
     });
   }
 
@@ -435,7 +444,7 @@
     const buttons = document.querySelectorAll('.practice-check');
     if (!buttons.length) return;
     const storageKey = document.body.dataset.practiceKey || 'practice-default';
-    const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
+    const saved = store.json(storageKey);
 
     function updateProgress() {
       const total = buttons.length;
@@ -453,7 +462,7 @@
         e.stopPropagation();
         btn.classList.toggle('done');
         saved[id] = btn.classList.contains('done');
-        localStorage.setItem(storageKey, JSON.stringify(saved));
+        store.set(storageKey, JSON.stringify(saved));
         updateProgress();
       });
     });
@@ -476,11 +485,11 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=12';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=13';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
-      fonts.href = 'https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&family=Patrick+Hand&display=swap';
+      fonts.href = root + 'assets/fonts.css?v=13';   // self-hosted (assets/fonts/); no third-party font origin
       document.head.appendChild(fonts);
     }
     // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
@@ -490,7 +499,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=12';
+    s.src = root + 'assets/nav.js?v=13';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a
@@ -520,7 +529,7 @@
     (g.sections || []).forEach(s => s.chapters.forEach(c => all.push(c)));
     const idx = all.findIndex(c => c.f === current);
     if (idx < 0) return;
-    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const num = all[idx].n, total = all.length, base = root + guidePath + '/';
 
     const eyebrow = document.querySelector('main .hero .eyebrow');
@@ -537,8 +546,8 @@
     const prev = all[idx - 1], next = all[idx + 1];
     const pnx = document.createElement('nav'); pnx.className = 'pnx'; pnx.setAttribute('aria-label', 'Chapter navigation');
     pnx.innerHTML =
-      (prev ? `<a href="${base + prev.f}"><span class="k">← Previous · ${esc(prev.n)}</span><span class="t">${esc(prev.t)}</span></a>` : '<span></span>') +
-      (next ? `<a class="next" href="${base + next.f}"><span class="k">Next · ${esc(next.n)} →</span><span class="t">${esc(next.t)}</span></a>` : '<span></span>');
+      (prev ? `<a href="${esc(base + prev.f)}"><span class="k">← Previous · ${esc(prev.n)}</span><span class="t">${esc(prev.t)}</span></a>` : '<span></span>') +
+      (next ? `<a class="next" href="${esc(base + next.f)}"><span class="k">Next · ${esc(next.n)} →</span><span class="t">${esc(next.t)}</span></a>` : '<span></span>');
     wrap.appendChild(pnx);
     const footer = main.querySelector(':scope > footer');
     footer ? main.insertBefore(wrap, footer) : main.appendChild(wrap);

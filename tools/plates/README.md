@@ -14,6 +14,10 @@ no runtime drawing library, no CDN. They follow the theme because ink is `var(--
 - `build.py` — renders every board with headless Chrome and inlines it into the hub between
   `<figure class="plate">…</figure>`, wrapping the hero text in `.hero-text` and adding `.has-plate`.
 - `vendor/rough.js` — rough.js 4.6.6 (MIT), used only at build time.
+  Source: npm `roughjs@4.6.6`, file `bundled/rough.js`
+  (https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js), SHA-256
+  `6853af8619532f3939b156cd16824d2e14f31e71d3df306ad5558eeafacab194`. Verify before replacing:
+  `shasum -a 256 tools/plates/vendor/rough.js`.
 
 ## Adding or changing a plate
 

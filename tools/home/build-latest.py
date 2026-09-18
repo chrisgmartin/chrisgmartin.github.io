@@ -83,20 +83,20 @@ def render(rows, total, n):
     age = (datetime.date.today() - datetime.date.fromisoformat(top["date"])).days
     label = "Just published" if age <= STRIP_FRESH_DAYS else "Latest guide"
     strip = (
-        f'<div class="wrap latestbar"><a href="{top["key"]}/index.html">'
+        f'<div class="wrap latestbar"><a href="{E(top["key"])}/index.html">'
         f'<span class="tag">{label}</span>'
         f'<span class="nm">{E(top["name"])}</span><span class="sep">·</span>'
-        f'<span class="dm">{top["n"]} {top["unit"]} · {E(top["domain"])}</span>'
+        f'<span class="dm">{E(str(top["n"]))} {E(top["unit"])} · {E(top["domain"])}</span>'
         f'<span class="go">Read →</span></a></div>'
     )
     li = ""
     for r in rest:
         show_year = int(r["date"][:4]) != this_year
-        li += (f'      <li><a href="{r["key"]}/index.html">'
-               f'<time class="dt" datetime="{r["date"]}">{pretty(r["date"], show_year)}</time>'
+        li += (f'      <li><a href="{E(r["key"])}/index.html">'
+               f'<time class="dt" datetime="{E(r["date"])}">{pretty(r["date"], show_year)}</time>'
                f'<span class="dm">{E(r["domain"])}</span>'
                f'<span class="tt">{E(r["name"])}<small>{E(clause(r["sub"]))}</small></span>'
-               f'<span class="len">{r["n"]} {r["unit"]} · {read_time(r)}</span></a></li>\n')
+               f'<span class="len">{E(str(r["n"]))} {E(r["unit"])} · {read_time(r)}</span></a></li>\n')
     lst = (f'<section class="wrap latest" aria-label="Latest guides">\n'
            f'    <div class="lhead"><h2>Latest</h2>'
            f'<a class="all" href="#domains">Browse all {total} guides →</a></div>\n'
