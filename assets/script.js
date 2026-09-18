@@ -116,7 +116,8 @@
       guides: [
         { name: 'Data Engineering Skills', folder: 'data-engineering-skills' },
         { name: 'dbt Agent Skills', folder: 'dbt-agent-skills' },
-        { name: 'Astronomer Agents — Airflow skills', folder: 'astronomer-agents' }
+        { name: 'Astronomer Agents — Airflow skills', folder: 'astronomer-agents' },
+        { name: 'SkillSpector', folder: 'skillspector' }
       ]
     }
   ];
@@ -474,7 +475,7 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=11';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=12';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
@@ -488,7 +489,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=11';
+    s.src = root + 'assets/nav.js?v=12';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a

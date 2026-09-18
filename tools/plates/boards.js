@@ -523,6 +523,20 @@
     d.note(20,300,'works with open-source Airflow — set AIRFLOW_API_URL');
   };
 
+  B['claude-skills/skillspector']=function(d){
+    d.title('Two review lines, one verdict');
+    var sk=d.box(14,66,104,44,'a skill you\nhaven\'t run yet',{size:10.5});
+    d.note(16,122,'treat it as\nuntrusted input',{size:10});
+    var stat=d.box(152,42,116,42,'static scan\n71 patterns · AST',{size:10.5,wash:1});
+    var sem=d.box(152,118,116,42,'read the source\nintent · permission fit',{size:10});
+    d.connect(sk,stat);d.connect(sk,sem);
+    var v=d.box(300,74,86,52,'APPROVE\nCAUTION\nREJECT',{size:10.5});
+    d.connect(stat,v);d.connect(sem,v);d.ring(292,66,102,68);
+    d.text(214,200,'score = verdict',{size:11});d.strike(156,196,272,196);
+    d.note(152,222,'a security skill scores CRITICAL for\ndiscussing exploits — read the finding',{size:10});
+    d.note(20,300,'skillspector scan ./skill/ --no-llm');
+  };
+
   // ===== TOPIC: CLAUDE SKILLS =====
   B['claude-skills']=function(d){
     d.title('A skill loads when the prompt matches');
