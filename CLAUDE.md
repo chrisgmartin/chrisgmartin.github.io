@@ -111,6 +111,10 @@ perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=14/$1?v=15/g' assets/script.js  
   "JavaScript detections" inline snippet (`window.__CF$cv$params`, per-request, unhashable) is blocked by design, so
   one refused inline script per page on christopherm.xyz (logged twice: header + meta) is expected — do not loosen
   `script-src` for it.
+- **Web Analytics is live** on christopherm.xyz (enabled in the Cloudflare dashboard, automatic injection). Cloudflare only
+  injects the beacon into responses to requests that send `Accept: text/html`, so check with
+  `curl -s --compressed -H 'Accept: text/html' https://christopherm.xyz/ | grep -c cloudflareinsights.com/beacon` — a bare
+  `curl` shows no beacon and is not evidence that analytics is off.
 - **Privacy page is a contract.** `privacy.html` lists exactly what runs (no cookies, `fg:` localStorage, Cloudflare Web
   Analytics injected at the edge on christopherm.xyz, jsDelivr for highlight.js). Adding any tool, provider or stored
   value means updating that page in the same PR.
