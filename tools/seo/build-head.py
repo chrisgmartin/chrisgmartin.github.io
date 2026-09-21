@@ -21,6 +21,7 @@ import html, os, re, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SITE = "https://christopherm.xyz"
 NAME = "Field Guides"
+OG_IMAGE = "/assets/og.png?v=2"     # bump the query when og.png changes: link-preview caches key on the URL
 OPEN, CLOSE = "<!-- HEAD:seo -->", "<!-- /HEAD:seo -->"
 DESCRIPTIONS = {   # pages with no hero subtitle
     "404.html": "That page is not here. Browse the Field Guides catalog instead.",
@@ -63,7 +64,7 @@ def block(rel, s):
                  '<meta property="og:title" content="%s">' % e(title),
                  '<meta property="og:description" content="%s">' % e(desc),
                  '<meta property="og:url" content="%s">' % url,
-                 '<meta property="og:image" content="%s/assets/og.png">' % SITE,
+                 '<meta property="og:image" content="%s%s">' % (SITE, OG_IMAGE),
                  '<meta property="og:image:width" content="1200">', '<meta property="og:image:height" content="630">',
                  '<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">',
                  '<meta name="twitter:card" content="summary_large_image">']

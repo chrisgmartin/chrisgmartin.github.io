@@ -11,7 +11,8 @@ Writes
 
 The geometry mirrors `isoArt` in assets/home.js (same grid → screen projection, tiers and key blocks); colours are the
 light-theme tokens. Needs Google Chrome (headless renders) and Pillow. Rarely needed — rerun only when the hero art,
-palette or headline changes, then bump `?v=` for the icon links (tools/seo/build-head.py writes them).
+palette or headline changes, then bump `?v=` for the icon links and `OG_IMAGE` in tools/seo/build-head.py (link-preview
+caches key on the image URL) and rerun it.
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -53,21 +54,22 @@ def favicon_svg():
             % stack(ICON, A=9.5, H=5, GAP=6.5, ox=32, oy=35, stroke=INK, sw=1.1, centre=True))
 
 def og_html():
+    """Everything sits inside the central 630px square: compact link previews (Slack, Messages, LinkedIn thumbnails)
+    centre-crop the 1200x630 image to a square, and a headline that runs wider than that gets cut mid-word."""
     fonts = "file://" + os.path.join(ROOT, "assets", "fonts.css")
-    art = stack(FULL, A=34, H=22, GAP=88, ox=650, oy=300, stroke=LINE, sw=1, risers=RISERS)
+    A, H, GAP = 31, 20, 52
+    art = stack(FULL, A=A, H=H, GAP=GAP, ox=612 - A, oy=596 - 4 * A - H, stroke="#a9b9b6", sw=1.2, risers=RISERS)
     return """<!DOCTYPE html><html><head><meta charset="UTF-8"><link rel="stylesheet" href="%s"><style>
-html,body{margin:0;width:1200px;height:630px;background:%s;overflow:hidden;font-family:"Inter",sans-serif;color:%s}
-svg{position:absolute;right:-70px;top:-40px;width:1000px;height:720px}
-.fade{position:absolute;inset:0;background:linear-gradient(to right,%s 0%%,%s 34%%,transparent 62%%)}
-.t{position:absolute;left:80px;top:0;bottom:0;width:640px;display:flex;flex-direction:column;justify-content:center}
-.m{font-family:"Fraunces",serif;font-size:17px;letter-spacing:.22em;text-transform:uppercase;color:%s;margin:0 0 30px}
-h1{font-family:"Fraunces",serif;font-weight:400;font-size:74px;line-height:1.04;letter-spacing:-.025em;margin:0}
+html,body{margin:0;width:1200px;height:630px;background:%s;overflow:hidden;color:%s}
+svg{position:absolute;left:0;top:0;width:1200px;height:630px}
+.t{position:absolute;left:285px;width:630px;top:50px;text-align:center}
+.m{font-family:"Fraunces",serif;font-size:16px;letter-spacing:.24em;text-transform:uppercase;color:%s;margin:0 0 20px}
+h1{font-family:"Fraunces",serif;font-weight:400;font-size:60px;line-height:1.05;letter-spacing:-.025em;margin:0}
 h1 em{font-style:italic;color:%s}
-.u{position:absolute;left:80px;bottom:56px;font-family:"JetBrains Mono",monospace;font-size:18px;letter-spacing:.06em;color:%s}
-.r{position:absolute;left:0;top:0;bottom:0;width:10px;background:%s}
-</style></head><body><svg viewBox="0 0 1000 640">%s</svg><div class="fade"></div><div class="r"></div>
-<div class="t"><p class="m">Field Guides</p><h1>%s <em>%s</em></h1></div><div class="u">christopherm.xyz</div></body></html>""" % (
-        fonts, BG, INK, BG, BG, MUTED, ACCENT, FAINT, ACCENT, art, HEADLINE[0], HEADLINE[1])
+.r{position:absolute;left:0;right:0;top:0;height:8px;background:%s}
+</style></head><body><svg viewBox="0 0 1200 630">%s</svg><div class="r"></div>
+<div class="t"><p class="m">Field Guides</p><h1>The craft of building<br>real systems,<br><em>%s</em></h1></div></body></html>""" % (
+        fonts, BG, INK, MUTED, ACCENT, ACCENT, art, HEADLINE[1])
 
 def shot(html_path, png, w, h, transparent=False):
     prof = tempfile.mkdtemp(prefix="fg-chrome-")
