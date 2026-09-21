@@ -50,9 +50,15 @@ def render(key):
     m = re.search(r"&lt;&lt;&lt;SVG&gt;&gt;&gt;(.*?)&lt;&lt;&lt;END&gt;&gt;&gt;", text, re.S)
     return html.unescape(m.group(1)) if m else None
 
+def plate_label(svg, name):
+    """Accessible name: the sketch's own title (its first <text>, written by d.title()), not just the guide name."""
+    m = re.search(r"<text\b[^>]*>(.*?)</text>", svg, re.S)
+    title = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))).strip() if m else ""
+    return "Whiteboard sketch for %s: %s" % (name, title) if title else "Whiteboard sketch: " + name
+
 def inject(page, svg, name):
     s = open(page, encoding="utf-8").read()
-    fig = f'<figure class="plate" aria-label="Whiteboard sketch: {html.escape(name)}">{svg}</figure>'
+    fig = f'<figure class="plate" aria-label="{html.escape(plate_label(svg, name))}">{svg}</figure>'
     if '<figure class="plate"' in s:
         s2 = re.sub(r'<figure class="plate".*?</figure>', lambda m: fig, s, count=1, flags=re.S)
     else:

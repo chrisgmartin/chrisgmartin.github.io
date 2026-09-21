@@ -83,3 +83,8 @@ reject (and re-ask) rather than escape:
 - Hub heroes are wrapped by the plate builder as `.hero.has-plate > .hero-text + figure.plate`; write the hero normally
   and let `build.py` do the wrapping.
 - Format badges are filled chips coloured by `--f-*` tokens; pick the right `format-*` class, never a colour.
+
+## Head block and sitemap
+
+After the hub and first chapter exist, run `python3 tools/seo/build-head.py` — `git add` the new page(s) first (it walks tracked files); it writes the
+   description / canonical / Open Graph / favicon block after `<title>` and refreshes `sitemap.xml`. Never hand-write that block.

@@ -55,6 +55,10 @@ Ask via AskUserQuestion if not provided:
 5. Regenerate the chapter manifest so the guide sub-bar, "NN of M" eyebrow and prev/next cards pick the chapter up:
    `python3 tools/nav/build-chapters.py`, then bump the shared-asset version (CLAUDE.md → *Shared-asset versioning*).
    Update the topic page's `.c` length and `.r` read time for the guide, and the hero `.stat` chapter total.
+   Then run `python3 tools/seo/build-head.py` — `git add` the new page(s) first (it walks tracked files); it writes the
+   description / canonical / Open Graph / favicon block after `<title>` and refreshes `sitemap.xml`. Never hand-write that block.
+   The description comes from the hero `<p class="subtitle">`, so write a real one; keep the `<title>` unique site-wide
+   (`Chapter title — Guide name`).
 
 6. Verify with `grep`:
    - The hub references the new file.

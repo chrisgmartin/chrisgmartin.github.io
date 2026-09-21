@@ -312,6 +312,16 @@
     input.addEventListener('input', apply);
   }
 
+  // ===== Wide tables scroll inside their own box instead of stretching the page (phones) =====
+  function wrapTables() {
+    document.querySelectorAll('main table').forEach(t => {
+      const p = t.parentElement;
+      if (p.classList.contains('table-scroll') || /overflow-x\s*:\s*auto/.test(p.getAttribute('style') || '')) return;
+      const w = document.createElement('div'); w.className = 'table-scroll';
+      p.insertBefore(w, t); w.appendChild(t);
+    });
+  }
+
   // ===== Syntax highlighting =====
   function applyHighlighting() {
     if (window.hljs) {
@@ -485,11 +495,11 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=13';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=14';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
-      fonts.href = root + 'assets/fonts.css?v=13';   // self-hosted (assets/fonts/); no third-party font origin
+      fonts.href = root + 'assets/fonts.css?v=14';   // self-hosted (assets/fonts/); no third-party font origin
       document.head.appendChild(fonts);
     }
     // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
@@ -499,7 +509,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=13';
+    s.src = root + 'assets/nav.js?v=14';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a
@@ -580,6 +590,7 @@
     reorderSidebarSections();
     injectBreadcrumb();
     initFilterBar();
+    wrapTables();
     applyHighlighting();
     initCopyButtons();
     initTabs();
