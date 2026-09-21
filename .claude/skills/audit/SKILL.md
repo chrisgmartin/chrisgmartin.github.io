@@ -118,6 +118,18 @@ without one (fix: add a spec to `tools/plates/boards.js` and run `tools/plates/b
 - `_redirects` covers `/CLAUDE.md`, `/_config.yml`, `/.gitignore`, `/.claude/*`, `/tools/*`, and `_config.yml` excludes
   `CLAUDE.md` and `tools/`, so repo tooling is never published.
 
+### 12. Head block, sitemap and launch basics
+
+- `python3 tools/seo/build-head.py --check` exits 0: every published page has a current `<!-- HEAD:seo -->` block
+  (description, canonical to `https://christopherm.xyz/…` in clean-URL form, Open Graph + Twitter card, favicon links)
+  and `sitemap.xml` / `robots.txt` match the tracked pages.
+- No two published pages share a `<title>`.
+- `favicon.ico`, `assets/favicon.svg`, `assets/apple-touch-icon.png` and `assets/og.png` exist (rebuild with
+  `tools/brand/build-brand.py`); `privacy.html` and `terms.html` exist and are linked from the home and 404 footers and
+  from `mount()` in `assets/nav.js` (the `.fg-legal` line on every inner page).
+- `python3 tools/content/review.py` reports no broken links or anchors (its "no folded answers" FAILs on older
+  curriculum chapters are known backlog, not a structural failure).
+
 ## Output format
 
 Report as a checklist. For each check, show `✓` or `✗` with failing items beneath. Example:

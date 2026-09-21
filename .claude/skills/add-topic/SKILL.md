@@ -74,3 +74,8 @@ so reject (and re-ask) rather than escape:
   *Local review*); never write outside the repo.
 - Keep the two security `<meta>` tags (Content-Security-Policy, referrer) the template carries right after `<meta charset>`.
   Pages may not contain inline `<script>` code or `on*=` handlers — the CSP blocks them; put code in `assets/*.js`.
+
+## Head block and sitemap
+
+After the topic page exists, run `python3 tools/seo/build-head.py` — `git add` the new page(s) first (it walks tracked files); it writes the
+   description / canonical / Open Graph / favicon block after `<title>` and refreshes `sitemap.xml`. Never hand-write that block.

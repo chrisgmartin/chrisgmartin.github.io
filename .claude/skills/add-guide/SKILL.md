@@ -53,6 +53,8 @@ reject (and re-ask) rather than escape:
    - `<button class="theme-toggle" id="themeToggle">🌙</button>` before `</body>`.
 
 3. Generate `<topic-folder>/<guide-folder>/00-START-HERE.html` via the `add-chapter` conventions. Asset paths are `../../assets/...`. No manual breadcrumb (auto-injected).
+   When the guide is to be written from sources, run the `write-chapter` skill's phases 1–2 (source map, topic
+   checklist) for the whole guide before scaffolding chapters, so the chapter list comes from the material.
 
 4. Register the guide in **three** places:
    - `assets/script.js` SITE_NAV — append to the topic's `guides` array: `{ name: '<Guide display name>', folder: '<guide-folder>' }`.
@@ -81,3 +83,8 @@ reject (and re-ask) rather than escape:
 - Hub heroes are wrapped by the plate builder as `.hero.has-plate > .hero-text + figure.plate`; write the hero normally
   and let `build.py` do the wrapping.
 - Format badges are filled chips coloured by `--f-*` tokens; pick the right `format-*` class, never a colour.
+
+## Head block and sitemap
+
+After the hub and first chapter exist, run `python3 tools/seo/build-head.py` — `git add` the new page(s) first (it walks tracked files); it writes the
+   description / canonical / Open Graph / favicon block after `<title>` and refreshes `sitemap.xml`. Never hand-write that block.
