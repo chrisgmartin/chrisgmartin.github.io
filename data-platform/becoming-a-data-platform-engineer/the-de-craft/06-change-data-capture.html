@@ -224,15 +224,19 @@ ORDER BY rental_id;</code></pre></div>
 
   <p>Now build <strong>full history</strong> — every version key 501 ever held, with a valid-from / valid-to window. This is SCD2, derived straight from the feed:</p>
 
-  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- each event opens a new version; the next event's ts closes it
-SELECT
-  rental_id,
-  status,
-  ts AS valid_from,
-  LEAD(ts) OVER (PARTITION BY rental_id ORDER BY lsn) AS valid_to,
-  (LEAD(lsn) OVER (PARTITION BY rental_id ORDER BY lsn) IS NULL) AS is_current
-FROM cdc_feed
-WHERE op &lt;&gt; 'd'          -- a delete closes the prior version but adds no new one
+  <div class="code-wrap"><div class="code-header"><span>duckdb</span></div><pre><code class="language-sql">-- each event opens a new version; the next event's ts closes it.
+-- Window over ALL events first (deletes included), then drop the delete rows:
+-- that way a delete closes the prior version but adds no new one.
+WITH versions AS (
+  SELECT
+    *,
+    LEAD(ts)  OVER (PARTITION BY rental_id ORDER BY lsn) AS valid_to,
+    (LEAD(lsn) OVER (PARTITION BY rental_id ORDER BY lsn) IS NULL) AS is_current
+  FROM cdc_feed
+)
+SELECT rental_id, status, ts AS valid_from, valid_to, is_current
+FROM versions
+WHERE op &lt;&gt; 'd'
   AND rental_id = 501
 ORDER BY lsn;</code></pre></div>
 
@@ -271,12 +275,33 @@ ORDER BY lsn;</code></pre></div>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Why can a query-based nightly snapshot never capture a deleted row?</li>
-    <li>What is the WAL, and why is tailing it cheaper than polling the table?</li>
-    <li>In a CDC event, what do <code>before</code> and <code>after</code> hold for an insert? For a delete?</li>
-    <li>How does the same change stream produce <em>both</em> current state and full history?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate adds <code>WHERE updated_at &gt; :last_run</code> to the nightly extract and says the warehouse now matches the source. Finance later finds 40 rentals in the warehouse that the product database doesn't have. What happened, and why can no change to that query fix it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Those rentals were deleted at the source. A query can only return rows that exist, so a deleted row has no <code>updated_at</code> left to compare — query-based extraction is structurally blind to deletes, however clever the predicate. You need the delete recorded somewhere: the WAL (log-based CDC) or a soft-delete flag in the source. See <a href="#problem">The snapshot problem</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The database writes its log whether or not anyone reads it. Why does that make log-based CDC cheaper for the source than polling every minute — and what two things does the log give you that timestamps can't?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Polling runs a real query against live tables on every tick; tailing the WAL reads a file the database already produces for durability, so it adds almost no query load. The log also gives an <em>exact</em> commit order (the LSN) and <em>every</em> intermediate state, where timestamps give approximate order and only the latest state between polls. See <a href="#log-based">Log-based CDC</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An event arrives with <code>"before": null</code>. Another arrives with <code>"after": null</code>. What is each one, and what must your current-state table do with the second?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>before: null</code> is an insert (<code>op = c</code>) — there was no prior row. <code>after: null</code> is a delete (<code>op = d</code>), and current state must remove that key; if you ignore it, the warehouse keeps a row the source no longer has. See <a href="#log-based">the event anatomy</a> and <a href="#handling">tombstones</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a connector restart, events <code>lsn 30</code> and <code>lsn 40</code> for rental #501 are delivered a second time — and <code>40</code> arrives before <code>30</code>. Your apply step does a blind <code>INSERT</code> per event. What goes wrong, and which two rules from this chapter prevent it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Blind inserts duplicate the rows, and applying 30 after 40 leaves #501 as <code>active</code> when the source says <code>completed</code>. The fixes are <strong>idempotent apply</strong> — upsert/merge on the key, so replaying an event changes nothing — and <strong>order by LSN, latest wins</strong>, so a stale event can never overwrite a newer one. See <a href="#handling">Handling the change stream</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In the history query, the window function runs over every event and the <code>op &lt;&gt; 'd'</code> filter comes afterwards. Suppose you moved that filter into the same <code>SELECT</code> as the <code>LEAD</code>. For a key whose last event is a delete, what would the history wrongly claim?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>WHERE</code> runs before window functions, so the delete row would be gone before <code>LEAD</code> looked for "the next event". The last real version would get <code>valid_to = NULL</code> and look current forever — history would say a deleted customer is still on <code>pro</code>. Windowing first, filtering second, is what lets the delete close the final version. Try it on the exercise below.</p></div></details>
+    </li>
+    <li>
+      <p>The source table behind <code>dim_gpu</code> — the list of GPU models — has 12 rows, changes about twice a year, never deletes, and feeds a daily report. A colleague wants it on Debezium "for consistency" with <code>rentals</code>. What do you recommend, and what fact would change your answer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep the simple extract from Chapter 05: no deletes, no latency need, and a full re-read of 12 rows costs nothing — CDC would add a connector and a stream to operate for no gain. The answer flips if you need the <em>history</em> of those rows (say, what a GPU type's spec was when a rental was priced) or if rows start being deleted. See <a href="#tradeoffs">Tradeoffs</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Apply three CDC events for one key</strong></summary>
     <div class="collapse-card-body">
@@ -302,10 +327,13 @@ SELECT id, tier FROM latest WHERE rn = 1 AND op &lt;&gt; 'd';
 --  -> zero rows. The delete tombstones key 42.
 
 -- (b) HISTORY: every version the key ever held (deletes add no new version).
-SELECT id, tier,
-       lsn AS valid_from_lsn,
-       LEAD(lsn) OVER (PARTITION BY id ORDER BY lsn) AS valid_to_lsn
-FROM cust_cdc
+-- LEAD runs over all events, THEN the delete row is dropped - so the delete still closes 'pro'.
+WITH versions AS (
+  SELECT *, LEAD(lsn) OVER (PARTITION BY id ORDER BY lsn) AS valid_to_lsn
+  FROM cust_cdc
+)
+SELECT id, tier, lsn AS valid_from_lsn, valid_to_lsn
+FROM versions
 WHERE op &lt;&gt; 'd'
 ORDER BY lsn;
 --  -> 42 | free | 100 | 200
