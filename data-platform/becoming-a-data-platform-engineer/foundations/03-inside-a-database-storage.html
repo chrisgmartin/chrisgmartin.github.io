@@ -97,7 +97,7 @@
 
   <div class="code-wrap"><div class="code-header"><span>sql</span></div><pre><code class="language-sql">SELECT * FROM orders WHERE order_id = 998877;</code></pre></div>
 
-  <p>How does the database find that one row? With only a heap, it has no idea where row <code>998877</code> is — remember, the heap has no order. So it does the only thing it can: it reads <em>every page</em>, checking every row, until it finds a match (or reaches the end). This is a <strong>full table scan</strong>, and its cost grows linearly with the table size — in the Big-O terms from <a href="02-data-structures-algorithms.html">Chapter 02</a>, it's <strong>O(n)</strong>. For 50 million rows, that's tens of thousands of page reads to fetch a single record. Painful.</p>
+  <p>How does the database find that one row? With only a heap, it has no idea where row <code>998877</code> is — remember, the heap has no order. So it does the only thing it can: it reads <em>every page</em>, checking every row, until it finds a match (or reaches the end). This is a <strong>full table scan</strong>, and its cost grows linearly with the table size — in the Big-O terms from <a href="02-data-structures-algorithms.html">Chapter 02</a>, it's <strong>O(n)</strong>. For 50 million rows, that's up to a few hundred thousand page reads — every page in the table — to fetch a single record. Painful.</p>
 
   <div class="callout analogy">
     <span class="callout-label">The library card catalog</span>
@@ -214,7 +214,7 @@ CREATE TABLE demo_orders AS
 SELECT g AS order_id,
        (g % 1000)        AS customer_id,
        (random() * 500)::int AS amount
-FROM generate_series(1, 1000000) AS g;
+FROM generate_series(1, 1000000) AS t(g);   -- t(g): names the column, so the same SQL runs in DuckDB too
 
 -- 2. find one row. With no index this is a FULL TABLE SCAN.
 EXPLAIN ANALYZE
@@ -237,12 +237,33 @@ SELECT * FROM demo_orders WHERE order_id = 998877;</code></pre></div>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Why is a page (block) the unit of disk I/O, and why does query cost track <em>pages read</em> more than rows matched?</li>
-    <li>In one sentence: how does an index turn an O(n) scan into an O(log n) lookup?</li>
-    <li>Why do databases use B-trees with high fan-out instead of plain binary trees?</li>
-    <li>Name the trade an index makes — what does it buy, and what does it cost?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Two queries against the same large table each return 1,000 rows. One needs 3 disk reads, the other about 1,000. How is that possible, and why doesn't the database simply read the rows it wants instead of whole 8&nbsp;KB pages?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Query cost tracks pages read, not rows matched: in the first case the rows sit together on three pages, in the second they are scattered one per page. The page is the atom of I/O because the expensive part of a read is finding the data and starting the transfer, so 8&nbsp;KB costs almost the same as one byte — the database grabs the whole page and bets you will want the neighbours. See <a href="#pages">Pages</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Over a billion rows, a plain binary search tree and a B-tree both find a key in logarithmic time. Roughly how many page reads does each need, and what design decision produces the gap?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 30 for the binary tree versus 3–4 for the B-tree. A B-tree node is sized to fill one page, so it holds hundreds of keys and branches hundreds of ways; that high fan-out makes the tree wide and shallow. Both are O(log n), but page reads are the expensive thing, and the B-tree is binary search re-shaped to minimise them. See <a href="#btree">B-tree indexes, deeply</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After step 3 of the hands-on (the index on <code>order_id</code> exists), you run <code>EXPLAIN ANALYZE SELECT * FROM demo_orders WHERE customer_id = 7;</code>. What kind of scan do you expect, how many rows come back, and what would you do if this query mattered?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A sequential scan of the whole heap, returning 1,000 rows (<code>g % 1000 = 7</code> for one row in every thousand of the million). The tempting assumption is "the table is indexed now, so it's fast" — but an index only helps queries that filter on the column it keeps sorted, and this one is sorted by <code>order_id</code>. If the query matters, create an index on <code>customer_id</code> and run <code>EXPLAIN ANALYZE</code> again to confirm the plan changed. See <a href="#hands-on">the hands-on</a> and <a href="#indexes">The problem indexes solve</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A table has a composite index on <code>(customer_id, order_date)</code>. <code>WHERE customer_id = 7 ORDER BY order_date</code> is fast, but <code>WHERE order_date = '2026-03-01'</code> is slow. Why does the same index serve one and not the other?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A composite index is sorted by the first column, then by the second <em>within</em> each value of the first. Customer 7's entries are contiguous and already in date order, so the first query is one descent and a short walk along the leaves. Rows for a single date are scattered across every customer's section, so the index cannot efficiently use the second column alone — column order matters. See <a href="#index-tradeoffs">Indexes aren't free</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A table takes thousands of inserts per second and is read once a night by a report that filters on <code>customer_id</code>. A teammate proposes indexing every column "so nothing is ever slow". What do you recommend, and what about the workload would change your answer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep indexes to a minimum — at most one on <code>customer_id</code>, and possibly none if the nightly scan is fast enough. Every <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> must update the heap <em>and</em> find the right leaf in every index, so each extra index taxes thousands of writes a second to speed up reads that nobody runs, and costs disk space too. The balance flips for a read-heavy reporting table with few writes, which can afford more indexes on the columns it filters, joins and sorts by; either way, confirm with <code>EXPLAIN</code> rather than guessing. See <a href="#index-tradeoffs">Indexes aren't free</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Impressed by how quickly DuckDB sums a billion-row column, someone suggests moving the application's order-processing tables — constant single-row reads and updates by id — from Postgres to a columnar store. What is wrong with the reasoning?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Columnar is not "faster", it makes the opposite bet. It wins when a query reads one or a few columns across huge numbers of rows, because it reads only those columns and they compress well. To fetch or update one whole record it must reassemble the row from every column, whereas a row store finds all the fields together on one page — which is exactly the OLTP pattern described. The query shape decides: whole records by key favour the row store, wide aggregates favour columnar. See <a href="#row-vs-col">Row-oriented vs columnar storage</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Reason about reads, writes, and layout</strong></summary>
     <div class="collapse-card-body">

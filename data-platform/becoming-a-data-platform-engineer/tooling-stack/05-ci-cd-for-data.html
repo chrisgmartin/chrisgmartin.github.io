@@ -138,7 +138,7 @@ jobs:
   <table>
     <thead><tr><th>CI step for data</th><th>What it catches</th></tr></thead>
     <tbody>
-      <tr><td><code>dbt compile</code></td><td>SQL that references a missing model/column, or broken Jinja — a model that won't even build.</td></tr>
+      <tr><td><code>dbt compile</code></td><td>A <code>ref()</code> to a model that doesn't exist, a broken macro or Jinja syntax — caught without touching the warehouse. (A missing <em>column</em> is not caught here: compile never runs the SQL, so that surfaces at <code>dbt build</code>.)</td></tr>
       <tr><td><code>dbt build</code></td><td>Runs models <em>and</em> their tests in dependency order; a downstream model that breaks from an upstream change.</td></tr>
       <tr><td><code>dbt test</code></td><td>Data-quality assertions: nulls in a key, duplicate primary keys, unexpected category values.</td></tr>
       <tr><td>SQL lint (e.g. <code>sqlfluff</code>)</td><td>Style and correctness issues — inconsistent formatting, risky patterns — before review.</td></tr>
@@ -252,12 +252,33 @@ gh pr create --fill          # open the PR from the terminal</code></pre></div>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain, in one sentence each, what CI and CD do — and the question each answers?</li>
-    <li>What does "main is always green" mean, and what enforces it beyond just running CI?</li>
-    <li>Why run dbt CI against a throwaway DuckDB instead of your real warehouse?</li>
-    <li>Where do credentials go, and why never in the workflow YAML?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A PR adds a <code>unique</code> test on a column that has duplicates. Trace the chain from that failing test to a disabled Merge button. Which link in the chain is <em>not</em> provided by <code>dbt-ci.yml</code>, and what happens if it is missing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The test fails, so <code>dbt build</code> exits non-zero; the step fails, the job fails, and the PR's check turns red. The last link — red check means no merge — comes from a <strong>branch protection rule</strong> requiring status checks to pass, which is a repo setting, not part of the workflow. Without it CI still runs and still goes red, but anyone can merge the red PR anyway, and "main is always green" is only a hope. See <a href="#ci">Continuous Integration</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A PR renames a column in <code>stg_rentals</code>. A downstream model still selects the old name, and the author only ran the staging model locally. With the hands-on workflow in place, where and when does this surface — and where would it have surfaced without CI?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>On the pull request: <code>dbt build</code> runs every model and its tests in dependency order, so the downstream model errors on the runner and the check goes red before anyone merges. Without CI it is found tomorrow morning when the production run fails — or later, as a dashboard quietly showing wrong numbers. CI turns a production problem into a pull-request problem owned by the person who caused it. See <a href="#data-ci">CI for data</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague suggests pointing the CI job at the real warehouse "so the tests see real data". What is the risk, and what three properties make a DuckDB file the better fit for this job?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>CI runs code that has not been reviewed or merged, so a buggy PR could rebuild or corrupt production tables — CI must run against a throwaway environment. DuckDB is just a file, needs no server, and needs no secrets; it is created fresh on the runner and destroyed with it, so you get a real engine to build against for the cost of a <code>pip install</code>. See <a href="#data-ci">CI for data</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone creates <code>deploy.yml</code> by copying <code>dbt-ci.yml</code>, changes the command to <code>dbt build --target prod</code>, and leaves <code>on: pull_request</code> in place. What does this workflow now do, and what should the trigger be?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It builds against the real warehouse every time anyone opens or updates a PR — deploying unreviewed, unmerged code to production. CD fires <em>after</em> merge: <code>on: push</code> with <code>branches: [ main ]</code>, because a merge is a push to <code>main</code>. CI answers "is this safe to merge?"; CD ships only what already passed. See <a href="#cd">Continuous Deployment</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The deploy job needs a Snowflake password and the repo is public. Describe the path the password takes from where it is stored to where dbt reads it, naming every file it does <em>not</em> appear in. A teammate once pasted it into the YAML and removed it in the next commit — is that the end of it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is stored as an encrypted GitHub secret, injected into the runner as an environment variable via <code>${{ secrets.SNOWFLAKE_PASSWORD }}</code> (and masked in logs), and read by <code>profiles.yml</code> through <code>env_var('SNOWFLAKE_PASSWORD')</code> — so the value is in neither the workflow nor the profile nor any other tracked file. The pasted password is not dealt with: it lives in git history and in every clone, so it must be rotated at the source. See <a href="#secrets-ci">Secrets in CI</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team's CD currently deploys to prod on every merge. Someone proposes adding a staging environment between CI and prod. What would staging catch that the CI sandbox cannot, what does it cost, and when is merge-straight-to-prod defensible?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>CI builds against a small throwaway DuckDB; staging is a prod-like copy, so it can show problems that only appear on a realistic warehouse and data before customers see them. The cost is another target and warehouse/schema to maintain and a slower path to prod — though the dbt code is identical, only <code>--target</code> changes. What decides it is who is hurt by a bad deploy: for a solo project like <code>mini-griddp</code>, CI then prod is reasonable; once customers read the output, a change should earn its way through staging. See <a href="#cd">environments</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Prove CI actually blocks a bad PR</strong></summary>
     <div class="collapse-card-body">

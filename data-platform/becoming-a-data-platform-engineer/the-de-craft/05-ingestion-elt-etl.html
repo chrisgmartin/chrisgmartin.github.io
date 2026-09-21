@@ -201,6 +201,8 @@ def extract_new_rows(watermark):
 
 def load_idempotent(con, rows):
     """UPSERT on rental_id so a re-run can never duplicate."""
+    if not rows:            # nothing new since the watermark; executemany() rejects an empty list
+        return
     con.executemany("""
         INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)
         ON CONFLICT (rental_id) DO UPDATE SET
@@ -245,12 +247,33 @@ python extract_rentals.py     # -> pulled 2 new row(s); total grows by exactly 2
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you name the three source shapes and how extraction differs for each?</li>
-    <li>Can you explain the high-watermark pattern — what you store and how it filters the next pull?</li>
-    <li>Why did ELT beat ETL? Can you tie its "L" and "T" to bronze and silver/gold?</li>
-    <li>What makes a load idempotent, and what are the two ways to achieve it?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Rental 150 was loaded last week. Today the application changes its <code>gpu_model</code> in Postgres. With the extractor exactly as written in this chapter, what does the next run do about it — and doesn't the upsert take care of updates?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nothing: the watermark is <code>max(rental_id)</code>, and 150 is below it, so the row is never fetched again. The tempting answer is "the upsert handles it", but the upsert can only update rows that the extract brings back. A watermark only captures what its column captures — an <code>id</code> sees new rows; to see changed rows you need a column that moves on every change, such as <code>updated_at</code>. See <a href="#extract">Pick a good watermark column</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A different team stores its watermark in a separate state file, written <em>after</em> the load. One night the load succeeds, then the job dies before the file is updated, and the scheduler retries. What does the retry fetch, and what decides whether the destination ends up correct?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It fetches the same rows again, because the watermark still points at the previous run. With a plain <code>INSERT</code> every one of them is duplicated; with an upsert on the key (or a replace-by-partition) the second write changes nothing. The watermark limits what you <em>fetch</em>, the idempotent write makes a <em>re-run</em> harmless — they guard different failures, which is why you want both. See <a href="#idempotent">Idempotent loads</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You discover that a cleaning rule has been mangling <code>region</code> for three months. Compare the cost of the fix in an ETL pipeline and in an ELT one.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>In ETL only the transformed result was loaded, so the raw rows are gone: you must re-extract three months from the source — slow, a load on the live database, and the source may have changed since. In ELT the raw rows were loaded into bronze first, so you fix the SQL and re-run the transform in the warehouse against untouched data. Keeping load and transform separate is what buys that. See <a href="#elt-etl">ELT vs ETL</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In the replace-by-partition pattern, the <code>DELETE</code> and the <code>INSERT</code> sit inside <code>BEGIN … COMMIT</code>. If they didn't, what would a dashboard reading <code>bronze_rentals</code> see when the job dies between the two statements?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A day with no rentals at all — the partition was deleted and never refilled, and it stays that way until someone re-runs the job. Inside one transaction the pair is atomic: readers see either the old partition or the new one, never the gap. See <a href="#idempotent">Pattern B</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A partner sends one file per day containing all of that day's rentals. They sometimes re-issue a day's file with corrections — and with some rows removed. Which idempotent-load pattern do you choose, and when would the other one be the better fit?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Replace-by-partition: delete that <code>load_date</code> and insert the re-issued file, so the day ends up <em>exactly</em> equal to the source. An upsert would fix the corrected rows but leave behind the ones the partner removed. Upsert is the better fit when rows trickle in incrementally, may be updates to existing keys, and there is no clean slice to reload wholesale — like the watermark extractor in this chapter. See <a href="#idempotent">Idempotent loads</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A product manager asks for the revenue dashboard to be "real-time" and suggests moving ingestion to streaming. The dashboard is read each morning. What do you propose, and what would have to be true for streaming to be the right call?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep batch — hourly, or micro-batch every few minutes if fresher numbers are genuinely useful: it is simpler, cheaper and easier to reason about, and nobody reading a morning dashboard benefits from seconds of latency. Streaming earns its complexity only when something acts on the data within seconds; reaching for it earlier is a classic over-engineering trap. See <a href="#patterns">Batch, micro-batch &amp; streaming</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Make a naive full-reload extractor incremental and idempotent</strong></summary>
     <div class="collapse-card-body">
@@ -283,12 +306,14 @@ pg = psycopg2.connect(host="localhost", dbname="postgres",
 cur = pg.cursor()
 cur.execute("SELECT rental_id, customer_id, gpu_model, updated_at "
             "FROM rentals WHERE rental_id > %s ORDER BY rental_id", (watermark,))  # 1c. incremental
+rows = cur.fetchall()
 
-con.executemany("""INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)
-    ON CONFLICT (rental_id) DO UPDATE SET
-        customer_id = excluded.customer_id,
-        gpu_model   = excluded.gpu_model,
-        updated_at  = excluded.updated_at""", cur.fetchall())  # 2. idempotent
+if rows:   # a second run finds nothing new, and executemany() rejects an empty list
+    con.executemany("""INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)
+        ON CONFLICT (rental_id) DO UPDATE SET
+            customer_id = excluded.customer_id,
+            gpu_model   = excluded.gpu_model,
+            updated_at  = excluded.updated_at""", rows)  # 2. idempotent
 print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre></div>
       <p>Run it twice: the count holds steady instead of doubling. If you instinctively reached for "store the max, filter above it, upsert on the key," the core skill of ingestion has landed — it's the same shape for files (track loaded filenames) and APIs (track the cursor token).</p>
     </div>
