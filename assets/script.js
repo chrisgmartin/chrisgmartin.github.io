@@ -561,6 +561,8 @@
     wrap.appendChild(pnx);
     const footer = main.querySelector(':scope > footer');
     footer ? main.insertBefore(wrap, footer) : main.appendChild(wrap);
+    const legal = main.querySelector(':scope > .fg-legal');   // nav.js adds it first; keep it as the last line of the page
+    if (legal) main.appendChild(legal);
   }
 
   // ===== Collapse the sidebar where it carries no chapter navigation =====
