@@ -200,7 +200,7 @@ con.execute("""
     CREATE TABLE events AS
     SELECT
         i                                   AS id,
-        DATE '2026-01-01' + (i % 180)       AS event_date,   -- 180 distinct days
+        DATE '2026-01-01' + (i % 180)::INTEGER AS event_date, -- 180 distinct days (DATE + n needs INTEGER)
         ['us','eu','apac'][1 + (i % 3)]     AS region,        -- only 3 values
         (i * 7 % 1000) / 10.0               AS amount
     FROM range(5_000_000) t(i);
@@ -230,7 +230,7 @@ print(f"Scan Parquet: {t_pq*1000:7.1f} ms   ({t_csv / t_pq:.1f}x faster)")</code
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>The Parquet file is dramatically smaller — commonly <strong>5–10× smaller</strong> than the CSV — because the <code>region</code> column (three repeated strings) and <code>event_date</code> (180 repeated dates) compress almost to nothing in columnar form. The Parquet scan is also several times faster: DuckDB reads only the two columns the query needs and uses the row-group <code>min/max</code> on <code>event_date</code> to skip data the CSV reader is forced to parse line by line. Exact numbers depend on your machine, but the <em>direction</em> is never in doubt.</p>
+    <p>The Parquet file is dramatically smaller — on this deliberately repetitive data around <strong>25× smaller</strong> than the CSV (real tables more often land at 5–10×) — because the <code>region</code> column (three repeated strings) and <code>event_date</code> (180 repeated dates) compress almost to nothing in columnar form. The Parquet scan is also many times faster (roughly 15× here): DuckDB reads only the three columns the query touches, while the CSV reader is forced to parse every field of every line. One thing it is <em>not</em> doing in this lab is skipping row groups: the dates cycle through all 180 days, so every row group's <code>min/max</code> for <code>event_date</code> spans the whole range and none can be ruled out. Sort the table by <code>event_date</code> before writing and those statistics start pruning too. Exact numbers depend on your machine, but the <em>direction</em> is never in doubt.</p>
   </div>
 
   <p>Prefer pandas? The same comparison, fewer moving parts:</p>
@@ -262,12 +262,33 @@ ORDER BY region;</code></pre></div>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain, in one sentence each, why columnar files are smaller <em>and</em> why they're faster for analytics?</li>
-    <li>What do per-column min/max statistics let an engine do, and what is that called?</li>
-    <li>Why is partitioning by <code>user_id</code> usually a mistake?</li>
-    <li>Why do the techniques in this chapter matter <em>more</em> on object storage than on a local disk?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A query computes <code>SUM(amount) … GROUP BY region</code> over every row of a 200-column dataset. What does an engine have to read from a CSV copy versus a Parquet copy, and why is the Parquet copy also several times smaller on disk before the query even starts?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>From the CSV it must read and parse every byte of every row to reach two fields; from Parquet it seeks to the <code>region</code> and <code>amount</code> column chunks and skips the other 198. The file is smaller because a column's values are similar and repetitive (<code>us, eu, us…</code>, steadily rising timestamps), which compression feeds on, whereas interleaved row data looks random and compresses poorly. See <a href="#row-vs-col-files">Row formats vs columnar formats</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A Parquet file holds 180 days of events written in arrival order from a shuffled backfill, so every row group contains dates from across the whole range. You run <code>WHERE event_date = '2026-03-01'</code>. How many row groups can the engine skip, and what would have to be true of the file for the filter to become cheap?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>None. Skipping works by reading each row group's min and max from the footer and ruling out groups that cannot contain the value; here every group's range runs from the first day to the last, so none can be ruled out. The tempting belief is that Parquet makes any filter cheap — the statistics only help when the data is sorted or clustered on the filter column (or partitioned by it), so that each row group covers a narrow range. You still get the columnar benefit of reading only the columns you need. See <a href="#parquet">Inside a Parquet file</a>.</p></div></details>
+    </li>
+    <li>
+      <p>To "make every filter fast", a team partitions its events by date, hour <em>and</em> region. The dataset is now hundreds of thousands of files of about 10&nbsp;KB each, and dashboards are slower than before. Why, and what are the two fixes?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>This is the small-files problem: each file carries fixed overhead — list it, open it, read its footer — so thousands of tiny files scan far more slowly than a handful of large ones holding the same rows, and object storage punishes many small reads hardest. Partition coarsely, on a low-cardinality column you actually filter on (date), aiming for files of tens to hundreds of megabytes, and run compaction to rewrite the accumulated small files into a few big ones. See <a href="#partitioning">Partitioning and the small-files problem</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The same Parquet dataset is queried from a local SSD and from S3. Why do column chunks, row-group skipping and partition pruning matter even more in the second case?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every object-storage read is an HTTP request over the network: slow to start, though throughput is high once bytes flow. The cost of a query is therefore driven by how many reads it makes and how large they are, and all three techniques exist to cut exactly that — they let the engine decide what <em>not</em> to fetch. On a low-latency local disk a wasted read is cheap; on S3 each one is a round trip. See <a href="#object-storage">Object storage</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A service emits one event at a time onto a stream, around the clock; analysts later aggregate months of those events. Someone proposes Parquet everywhere "because it's the analytics format". Which format belongs at each end, and what decides it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A row format such as Avro on the stream, Parquet for the analytics tables. What decides it is the access pattern: appending whole records one at a time is cheap in a row format, while a columnar file would have to touch every column to add a single row. Scanning a few columns across many rows is where columnar wins on both size and speed. So row for whole-record writes and streaming, columnar for analytics over many rows — and converting from one to the other is a normal pipeline step. See <a href="#row-vs-col-files">When row formats win</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You are choosing a Parquet compression codec for two datasets: a hot table scanned all day by a busy cluster, and a cold archive that is rarely read and billed by the gigabyte. What are you trading when you pick a codec, and what would you choose for each?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The trade is CPU for bytes: smaller files cost more CPU to write and to decompress on every read. For the hot table, favour decompression speed — Snappy (the default) or Zstd, which gets near-gzip ratios at near-Snappy speed. For the archive, size matters most and read speed least, so a high-ratio codec fits: Zstd at a higher level, or gzip if something downstream demands maximum portability. When unsure, measure on your own data rather than agonise. See <a href="#compression">Compression</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Prove it, then explain a dashboard</strong></summary>
     <div class="collapse-card-body">

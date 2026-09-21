@@ -269,13 +269,33 @@ def get_with_retry(url, max_attempts=4, **kwargs):
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain "request out, response back" and which side starts the conversation?</li>
-    <li>Why does latency — not bandwidth — dominate a workload of many small requests?</li>
-    <li>What's the difference between a 4xx and a 5xx, and which is worth retrying?</li>
-    <li>Where should an API key live, and why is committing one dangerous even after you delete the line?</li>
-    <li>Why must a request be idempotent before you auto-retry it?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>An extractor fetches 200,000 records one per request, sequentially, at 40&nbsp;ms per round trip. How long does it spend purely waiting? The team's proposed fix is a link with ten times the bandwidth — how much does that help, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>200,000 × 40&nbsp;ms = 8,000 seconds, a little over two hours. More bandwidth barely helps: bandwidth is how much fits through the pipe per second, latency is how long one round trip takes, and they are independent — tiny responses don't fill the pipe, the job is just paying the round-trip delay 200,000 times. The fix is fewer round trips: larger pages or batches, or fetching in parallel. See <a href="#tcp-ip">Latency vs bandwidth</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A nightly pull from a vendor with about 12,000 customers lands exactly 100 rows every night. Every response is <code>200 OK</code> and nothing is logged as an error. What is the most likely bug, and what should the extraction loop look like?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The job reads page 1 and stops. APIs return a page — here 100 records — plus a hint for the next one (a <code>next_page</code> number, a cursor, or a <code>Link</code> header), and a successful status only means <em>that page</em> worked. Loop: fetch a page, process it, follow the hint, and stop only when the hint runs out or a page comes back empty. See <a href="#rest">REST APIs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>During one run your extractor receives a <code>400</code>, a <code>401</code>, a <code>429</code> and a <code>503</code>. Which should be retried automatically, which should not, and what is the reasoning behind the split?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retry the <code>429</code> and the <code>503</code>, with backoff; don't retry the <code>400</code> or <code>401</code>. 4xx means <em>you</em> sent something wrong — a malformed request, a bad or missing token — so repeating it just repeats the mistake until you fix the request or the credentials. 5xx means <em>their</em> side broke or is overloaded, which often clears. <code>429</code> is the 4xx exception: you are being rate-limited, so slow down, honour <code>Retry-After</code> if it is sent, and try again later. See <a href="#http">HTTP up close</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate pastes an API token into <code>extract.py</code>, commits, notices ten minutes later, deletes the line and commits again. "Fixed — it's gone." Why is that wrong, and where should the token have lived?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The token is still in git history, which keeps every committed version forever; on a public repo, scrapers harvest keys within minutes. Deleting the line changes only the latest snapshot, so the token has to be treated as leaked — and since a token is a password, anyone holding it can act as you until it is revoked and replaced. It belongs in an environment variable or a secrets manager, read at runtime (<code>os.environ["API_TOKEN"]</code>), with any file that holds it listed in <code>.gitignore</code>. See <a href="#auth">Authentication &amp; where secrets go</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You adapt <code>get_with_retry</code> to <code>POST</code> "create order". One request times out on the client, the retry succeeds — and the customer now has two orders. Reconstruct what happened, and give the two ways to make retrying this call safe.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The first request reached the server and created the order; only the <em>response</em> was lost or late, so the client saw a failure and sent it again. A timeout tells you that you didn't hear back, not that nothing happened. Either auto-retry only operations that are idempotent — doing them twice has the same effect as once, as with <code>GET</code> — or make the write idempotent by sending a unique request ID that the server de-duplicates on. See <a href="#reliability">Why retried requests must be idempotent</a>.</p></div></details>
+    </li>
+    <li>
+      <p>To cut the wait in question 1 you can request bigger pages or run many requests in parallel. The API allows 60 requests per minute. Which lever do you pull first, what decides it, and when does the other one win?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Bigger pages first. With a rate limit, the number of requests is the scarce thing: parallel calls only hit the cap sooner and earn <code>429</code>s, while a larger page moves more rows per allowed request and removes round trips outright. Parallelism wins when the limit is generous (or absent) but the page size is capped by the vendor, so the only way left to overlap the waiting is to have several requests in flight — still with backoff when the server pushes back. The vendor's docs tell you both numbers; read them first. See <a href="#rest">Rate limits</a> and <a href="#tcp-ip">fewer round trips</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Fetch every page from a paginated API (with a timeout and one retry)</strong></summary>
     <div class="collapse-card-body">
@@ -288,11 +308,11 @@ def get_once_with_retry(url, params):
     for attempt in range(2):                 # original try + 1 retry
         try:
             resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code < 500 and resp.status_code != 429:
-                resp.raise_for_status()      # raise on a real 4xx
-                return resp.json()
-        except requests.exceptions.RequestException:
-            pass
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            resp = None                      # network blip: fall through to the retry
+        if resp is not None and resp.status_code < 500 and resp.status_code != 429:
+            resp.raise_for_status()          # a real 4xx is our bug: raise now, never retry
+            return resp.json()
         if attempt == 0:
             time.sleep(1)                    # brief backoff before the retry
     raise RuntimeError(f"failed to fetch {url} {params}")

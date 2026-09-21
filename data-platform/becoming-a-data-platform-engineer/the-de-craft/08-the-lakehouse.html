@@ -167,7 +167,7 @@ SELECT
     ['A100','H100','L4'][1 + (i % 3)] AS gpu_type,
     round(50 + random() * 200, 2)  AS revenue_usd
 FROM range(0, 90) t(i),
-     LATERAL (SELECT DATE '2026-01-01' + i AS d);
+     LATERAL (SELECT DATE '2026-01-01' + i::INTEGER AS d);   -- range() yields BIGINT; DATE + n needs INTEGER
 """)
 
 # Write to the lake as Parquet, one subfolder per month.
@@ -260,12 +260,33 @@ WHERE month = '2026-02';</code></pre></div>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain, in one sentence each, what the lake contributes and what the warehouse contributes to a lakehouse?</li>
-    <li>What does a table format (Iceberg/Delta/Hudi) add on top of loose Parquet — and why is the manifest the key piece?</li>
-    <li>Why does a filter on the partition column run faster than a filter on a regular column?</li>
-    <li>What's the danger of partitioning by a high-cardinality column?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A job writing new Parquet files into a bucket crashes halfway, leaving one half-written file behind. One reader globs the folder with <code>**/*.parquet</code>; another reads the same data as an Iceberg table. What does each of them see, and which piece of the table format makes the difference?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The glob reader picks up whatever is in the folder, so it hits the broken file (or a partial set of new data). The Iceberg reader sees the previous complete version: engines read the <em>manifest</em> — the tracked list of files that make up the table — not the directory, and the failed write never flipped the manifest, so its files are simply not listed. That same mechanism is what gives ACID commits and time travel. See <a href="#table-formats">Table formats</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The February query with <code>WHERE month = '2026-02'</code> reports <code>Total Files Read: 1</code>. Rewrite the filter as <code>WHERE day BETWEEN DATE '2026-02-01' AND DATE '2026-02-28'</code> — exactly the same rows. How many files does the plan report now, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Three. Pruning works by matching the filter against folder names, and the folders encode <code>month</code>, not <code>day</code>; the engine can't tell from a path that <code>month=2026-01</code> holds no February days, so it has to open every file. Same answer, more I/O — filter on the partition column you laid the data out by. See <a href="#hands-on">step 3</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Read <code>lake/gold_daily_revenue/month=2026-02/data_0.parquet</code> on its own with <code>hive_partitioning=false</code>. Which of the table's four columns is missing, and what does that tell you about how pruning can work without opening a file?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>month</code> is missing — the file holds only <code>day</code>, <code>gpu_type</code> and <code>revenue_usd</code>. The partition value lives in the <em>path</em>, not in the rows, and <code>hive_partitioning=true</code> turns the folder name back into a column. Because the value is in the path, the engine can decide a file is irrelevant from its name alone. See <a href="#hands-on">step 1</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Most dashboards filter by customer, so a colleague proposes partitioning the rentals table by <code>customer_id</code> — the marketplace has about 40,000 customers. What happens to the layout and to query speed, and what would you partition by instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>You get tens of thousands of folders, each holding a tiny file, and reading many tiny files is slower than reading a few large ones — the small-files problem — so most queries get worse, not better. Partition by something coarse and frequently filtered, such as month or day, aiming for files in the hundreds of megabytes. See <a href="#hands-on">Don't over-partition</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A Spark job and a BI tool both need the daily-revenue table. Why isn't agreeing on the path <code>s3://…/gold_daily_revenue</code> enough, and what does a catalog answer for them that a path cannot?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A path says where files are, not which of them are the table <em>right now</em>, what it is called or what its schema is. A catalog maps a name such as <code>analytics.gold.daily_revenue</code> to the physical location and to the table format's current metadata, so every engine asks "where is it and what is its latest version?" and gets the same answer. See <a href="#catalog">A word on catalogs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The marketplace has about 20 GB of data and one analytics team that works entirely in SQL. The CTO wants to move everything to Iceberg on object storage. What do you advise, and which changes in the business would reverse your advice?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Stay on a plain warehouse: the data fits comfortably, one engine serves everyone, and simplicity is worth more than openness — most teams start here and are right to. The lakehouse wins when data is large or growing fast, when several engines (BI, Spark, ML training) need the same copy, when lock-in matters, or when storage at warehouse prices starts to hurt; and "both" — a warehouse engine querying open tables — is a common end state. See <a href="#when">Warehouse, lakehouse, or both</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Partition a table and prove pruning makes it faster</strong></summary>
     <div class="collapse-card-body">
@@ -276,7 +297,7 @@ con = duckdb.connect()
 # Reuse the gold table, this time partition by gpu_type
 con.sql("""
 CREATE TABLE g AS
-SELECT (DATE '2026-01-01' + (i % 90)) AS day,
+SELECT (DATE '2026-01-01' + (i % 90)::INTEGER) AS day,
        ['A100','H100','L4'][1 + (i % 3)] AS gpu_type,
        round(50 + random()*200, 2) AS revenue_usd
 FROM range(0, 300) t(i);

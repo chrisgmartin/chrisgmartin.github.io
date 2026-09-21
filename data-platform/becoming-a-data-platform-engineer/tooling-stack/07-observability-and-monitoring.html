@@ -261,39 +261,68 @@ if __name__ == "__main__":
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain the difference between monitoring and observability — and between logs, metrics, and traces?</li>
-    <li>Why does <em>data</em> need its own observability beyond "is the code running?" Name the four dimensions.</li>
-    <li>What makes an alert good rather than noisy, and how do SLOs and error budgets feed into that?</li>
-    <li>Why is a postmortem "blameless," and what does that get you?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Last night's job exited zero, logged no errors, and shows green in the orchestrator. This morning the dashboard reports yesterday's total as zero, because the upstream source was empty when the job read it. Why did process monitoring see nothing, and which data-observability dimension would have caught it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nothing technically failed: the code ran correctly on empty input, and "is the code running?" is all process monitoring asks. The tempting belief is that a green run means good data; a pipeline that loads wrong numbers throws nothing. A <strong>volume</strong> check — rows arrived versus the normal range — catches a load that came in empty or short. See <a href="#data-obs">Data observability</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You run <code>observe_demo.py</code> unchanged, with its input <code>[1, 2, None, 4, 5]</code>. How many lines does it print, what is <code>metric.row_count</code> on the last one, and what could a log system do with that line that it could not do with <code>print("done")</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Two JSON lines — <code>run_started</code> and <code>run_finished</code> — and <code>metric.row_count</code> is <code>4</code>, because the pretend transform drops the <code>None</code>. Since each line is a JSON object with named fields, a log system can filter on <code>event</code>, chart <code>metric.duration_s</code> over time, or alert when <code>status</code> is not <code>success</code>; prose output supports none of that. See <a href="#hands-on">the hands-on</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The nightly run has crept from 10 minutes to 40 over a month, and it spans ingest, transform and publish across several services. Which kind of signal tells you the creep is happening, which tells you <em>where</em> the time goes, and which do you read once you know the step?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A <strong>metric</strong> (run duration over time) shows the trend — but metrics say <em>that</em> something changed, rarely why. A <strong>trace</strong> follows one run hop by hop with timing, so it shows which step is slow. <strong>Logs</strong> then give the ordered detail of what that step was doing. See <a href="#three-pillars">The three pillars</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The team channel gets "CPU is at 71%" most nights; all twelve engineers are tagged, and most have muted it. Name what is wrong with this alert, the danger it creates, and how you would arrive at a replacement rather than guessing a better number.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is not actionable (71% implies no fix), not rare, not targeted, and it interrupts people for something that is at most a ticket. The danger is alert fatigue: a muted channel is where the one real outage gets lost. Start from an SLO — "the table is fresh within 2 hours, 99% of the time" — and let it write the alert: fire when freshness exceeds 2 hours, routed to whoever is on call. See <a href="#alerting">Alerting</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your SLO is "fresh within 2 hours, 99% of the time, measured monthly". By the 15th the table has already been stale for nine hours in total, and product wants a risky pipeline migration shipped this week. What does the error budget say, and what would have made shipping it the right call?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>One percent of a month is roughly seven hours, so the budget is already overspent: slow down and stabilize before adding risk. Had most of the budget been left, shipping would be exactly what it is for — the budget turns "never fail", which is impossible, into "fail within an agreed amount", and spending it on speed is legitimate. What decides it is the measured budget, not anyone's nerve. See <a href="#alerting">SLOs and error budgets</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A postmortem draft gives the root cause as "the on-call engineer ran the backfill against prod instead of staging by mistake" and the action item as "be more careful". What is wrong with both lines, how would you rewrite them, and what does the team lose if they stay?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Both blame a person and change nothing about the system, so the next tired engineer can make the same slip. A blameless version asks what about the system let it happen — why was pointing a backfill at prod that easy, and what makes it safe — and produces concrete changes that prevent a repeat. Keep the blame and people learn to hide mistakes, so problems surface late, as disasters rather than early reports. See <a href="#oncall">On-call &amp; blameless postmortems</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Instrument your pipeline and define an SLO</strong></summary>
     <div class="collapse-card-body">
       <p>Take any pipeline function in your <code>mini-griddp</code> repo. (1) Add structured logging that emits a <code>run_finished</code> event with <code>row_count</code> and <code>duration_s</code>. (2) Write down one SLO for it in plain language, and state the alert that would enforce it.</p>
       <div class="code-wrap"><div class="code-header"><span>solution — the metric</span></div><pre><code class="language-python">import json, logging, time
 
+# Without a handler and a level, INFO lines are silently dropped.
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("pipeline")
 
 def with_observability(fn):
     """Wrap a pipeline step so it emits a structured run metric."""
     def wrapped(*args, **kwargs):
         start = time.perf_counter()
+        status, row_count = "failed", None
         try:
             result = fn(*args, **kwargs)
             status = "success"
+            row_count = len(result) if hasattr(result, "__len__") else None
             return result
-        except Exception:
-            status = "failed"
-            raise
         finally:
             log.info(json.dumps({
                 "event": "run_finished",
                 "job": fn.__name__,
-                "metric.duration_s": round(time.perf_counter() - start, 3),
                 "status": status,
+                "metric.row_count": row_count,
+                "metric.duration_s": round(time.perf_counter() - start, 3),
             }))
-    return wrapped</code></pre></div>
+    return wrapped
+
+@with_observability
+def load_rentals():
+    return [{"rental_id": 1}, {"rental_id": 2}, {"rental_id": 3}]
+
+load_rentals()</code></pre></div>
       <div class="code-wrap"><div class="code-header"><span>solution — one SLO</span></div><pre><code class="language-text">SLO:   The orders table is fresh within 2 hours, 99% of the time
        (measured monthly).
 Alert: Fire to the #data-oncall channel when

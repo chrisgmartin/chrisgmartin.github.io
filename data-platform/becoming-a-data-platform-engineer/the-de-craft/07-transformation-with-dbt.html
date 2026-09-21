@@ -334,19 +334,40 @@ Finished running 1 view model, 3 data tests, 1 table model in 0.31s
 Completed successfully
 
 Done. PASS=5 WARN=0 ERROR=0 SKIP=0 TOTAL=5</code></pre></div>
-    <p><code>PASS=5 ERROR=0</code> means every model built and every test held. Query the result to see it: <code>duckdb griddp.duckdb "SELECT * FROM fct_revenue_by_gpu"</code> — H100 should top the revenue list. If a test had failed, dbt would print <code>ERROR</code> and a count of the offending rows, and the run would not be "successful." That's the safety net working.</p>
+    <p><code>PASS=5 ERROR=0</code> means every model built and every test held. Query the result to see it: <code>duckdb griddp.duckdb "SELECT * FROM fct_revenue_by_gpu"</code> — A100 should top the revenue list at 45.00 (18 hours × 2.50), ahead of H100 at 32.00 and L40S at 25.00. If a test had failed, dbt would print <code>ERROR</code> and a count of the offending rows, and the run would not be "successful." That's the safety net working.</p>
   </div>
   <p>You now have a real dbt project: a declared source, a layered staging→marts DAG, tests that gate the build, and a reproducible <code>dbt build</code>. Commit <code>griddp_dbt/</code> to <code>mini-griddp</code> — this is a centerpiece of your portfolio.</p>
 </section>
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>What does <code>ref()</code> do that hard-coding a table name doesn't — and why does dbt need it?</li>
-    <li>Which medallion layer does a <code>stg_</code> model correspond to? A <code>fct_</code> model?</li>
-    <li>What does a dbt test actually run, and what makes it "pass"?</li>
-    <li>When would you reach for an <code>incremental</code> materialization instead of <code>table</code>?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate writes <code>from main.stg_rentals</code> in <code>fct_revenue_by_gpu.sql</code> instead of using <code>ref()</code>. The SQL is valid and it runs on their machine. What has dbt lost, and how might that show up later?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The dependency. dbt assembles its DAG only from <code>ref()</code> and <code>source()</code> calls, so it no longer knows the mart reads the staging model: it may build the mart before (or without) <code>stg_rentals</code>, the lineage graph loses the edge, and "what is affected if I change this column?" stops including the mart. It worked only because the view already existed. See <a href="#models">ref() builds the graph</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The <code>unique</code> test on <code>stg_rentals.rental_id</code> fails and reports 2. What did dbt actually run, what is the 2, and what upstream problems does the chapter say this test typically catches?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every dbt test compiles to a query that <em>should return zero rows</em>; this one selects the <code>rental_id</code> values that occur more than once, and it returned two of them. The usual causes are a fan-out join or rows that were loaded twice. See <a href="#tests">Tests</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Add a sixth row to the raw <code>rentals</code> table with <code>gpu_model = 'B200'</code> and run <code>dbt build</code> again. Which of the five steps changes its result, and what happens to <code>fct_revenue_by_gpu</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The <code>stg_rentals</code> view still builds, but the <code>accepted_values</code> test on <code>gpu_model</code> fails — <code>'B200'</code> isn't in the allowed list — and because <code>dbt build</code> runs tests in DAG order, the downstream mart is skipped rather than rebuilt on data that broke a contract. The run is not "successful". Whether the fix is to add <code>'B200'</code> to the list or to reject the row is a decision the test has forced someone to make. See <a href="#hands-on">step 8</a> and <a href="#tests">Tests</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The incremental <code>fct_rentals</code> model runs at noon on 3 June and loads everything up to and including that morning's rentals. More rentals dated 3 June arrive in the afternoon. What does the next run do with them, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It skips them, permanently. The filter is <code>rental_date &gt; (select max(rental_date) from {{ this }})</code>, and the table's maximum is already 3 June, so only rows dated 4 June or later qualify. This is the "late-arriving data can slip through a naive high-water-mark filter" warning made concrete; a <code>--full-refresh</code> rebuilds the table and recovers them. See <a href="#incremental">Incremental models</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The project config materializes <code>staging</code> as views and <code>marts</code> as tables. Why is that a sensible default for each layer — and what has to be true before you change a mart to <code>incremental</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A view is recomputed on every query: fine for light staging logic, always fresh and costs nothing to store. Marts are heavier and queried often, so a physical table rebuilt each run gives fast reads. Incremental wins only when full rebuilds genuinely hurt — a large fact table where reprocessing everything is wasteful — because it brings real complexity (late data, updates); until then a plain <code>table</code> is simpler and always correct. See <a href="#models">materializations</a> and <a href="#incremental">Keep it boring</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You need customer names next to each rental, which means joining <code>stg_rentals</code> to <code>stg_customers</code>. A colleague wants to put the join inside <code>stg_rentals</code> "so everything downstream gets it for free". Where does the chapter say it belongs, and what does staging stay limited to?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>In an intermediate model (<code>int_rentals_enriched</code>) or, in a small project that skips that layer, in the mart. Staging is one model per source table — rename, cast, trim, drop obvious garbage — with no joins and no business logic, so that a change to how a column is cleaned happens in exactly one place. See <a href="#layering">Layering</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Add tests to the marts model and build a revenue-per-customer mart</strong></summary>
     <div class="collapse-card-body">
