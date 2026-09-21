@@ -7,7 +7,7 @@ Usage:  python3 tools/content/review.py [--summary] [--strict] [path ...]
 (`<topic>/<guide>/NN-*.html`, plus the nested curriculum) is reviewed. Read-only: it writes nothing.
 
 Per chapter it reports
-  FAIL  broken intra-site links or #anchors, sidebar Sections out of step with <section id>s, visible (unfolded)
+  FAIL  broken intra-site links or #anchors, <section id>s missing from the sidebar, visible (unfolded)
         Check-yourself answers, external links without rel="noopener", code without the highlight.js tags,
         inline <script> / on*= handlers
   WARN  no Takeaway, no Check yourself, yes/no "Do you understand…" questions, Takeaway without a hand-off link,
@@ -73,14 +73,13 @@ def review(rel):
     for a in re.findall(r'<a\b[^>]*\bhref="https?://[^"]*"[^>]*>', main):
         if "noopener" not in a: fail.append("external link without rel=noopener: " + re.search(r'href="([^"]+)"', a).group(1))
 
-    # sidebar Sections vs <section id>
-    block = re.search(r"<h2>Sections</h2>(.*?)(<h2>|</nav>)", aside, re.S)
+    # sidebar (every link group above Navigation) vs <section id> — other id'd targets, e.g. a Setup callout, are fine
+    block = re.search(r"<nav\b[^>]*>(.*?)(<h2>Navigation</h2>|</nav>)", aside, re.S)
     if block:
-        side = re.findall(r'href="#([^"]+)"', block.group(1)); secs = re.findall(r'<section\b[^>]*\bid="([^"]+)"', main)
-        if side != secs:
-            miss = [x for x in secs if x not in side]; extra = [x for x in side if x not in secs]
-            fail.append("sidebar Sections out of step" + (" — not in sidebar: " + ", ".join(miss) if miss else "")
-                        + (" — no such section: " + ", ".join(extra) if extra else "") + ("" if miss or extra else " — order differs"))
+        secs = re.findall(r'<section\b[^>]*\bid="([^"]+)"', main)
+        side = re.findall(r'href="#([^"]+)"', block.group(1))
+        miss = [x for x in secs if x not in side]
+        if miss: fail.append("sections missing from the sidebar: " + ", ".join(miss))   # order is free: some sidebars group links
 
     # CSP and code
     if re.search(r"<script\b(?![^>]*\bsrc=)(?![^>]*application/json)[^>]*>", s): fail.append("inline <script>")
