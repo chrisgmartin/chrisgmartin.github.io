@@ -18,6 +18,8 @@ Ask via AskUserQuestion if not provided:
 - **Title**: the chapter `<h1>` text.
 - **Number**: chapter number — default to the next integer above `ls <topic>/<guide>/[0-9]*.html`. For stretch-style suffixes (04a, 04b, …), match the existing pattern.
 - **Outline**: optional — a short list of section names. If omitted, scaffold a single placeholder section.
+  This skill builds the shell only; the body is written with the `write-chapter` skill (sources → topic checklist →
+  draft → Check yourself / Takeaway / Further reading → self-review). If the user asked for a written chapter, run it next.
 - **Section group**: which `Section X · …` block on the guide hub the new card belongs to. Infer from chapter number if obvious; otherwise ask.
 
 ## Steps
@@ -58,6 +60,7 @@ Ask via AskUserQuestion if not provided:
    - The hub references the new file.
    - The previous chapter's `Next:` link points at the new file.
    - The new chapter's `<aside>` contains both `<h2>Sections</h2>` and `<h2>Navigation</h2>`.
+   - `python3 tools/content/review.py <new chapter>` reports no FAIL.
 
 ## Gotchas
 

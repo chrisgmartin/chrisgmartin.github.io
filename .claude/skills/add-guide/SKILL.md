@@ -53,6 +53,8 @@ reject (and re-ask) rather than escape:
    - `<button class="theme-toggle" id="themeToggle">🌙</button>` before `</body>`.
 
 3. Generate `<topic-folder>/<guide-folder>/00-START-HERE.html` via the `add-chapter` conventions. Asset paths are `../../assets/...`. No manual breadcrumb (auto-injected).
+   When the guide is to be written from sources, run the `write-chapter` skill's phases 1–2 (source map, topic
+   checklist) for the whole guide before scaffolding chapters, so the chapter list comes from the material.
 
 4. Register the guide in **three** places:
    - `assets/script.js` SITE_NAV — append to the topic's `guides` array: `{ name: '<Guide display name>', folder: '<guide-folder>' }`.

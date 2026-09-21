@@ -25,8 +25,10 @@ reference list of Claude Skills.
 /tools/plates/                   plate (whiteboard sketch) specs + builder      → tools/plates/README.md
 /tools/nav/build-chapters.py     regenerates the CHAPTERS manifest in nav.js from the hubs
 /tools/home/build-latest.py      regenerates the home page's Latest strip + list (git history + manifest)
+/tools/content/review.py         read-only content review of chapters (links, anchors, sidebar, self-checks, takeaways)
 /tools/fonts/fetch-fonts.py      re-fetches the self-hosted fonts into assets/fonts/ (network; rarely needed)
-/.claude/skills/                 add-topic, add-guide, add-chapter, audit — follow them for structural changes
+/.claude/skills/                 add-topic, add-guide, add-chapter, audit — follow them for structural changes;
+                                 write-chapter, review-chapter — follow them for the writing itself
 ```
 
 Asset paths are relative and depth-aware: `assets/…` (root), `../assets/…` (topic), `../../assets/…` (hub/chapter).
@@ -72,6 +74,18 @@ perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=13/$1?v=14/g' assets/script.js  
 - Plates: every hub hero has a whiteboard-style sketch of the guide's central idea (`tools/plates`). Draw the *idea*
   (method, ladder, loop, trade-off), never a keyword collage. Static SVG; ink/wash/marker follow the tokens.
 - Motion is restrained and respects `prefers-reduced-motion`. Hairline rows over shadowed cards.
+
+## Writing
+
+- Chapters are written with the **`write-chapter`** skill and checked with **`review-chapter`**: map and verify sources →
+  topic checklist → draft in the house voice (senior-to-senior, mechanism before consequence, concrete numbers, the
+  guide's running example, recommendations with their exceptions) → close with `✓ Check yourself` (4–6 questions,
+  answers folded in `details.reveal`, no yes/no prompts), `Takeaway` (claims + a linked hand-off) and `Further reading`
+  (primary sources) → interlink → self-review against `write-chapter/references/quality-checklist.md`.
+- `python3 tools/content/review.py [--summary] [path…]` runs the mechanical half of that checklist and is the way to
+  plan backfill of older chapters. It exits non-zero on FAIL (broken links/anchors, sidebar out of step, unfolded
+  answers); older chapters still carry known FAILs, so it is not yet a PR gate for the whole catalog — run it on the
+  chapters you touched.
 
 ## Hosting gotchas
 
