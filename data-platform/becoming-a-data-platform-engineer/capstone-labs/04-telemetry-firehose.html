@@ -360,12 +360,33 @@ git commit -m "Lab 04: telemetry firehose — produce, land to bronze, roll up t
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Why do we land telemetry in bronze and roll it up, instead of querying the raw readings directly from the dashboard?</li>
-    <li>What does keying each message by <code>gpu_id</code> buy you when you scale to multiple consumers and partitions?</li>
-    <li>Roughly how many raw readings collapse into one <code>fct_telemetry_hourly</code> row, and why is that ratio the whole point?</li>
-    <li>Which two systems-design chapters does this dual-path pattern map to, and what changes at full scale?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>An analyst asks for a Metabase chart straight off <code>bronze.telemetry</code> so they can see every reading. What breaks first as the fleet grows, and what do you offer instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every dashboard load would scan the raw firehose — 720 readings per GPU per hour at a 5-second interval, on the order of 150 million a day at the reference scale — so query time and cost grow with the fleet. Raw stays landed to one side; dashboards read <code>fct_telemetry_hourly</code>, where those 720 readings are one row. See <a href="#goal">the dual path</a> and <a href="#rollup">the rollup</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You run the producer (20 GPUs, one reading each every 5 seconds) for four minutes, all inside one clock hour. Roughly how many rows should <code>bronze.telemetry</code> and <code>fct_telemetry_hourly</code> hold — and what changes if the four minutes straddle the top of the hour?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 20 × 12 × 4 = 960 raw readings and 20 rollup rows, each with a <code>sample_count</code> near 48. Straddle the hour and you get 40 rollup rows: <code>date_trunc('hour', ts)</code> buckets by clock hour, not by elapsed time, so each GPU's samples split across two rows. See <a href="#rollup">Roll up to an hourly fact</a> and <a href="#run">Run it end to end</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Every message is produced with <code>key=gpu_id</code>. With a 3-partition topic and three consumers, what does that key guarantee — and what does it not?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The same key always goes to the same partition, so all of one card's readings stay in order and are handled by a single consumer. It does not give each GPU a partition of its own: twenty keys are hashed across three partitions, so every partition carries several cards. See <a href="#produce">Produce the telemetry stream</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You rename the consumer's <code>group.id</code> from <code>telemetry-lander</code> to <code>telemetry-lander-v2</code> and restart it. What lands in <code>bronze.telemetry</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Everything still held in the topic, all over again. Redpanda remembers the read position <em>per group</em>; a new group has none, and <code>auto.offset.reset: earliest</code> starts it from the beginning, so each retained reading is inserted a second time and every <code>sample_count</code> doubles at the next rollup. The group id is the thing that lets a restart resume. See <a href="#consume">Why a consumer group?</a></p></div></details>
+    </li>
+    <li>
+      <p>For one GPU, hour A has 700 samples averaging 90% utilization and hour B has 20 samples averaging 10%. A daily rollup built on the hourly fact takes <code>avg(avg_util_pct)</code>. What does it report, what is the true figure, and which hourly column rescues you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It reports 50%; the true mean is (700 × 90 + 20 × 10) ÷ 720 ≈ 87.8%. An average of averages gives the 20-sample hour the same weight as the 700-sample one, so weight each hour by <code>sample_count</code> — which is why the rollup keeps it. <code>max(max_temp_c)</code> needs no such care: maxima compose, averages do not. See <a href="#rollup">the rollup's columns</a> and the exercise below.</p></div></details>
+    </li>
+    <li>
+      <p>Ops wants to know whenever a card runs above 90&nbsp;°C for more than two minutes. How far does the hourly rollup get them, and what decides whether you build something finer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>max_temp_c</code> shows that a card peaked above 90 at some point in the hour — not when, nor for how long — and because the rollup is built in a batch, it arrives too late to act on. If the real question is a trend ("which cards run hot?"), hourly is enough and the cheapest thing to serve. If duration or a fast reaction matters, you need a finer bucket — a per-minute rollup, or a check on the stream itself — at the price of 60× the rows. Same pattern, different grain. See <a href="#rollup">the rollup</a> and <a href="#scale">real scale</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Add a daily rollup on top of the hourly one (a rollup cascade)</strong></summary>
     <div class="collapse-card-body">

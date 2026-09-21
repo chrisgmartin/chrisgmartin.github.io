@@ -318,12 +318,33 @@ git commit -m "Lab 02: ingest Postgres -> bronze (incremental + idempotent)"</co
 
 <section id="check">
   <h2>✓ Check yourself</h2>
-  <ul>
-    <li>Can you explain why bronze lands data <em>raw</em>, with no cleaning, and what you'd lose if you cleaned it here instead?</li>
-    <li>Why are <code>customers</code>/<code>gpus</code>/<code>gpu_prices</code> full-refreshed but <code>rentals</code> incremental — what makes that the right call for each?</li>
-    <li>What does the <code>_watermarks</code> table store, and how does it stop a second run from duplicating rentals?</li>
-    <li>If you re-ran the extractor right now, how many new rentals would it pull — and why?</li>
-  </ul>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate wants the extractor to trim whitespace and drop obviously broken rows on the way into bronze, "to save dbt the work". What is lost if you agree?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The record of what the source actually said. If that cleaning rule turns out to be wrong, the discarded detail is gone and you have to re-pull from the source; with a raw bronze you fix the transform and rebuild silver and gold from what already landed. Cleaning belongs in silver. See <a href="#bronze">What "bronze" means</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Run the extractor twice with no new source data. What should the rentals line print the second time — and if the total had doubled instead, where would you look?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>+0 new</code>, with the same watermark and the same total: the stored watermark already equals the largest <code>rental_id</code>, so <code>rental_id &gt; watermark</code> matches nothing. A doubled total means the insert is not being filtered — the watermark was never stored or advanced (check <code>bronze._watermarks</code>), or the <code>INSERT</code> lost its <code>WHERE</code>. See <a href="#idempotent">Run it twice</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone switches the rentals watermark from <code>rental_id</code> to <code>started_at</code>, reasoning that a timestamp is more meaningful. Which rentals does the extractor start missing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Any rental inserted later but carrying a <code>started_at</code> earlier than the stored maximum. A watermark needs a column that only ever increases as rows are added. <code>rental_id</code> does; <code>started_at</code> does not — the Lab 01 generator writes rentals scattered across the last 90 days in random order — so new rows routinely fall below the watermark and are skipped for good. See <a href="#extract">Writing the extractor</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer is upgraded from <code>free</code> to <code>pro</code> in Postgres. After the next extractor run, what does <code>bronze.customers</code> show — and what would it show had <code>customers</code> used the same watermark pattern as <code>rentals</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It shows <code>pro</code>: <code>CREATE OR REPLACE TABLE</code> re-copies the whole table each run, so updates come along for free (the old value is overwritten, not kept). A <code>customer_id</code> watermark only fetches ids above the stored maximum, so an edit to an existing row would never be picked up and bronze would say <code>free</code> indefinitely. See <a href="#extract">Writing the extractor</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The process is killed after <code>INSERT INTO bronze.rentals</code> finishes but before <code>set_watermark</code> runs. What does the next run do, and how would you close the gap?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It reads the old watermark from <code>_watermarks</code>, selects the same rows again and inserts them a second time — duplicates. The insert and the watermark update are separate statements with no transaction around them, so "run it twice" only proves idempotency for runs that finish. Wrap both in one transaction, or take the watermark from <code>max(rental_id)</code> in <code>bronze.rentals</code> at the start of each run instead of from a separately stored value. See <a href="#extract">incremental_rentals</a>.</p></div></details>
+    </li>
+    <li>
+      <p><code>customers</code> grows to 50 million rows and the nightly full refresh now takes an hour. What do you weigh before moving it to the watermark pattern used for <code>rentals</code>?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Size now argues for incremental, but the append-only watermark is only correct for rows that never change — and customers do (a tier upgrade). A plain id watermark would be fast and wrong; you need a way to catch edits too, which means a merge/upsert on the primary key driven by a change timestamp. Full refresh stays the right call for as long as re-copying is cheap, because it is trivially idempotent and picks up updates. See <a href="#extract">Writing the extractor</a>.</p></div></details>
+    </li>
+  </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Make the rentals extract incremental so a second run only pulls new rows</strong></summary>
     <div class="collapse-card-body">
