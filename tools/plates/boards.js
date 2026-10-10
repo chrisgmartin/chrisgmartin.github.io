@@ -341,6 +341,21 @@
     d.text(60,262,'bull',{size:12});d.text(340,262,'bear',{size:12});d.line(80,258,320,258);d.line(200,250,200,266);
     d.note(30,292,'~3M users · profitable · no model of its own');
   };
+  B['data-science/experimentation-ab-testing']=function(d){
+    d.title('Randomize, then compare');
+    var pop=d.box(150,44,100,30,'all users');
+    var rnd=d.round(152,90,96,30,'random split',{red:1});
+    d.connect(pop,rnd);
+    var a=d.box(56,150,110,36,'A · control');
+    var b=d.box(234,150,110,36,'B · treatment',{wash:1});
+    d.connect(rnd,a);d.connect(rnd,b);
+    var ma=d.round(66,216,90,32,'10.0%',{size:12.5});
+    var mb=d.round(244,216,90,32,'10.3%',{size:12.5});
+    d.connect(a,ma);d.connect(b,mb);
+    d.arrow(160,232,240,232,{red:1});
+    d.text(200,210,'Δ = effect',{size:11.5});
+    d.note(26,286,'the random split makes A and B comparable — even on what you never measured');
+  };
   // ===== DEFI =====
   B['defi-engineering/senior-defi-protocol-engineer']=function(d){
     d.title('A lending market, and where it breaks');
