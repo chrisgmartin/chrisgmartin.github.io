@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scaling the Database — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The database is usually the first wall a growing service hits, because it is the one component you cannot simply clone.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/04-scaling-the-database">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Scaling the Database — Designing for Scale">
+<meta property="og:description" content="The database is usually the first wall a growing service hits, because it is the one component you cannot simply clone.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/04-scaling-the-database">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#read-replicas">Read replicas</a>
+    <a href="#pooling">Connection pooling</a>
+    <a href="#write-ceiling">The write ceiling</a>
+    <a href="#partitioning">Partitioning and sharding</a>
+    <a href="#hot-partitions">Hot partitions</a>
+    <a href="#cross-shard">Costs you inherit</a>
+    <a href="#snip">Snip, concretely</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-caching.html">← Previous</a>
+    <a href="05-consistency-and-its-price.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The building blocks</span>
+  <h1>Scaling the Database</h1>
+  <p class="subtitle">The database is usually the first wall a growing service hits, because it is the one component you cannot simply clone. This chapter climbs the ladder in order: replicas for reads, a pool for connections, then partitioning when one primary can no longer take the writes or hold the data. Each rung fixes one limit and adds a cost you will meet again.</p>
+</header>
+
+<section id="read-replicas">
+  <h2>Read replicas: scaling reads, and the lag you buy</h2>
+  <p>Start with the cheapest move. One <strong>primary</strong> database accepts every write and appends it to a log (the write-ahead log in Postgres, the binlog in MySQL). One or more <strong>replicas</strong> stream that log and replay it, so each holds a copy of the data. Reads can go to any copy; writes still go to the primary. Because most services read far more than they write, this moves most of the query load off the machine that cannot be cloned. Snip's redirects are almost pure reads, so five replicas can serve roughly five times the lookups one primary could.</p>
+  <p>The price is set by <em>when the primary tells the client the write succeeded</em>.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Mode</th><th>Primary acknowledges when…</th><th>Write latency</th><th>If the primary dies</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Asynchronous</td><td>the write is on its own disk</td><td>lowest</td><td>recent writes not yet shipped are lost</td></tr>
+      <tr><td class="term">Semi-synchronous</td><td>at least one replica has received (not yet applied) the log record</td><td>adds one network round trip</td><td>no acknowledged write is lost, as long as that replica survives</td></tr>
+      <tr><td class="term">Synchronous</td><td>the replica has applied it and made it durable</td><td>highest; one slow replica stalls every write</td><td>nothing lost, but availability now depends on the replica</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Most deployments run asynchronous replicas for read scale and, where durability matters, one semi-synchronous replica as the failover target. Fully synchronous replication to every replica is rare: it makes the system as slow and as fragile as its worst member.</p>
+  <h3>Replication lag and read-your-own-writes</h3>
+  <p>With async replication a replica is always some distance behind: typically milliseconds, but seconds during a bulk write, a long-running query on the replica, or a network hiccup. That gap is <strong>replication lag</strong>, and it produces a specific bug. A user creates a Snip link, the write commits on the primary, the app redirects them to their dashboard, and the dashboard query lands on a replica that has not replayed the insert yet. The link they made one second ago is not there. Nothing is broken; the system is behaving as designed. It violates <strong>read-your-own-writes</strong>, which is the guarantee users assume.</p>
+  <p>Three fixes, from blunt to precise:</p>
+  <ul>
+    <li><strong>Read from the primary after a write.</strong> Route reads that follow a write, or reads of data the user just changed, to the primary. Simple and correct, and it keeps replicas for everything else.</li>
+    <li><strong>Sticky-to-primary window.</strong> After any write, pin that user to the primary for a fixed window, say 5 seconds, longer than your normal p99 lag. A cookie or session field carries the timestamp. It is crude but needs no lag measurement.</li>
+    <li><strong>Causal tokens.</strong> The write returns the log position it landed at (a Postgres LSN, a MySQL GTID). The client sends it with later reads, and the router sends the read only to a replica that has replayed past that position, or to the primary if none has. This is exact and costs the most plumbing.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Replicas make reads fast and slightly wrong</span>
+    <p>Any query that must see the latest committed state, such as checking a custom code is free before inserting it, belongs on the primary. A uniqueness check run on a lagging replica passes and then fails at insert, or worse, does not fail. Decide per query, not per service. <a href="05-consistency-and-its-price.html">Consistency &amp; Its Price</a> turns this per-query choice into a framework.</p>
+  </div>
+</section>
+
+<section id="pooling">
+  <h2>Connection pooling: bounding the most expensive thing you can open</h2>
+  <p>A database connection is not a cheap socket. In Postgres each connection is a dedicated backend <em>process</em> with its own memory, commonly several megabytes and much more under heavy queries; MySQL uses a thread per connection, lighter but still real. The server also does work proportional to the connection count: lock tables, snapshot bookkeeping, and the OS scheduling a few hundred runnable processes onto a handful of cores. Throughput does not keep rising with connections. It rises to roughly the core count, then flattens and falls as the processes contend.</p>
+  <p>The service side makes this worse. Fifty app instances with 20 connections each is 1,000 connections, and most are idle most of the time, since a request holds a connection only while a query runs. A <strong>pool</strong> such as PgBouncer sits between app and database and multiplexes many client connections onto a small, fixed set of server connections. In transaction mode a server connection is lent out for one transaction and returned.</p>
+  <p>Size the pool with <a href="01-the-numbers-and-the-laws.html">Little's Law</a>: the number of requests in flight equals arrival rate times time in the system. At Snip's peak of about 8,000 lookups per second that miss the cache, each taking 5 ms in the database, in-flight queries average 8,000 × 0.005 = 40. A pool of 50 to 100 server connections is plenty; 2,000 would only add contention. When all pool slots are busy, new requests wait in a queue instead of piling onto the database.</p>
+  <div class="callout danger">
+    <span class="callout-label">Unbounded connections turn a slowdown into an outage</span>
+    <p>Without a pool, a slow query makes each request hold its connection longer, so in-flight work rises (Little's Law again), so the app opens more connections, so the database slows further, so queries get slower still. It ends at the server's connection limit, with every new request refused. A bounded pool breaks the loop: excess load waits, or is rejected quickly, at the pool.</p>
+  </div>
+</section>
+
+<section id="write-ceiling">
+  <h2>The single-primary write ceiling</h2>
+  <p>Replicas copy writes; they do not share them. Every replica replays the same log the primary produced, so adding replicas raises read capacity and leaves write capacity exactly where it was. Worse, each replica adds replay work and network fan-out for the primary. Writes scale only by making the primary bigger, or by giving each write a different primary.</p>
+  <p>Bigger works for a long time: more cores, more RAM so the working set stays in the buffer pool, faster NVMe. Do this first. It is the cheapest move and changes no code. It then runs out in three ways:</p>
+  <ul>
+    <li><strong>Write throughput.</strong> The log is written serially and every write flushes to durable storage. A tuned single node sustains tens of thousands of simple writes per second, not millions, and its failover target must keep up too.</li>
+    <li><strong>Dataset beyond one machine.</strong> Once the hot data no longer fits in the buffer pool, reads become disk seeks, and replicas have to hold the same full copy, so they do not help.</li>
+    <li><strong>Index maintenance.</strong> Each insert updates every index. A table with five indexes does roughly six writes per row, and big B-tree indexes that no longer fit in memory turn each one into random I/O. Backups, schema changes and vacuum also lengthen with size.</li>
+  </ul>
+  <p>When you can name which of these you are hitting and the next machine size will not clear it, you partition. Not before: sharding is the most expensive move in this guide, and many systems never need it.</p>
+</section>
+
+<section id="partitioning">
+  <h2>Partitioning and sharding: one table, many databases</h2>
+  <p><strong>Partitioning</strong> splits one logical table into pieces. The pieces can live in one database (a Postgres partitioned table, useful for dropping old data cheaply) or on separate servers, and then it is called <strong>sharding</strong>. Each shard is a full database with its own primary and replicas, holding a slice of the rows. Write capacity now adds up: ten shards take roughly ten times the writes, and each holds a tenth of the data and indexes.</p>
+  <p>Every row needs a rule that says which shard owns it, built from a <strong>shard key</strong>, a column in the row. Two ways to turn a key into a shard:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Scheme</th><th>Rule</th><th>Good at</th><th>Bad at</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Range</td><td>keys A–F on shard 1, G–M on shard 2…</td><td>range scans (“links created this week”); simple to split a full shard</td><td>hotspots: new writes all land on the newest range</td></tr>
+      <tr><td class="term">Hash</td><td>shard = hash(key) mod N</td><td>even spread of rows and load</td><td>range scans: neighbors in key order are scattered, so a range query asks every shard</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Range partitioning on a timestamp or an auto-increment ID is the classic trap: all inserts hit the last shard while the others sit idle. Hashing scrambles the order and removes that hotspot, at the cost of ordered access. Pick based on how you query, not on how the data looks.</p>
+  <h3>Choosing the shard key</h3>
+  <p>This is the most consequential decision in the whole ladder, because changing it later means moving every row. A good key has four properties:</p>
+  <ul>
+    <li><strong>High cardinality</strong>: many more distinct values than shards, so rows can spread. A country code on 16 shards fails.</li>
+    <li><strong>Even load</strong>: values are hit about equally. A key that is balanced by row count can still be wildly unbalanced by traffic (see the next section).</li>
+    <li><strong>Present in your hottest queries</strong>: if the key is in the <code>WHERE</code> clause, the query goes to one shard. If not, it goes to all of them.</li>
+    <li><strong>Stable</strong>: it never changes for a row, since changing it means moving the row between servers.</li>
+  </ul>
+  <p>Requests then need to find the shard. Either a <strong>routing tier</strong> (a proxy such as Vitess's VTGate) receives the SQL, extracts the key and forwards it, or the <strong>client library</strong> holds a directory of shard locations and connects directly. The proxy keeps clients simple and lets you move shards without redeploying apps. The client-side route saves a hop but spreads the shard map into every service. Either way, the map is now critical metadata: if two routers disagree, writes land in the wrong place.</p>
+</section>
+
+<section id="hot-partitions">
+  <h2>Skew and hot partitions</h2>
+  <p>A hash spreads <em>distinct keys</em> evenly. It does nothing about <em>unequal traffic per key</em>. A single key always hashes to the same shard, so if one key receives a large share of the requests, one shard takes that share however many shards you have. Adding shards does not help the hot one; it is already as parallel as it gets.</p>
+  <p>Snip has the textbook case. A link goes viral and draws 50,000 redirects per second, more than the whole system averages. All of it lands on one shard, whose CPU and connection pool saturate, so every other link that shares the shard slows down with it. The same applies to the click counter for that link: thousands of increments per second on one row, all serialized by the row lock.</p>
+  <p>Mitigations, by where the pressure falls:</p>
+  <ul>
+    <li><strong>Absorb reads upstream.</strong> A hot read is one value requested constantly, which is the best case for a cache. A short-TTL entry in <a href="03-caching.html">the cache tier</a> or at the edge takes the 50,000 rps before it reaches the shard.</li>
+    <li><strong>Split hot keys (salting).</strong> For hot writes, append a small random suffix: <code>code#0</code> … <code>code#7</code>. Writes spread over eight rows (and so, via hash, up to eight shards); a read of the total sums all eight. Apply it only to keys you have detected as hot, since the read fan-out is the cost.</li>
+    <li><strong>Separate the counter path.</strong> The click count does not need to live in the links row. Buffer increments elsewhere and apply them in batches, so a link's lookup and its counting never compete. That design is the topic of <a href="06-async-work-and-queues.html">Async Work &amp; Queues</a>.</li>
+  </ul>
+</section>
+
+<section id="cross-shard">
+  <h2>The costs you inherit</h2>
+  <p>Sharding does not make the database faster; it makes each query smaller, as long as the query stays on one shard. The moment it cannot, you pay.</p>
+  <ul>
+    <li><strong>Cross-shard joins</strong> have no single engine to run them. A router must fetch from each shard and join in memory, or the app must do it. Latency becomes that of the slowest shard, and a fan-out to 16 shards makes tail latency far more likely.</li>
+    <li><strong>Cross-shard transactions</strong> need a protocol such as two-phase commit, in which a coordinator asks every shard to prepare and then to commit. It holds locks across network round trips and blocks if the coordinator fails. Many systems simply do not offer it.</li>
+    <li><strong>Resharding</strong> is operational work. With <code>hash(key) mod N</code>, changing N from 16 to 17 moves about 16/17 of all rows. <strong>Consistent hashing</strong> instead places shards (and keys) on a ring so that adding one shard moves only about 1/N of the keys. The common practical form is <strong>virtual nodes</strong>: create many logical shards up front (say 1,024), map them onto the physical servers, and rebalance by moving whole logical shards. Even so, you copy live data while it takes writes, then cut over.</li>
+  </ul>
+  <p>So design to avoid all three. <strong>Denormalize</strong> so that the data a query needs lives with its shard key: copy the owner's name onto their rows rather than joining a users table on another shard. Choose a shard key so that the transactions you need are within one shard. Treat any cross-shard transaction as a design smell, and replace it with an idempotent, retryable step where you can. Anything that truly needs global consistency, such as a unique custom alias across all shards, goes to a small, separate, unsharded store.</p>
+  <div class="callout tip">
+    <span class="callout-label">Shard late, but pick the key early</span>
+    <p>You can run unsharded for years, but if you suspect you will shard, model your tables so every query already carries the future key. Adding it later is a rewrite; carrying it early costs nothing.</p>
+  </div>
+</section>
+
+<section id="snip">
+  <h2>Snip, concretely</h2>
+  <p>Start with the honest question: do Snip's numbers force sharding? The links table is 1B rows × ~500 B ≈ 500 GB. That fits on a large single server, and link creation is only about 1M a day, around 12 writes per second. Taken alone, a primary plus replicas, a pool and a cache would carry it for a long time. Three things push past that: the table keeps growing at roughly 500 MB a day with indexes on top; the buffer pool cannot hold 500 GB of hot data on a sensible instance; and the click stream, 100M events a day at peaks of 10x the average, writes at thousands per second, which no single primary should share with the link lookup. Those, not the link inserts, justify partitioning.</p>
+  <p>The design:</p>
+  <ol>
+    <li><strong>Shard links by <code>hash(code)</code>.</strong> The code is high cardinality, immutable, and in the <code>WHERE</code> clause of the redirect query, so <code>SELECT url FROM links WHERE code = $1</code> goes to exactly one shard as a primary-key point lookup. Using 1,024 logical shards on 16 physical servers gives about 62M rows, around 31 GB, per server, small enough to sit mostly in memory.</li>
+    <li><strong>Each shard has its own replicas</strong> for redirect reads, with the user's own just-created link read from the primary for the sticky window described above.</li>
+    <li><strong>A router pool</strong> in front of each shard group keeps connections bounded: tens per shard, not thousands.</li>
+    <li><strong>A viral link</strong> is absorbed by the cache tier first; whatever misses is a single in-memory row on one shard's replicas.</li>
+    <li><strong>User dashboards</strong> ("all my links") are a different access path. Keep a second table keyed by <code>user_id</code> holding code and title: a deliberate denormalization, so that query is also single-shard.</li>
+  </ol>
+  <div class="flow">redirect GET /a3Xk9
+   ↓
+[cache]  hit → 302
+   ↓ miss
+[router]  hash("a3Xk9") → logical shard 417 → server 5
+   ↓
+[shard 5 replica]  SELECT url … WHERE code = 'a3Xk9'   (one row)
+   ↓
+302 → original URL</div>
+  <p>What this does not yet answer is the click path. Counting clicks into the shard that holds the link would put 1,200 to 12,000 writes per second on the same primaries that serve lookups, and hot links on single rows. The next steps are to buffer clicks through queues and aggregate counters, covered in <a href="06-async-work-and-queues.html">Async Work &amp; Queues</a>, and to decide which reads may be stale and which may not, covered in <a href="05-consistency-and-its-price.html">Consistency &amp; Its Price</a>. For where the click data finally lands for analysis, see the data-side <a href="../../data-engineering/data-systems-design/index.html">Data Systems Design</a> guide.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A user creates a Snip link and the next page load says “link not found”. Reloading a second later works. Trace exactly what happened, and give two fixes with different costs.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The insert committed on the primary, but the read went to an async replica that had not yet replayed it: replication lag, a read-your-own-writes failure. Cheap fix: read from the primary for a window (for example 5 seconds) after the user writes. Precise fix: return the log position with the write and route reads only to replicas past it. See <a href="#read-replicas">Read replicas</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague raises the app's pool from 100 to 2,000 connections because requests are queuing, and the database gets slower. Why does it get slower, and what would you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each connection is a backend process with memory and scheduling cost; throughput peaks near the core count and then falls from contention. Queuing at the pool was a symptom, usually of slow queries. Compute in-flight work with Little's Law (rate × query time) to see the pool you need, then find why queries are slow. See <a href="#pooling">Connection pooling</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your primary runs at 90% CPU on writes with five replicas. A manager proposes adding five more replicas. What do you tell them, and what do you propose?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Replicas replay every write, so they add no write capacity and slightly more load on the primary. Options: a larger primary if you have not maxed it out, removing indexes, batching writes, moving write-heavy data (such as clicks) off this database, and sharding if the writes truly exceed one node. See <a href="#write-ceiling">The write ceiling</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You range-partition a table by <code>created_at</code> across four servers. A month later one server is at 100% and three are idle. Why, and what changes?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>New rows always have the newest timestamp, so every insert lands in the last range. Hash the key to spread inserts, accepting that time-range queries now touch all shards, or keep ranges for data you query by time and delete by dropping old partitions. See <a href="#partitioning">Partitioning</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Snip is sharded by <code>hash(code)</code> across 16 shards, yet one shard has 10x the CPU of the others. Rows are evenly spread. What is happening and what are your options?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A hot key: one viral code takes a large share of traffic, and all of it hashes to one shard. Even rows do not mean even load. Cache the hot reads, salt hot write keys across several rows, and move the counter off the lookup path. More shards would not help. See <a href="#hot-partitions">Skew and hot partitions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Product wants “top 10 links by clicks this week across all users”, and the clicks are sharded by link code. Why is this hard, and how would you serve it without a 16-shard query on every page view?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The answer needs data from every shard, so latency is the slowest shard and it grows with shard count. Precompute it: each shard reports its own top 10 periodically (the global top 10 is among the shard tops), merge them into a small table or cache and serve that, accepting a delay of minutes. See <a href="#cross-shard">The costs you inherit</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Read replicas scale reads only; every replica replays all writes, so they never raise write capacity.</li>
+    <li>Asynchronous replication is fast but lags, so reads that must see a user's own write go to the primary, or are pinned or token-routed to a replica that has caught up.</li>
+    <li>A database connection is a costly process or thread; a bounded pool sized by Little's Law keeps a slowdown from becoming an outage.</li>
+    <li>Scale the primary up first. Shard when write throughput, dataset size or index cost exceeds what the largest sensible machine can carry.</li>
+    <li>The shard key is the hardest decision to undo: it needs high cardinality, even load, presence in your hottest queries, and stability.</li>
+    <li>Hashing spreads keys but not traffic: one viral key still overloads one shard, and needs caching, key splitting and a separate counter path.</li>
+    <li>Sharding makes cross-shard joins, transactions and resharding expensive, so denormalize to keep queries on one shard.</li>
+  </ul>
+  <p>Sharding and replicas give you several copies of the truth that disagree for a moment. How much disagreement a product can tolerate, and what it costs to remove it, is next. → <a href="05-consistency-and-its-price.html">Consistency &amp; Its Price</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><strong>Designing Data-Intensive Applications</strong>, chapters 5 (Replication) and 6 (Partitioning) — Martin Kleppmann, O'Reilly, 2017. The standard treatment of replication lag, read-your-writes, hot spots and rebalancing; read it for the failure cases.</li>
+    <li><a href="https://vitess.io/docs/" target="_blank" rel="noopener"><strong>Vitess documentation</strong></a> — The Vitess project. How a production routing tier, vindexes (shard-key functions) and resharding work for MySQL.</li>
+    <li><a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener"><strong>How Discord Stores Billions of Messages</strong></a> — Discord Engineering, 2017. A real-world sharding story: choosing the shard key (channel plus time bucket), keeping queries single-shard, and why that key is the decision you cannot easily undo.</li>
+    <li><a href="https://www.postgresql.org/docs/current/warm-standby.html" target="_blank" rel="noopener"><strong>PostgreSQL: Log-Shipping Standby Servers</strong></a> — PostgreSQL documentation. Exact semantics of async, synchronous and replay-lag settings.</li>
+    <li><a href="https://www.pgbouncer.org/features.html" target="_blank" rel="noopener"><strong>PgBouncer features</strong></a> — PgBouncer documentation. What session, transaction and statement pooling allow and break.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

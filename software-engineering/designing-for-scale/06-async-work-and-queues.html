@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Asynchronous Work &amp; Queues — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A queue lets a request hand slow or bursty work to another process and return at once, so a spike lands in a buffer instead of on a database.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/06-async-work-and-queues">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Asynchronous Work &amp; Queues — Designing for Scale">
+<meta property="og:description" content="A queue lets a request hand slow or bursty work to another process and return at once, so a spike lands in a buffer instead of on a database.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/06-async-work-and-queues">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-async">The move: a queue between two speeds</a>
+    <a href="#backpressure">Backpressure and the infinite queue</a>
+    <a href="#delivery">Delivery semantics</a>
+    <a href="#idempotency">Idempotency in practice</a>
+    <a href="#dlq">Poison messages, retries and ordering</a>
+    <a href="#outbox">The dual-write problem and the outbox</a>
+    <a href="#snip">Snip's click pipeline</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-consistency-and-its-price.html">← Previous</a>
+    <a href="07-choosing-a-data-store.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Consistency, flow &amp; failure</span>
+  <h1>Asynchronous Work &amp; Queues</h1>
+  <p class="subtitle">A queue lets a request hand slow or bursty work to another process and return at once, so a spike lands in a buffer instead of on a database. The price is new failure modes: messages that arrive twice, arrive out of order, or never arrive. This chapter builds the mechanism, then uses it to define the pipeline that records Snip's clicks.</p>
+</header>
+
+<section id="why-async">
+  <h2>The move: a queue between two speeds</h2>
+  <p>A redirect must finish in tens of milliseconds, and it also has a second job: record that the click happened. Doing that write inline ties the redirect's speed and availability to the analytics store. A queue breaks the tie. The <strong>producer</strong> (the redirect handler) appends a message to a durable log and returns. A <strong>consumer</strong>, running in a separate process at its own pace, reads the message later and does the work. The producer never waits for the consumer and never learns whether it succeeded.</p>
+  <div class="flow">[Redirect handler] ──append click──▶ [ Queue (durable, ordered log) ] ──read──▶ [Consumer]
+   returns 302 now                                                            writes to store
+   (producer)                                  absorbs the burst              (own pace)</div>
+  <p>The queue works as a shock absorber because it decouples <em>arrival rate</em> from <em>service rate</em>. Suppose a viral link pushes Snip to its 12,000 clicks per second peak, ten times the 1,200 average, for 5 minutes. A database that can apply 3,000 writes per second cannot take that directly; <a href="01-the-numbers-and-the-laws.html">Little's Law</a> says its in-flight requests balloon until connections run out. Behind a queue, the 9,000 per second of excess accumulates as backlog: 9,000 × 300 s = 2.7 million messages, about 270 MB at 100 B each. When the spike ends, consumers keep draining at 3,000 per second against 1,200 arriving, a net 1,800 per second, and the queue empties in about 25 minutes. The database saw a flat 3,000 per second the whole time. You traded latency on the background work for protection of the thing that cannot scale quickly.</p>
+  <p>That trade defines what belongs off the request path. Move work when the caller does not need its result to build the response, and when it is slow, bursty, or depends on a flaky third party: sending email, delivering webhooks, generating thumbnails, writing analytics, updating a search index. Keep work on the path when the response depends on it. Checking that a short code exists, verifying a password, or charging a card before showing "paid" must be synchronous, because the user is waiting for that answer. The test is simple: if you can return the response without knowing the outcome, queue it. If you would have to lie in the response, do not.</p>
+</section>
+
+<section id="backpressure">
+  <h2>Backpressure and the infinite queue</h2>
+  <p>A queue absorbs a burst only if consumers are, on average, faster than producers. When arrivals exceed capacity for long enough, the backlog grows without limit, and a growing backlog is growing latency. Little's Law applies to the queue as to a server: with L messages waiting and a drain rate of λ per second, a new message waits L / λ. A backlog of 2.7 million at 3,000 per second means the newest click is recorded 15 minutes after it happened. The queue did not fail; it is working, and the dashboards are 15 minutes stale.</p>
+  <p>Bound the queue in size or age so overload shows at a defined point. At the bound you have three options, and you pick one on purpose.</p>
+  <ul>
+    <li><strong>Slow the producer (backpressure).</strong> The queue refuses or delays the write, and the producer waits or returns an error such as HTTP 429 or 503.</li>
+    <li><strong>Shed load.</strong> Drop the lowest-value messages, newest or oldest, and count what you dropped. Right when freshness beats completeness.</li>
+    <li><strong>Add consumers.</strong> Scale out the readers. This helps only until the shared downstream (the database) is the limit; ten consumers feeding one saturated database make the backlog worse, not better.</li>
+  </ul>
+  <p>Alert on the age of the oldest message, not its depth: age matches the promise you made ("clicks appear within 5 minutes"). An unbounded queue never refuses a write, which is the trap: the system keeps accepting work it cannot finish, and you learn from latency, not from an error.</p>
+</section>
+
+<section id="delivery">
+  <h2>Delivery semantics</h2>
+  <p>A consumer receives a message, does the work, and tells the broker it is done. The order of those steps, and the fact that the network can fail between any two of them, decides what guarantee you get.</p>
+  <p>The broker keeps each message until the consumer <strong>acknowledges</strong> (acks) it. If the consumer crashes or the ack is lost, the broker never learns the work finished and <strong>redelivers</strong> the message. In SQS this is the <em>visibility timeout</em>: a received message is hidden from other consumers for a set time (30 seconds by default), and if no delete arrives in that window it reappears. In Kafka the consumer commits an <em>offset</em>, a bookmark in the log, and after a crash it resumes from the last committed one. A negative ack (nack) tells the broker to redeliver immediately, because this attempt failed.</p>
+  <p>Where you ack decides the guarantee:</p>
+  <ul>
+    <li><strong>At-most-once.</strong> Ack first, then process. A crash after the ack loses the message. Nothing is ever processed twice, and sometimes nothing is processed at all. Fine for a metric sample.</li>
+    <li><strong>At-least-once.</strong> Process first, then ack. A crash before the ack means redelivery, so every message is processed one or more times. Assume this from any queue.</li>
+    <li><strong>Exactly-once.</strong> Each message has exactly one effect. This is what everyone wants, and as a property of delivery over an unreliable network it is not achievable. When the ack is lost, the broker cannot tell "the consumer died before working" from "it worked and the ack vanished". It must pick redelivery or loss.</li>
+  </ul>
+  <div class="callout insight">
+    <span class="callout-label">Exactly-once processing is at-least-once delivery plus an idempotent consumer</span>
+    <p>You cannot stop the duplicate delivery; you can make it harmless. If applying the same message twice leaves the same state as applying it once, then the redelivery changes nothing and the visible effect is exactly-once. Products that advertise "exactly-once" do this somewhere: Kafka's transactions give it between Kafka topics, and SQS FIFO queues deduplicate sends within a 5-minute window. The guarantee stops at the system's edge. The moment the consumer sends an email or calls a payment API, the idempotency is yours to build.</p>
+  </div>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency in practice</h2>
+  <p>An operation is <strong>idempotent</strong> when running it twice equals running it once. Setting a field to a value is idempotent; incrementing a counter is not. Three techniques turn a non-idempotent effect into a safe one.</p>
+  <p><strong>Idempotency keys.</strong> The producer attaches a unique id to each message when it creates the event, not when it sends it, so a retried send carries the same id. The consumer records ids it has handled and skips repeats.</p>
+  <p><strong>Dedup records.</strong> Store the ids in a table or set, and check-and-apply in one atomic step. The dedup check and the effect must commit together, or a crash between them recreates the problem. You also need not remember ids forever: only as long as a duplicate can arrive, which is bounded by the broker's retention and your retry policy. Keep 48 hours, then delete.</p>
+  <p>Here is Snip's click consumer. It reads a batch of events, inserts their ids into a dedup table, and applies counter increments only for ids that were new, all in one transaction. A redelivered batch inserts no new ids, so it adds nothing.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>click_consumer.sql (sketch, Postgres)</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-sql">BEGIN;
+
+-- 1. Claim the event ids. Only first-time ids come back.
+WITH fresh AS (
+  INSERT INTO processed_clicks (event_id, seen_at)
+  SELECT event_id, now() FROM unnest($1::uuid[]) AS t(event_id)
+  ON CONFLICT (event_id) DO NOTHING
+  RETURNING event_id
+)
+-- 2. Count fresh events per code, then add to the counters.
+INSERT INTO link_counts (code, clicks)
+SELECT e.code, count(*)
+FROM unnest($1::uuid[], $2::text[]) AS e(event_id, code)
+JOIN fresh USING (event_id)
+GROUP BY e.code
+ON CONFLICT (code) DO UPDATE SET clicks = link_counts.clicks + EXCLUDED.clicks;
+
+COMMIT;  -- then ack the batch / commit the Kafka offset</code></pre>
+  </div>
+  <p>Order matters in the last line: commit the transaction, then ack. If the process dies between them, the broker redelivers, step 1 finds every id already present, and the batch is a no-op. Prune the dedup table after 48 hours; at 100M clicks per day it holds a few gigabytes of ids. A cheaper variant for Kafka stores the last processed offset per partition in the same transaction and ignores anything at or below it.</p>
+</section>
+
+<section id="dlq">
+  <h2>Poison messages, retries and ordering</h2>
+  <p>Some messages fail every time: malformed JSON, a code that references a deleted record, a bug in your handler that one input triggers. With at-least-once delivery, a failing message is redelivered, fails, and is redelivered again. If the consumer retries immediately and in order, one such <strong>poison message</strong> blocks everything behind it, or burns the whole consumer fleet's capacity on a loop that cannot succeed.</p>
+  <p>Two mechanisms contain it. First, <strong>limit attempts</strong>: SQS calls the limit <code>maxReceiveCount</code>, and after that many receives the broker moves the message to a <strong>dead-letter queue</strong> (DLQ), a separate queue you inspect by hand. Kafka has no built-in DLQ; the consumer writes the failing record to a "dead letter" topic itself. Alert when the DLQ is non-empty: each message is work that never happened, to replay after the fix.</p>
+  <p>Second, <strong>space the retries</strong>. When a failure is transient (a downstream timeout), retrying instantly makes it worse. Use exponential backoff: wait 1 s, 2 s, 4 s, 8 s, up to a cap. Add <strong>jitter</strong>, a random fraction of the delay, because without it every consumer that failed at the same moment retries at the same moment, and the recovering dependency sees a synchronized spike, the same stampede <a href="03-caching.html">the caching chapter</a> described. "Full jitter" picks a random wait between 0 and the backoff ceiling. Retry only errors that can heal; a validation failure goes straight to the DLQ.</p>
+  <p>Ordering is the last thing the queue does not promise. A plain queue such as SQS Standard gives best-effort order at most, and redelivery makes it worse: message 1 fails and returns after message 2 has been handled. Kafka orders messages <em>within a partition</em> only; across partitions, none. To keep all events for one entity in order, send them to one partition by hashing the entity id, the same idea as the shard keys in <a href="04-scaling-the-database.html">the database chapter</a>. The cost is that a hot key means a hot partition. So ask whether you need order at all. Counters commute (adding 1 then 2 equals adding 2 then 1), so click counting needs none. A "link edited, then deleted" sequence does.</p>
+</section>
+
+<section id="outbox">
+  <h2>The dual-write problem and the outbox</h2>
+  <p>Now the producer side. When a user creates a link, Snip must insert the row and also publish a <code>link.created</code> event so an abuse scanner can check the target URL. That is two systems, the database and the broker, and no transaction spans both. Any order fails:</p>
+  <ul>
+    <li><strong>Write the row, then publish.</strong> A crash between them leaves a link that exists and was never scanned. The event is lost.</li>
+    <li><strong>Publish, then write the row.</strong> If the insert then fails or rolls back, the scanner reviews a link that does not exist. The event is a phantom.</li>
+  </ul>
+  <p>The fix is to make it one write to one system. In the <strong>transactional outbox</strong> pattern, the service inserts the link row and an <code>outbox</code> row describing the event in the same database transaction. Both commit or neither does. A separate <strong>relay</strong> process reads unsent outbox rows, publishes them to the broker, and marks them sent. The relay can crash after publishing and before marking, so it will sometimes publish twice. That is acceptable, because you already built idempotent consumers: the outbox gives you at-least-once publishing, the event id gives you dedup.</p>
+  <div class="flow">  one transaction                          separate process
+┌──────────────────────────┐            ┌─────────┐        ┌─────────┐
+│ INSERT links (row)       │            │  Relay  │─publish▶│  Queue  │
+│ INSERT outbox (event)    │───commit──▶│ polls   │        └─────────┘
+└──────────────────────────┘   rows     │ outbox  │◀─mark sent
+                                        └─────────┘</div>
+  <p>With Snip's sharded links table, put the outbox table on the same shard as the row it describes; a transaction cannot span shards cheaply. The relay can poll (<code>SELECT … WHERE sent_at IS NULL ORDER BY id LIMIT 500</code>, simple and a little delayed) or read the database's write-ahead log, which is <strong>change data capture</strong> (CDC). CDC tails committed changes with no polling load and no outbox table needed for plain row changes. It is the same mechanism that feeds a warehouse, and the <a href="../../data-engineering/data-systems-design/index.html">data systems design guide</a> covers it.</p>
+  <div class="callout warn">
+    <span class="callout-label">Not every event needs an outbox</span>
+    <p>The outbox exists for events that must match a database change. Snip's click events have no row to match: the click is the fact, and the redirect only publishes. For those, the producer buffers in memory and sends asynchronously, and losing a few events when a server crashes is a tolerated cost. Pay for the outbox when losing the event creates a wrong state, not just a slightly low count.</p>
+  </div>
+</section>
+
+<section id="snip">
+  <h2>Snip's click pipeline</h2>
+  <p>This is the pipeline <a href="03-caching.html">the caching chapter</a> and <a href="04-scaling-the-database.html">the database chapter</a> deferred. The redirect path does its lookup, builds the response, and as its last step appends a click event to a durable log such as Kafka or SQS. The event is about 100 B: an event id (a UUID generated in the handler), the code, a timestamp, and coarse fields such as country and user agent. The handler sends it asynchronously and does not wait for the broker; the 302 goes out regardless.</p>
+  <div class="flow">[Redirect handler] ──click event (id, code, ts, ~100 B)──▶ [Queue: Kafka / SQS]
+                                                                │
+                                              ┌─────────────────┴───────────────┐
+                                              ▼                                 ▼
+                              [Aggregator consumers]                 [Raw-event archive]
+                         batch 500–5,000, dedup on event id            roll up into the
+                         add per-code deltas, commit, ack              analytics store
+                                              │
+                                              ▼
+                                   [link_counts, eventual]</div>
+  <p><strong>Peak is absorbed by the queue, not the database.</strong> At 12,000 events per second, the broker takes about 1.2 MB per second of appends, trivial for a log. Retaining 7 days costs 100M × 100 B × 7 ≈ 70 GB. The counter store sees only what consumers choose to send it.</p>
+  <p><strong>Batching beats a row per click.</strong> The aggregator reads a few thousand events, groups them by code in memory, and issues one update per distinct code. A viral link receiving 10,000 clicks per second turns into a single <code>clicks = clicks + N</code> per batch instead of 10,000 competing updates on one row, which would queue behind that row's lock. If even one update per batch per code is too much, the consumer keeps counters in memory and flushes every second. Partition by event id rather than by code so that a hot code spreads across all consumers; since counts commute, no ordering is needed. The idempotent upsert from the sketch above keeps redelivery from inflating counts.</p>
+  <p><strong>Counts are eventual</strong>, as <a href="05-consistency-and-its-price.html">the consistency chapter</a> set out. The dashboard shows a number that trails reality by the queue's age, usually seconds, up to 15 minutes in the spike worked above. Say so in the product ("updated within 5 minutes") and alert when queue age passes that number.</p>
+  <p><strong>The raw events leave through a second consumer group.</strong> Each click is archived to object storage and rolled up into the analytics store, where "clicks by country by day" queries belong, as described in <a href="../../data-engineering/data-systems-design/index.html">the data systems design guide</a>. At 100 B per click, that is the 3.6 TB per year from the sizing exercise. Because a separate consumer reads the queue, a slow warehouse load just grows its own backlog. It cannot slow a redirect, which never touches it. That separation is the point of the design: the redirect's only dependency on analytics is an append to a log.</p>
+  <p>The costs: a click is lost if an app server dies with unsent events buffered, which Snip accepts because it does not bill by the click. A duplicate from a consumer crash is removed by the event id.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A consumer processes a message, writes to the database, and crashes before sending the ack. What does the broker do next, and what must be true of the consumer for the system to stay correct?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The broker cannot tell that the work finished, so it redelivers (after the visibility timeout in SQS, or from the last committed offset in Kafka). The consumer must be idempotent, so the second run leaves the same state as one run. See <a href="#delivery">Delivery semantics</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vendor's page says its queue offers "exactly-once delivery". What do you ask before relying on it, and why is the claim suspect as stated?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask where the guarantee ends. Over an unreliable network a lost ack makes "consumer died" and "ack lost" indistinguishable, so the broker must choose redelivery or loss. Real offerings deduplicate within a window or inside the broker (Kafka transactions, SQS FIFO), and side effects outside it, like an email, are still yours to make idempotent. See <a href="#delivery">Delivery semantics</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Consumers drain 3,000 messages per second. A 10-minute surge brings 9,000 per second against that capacity, then arrivals fall to 1,000 per second. About how long after the surge ends does the backlog clear, and what number should you alert on during it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The backlog is (9,000 − 3,000) × 600 = 3.6 million. After the surge the net drain is 2,000 per second, so about 1,800 seconds, or 30 minutes. Alert on the age of the oldest message, since that is what the user feels. The tempting answer, queue depth, hides whether the drain is working. See <a href="#backpressure">Backpressure</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A handler runs <code>INSERT order</code> and then <code>publish("order.created")</code>. Describe two different ways production can leave the two systems disagreeing, and how an outbox removes both.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A crash after the insert but before the publish loses the event; publishing first and failing the insert sends an event for an order that does not exist. With an outbox, the order row and the event row commit in one transaction, so both exist or neither does, and a relay publishes later with at-least-once semantics that idempotent consumers absorb. See <a href="#outbox">the outbox</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your colleague wants one Kafka partition per link code so each link's clicks stay in order. What do you ask, and what would you propose instead for counting?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask whether counting needs order at all. Increments commute, so it does not. Keyed partitioning would also send a viral link's 10,000 events per second to one partition and one consumer, a hot spot. Partition by event id to spread the load, and keep per-key ordering for sequences where order matters, like edit then delete. See <a href="#dlq">Ordering</a> and <a href="#snip">Snip's pipeline</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A message in your queue fails with a validation error on every attempt, while another fails with a database timeout. How should the retry policy treat each?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The validation failure cannot heal, so retrying wastes capacity: send it to the dead-letter queue and alert. The timeout is transient, so retry with exponential backoff and jitter so that many consumers do not hit the recovering database in the same instant. Cap the attempts and dead-letter at the limit. See <a href="#dlq">Poison messages</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A queue protects a slow component by turning a burst of arrivals into backlog that drains at the consumer's pace; the cost is latency on the queued work, not on the caller.</li>
+    <li>An unbounded queue hides overload until latency or memory fails, so bound it, choose between backpressure and shedding in advance, and alert on the age of the oldest message.</li>
+    <li>Over an unreliable network you get at-most-once or at-least-once delivery; exactly-once effects come from at-least-once delivery plus an idempotent consumer.</li>
+    <li>Idempotency means the event id is fixed at the source and the dedup check commits in the same transaction as the effect.</li>
+    <li>Retry only errors that can heal, with exponential backoff and jitter, cap attempts, and send what remains to a dead-letter queue someone watches; do not assume ordering beyond a single partition.</li>
+    <li>Writing to a database and a broker cannot be atomic, so write the event to an outbox table in the same transaction and let a relay publish it.</li>
+    <li>Snip's redirect only appends a click event to a log; batched, idempotent consumers turn it into eventual counts and feed the analytics store, so neither can slow a redirect. The next question is where each kind of data should live: <a href="07-choosing-a-data-store.html">Choosing a Data Store by Shape</a>.</li>
+  </ul>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, O'Reilly, 2017. Chapter 11 on stream processing and messaging covers delivery guarantees, ordering and idempotence in depth; chapter 9 explains why exactly-once is subtle.</li>
+    <li><a href="https://kafka.apache.org/documentation/#design" target="_blank" rel="noopener"><strong>Apache Kafka documentation: Design</strong></a> — see "Message Delivery Semantics" for offsets, the idempotent producer and transactions, and what they do and do not guarantee.</li>
+    <li><a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener"><strong>Amazon SQS Developer Guide: Visibility timeout</strong></a> — the redelivery mechanism in concrete numbers; read alongside the dead-letter queue pages for <code>maxReceiveCount</code>.</li>
+    <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener"><strong>Timeouts, retries and backoff with jitter</strong></a> — Marc Brooker, Amazon Builders' Library. Why retries amplify outages and how jitter fixes it.</li>
+    <li><a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener"><strong>Transactional outbox</strong></a> — Chris Richardson, microservices.io. The pattern, its polling and log-tailing relays, and the trade-offs.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

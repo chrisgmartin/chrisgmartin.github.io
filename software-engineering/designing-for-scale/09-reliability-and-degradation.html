@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reliability &amp; Graceful Degradation — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="At scale, something is always broken: a disk, a node, a network link, a dependency having a bad minute.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/09-reliability-and-degradation">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Reliability &amp; Graceful Degradation — Designing for Scale">
+<meta property="og:description" content="At scale, something is always broken: a disk, a node, a network link, a dependency having a bad minute.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/09-reliability-and-degradation">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#redundancy-failover">Redundancy and failover</a>
+    <a href="#timeouts-retries">Timeouts and retries</a>
+    <a href="#circuit-breakers">Circuit breakers and bulkheads</a>
+    <a href="#rate-limiting-shedding">Rate limiting and load shedding</a>
+    <a href="#degradation">Graceful degradation</a>
+    <a href="#snip">Snip under failure</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-tail-latency-and-capacity.html">← Previous</a>
+    <a href="10-a-worked-design.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Consistency, flow &amp; failure</span>
+  <h1>Reliability &amp; Graceful Degradation</h1>
+  <p class="subtitle">At scale, something is always broken: a disk, a node, a network link, a dependency having a bad minute. A reliable system is not one where nothing fails but one built to lose a piece and keep serving. This chapter covers redundancy, timeouts, retries, circuit breakers, load shedding, and how to decide in advance what gives way first.</p>
+</header>
+
+<section id="redundancy-failover">
+  <h2>Redundancy and failover</h2>
+  <p>Failure is arithmetic. A server that fails once every 3 years fails about once per 1,100 days; run 1,000 of them and one fails roughly every day. The bigger the fleet, the more certain it is that something is down right now, so you design so that no single failure matters.</p>
+  <p>The rule is <strong>no single point of failure</strong>: for each component, ask what happens if it vanishes, and if the answer is "the service stops," add a second one. <strong>N+1</strong> means enough capacity to carry peak with one unit missing: if 4 app servers carry peak, run 5. <strong>Multi-AZ</strong> puts the copies in separate availability zones (independent power and network), so one fire or fiber cut costs a third of capacity, not all of it. N+1 inside one zone protects against a bad machine and nothing else.</p>
+  <p>Redundancy helps only if traffic moves off the dead unit. That is <strong>failover</strong>, and it has two designs.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Design</th><th>Mechanism</th><th>Cost</th><th>Use it for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Active-active</td><td>All copies serve traffic. When one dies, the others absorb its share.</td><td>Keep each copy below about (N-1)/N of capacity, or survivors overload.</td><td>Stateless tiers: app servers, cache nodes</td></tr>
+      <tr><td class="term">Active-passive</td><td>One primary serves; a standby holds a copy and is promoted when the primary dies.</td><td>The standby idles; promotion takes seconds to minutes and the standby may lag.</td><td>Stateful systems with a single writer: a database primary</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The mechanism is detect, then reroute. Something notices the failure: a load balancer probing each backend every 2–5 seconds and removing one after 2–3 misses, as <a href="02-load-balancing-and-statelessness.html">the load balancing chapter</a> describes, or an orchestrator watching a database primary's heartbeat. Then something changes where requests go: the balancer drops the node, or a standby is promoted. Detection time is your outage floor. With a 5-second probe and 3 misses, a dead node keeps receiving traffic for up to 15 seconds.</p>
+  <p>Failover has two classic ways to go wrong.</p>
+  <ul>
+    <li><strong>Split-brain.</strong> The standby cannot reach the primary, concludes it is dead and promotes itself, but the primary is only partitioned away and still accepting writes. Two nodes now accept different writes, and merging them is painful. Require a majority (quorum) to promote, and <em>fence</em> the old primary (revoke its storage lease or network access) before promoting. A fast unfenced failover is more dangerous than a slow one.</li>
+    <li><strong>The thundering reconnect.</strong> When a primary dies, every app server's pooled connections break at once, and after promotion they all reconnect and retry in the same second. The new primary, with a cold buffer pool, takes a burst it never sees in steady state. Use jittered reconnects and connection-pool ceilings.</li>
+  </ul>
+</section>
+
+<section id="timeouts-retries">
+  <h2>Timeouts and retries</h2>
+  <p>Most outages that spread start with a call that never returns. Many client libraries default to no timeout, and the stuck worker is held the whole time. <a href="01-the-numbers-and-the-laws.html">Little's Law</a> says concurrency equals arrival rate times time in system. A service taking 1,000 rps with a 50 ms dependency holds about 50 requests in flight. If the dependency hangs and calls wait 30 seconds, the same rate wants 30,000 in flight, and a pool of 200 workers is full in a fifth of a second. Then even requests that never touch the broken dependency queue for a worker. <strong>Set a timeout on every call that leaves the process</strong>, a bit above the dependency's p99 as <a href="08-tail-latency-and-capacity.html">the tail latency chapter</a> measures it, not a round 30 seconds.</p>
+  <p>A timeout turns a hang into an error, and an error invites a retry. Retries suit brief faults but add load to a system short of capacity. Three rules keep them safe.</p>
+  <p><strong>Back off exponentially, with jitter.</strong> Wait longer after each failure (100 ms, 200 ms, 400 ms…) up to a cap. Without randomness, clients that failed together retry together, and the dependency sees synchronized waves. Full jitter picks the delay at random between zero and the exponential ceiling, which spreads the waves into a trickle.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>retry.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">def call_with_retries(fn, attempts=3, base=0.1, cap=2.0, timeout=0.3):
+    for attempt in range(attempts):
+        try:
+            return fn(timeout=timeout)                  # always bounded
+        except (Timeout, Unavailable):
+            if attempt == attempts - 1 or not retry_budget.try_spend():
+                raise                                   # give up: fail fast
+            ceiling = min(cap, base * 2 ** attempt)
+            time.sleep(random.uniform(0, ceiling))      # full jitter</code></pre>
+  </div>
+  <p><strong>Know the amplification.</strong> If each of three layers retries 3 times, one user request becomes 3 &times; 3 &times; 3 = 27 calls at the bottom. The retries you wrote to survive a blip become a self-inflicted denial of service. Retry in one layer, usually the one closest to the user, and have the others fail fast.</p>
+  <p><strong>Cap retries with a budget.</strong> Three retries per request is still a 4x load when everything fails. A retry budget allows a retry only while retries are under, say, 10% of recent requests. When the dependency is healthy almost nothing is spent; when it fails everywhere the budget runs out and clients stop adding load.</p>
+  <div class="callout warn">
+    <span class="callout-label">A retry of a non-idempotent call is a duplicate</span>
+    <p>A timeout does not mean the work did not happen; the server may have committed the write and lost the response. Retrying "create link" then makes two links. Retry only operations that are safe to repeat, or give them an idempotency key the server checks, as <a href="06-async-work-and-queues.html">the queues chapter</a> shows.</p>
+  </div>
+</section>
+
+<section id="circuit-breakers">
+  <h2>Circuit breakers and bulkheads</h2>
+  <p>Backoff slows each client. A <strong>circuit breaker</strong> stops them when the evidence says the dependency is down. It wraps calls to one dependency, tracks recent outcomes, and has three states.</p>
+  <div class="flow">  failures over threshold            timer expires
+ ┌────────┐ ───────────────────▶ ┌────────┐ ─────────────▶ ┌───────────┐
+ │ CLOSED │                      │  OPEN  │                │ HALF-OPEN │
+ │ calls  │ ◀─────────────────── │ fail   │ ◀───────────── │ few trial │
+ │ pass   │   trial calls succeed│ fast   │  a trial fails │ calls     │
+ └────────┘ ◀────────────────────┴────────┘                └───────────┘</div>
+  <ul>
+    <li><strong>Closed:</strong> normal. Calls pass while a sliding window counts failures, for example "more than 50% of the last 20 calls failed."</li>
+    <li><strong>Open:</strong> calls fail in microseconds without touching the network. The dependency gets silence to recover, and your workers are not held for a timeout each. After a cool-down (say 10 seconds) the breaker moves on.</li>
+    <li><strong>Half-open:</strong> a few trial calls pass. If they succeed, the breaker closes; if any fails, it reopens for another cool-down. Full traffic at a dependency that just came back is how you knock it over again.</li>
+  </ul>
+  <p>The gain is fail-fast. Without a breaker, every request waits out its 300 ms timeout before failing. With one, the cost is near zero and the caller moves straight to its fallback. A breaker is half a design unless the caller has a fallback, which <a href="#degradation">the degradation section</a> covers.</p>
+  <p>A <strong>bulkhead</strong> asks a different question: when one dependency is slow, how much of your capacity can it take with it? Ship hulls use watertight compartments so one breach does not sink the vessel. In software, give each dependency its own pool, a separate connection or thread pool with its own cap. With 200 shared workers and a stalled recommendations API, all 200 can end up waiting on it. With a pool of 20 for recommendations, the other 180 keep serving. The cost is lower utilization: idle capacity in one pool cannot help another.</p>
+</section>
+
+<section id="rate-limiting-shedding">
+  <h2>Rate limiting and load shedding</h2>
+  <p>Every service has a capacity. Above it, arrivals exceed departures and the queue grows without bound, and by Little's Law (<a href="01-the-numbers-and-the-laws.html">chapter 1</a>) waiting time grows with it. A server that does 1,000 rps and receives 1,200 falls 200 requests further behind every second. After 30 seconds the queue holds 6,000 requests and each new arrival waits 6 seconds, by which point most clients have timed out or retried. The server still works, but for people who have left. <strong>Goodput</strong>, the useful throughput, falls toward zero while the CPU sits at 100%.</p>
+  <p>The answer is to <strong>reject early and cheaply</strong>. Refusing costs microseconds and gives the caller a fast, honest error (HTTP 429 or 503, with <code>Retry-After</code>). Accepting a request and failing it after 30 seconds uses the same capacity as serving it and returns nothing. Keep queues short and bounded.</p>
+  <p>Two mechanisms, with different jobs.</p>
+  <p><strong>Rate limiting</strong> is a policy applied to <em>callers</em>: this API key may make 100 requests per minute. It stops one client, abusive or buggy, taking more than its share. The standard algorithm is the <strong>token bucket</strong>: a bucket holds up to B tokens and refills at r per second; each request removes one, and with an empty bucket the request is rejected. That allows a burst of B but a sustained rate of at most r. The <strong>leaky bucket</strong> instead queues requests and drains them at a fixed rate: smooth output, but delay instead of bursts. Prefer the token bucket for APIs, where bursts are normal.</p>
+  <p><strong>Load shedding</strong> is the <em>server's</em> decision about itself: I am overloaded, so I drop some work whoever sent it. Signals include in-flight concurrency over a limit, queue depth, or queueing delay beyond a threshold. Shed selectively: tag requests with a priority and drop the cheapest to lose first, such as background refreshes before user-facing reads, and dashboard reads before the write that completes a purchase.</p>
+</section>
+
+<section id="degradation">
+  <h2>Graceful degradation and cascading failure</h2>
+  <p>Overload spreads. Service C, a dependency of B, slows after a bad deploy. B's workers wait on C and pile up until B's threads are gone. A's calls to B time out and A's workers pile up. A's callers retry, adding load to a system already behind, and the load balancer, seeing A's health checks time out, pulls A's nodes from rotation, which pushes their traffic onto the rest and makes those fail faster. One slow component is now a full outage, and fixing C does not end it, because the retry storm holds the system down. This is a <strong>cascading failure</strong>: a positive feedback loop where failure raises load on the survivors, which raises failure.</p>
+  <p>Every tool in this chapter breaks that loop at a different point. Timeouts bound how long a worker is held. Bulkheads stop the pile-up crossing pools. Breakers stop calls to a sick dependency. Budgets stop retry growth. Shedding keeps the survivors under capacity so they finish the work they accept; without it nothing stops the cascade.</p>
+  <p>The stance is <strong>degrade, don't collapse</strong>. For each dependency, decide ahead of time what the service does when it is gone, and write that path as carefully as the happy one.</p>
+  <ul>
+    <li><strong>Serve stale.</strong> If the database struggles, answer from cache even past the TTL. A 10-minute-old answer beats an error.</li>
+    <li><strong>Turn off the optional feature.</strong> Drop recommendations or live counters and render the core page without them. Use feature flags so an operator can do it in seconds.</li>
+    <li><strong>Return a partial result.</strong> A search over 20 shards where 2 time out can return the 18 that answered, with a note.</li>
+  </ul>
+  <p>A fallback that has never run in production is a guess, and it often depends on the very thing that failed. Switch the dependency off on purpose, in staging first, then in production at a quiet hour.</p>
+</section>
+
+<section id="snip">
+  <h2>Snip under failure</h2>
+  <p>Snip's rule: <strong>the redirect is the product, and everything else is optional.</strong> At 1,200 rps average and 6,000–12,000 at peak, a redirect must work while much of the rest is on fire.</p>
+  <ul>
+    <li><strong>The click pipeline is down.</strong> Redirects do not wait for it. As in <a href="06-async-work-and-queues.html">the queues chapter</a>, each click goes to a queue and the redirect returns at once. If the queue is full, the redirect path drops or samples the event rather than block. At 100 B per click, 100 million clicks a day is 10 GB, so an hour of backlog is under 0.5 GB and the queue absorbs a long outage. Past that Snip loses some analytics, never a redirect.</li>
+    <li><strong>A shard primary dies.</strong> Its replica (<a href="04-scaling-the-database.html">chapter 4</a>) is promoted behind a quorum and fencing. Reads for that shard's codes keep working from cache and surviving replicas. Writes (new links) fail for the detection-plus-promotion window, tens of seconds, and the client retries with the same idempotency key.</li>
+    <li><strong>Redis is down.</strong> Cache-aside (<a href="03-caching.html">chapter 3</a>) falls through to the database: slower, but correct. The risk is the database meeting the full 1,200–12,000 rps it was sized to see at about 1%. So guard the fall-through with a per-shard concurrency cap, per-key coalescing, an in-process cache for the hottest codes, and shedding of the lowest-priority reads at the cap.</li>
+    <li><strong>Abuse.</strong> Link creation is rate limited per account and per IP with a token bucket (say 10 links per minute, burst of 20), because each creation is a database write. Code-guessing crawlers hit a per-IP limit on redirect misses; negative caching keeps each bad guess cheap and the limit cuts the guesses off.</li>
+  </ul>
+  <p>The ordering of what gives way, first to last:</p>
+  <ol>
+    <li>Click recording and live counters: dropped or delayed first.</li>
+    <li>Dashboards, link statistics, and other reads that are not redirects.</li>
+    <li>Link creation and edits, rejected with a retryable error, because a user can try again.</li>
+    <li>Redirects for cold codes that must hit the database.</li>
+    <li>Redirects for hot, cached codes. This is the last thing to go, and the design should make it nearly impossible.</li>
+  </ol>
+  <p>Writing the hierarchy down is the work. Under pressure nobody argues about what to cut, because the breakers and shed rules already encode it. Keeping enough headroom that shedding rarely triggers is a capacity question for <a href="08-tail-latency-and-capacity.html">the tail latency and capacity chapter</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A service handles 500 rps with a 40 ms dependency and a pool of 100 workers. The dependency begins to hang with no timeout configured. How quickly does the pool run out, and why do requests that never use that dependency also begin to fail?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Normal concurrency is 500 &times; 0.04 = 20 workers. Hung calls never release their workers, so 500 new requests per second consume the 80 free ones in under a quarter of a second. After that, every request, including those that never call the dependency, waits for a free worker. A timeout bounds how long each worker is held. See <a href="#timeouts-retries">Timeouts and retries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague adds "retry 3 times" at the web tier, the service tier and the database client. The database slows slightly and then falls over. Explain why, and what you would change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retries multiply across layers: 4 attempts at each of three layers can turn one request into up to 64 database calls, so a modest slowdown becomes a flood. More backoff alone does not remove the multiplication. Retry in one layer only, add jitter, and cap retries with a budget (about 10% of traffic) so a failing dependency stops receiving extra load. See <a href="#timeouts-retries">Timeouts and retries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does a circuit breaker move to half-open instead of going straight back to closed when its cool-down ends?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The breaker has no evidence the dependency has recovered; the timer only says time has passed. Full traffic could knock over a dependency that just came back. Half-open sends a few trial calls: success closes the circuit, failure opens it again for another cool-down. See <a href="#circuit-breakers">Circuit breakers and bulkheads</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An API sits at 100% CPU and its queue holds 8,000 requests, yet it reports almost no successful responses. Why, and why is adding a bigger queue the wrong response?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Queueing delay is now longer than the client timeout, so the server works on requests whose callers have already given up. Goodput collapses while utilization stays high. A bigger queue lengthens the delay and makes it worse. Bound the queue and reject early, so the work done is for callers still waiting. See <a href="#rate-limiting-shedding">Rate limiting and load shedding</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A product manager wants every request to the checkout service treated equally during overload "to be fair." What do you propose instead, and when would equal treatment be right?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Shed by priority: drop background and read-only traffic first and protect the requests that complete a purchase, because losing them costs revenue and a retry later costs little. Equal treatment is right when requests are interchangeable, or when clients mark everything high and the signal cannot be trusted. See <a href="#degradation">Graceful degradation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Redis fails during Snip's peak of 10,000 rps. The design says cache-aside makes this a slowdown. What can still go wrong, and which controls prevent it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The database, sized for about 1% of traffic, now receives all of it and may collapse, turning a slowdown into an outage. Prevent it with a concurrency cap on database reads, per-key request coalescing, an in-process cache for the hottest codes, and shedding of low-priority reads once the cap is reached. See <a href="#snip">Snip under failure</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>At scale, failure is constant, so a design is judged by what happens when a component dies: remove every single point of failure with N+1 capacity spread across zones.</li>
+    <li>Failover is detect, then reroute, and detection time is your outage floor; unfenced promotion risks split-brain and mass reconnects can knock over the new primary.</li>
+    <li>Every outbound call needs a timeout, because an unbounded wait ties up a worker and, by Little's Law, exhausts the pool within a second.</li>
+    <li>Retry in one layer, with exponential backoff, full jitter and a budget of roughly 10% of traffic, and only for idempotent operations; otherwise retries multiply a small fault into a self-inflicted overload.</li>
+    <li>Circuit breakers fail fast and let a dependency recover; bulkheads cap how much of your capacity one slow dependency can consume.</li>
+    <li>Above capacity, queues grow without bound and goodput collapses, so reject early and shed low-priority work first; rate limits police callers, shedding protects the server.</li>
+    <li>Decide the order in which features give way before the incident: Snip drops click counts first and the cached redirect last. Next, <a href="10-a-worked-design.html">A Worked Design: Snip at Scale</a> puts every piece of this guide into one end-to-end design.</li>
+  </ul>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener"><strong>Handling Overload</strong></a> — Google SRE Book. Per-client and adaptive throttling, criticality levels and retry budgets, from a fleet that lives with overload.</li>
+    <li><a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener"><strong>Addressing Cascading Failures</strong></a> — Google SRE Book. Why overload feeds on itself, with the mitigations and the order to apply them.</li>
+    <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener"><strong>Timeouts, retries, and backoff with jitter</strong></a> — Marc Brooker, AWS Builders' Library. The clearest account of retry amplification and why full jitter works.</li>
+    <li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener"><strong>CircuitBreaker</strong></a> — Martin Fowler. The three states in a short article, with the monitoring a breaker needs.</li>
+    <li><a href="https://pragprog.com/titles/mnee2/release-it-second-edition/" target="_blank" rel="noopener"><strong>Release It!</strong></a> — Michael Nygard, 2nd ed., 2018. The source of the circuit breaker and bulkhead patterns, written from production outages.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

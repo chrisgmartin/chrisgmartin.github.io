@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pagination, Filtering & Fields — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A collection endpoint that returns everything works in the demo and falls over in production.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/03-pagination-filtering-and-fields">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Pagination, Filtering &amp; Fields — Designing APIs">
+<meta property="og:description" content="A collection endpoint that returns everything works in the demo and falls over in production.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/03-pagination-filtering-and-fields">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-paginate">Paginate from day one</a>
+    <a href="#offset">Offset and why it breaks</a>
+    <a href="#cursors">Cursor pagination</a>
+    <a href="#envelope">The response envelope</a>
+    <a href="#page-size">Page size</a>
+    <a href="#filtering">Filtering</a>
+    <a href="#sorting">Sorting</a>
+    <a href="#fields">Sparse fieldsets</a>
+    <a href="#clicks">The hard case: clicks</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-resource-modeling.html">← Prev</a>
+    <a href="04-errors-and-validation.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Shape the surface</span>
+  <h1>Pagination, Filtering &amp; Fields</h1>
+  <p class="subtitle">A collection endpoint that returns everything works in the demo and falls over in production. This chapter is why offset pagination breaks and cursors do not, filtering and sorting that stay cheap, and letting callers ask for only the fields they need.</p>
+</header>
+
+<section id="why-paginate">
+<h2>Paginate from day one</h2>
+<p>Every endpoint that returns a collection needs a page limit before it ships. An unbounded <code>GET /v1/links</code> is fine for the first customer, who has forty links. It is not fine for the customer who imports forty thousand. The server reads every row, builds one JSON array in memory, and sends tens of megabytes down one connection. Latency grows with the table, memory use grows with the table, and one slow client holds a worker the whole time. <a href="../designing-for-scale/08-tail-latency-and-capacity.html">Tail latency and capacity</a> covers what that does to your p99.</p>
+<p>The second cost is the one people miss. Adding a limit later is a breaking change. Clients that were told "you get all of it" have loops that read the first response and stop. After you add a default page of 100, those clients silently miss data, and nothing errors. So the first version of the list endpoint returns a page and says whether more exists, even if the default page size is large.</p>
+<p>This chapter covers the <em>control plane</em> of Snip: managing links and reading their data through <code>https://api.snip.ly/v1</code>. The redirect itself is the data plane and never paginates. A short code resolves to one URL.</p>
+</section>
+
+<section id="offset">
+<h2>Offset pagination, and why it breaks</h2>
+<p>The familiar form takes a page size and a position:</p>
+<pre><code class="language-http">GET /v1/links?limit=20&amp;offset=40</code></pre>
+<pre><code class="language-sql">SELECT * FROM links
+WHERE account_id = :acct
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 40;</code></pre>
+<p>It is easy to build and lets a UI jump to page 7. It has two defects, and both get worse with load.</p>
+<p><strong>The database skips by reading.</strong> <code>OFFSET 40</code> does not seek to row 41. The engine walks the index, produces 40 rows, throws them away, then returns 20. Cost is O(offset + limit). Page 1 is cheap. At <code>offset=500000</code> the query reads half a million index entries to return twenty. A client that crawls your whole list therefore does quadratic total work: each page costs more than the last. Even a perfect index does not help, because the skip walks the index itself. See <a href="../designing-for-scale/04-scaling-the-database.html">Scaling the database</a> for why index scans, not seeks, set the cost here.</p>
+<p><strong>Pages drift when data changes.</strong> The offset names a position, not a row. Say a caller reads page 1 (rows 1–20, newest first). Then someone creates a link. Every row moves down by one. Page 2, at offset 20, now begins with the row that was last on page 1, so the caller sees a duplicate. Delete a row instead and the caller skips one. A link shortener with a busy create endpoint hits this constantly. The caller cannot detect it, because each response looks valid.</p>
+<p>Offset is still the right choice for a small, slow-changing list read by humans: an admin screen of 200 API keys, say, where "page 7 of 10" is a real feature. For anything that grows or that scripts will walk, use a cursor.</p>
+</section>
+
+<section id="cursors">
+<h2>Cursor (keyset) pagination</h2>
+<p>A cursor names the last row you returned instead of a position. The next query asks for rows strictly after that row in sort order. Snip sorts by <code>created_at</code> descending, and many links can share a timestamp, so the sort key needs a tiebreaker: <code>code</code>, which is unique.</p>
+<pre><code class="language-sql">SELECT code, url, created_at
+FROM links
+WHERE account_id = :acct
+  AND (created_at, code) &lt; (:last_ts, :last_code)
+ORDER BY created_at DESC, code DESC
+LIMIT 21;  -- limit + 1, to learn whether more rows exist</code></pre>
+<p>The row-value comparison <code>(created_at, code) &lt; (…)</code> is standard SQL and works in Postgres and MySQL. With an index on <code>(account_id, created_at DESC, code DESC)</code> the engine seeks straight to the boundary and reads 21 entries. Cost no longer depends on how deep you are. Page 10,000 costs what page 1 costs. Inserts at the top do not move the boundary, so no duplicates and no skips.</p>
+<p>The client never sees <code>(created_at, code)</code>. It sees an opaque string:</p>
+<pre><code class="language-http">GET /v1/links?limit=2 HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_…
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "data": [
+    { "code": "aZ3k9Qx", "url": "https://example.com/spring", "short_url": "https://snip.ly/aZ3k9Qx",
+      "created_at": "2026-10-11T14:02:09Z", "tags": ["spring-campaign"], "total_clicks": 812 },
+    { "code": "Q81mTpL", "url": "https://example.com/pricing", "short_url": "https://snip.ly/Q81mTpL",
+      "created_at": "2026-10-11T09:40:51Z", "tags": [], "total_clicks": 97 }
+  ],
+  "next_cursor": "eyJ0IjoiMjAyNi0xMC0xMVQwOTo0MDo1MVoiLCJjIjoiUTgxbVRwTCJ9",
+  "has_more": true
+}</code></pre>
+<p>The caller passes it back unchanged:</p>
+<pre><code class="language-http">GET /v1/links?limit=2&amp;cursor=eyJ0IjoiMjAyNi0xMC0xMVQwOTo0MDo1MVoiLCJjIjoiUTgxbVRwTCJ9</code></pre>
+<p>That string is base64url of <code>{"t":"2026-10-11T09:40:51Z","c":"Q81mTpL"}</code>. Treat the encoding as private. If clients can read it, some will build their own, and then you can never change the sort key, add a column, or switch storage engines. Document it as "opaque; do not parse". Some teams sign or encrypt it, which also stops callers from forging a cursor that points at another account's rows. Always re-apply the <code>account_id</code> filter on the server; never trust the cursor for authorisation.</p>
+<div class="callout warn">
+<p><strong>The cost of cursors.</strong> No jumping to page 7, no "page 3 of 40". Callers move forward (and, if you offer a <code>prev_cursor</code>, backward). That is a real loss for UIs with page numbers. Most API consumers are scripts and sync jobs that only want "the next batch", so for a public API the trade favours cursors.</p>
+</div>
+<p>A cursor also changes meaning when the query changes. Reject a cursor sent with a different <code>sort</code> or filter than the one that produced it, with a 400 problem response (see <a href="04-errors-and-validation.html">Errors &amp; Validation</a>), instead of returning wrong pages.</p>
+</section>
+
+<section id="envelope">
+<h2>The response envelope</h2>
+<p>Where does the cursor go? Two common answers.</p>
+<table>
+<thead><tr><th></th><th>Body envelope</th><th>Link header (RFC 8288)</th></tr></thead>
+<tbody>
+<tr><td>Shape</td><td><code>{ "data": […], "next_cursor": "…", "has_more": true }</code></td><td><code>Link: &lt;https://api.snip.ly/v1/links?cursor=…&gt;; rel="next"</code></td></tr>
+<tr><td>Body stays a bare array</td><td>No</td><td>Yes</td></tr>
+<tr><td>Visible to naive clients</td><td>Yes, it is in the JSON</td><td>Only if they read headers</td></tr>
+<tr><td>Room for extra metadata</td><td>Yes (counts, warnings)</td><td>No</td></tr>
+<tr><td>Standard, with tooling</td><td>Convention</td><td>Yes, <code>rel</code> values are registered</td></tr>
+</tbody>
+</table>
+<p>GitHub uses Link headers and returns bare arrays. Stripe uses a body envelope with <code>has_more</code>. Snip uses the body envelope with <code>next_cursor</code>, for one reason: an object at the top level can grow. If the response were a bare array, adding any field later would break every parser. With <code>data</code> inside an object, you can add <code>warnings</code> or <code>as_of</code> next to it without a version bump. (This is the same compatibility logic as in <a href="02-resource-modeling.html">Resource Modeling</a>.) Nothing stops you from sending both; a <code>Link</code> header costs a few bytes and helps generic HTTP clients.</p>
+<p>Return <code>next_cursor: null</code> and <code>has_more: false</code> on the last page. Keep <code>has_more</code> even though it is derivable, because it is the field callers actually test. Get it from the <code>LIMIT n+1</code> trick above: if you fetched n+1 rows, drop the extra and set the flag.</p>
+<h3>No total count by default</h3>
+<p>Callers ask for "how many links do I have?" next to every list. Resist putting <code>total</code> in every response. <code>SELECT COUNT(*)</code> over a large, filtered table is a scan, and you would pay it on every page request. It also goes stale between pages as rows change. If a UI really needs a number, offer <code>?include=total_estimate</code> that returns an approximate figure from table statistics or a cached counter, and name the field so nobody mistakes it for exact. Better: a separate cheap endpoint such as <code>GET /v1/links/count</code> that you can cache and rate limit on its own.</p>
+</section>
+
+<section id="page-size">
+<h2>Page size: a default, a ceiling, and clamping</h2>
+<p>Take <code>limit</code> as a query parameter. Pick a default and a maximum, and publish both. Snip uses a default of 20 and a maximum of 100.</p>
+<ul>
+<li><strong>Default.</strong> Small enough that a casual <code>curl</code> prints something readable and the query is fast. Callers who want throughput raise it.</li>
+<li><strong>Maximum.</strong> Set by your worst-case page cost: row width times limit, plus the time to serialize. Measure it; do not guess. 100 rows of 300 bytes is 30 KB. 10,000 rows is a spike on your tail latency.</li>
+<li><strong>Oversize requests.</strong> <code>?limit=5000</code> gets clamped to 100 and served, not rejected. A clamp keeps working when you later lower the ceiling; a 400 breaks a client that was fine yesterday. The response carries the page it got, and callers who care see fewer rows than they asked for and follow <code>next_cursor</code>. Reject only nonsense: <code>limit=0</code>, <code>limit=-3</code>, <code>limit=abc</code>.</li>
+</ul>
+<p>The exception: if silent clamping would hide a bug, such as a caller who expects exactly 500 rows to arrive in one response, say so in a response header (<code>Snip-Limit-Applied: 100</code>). That is a courtesy, not a contract.</p>
+</section>
+
+<section id="filtering">
+<h2>Filtering: a whitelist, not a language</h2>
+<p>Callers will not page through ten thousand links to find the twelve tagged <code>spring-campaign</code>. Give them filters as plain query parameters:</p>
+<pre><code class="language-http">GET /v1/links?tag=spring-campaign&amp;created_after=2026-03-01T00:00:00Z&amp;limit=50</code></pre>
+<p>Each filter is a field you chose, with a defined meaning, a type, and an index behind it. Snip's list is: <code>tag</code> (exact match, repeatable for OR), <code>created_after</code> and <code>created_before</code> (RFC 3339, half-open), and <code>q</code> for a prefix match on the destination domain. Anything else returns 400 with a problem response naming the unknown parameter. Silently ignoring an unknown filter is the worse failure: the caller thinks they filtered, receives everything, and deletes it.</p>
+<p>The temptation is a general query language: <code>?filter=tags contains 'x' and total_clicks &gt; 100 or …</code>, or passing a JSON predicate through. Avoid it on a public API, for three reasons.</p>
+<ol>
+<li><strong>Cost is unbounded.</strong> A caller can write a predicate no index serves, and your database scans the table for each request. You have handed strangers a query planner.</li>
+<li><strong>Injection surface.</strong> A parser that builds SQL from caller input is the oldest bug there is. Even with parameters bound, field names and operators need their own whitelist.</li>
+<li><strong>It is a contract you cannot narrow.</strong> Every expression you accept today is one you must keep supporting.</li>
+</ol>
+<p>Note the field <code>total_clicks</code> is absent from the filter list. It is eventually consistent, and filtering on it would mean an index updated on every click. Do not offer a filter you cannot keep cheap. If a product need really calls for rich queries (a reporting API, say), build it as a separate endpoint with its own per-request cost limits: a maximum number of terms, a timeout, and a bound on the time window. Expose it as an advanced option, not the default list.</p>
+<div class="callout tip">
+<p><strong>Make each filter earn its index.</strong> Before adding <code>?tag=</code>, check that a query on <code>(account_id, tag, created_at, code)</code> or a tag join table seeks, not scans. If you cannot afford the index, you cannot afford the filter. Filters also have to compose with the cursor, so the cursor index must lead with the filtered column.</p>
+</div>
+</section>
+
+<section id="sorting">
+<h2>Sorting</h2>
+<p>The common convention is a <code>sort</code> parameter with a leading minus for descending: <code>?sort=-created_at</code>. Snip's default is <code>-created_at</code>. The set of allowed values is short and fixed: <code>created_at</code>, <code>-created_at</code>, <code>code</code>, <code>-code</code>.</p>
+<p>Two rules.</p>
+<ol>
+<li><strong>Only sort on indexed columns.</strong> A sort with no matching index makes the database sort the whole result set before it applies the limit. This is the same scan problem as deep offsets, wearing a different hat. Reject other values with 400.</li>
+<li><strong>The sort key is part of the cursor.</strong> A keyset query works only when it compares against the same columns it orders by. For <code>sort=code</code>, the cursor holds <code>(code)</code>; for <code>sort=-created_at</code> it holds <code>(created_at, code)</code>. Always append the unique key as the last tiebreaker, or rows with equal sort values will be skipped or repeated at page boundaries. That is the most common bug in hand-rolled cursors.</li>
+</ol>
+<p>Sorting by a mutable field such as <code>total_clicks</code> breaks the stability guarantee that makes cursors worth having: a row can move across the boundary between page requests. Do not offer it on a paginated list. Offer a "top links" report instead, computed on a snapshot.</p>
+</section>
+
+<section id="fields">
+<h2>Sparse fieldsets</h2>
+<p>A link object is small. A list of 100 of them, each with tags, metadata and counters, is not, and a dashboard that only needs <code>code</code> and <code>url</code> pays for the rest in bytes, serialization time and any join you ran to compute them. Let callers choose:</p>
+<pre><code class="language-http">GET /v1/links?fields=code,url&amp;tag=spring-campaign
+</code></pre>
+<pre><code class="language-json">{
+  "data": [
+    { "code": "aZ3k9Qx", "url": "https://example.com/spring" },
+    { "code": "mR4wB7e", "url": "https://example.com/spring/signup" }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}</code></pre>
+<p>Design notes:</p>
+<ul>
+<li><strong>Whitelist the names.</strong> Unknown field: 400, same as filters.</li>
+<li><strong>Pick a default set.</strong> With no <code>fields</code>, return the standard link: <code>code, url, short_url, created_at, tags</code>. Fields that are costly to compute, like <code>total_clicks</code>, can be opt-in (<code>fields=*,total_clicks</code>) so the common case skips the aggregate lookup. This is where sparse fields save the server work, not only bandwidth.</li>
+<li><strong>Do not let it change identity.</strong> <code>code</code> is always present, even if omitted from <code>fields</code>, so callers can still correlate rows. Say so in the docs.</li>
+<li><strong>Cache keys.</strong> A shared cache must key on the <code>fields</code> value or return the wrong shape. Normalize the order (<code>url,code</code> equals <code>code,url</code>) to avoid duplicate cache entries.</li>
+</ul>
+<p>GraphQL exists largely to make this choice universal. For a REST API with a handful of list endpoints, a <code>fields</code> parameter on the heavy ones is enough.</p>
+</section>
+
+<section id="clicks">
+<h2>The hard case: pagination for clicks</h2>
+<p>Links number in thousands per account. Clicks number in billions. <code>GET /v1/links/{code}/clicks</code> is the endpoint where every earlier choice gets tested: the collection is huge, grows constantly, is aggregated, and is eventually consistent (a click may take seconds to show up).</p>
+<pre><code class="language-http">GET /v1/links/aZ3k9Qx/clicks?since=2026-10-11T00:00:00Z&amp;until=2026-10-12T00:00:00Z&amp;limit=100&amp;cursor=…</code></pre>
+<p>Three decisions make it cheap.</p>
+<p><strong>A time window is required in effect.</strong> <code>since</code> and <code>until</code> are RFC 3339 and half-open (<code>since</code> inclusive, <code>until</code> exclusive). If the caller omits them, default to the last 24 hours, and cap the maximum span at, say, 31 days (return 400 beyond). The storage layer partitions by time, so a window prunes whole partitions before any row is read. That bound is what keeps a worst-case query predictable, and predictable worst cases are what <a href="../designing-for-scale/08-tail-latency-and-capacity.html">capacity planning</a> needs.</p>
+<p><strong>Keyset inside the window.</strong> The sort is fixed (newest first) and the cursor holds <code>(clicked_at, click_id)</code>. No offset, ever, on this endpoint. Because the log is append-only, a cursor stays valid for the length of its window.</p>
+<p><strong>Eventual consistency is part of the contract.</strong> Reading page 1, then page 2 a minute later, may show clicks that were not there when page 1 was cut, but only at the head of the window, above the cursor, which a keyset cursor never revisits. Callers that must have a complete count for a closed window should wait until <code>until</code> is older than the documented lag (Snip says 5 minutes) before they read. State the lag in the reference and return an <code>as_of</code> timestamp beside <code>data</code> so callers can tell. That is the extra top-level field the envelope was built to carry.</p>
+<p>For aggregates ("clicks per day last month") do not page raw rows at all. Offer <code>GET /v1/links/{code}/clicks?group_by=day</code>, which returns at most 31 buckets in one response. The cheapest page is the one you never make the caller fetch.</p>
+<div class="callout insight">
+<p><strong>Bound the work, not just the page.</strong> A limit bounds the rows returned. A time window bounds the rows <em>examined</em>. For huge collections you need both.</p>
+</div>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Try these before opening the answers. Each one needs a reason, not a name.</p>
+<ol>
+<li><p>A caller walks <code>GET /v1/links?limit=100&amp;offset=N</code> over an account with two million links while other users create links. Name the two things that go wrong and say which one the database causes.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Cost grows with every page, because the database reads and discards N rows before it returns 100. That is the database's work. Results also drift: new rows shift later pages, so the caller sees duplicates, or skips rows when others are deleted. See <a href="#offset">Offset pagination, and why it breaks</a>.</p></div></details></li>
+<li><p>Why does the cursor query order by <code>(created_at, code)</code> and not by <code>created_at</code> alone?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Many links can share one timestamp. With only <code>created_at</code> in the key, the boundary row is ambiguous, and rows with the same timestamp get skipped or repeated at a page edge. <code>code</code> is unique, so it makes the order total. See <a href="#cursors">Cursor pagination</a>.</p></div></details></li>
+<li><p>A client asks for <code>limit=5000</code>, and a teammate wants a 400. Give the case for clamping and one case where you would still say so out loud.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Clamping keeps clients working when you lower the ceiling later, and the next_cursor lets them continue. Flag it with a header, or reject, only when a caller's logic depends on getting exactly that many rows in one response. See <a href="#page-size">Page size</a>.</p></div></details></li>
+<li><p>Product asks for <code>?sort=-total_clicks</code> on the paginated link list. What breaks, and what do you offer instead?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Two things: there is no index to seek on, because the value changes with every click, and rows cross the cursor boundary between requests, so pages repeat or skip. Offer a separate top-links report computed on a snapshot. See <a href="#sorting">Sorting</a>.</p></div></details></li>
+<li><p>Why does the clicks endpoint need a time window when it already has a <code>limit</code>?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The limit bounds rows returned; the window bounds rows examined, and lets storage skip whole time partitions. Without the window, a query for a link with a billion clicks has an unbounded worst case. See <a href="#clicks">The hard case: clicks</a>.</p></div></details></li>
+<li><p>Your list responses need a "total links" figure on the dashboard. How do you provide it without making every page request slower?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep it out of the page response. Serve an approximate or cached count from a separate endpoint, or an opt-in field named as an estimate. See <a href="#envelope">The response envelope</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>Paginate every collection from the first release; adding a limit later breaks clients without any error.</li>
+<li>Offset costs O(offset) and drifts under writes. Keep it for small, static, human-read lists.</li>
+<li>Use an opaque cursor over the full sort key plus a unique tiebreaker, so cost stays flat and pages stay stable.</li>
+<li>Wrap lists in an object (<code>data</code>, <code>next_cursor</code>, <code>has_more</code>) so you can add fields later; skip the total count by default.</li>
+<li>Whitelist filters, sorts and fields, each backed by an index. Clamp page size; reject unknown names.</li>
+<li>For huge, eventually consistent collections such as clicks, bound the work with a time window as well as a limit.</li>
+</ul>
+<p>Next, what the API says when a request is wrong. <a href="04-errors-and-validation.html">Errors &amp; Validation →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8288" rel="noopener">RFC 8288: Web Linking</a> — the standard for the <code>Link</code> header and the <code>next</code> and <code>prev</code> relations.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5988" rel="noopener">RFC 5988: Web Linking (obsoleted by RFC 8288)</a> — the earlier definition, still cited by older APIs.</li>
+<li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link" rel="noopener">MDN: Link header</a> — syntax and examples in plain terms.</li>
+<li><a href="https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api" rel="noopener">GitHub REST API: using pagination</a> — a production Link-header design.</li>
+<li><a href="https://docs.stripe.com/api/pagination" rel="noopener">Stripe API: pagination</a> — a production cursor design with <code>has_more</code> and <code>starting_after</code>.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consistency &amp; Its Price — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Once data lives in more than one place (replicas, a cache, shards), the copies disagree for a while.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/05-consistency-and-its-price">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Consistency &amp; Its Price — Designing for Scale">
+<meta property="og:description" content="Once data lives in more than one place (replicas, a cache, shards), the copies disagree for a while.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/05-consistency-and-its-price">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#what-consistency-means">What consistency means</a>
+    <a href="#cap-pacelc">CAP and PACELC</a>
+    <a href="#models">The spectrum of models</a>
+    <a href="#quorums">Quorums</a>
+    <a href="#consensus">Consensus</a>
+    <a href="#snip">Consistency in Snip</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-scaling-the-database.html">← Previous</a>
+    <a href="06-async-work-and-queues.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Consistency, flow &amp; failure</span>
+  <h1>Consistency &amp; Its Price</h1>
+  <p class="subtitle">Once data lives in more than one place (replicas, a cache, shards), the copies disagree for a while. Consistency is the contract about what a read may see during that while, and every stronger contract costs latency and availability. This chapter explains the models, the quorum arithmetic and consensus, then spends them on Snip only where they earn their cost.</p>
+</header>
+
+<section id="what-consistency-means">
+  <h2>What consistency means</h2>
+  <p>Snip now keeps the same link in several places: a primary database, its replicas, a Redis entry and a CDN edge. A write lands on one of them first and travels to the rest over a network that takes time. For that interval the copies hold different values. A reader who asks a copy that has not heard yet gets the old answer. That is the whole problem. Everything else in this chapter is a rule about which old answers a reader may be given.</p>
+  <p>Take a user who edits a link's destination. The write commits on the primary at time 0. A replica receives it at 40 ms, another at 900 ms because it was busy replaying a backlog. If the user reloads at 100 ms and the load balancer sends the read to the second replica, the edit appears to have vanished. Nothing failed; that is asynchronous replication working as designed.</p>
+  <p><strong>Consistency</strong>, in this chapter, is a guarantee about what reads observe when data is replicated. It is a contract between the storage system and the code that calls it. It is not the "C" in ACID. ACID consistency means a transaction takes the database from one valid state to another, with constraints such as foreign keys and unique indexes intact; it concerns a single database's rules and is enforced by the application and isolation levels. The two share a word and little else.</p>
+  </section>
+
+<section id="cap-pacelc">
+  <h2>CAP and PACELC</h2>
+  <p>The CAP theorem is the most quoted and most misread result in the field. Its claim is narrow. Suppose a network partition splits your replicas into two groups that cannot reach each other. A client writes to one side and another client reads from the other. The reader's replica can either answer with what it has, which may be stale, or refuse to answer until it can confirm it is current. Answering keeps the system <em>available</em> and gives up <em>linearizability</em>, the strongest consistency model, defined in the next section. Refusing keeps linearizability and gives up availability. There is no third option, because the information the reader needs is on the far side of the break.</p>
+  <p>"Pick two of three" misreads this in three ways. Partitions are not a feature you can decline; they happen to you, so the real choice is only between consistency and availability, and only while one is happening. CAP says nothing about normal operation, when there is no partition. And "C" and "A" mean specific, strict things: linearizability, and every non-failing node answering every request. A system that is slow, or that answers only from a majority side, is "unavailable" to CAP yet may be perfectly useful.</p>
+  <p>Partitions are rare enough that the everyday cost is elsewhere, and Daniel Abadi's PACELC captures it. <strong>If</strong> there is a partition (P), choose availability (A) or consistency (C); <strong>else</strong> (E), choose latency (L) or consistency (C). The second half applies to every request you serve. To give a strongly consistent answer, a replica must confirm it is current, which means coordinating with another node. Coordination within a data center costs about 0.5 ms for a round trip; across regions it costs 60–150 ms. A read served from the nearest replica without asking anyone is fast and may be stale. A read that checks with the primary or a majority is correct and slower, by exactly one round trip. That latency is the price of consistency on a healthy day.</p>
+  </section>
+
+<section id="models">
+  <h2>The spectrum of models</h2>
+  <p>A consistency model is a rule that forbids some set of surprising results. Stronger models forbid more and force more coordination before a node may answer. This table runs from strongest to weakest.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Model</th><th>What it forbids</th><th>What it costs</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Linearizable (strong)</td><td>Any read that returns an older value than a write that has already completed. The system behaves like one copy, and operations take effect at a single instant between their start and finish.</td><td>Every read and write coordinates with a leader or majority. Unavailable on the minority side of a partition. One round trip or more per operation.</td></tr>
+      <tr><td class="term">Sequential</td><td>Two clients seeing operations in different orders. All agree on one order that respects each client's own sequence, but it need not match real time.</td><td>Still needs a single agreed order, so most of linearizability's coordination; saves little in practice.</td></tr>
+      <tr><td class="term">Causal</td><td>Seeing an effect before its cause: a reply before the post it answers. Unrelated writes may appear in different orders on different nodes.</td><td>Track dependencies and delay delivery until causes arrive. Can stay available during a partition, which linearizability cannot.</td></tr>
+      <tr><td class="term">Session guarantees</td><td><strong>Read-your-writes:</strong> you never miss your own write. <strong>Monotonic reads:</strong> you never see data go backward in time.</td><td>Cheap. Pin a session to one replica, or carry a version token and have a replica wait until it has caught up to it.</td></tr>
+      <tr><td class="term">Eventual</td><td>Nothing in the short term. Only requires that if writes stop, all replicas end with the same value.</td><td>No coordination on reads. Lowest latency, highest availability, and the application sees every anomaly.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Three points in that table deserve a second look. First, <em>linearizable</em> is a statement about real time: once a write returns, no later read anywhere may return the old value. That is what a lock, a unique username or a bank balance needs, and it is almost nothing else. Second, <em>causal</em> is the strongest model that survives a partition. Third, the <em>session guarantees</em> are the practical middle. They give a user a coherent story about their own actions without a global order, and they cost one routing decision. Most product bugs reported as "the system lost my change" are a missing read-your-writes guarantee, not a need for linearizability.</p>
+  <p>Monotonic reads fixes a different surprise. A user refreshes a list and sees a new link, refreshes again and it is gone, because the second request reached a lagging replica. Sending each user's reads to the same replica removes it without touching the write path.</p>
+  </section>
+
+<section id="quorums">
+  <h2>Quorums: tunable consistency without a leader</h2>
+  <p>Some stores, in the style of Amazon's Dynamo (Cassandra, Riak, ScyllaDB), have no single primary. Each key is stored on N replicas, say N = 3, and any replica may accept a write. The client or a coordinating node sends each write to all N and waits for W of them to acknowledge. A read asks R replicas and takes the newest version among the R answers. The rule that makes this work is one line of arithmetic.</p>
+  <p><strong>If W + R &gt; N, every read set overlaps every write set in at least one replica.</strong> With N = 3, W = 2, R = 2, a write reaches two nodes and a read asks two of three, so at least one node in the read has the latest write. The reader compares version numbers or timestamps and picks the newest. The system never needs to know which nodes are ahead; the overlap guarantees at least one is.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>N / W / R</th><th>W + R</th><th>Behavior</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">3 / 2 / 2</td><td>4 &gt; 3</td><td>Overlap. Reads see the latest acknowledged write. Tolerates one slow or dead node for reads and for writes.</td></tr>
+      <tr><td class="term">3 / 3 / 1</td><td>4 &gt; 3</td><td>Overlap. Fast reads, but one dead node blocks all writes.</td></tr>
+      <tr><td class="term">3 / 1 / 1</td><td>2 &lt; 3</td><td>No overlap. Fastest and most available; reads can be stale for as long as repair takes.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The dial moves latency and availability in opposite directions, which is PACELC as a parameter. A larger W makes writes wait for slower replicas and makes them fail when too many are down. A smaller R makes reads fast and risks stale answers. The common choice, W = R = quorum (2 of 3), tolerates one failure on each path and keeps the overlap.</p>
+  <p>Overlap is weaker than it sounds. It guarantees that a read <em>can</em> see the latest acknowledged write, not that the system is linearizable. Concurrent writes to the same key can interleave, a write that fails partway may be visible to some readers and not others, and "newest" depends on clocks or version vectors that can pick a loser.</p>
+  <p><strong>Sloppy quorums and hinted handoff.</strong> A strict quorum requires W acknowledgments from the N replicas that own the key. If two are unreachable, writes fail. A sloppy quorum accepts acknowledgments from any W reachable nodes, even ones that do not own the key. A stand-in node holds the write with a "hint" naming the intended owner, and hands it over when the owner returns. This buys write availability through failures and partitions: the write succeeds. It costs the overlap guarantee. A read of the true owners can miss a write sitting on a stand-in, so W + R &gt; N no longer promises fresh reads until handoff completes. You have chosen availability over consistency, openly, per write.</p>
+</section>
+
+<section id="consensus">
+  <h2>Consensus in one page</h2>
+  <p>Quorums let replicas disagree and patch it up later. Some jobs cannot tolerate that: exactly one node may be leader, exactly one client may hold a lock, a configuration change must take effect for everyone in the same order. These need <strong>consensus</strong>: a group of nodes agreeing on a value, even though some of them crash and messages are delayed.</p>
+  <p>Raft and Paxos both solve this by building a <strong>replicated log</strong>, an ordered list of commands that every node holds and applies in order. If all nodes apply the same commands in the same sequence, they all reach the same state. Agreement on one total order is the product. Raft makes it understandable by splitting the job into parts.</p>
+  <ul>
+    <li><strong>A leader.</strong> At any time one node is leader for a numbered term. Clients send writes to it. If followers stop hearing from it, one starts an election for a higher term.</li>
+    <li><strong>A majority vote.</strong> A candidate wins with votes from more than half the nodes. Two candidates cannot both win a term, because two majorities of the same cluster always share a node.</li>
+    <li><strong>Commit by majority.</strong> The leader appends a command to its log, sends it to followers, and counts it committed once a majority has stored it. Then it replies to the client. A committed entry survives any minority of failures, because any future leader must have been elected by a majority that includes a node holding it.</li>
+  </ul>
+  <p>The arithmetic is the same overlap as in quorums, applied with strict rules. A cluster of 3 survives 1 failure; 5 survives 2; 7 survives 3. Past 5 nodes you mostly add cost and slower commits. If a partition leaves a minority, that side cannot elect a leader or commit, so it stops accepting writes. That is the CAP choice, made for consistency.</p>
+  <p><strong>Where to use it.</strong> Leader election; cluster metadata such as which shard lives on which server (the 1,024-shard map from <a href="04-scaling-the-database.html">chapter 4</a> is a good candidate); configuration; distributed locks and leases; and the rare small dataset that must be linearizable. You rarely run it yourself: etcd, ZooKeeper and Consul package it.</p>
+  <p><strong>Where not to.</strong> Do not push high-volume data through one consensus group. Every write pays a leader-to-majority round trip plus a disk flush, so latency is at least one network round trip (about 0.5 ms in a data center, 60–150 ms across regions) and throughput is capped by one leader's log. A well-run group commits thousands to tens of thousands of small writes per second, depending on hardware and batching, but it does not scale out by adding nodes: more nodes means more votes to collect, not more capacity. Databases that need both scale and consensus run many small groups, one per shard, and keep each group's data small.</p>
+  </section>
+
+<section id="snip">
+  <h2>Consistency in Snip</h2>
+  <p>Snip is a good model for the discipline because almost none of it needs the expensive end of the table. Go through each data path and pick the weakest model that keeps users from noticing.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Path</th><th>What a wrong read looks like</th><th>Chosen guarantee</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Create a link, then open it</td><td>The creator clicks "copy" and gets 404 from a lagging replica.</td><td>Read-your-writes for the creator, by routing their reads to the shard's primary for a brief window after the write, as in <a href="04-scaling-the-database.html">chapter 4</a>.</td></tr>
+      <tr><td class="term">Redirect someone else's link</td><td>After an edit, some visitors reach the old URL for a few seconds.</td><td>Eventual, read from replicas and the cache. A few seconds of staleness is invisible, and <a href="03-caching.html">the 5-minute edge TTL</a> already sets a looser bound.</td></tr>
+      <tr><td class="term">Click counts</td><td>The dashboard shows 10,412 and the true figure is 10,430.</td><td>Eventual and approximate. Clicks flow through a queue into counters, covered in <a href="06-async-work-and-queues.html">chapter 6</a>.</td></tr>
+      <tr><td class="term">Shard map and primaries</td><td>Two servers each believe they own shard 17 and both accept writes.</td><td>Linearizable, kept in a small consensus store (etcd or similar), cached by every app server.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Count the strong guarantees: one. Only the shard map and the primary lock need linearizability, because two owners for one shard corrupt data. That is a few kilobytes changing a few times a day, which a three-node consensus group handles without effort. The 1,200 redirects per second never touch it. The link-creation path, around 12 writes per second, needs only a session guarantee, which costs a routing rule, not a protocol.</p>
+  <p>Where would a stronger model actually be worth it? Custom short codes, where two users must not both claim <code>/sale</code>. That is a uniqueness constraint, and it belongs on the primary of the shard that owns that code, enforced by a unique index in the same transaction as the insert. It is a linearizable operation on one row, on one machine. It does not need cross-region consensus, because the sharding scheme already gave the code a single owner. Consistency got cheap by deciding who owns the data.</p>
+    <p>Eventual consistency turns on one assumption: the work that brings copies together actually happens. Click counts rely on a queue delivering events, which is a flow-control problem. That is the next chapter: <a href="06-async-work-and-queues.html">Asynchronous Work &amp; Queues</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague says "CAP means we have to pick two of consistency, availability and partition tolerance, and we picked CP." What is wrong with that sentence, and what does CAP actually say about a healthy cluster?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>You do not choose partition tolerance; networks split whether you plan for it or not. CAP says only that during a partition you must give up either linearizability or availability. It says nothing about a healthy cluster, where the trade is latency against consistency (PACELC). See <a href="#cap-pacelc">CAP and PACELC</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A user saves a setting, the page reloads, and the old value shows. Ten seconds later it is correct. Name the guarantee that was missing and two ways to provide it without making the whole database linearizable.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Read-your-writes. Route that user's reads to the primary for a short window after their write, or carry a version token with the session and have a replica wait until it has applied that version before answering. Both cost a routing or wait decision on one user's requests, not coordination on every read. See <a href="#models">The spectrum of models</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A store has N = 5 replicas. You set W = 2 and R = 3. Does a read always see the latest acknowledged write? Then change one number to make the answer different and say what it costs.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>W + R = 5, which is not greater than N = 5, so the read set can miss the two nodes that took the write. Raising W to 3 gives overlap (6 &gt; 5), at the cost that writes now wait for three replicas and fail if three are unreachable. Raising R to 4 also works but makes reads slower and less available. See <a href="#quorums">Quorums</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team proposes routing all link creations through a 5-node Raft group so every write is linearizable. At 12 writes per second, would throughput be a problem? What else would you ask before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Throughput would be fine, since a group handles thousands of small writes per second. The tempting objection is wrong at this volume. Ask instead about data size (500 GB and growing in one group's log and state), latency (every create pays a majority round trip, more if nodes are in different regions), and what the guarantee buys. Sharding already gives each code one owner, so a unique index on that shard's primary is linearizable for uniqueness without a global log. See <a href="#consensus">Consensus</a> and <a href="#snip">Consistency in Snip</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A sloppy quorum accepts a write while two of its three owner replicas are down. What does the client see, and what can a later read with R = 2 return?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The client sees success, because stand-in nodes acknowledged and hold the write with hints. A later read that queries the owners can return the old value until handoff delivers the write, since the stand-ins are outside the owner set that the overlap rule counts on. The system chose write availability over the freshness guarantee. See <a href="#quorums">Quorums</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Copies disagree because writes travel at different speeds. A consistency model is the rule about which stale answers a reader may get, and it is separate from the C in ACID.</li>
+    <li>CAP covers only the partition case, where you give up linearizability or availability. The cost you pay every day is PACELC's latency against consistency, one round trip per coordinated read.</li>
+    <li>Stronger models forbid more and coordinate more. Session guarantees like read-your-writes cover most user-visible bugs for the price of a routing rule.</li>
+    <li>Quorums give tunable consistency with W + R &gt; N overlap, but overlap is weaker than linearizability, and sloppy quorums trade even that for write availability.</li>
+    <li>Consensus gives one agreed order through a leader and a majority. Use it for small, critical facts such as leaders, locks and shard maps, and never for bulk data, because every write pays a majority round trip and one group does not scale out.</li>
+    <li>Snip needs one linearizable thing, the shard map and primary ownership, and it handles everything else with read-your-writes or eventual reads. Pay for strength per data path, not per system.</li>
+  </ul>
+  <p>Eventual consistency only holds if the work that reconciles the copies gets done, and click counting does that work in the background at 100 million events a day. → <a href="06-async-work-and-queues.html">Asynchronous Work &amp; Queues</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, 2017. Chapter 5 (replication, lag and its anomalies) and chapter 9 (linearizability, ordering, consensus) are the best single treatment of this chapter.</li>
+    <li><a href="https://jepsen.io/consistency" target="_blank" rel="noopener"><strong>Jepsen: Consistency Models</strong></a> — Kyle Kingsbury. A map of every model in this chapter and how they relate, with precise definitions.</li>
+    <li><a href="http://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf" target="_blank" rel="noopener"><strong>Consistency Tradeoffs in Modern Distributed Database System Design</strong></a> — Daniel Abadi, 2012. The PACELC argument, and why CAP alone misleads.</li>
+    <li><a href="https://raft.github.io/raft.pdf" target="_blank" rel="noopener"><strong>In Search of an Understandable Consensus Algorithm</strong></a> — Ongaro and Ousterhout, USENIX ATC 2014. The Raft paper: readable, with the election and log rules in full.</li>
+    <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener"><strong>Dynamo: Amazon's Highly Available Key-value Store</strong></a> — DeCandia et al., SOSP 2007. Where quorums, sloppy quorums and hinted handoff come from.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

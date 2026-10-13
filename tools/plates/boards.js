@@ -356,6 +356,49 @@
     d.text(200,210,'Δ = effect',{size:11.5});
     d.note(26,286,'the random split makes A and B comparable — even on what you never measured');
   };
+  // ===== SOFTWARE ENGINEERING =====
+  B['software-engineering/designing-for-scale']=function(d){
+    d.title('Find the bottleneck, then move it');
+    var c=d.round(16,56,64,32,'client');
+    var lb=d.box(106,54,78,36,'load\nbalancer',{size:10.5});
+    var app=d.box(212,54,66,36,'app',{wash:1});
+    var db=d.cyl(314,46,62,60,'DB');
+    d.connect(c,lb);d.connect(lb,app);d.connect(app,db);
+    d.ring(306,40,78,74);d.note(300,130,'bottleneck',{size:10.5});
+    d.line(30,162,370,162,{faint:1});d.text(200,156,'two moves',{size:11});
+    d.text(92,186,'scale up',{size:12});
+    d.cyl(66,196,66,80,'bigger\nbox');
+    d.note(26,300,'more CPU / RAM · simple · has a ceiling',{size:9.5});
+    d.text(292,186,'scale out',{size:12});
+    d.cyl(232,206,38,56,'',{});d.cyl(278,206,38,56,'',{wash:1});d.cyl(324,206,38,56,'',{});
+    d.note(232,300,'more boxes · split the data',{size:9.5});
+    d.arrow(150,236,224,236,{red:1,label:'shard / replicate',ly:230});
+  };
+  B['software-engineering/apis']=function(d){
+    d.title('A stable surface over a changing system');
+    d.round(14,80,58,32,'client');
+    d.box(116,42,108,150,'',{});
+    d.text(170,60,'API · /v1',{size:12});
+    d.text(170,86,'POST /links',{size:10});
+    d.text(170,104,'GET /links/{code}',{size:9.5});
+    d.text(170,122,'PATCH /links/{code}',{size:9});
+    d.text(170,140,'GET …/clicks',{size:9.5});
+    d.text(170,172,'stable · versioned',{size:9.5});
+    d.arrow(74,96,114,96,{label:'depends on',ly:90});
+    d.cyl(300,54,54,44,'db');
+    d.box(300,108,54,28,'cache',{wash:1});
+    d.box(300,146,54,28,'queue');
+    d.arrow(226,96,298,80,{faint:1});
+    d.arrow(226,116,298,120,{faint:1});
+    d.arrow(226,136,298,158,{faint:1});
+    d.note(272,192,'implementation — free to change',{size:9.5});
+    d.line(30,224,370,224,{faint:1});
+    d.text(200,218,'evolve by adding',{size:11});
+    d.round(40,244,150,30,'v1  { code, url }',{size:10});
+    d.arrow(196,259,250,259,{red:1});
+    d.round(256,244,120,30,'+ tags',{size:10});
+    d.note(26,302,'add fields · never remove or rename · new /v2 only on a real break',{size:9.5});
+  };
   // ===== DEFI =====
   B['defi-engineering/senior-defi-protocol-engineer']=function(d){
     d.title('A lending market, and where it breaks');

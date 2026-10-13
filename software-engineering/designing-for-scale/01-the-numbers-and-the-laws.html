@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Numbers and the Laws — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="After the model in Start Here comes the arithmetic that tells you which resource will run out first.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/01-the-numbers-and-the-laws">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Numbers and the Laws — Designing for Scale">
+<meta property="og:description" content="After the model in Start Here comes the arithmetic that tells you which resource will run out first.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/01-the-numbers-and-the-laws">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#latency-throughput">Latency and throughput</a>
+    <a href="#up-vs-out">Scaling up versus out</a>
+    <a href="#littles-law">Little's Law</a>
+    <a href="#latency-numbers">The latency numbers</a>
+    <a href="#back-of-envelope">Back-of-the-envelope</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous</a>
+    <a href="02-load-balancing-and-statelessness.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The building blocks</span>
+  <h1>The Numbers and the Laws</h1>
+  <p class="subtitle">After the model in Start Here comes the arithmetic that tells you which resource will run out first. This chapter defines latency and throughput, ties them together with Little's Law, sets the latency numbers you should know by heart, and uses them to size Snip on paper in a few minutes.</p>
+</header>
+
+<section id="latency-throughput">
+  <h2>Latency and throughput are different axes</h2>
+  <p>A teammate says "the redirect path is slow." That sentence hides two different complaints, and the fixes do not overlap. <strong>Latency</strong> is how long one request takes from arrival to response, measured in time. <strong>Throughput</strong> is how many requests the system finishes per unit of time, measured in requests per second. A user feels latency. Your capacity bill follows throughput.</p>
+  <p>They move independently. A single-threaded handler that answers in 1 ms has excellent latency and a ceiling of about 1,000 requests per second, because it does one thing at a time. A nightly batch job that scans a billion rows has terrible latency (hours) and enormous throughput (millions of rows per second). A cross-continent link has high latency and, with enough packets in flight, high throughput. The first system needs more workers. The second needs nothing. The third needs the data moved closer.</p>
+  <p>For Snip, the redirect has a latency target: a median (p50) of a few milliseconds of server time, because a person is waiting for the destination page to start loading. It also has a throughput requirement: about 1,200 redirects per second on average and 6,000 to 12,000 at peak. Meeting one says nothing about the other. A cache in front of the database cuts latency and, as a side effect, raises throughput. Adding a second server does nothing for the latency of any single request, but it doubles the number the fleet can finish per second.</p>
+  <div class="callout insight">
+    <span class="callout-label">Latency fixes need a faster path; throughput fixes need more paths</span>
+    <p>To cut latency you shorten the work on the critical path: skip a hop, avoid a disk read, parallelize independent calls. To raise throughput you run more of that work at once: more threads, more machines, batching. Know which number is missing before choosing, or you will buy capacity to fix a slow query. The next two sections connect the two numbers precisely. Percentiles beyond p50 (p99, p99.9) are their own problem, covered in <a href="08-tail-latency-and-capacity.html">chapter 08</a>.</p>
+  </div>
+</section>
+
+<section id="up-vs-out">
+  <h2>Scaling up versus scaling out</h2>
+  <p>When a number is short, you can make the machine bigger or add machines. <a href="00-START-HERE.html#two-moves">Start Here</a> introduced both moves. The question now is which to make first, and the answer depends on what the cost curve and the failure model look like.</p>
+  <p><strong>Vertical scaling</strong> moves the same process to a larger box: more cores, more RAM, faster disks. Nothing in your code changes, and there is no coordination problem, because there is still one machine holding one copy of the truth. That makes it the right first move for most stateful components, above all the database. Snip's 500 GB of links fits comfortably on one modern server, and a bigger instance is a one-afternoon fix.</p>
+  <p>Its limits come from two directions. The price curve bends upward: hardware is priced for the middle of the market, so the last doubling of cores or memory costs far more than the one before, and past a point no larger machine exists. And one big machine is a single point of failure. When it reboots, crashes or is being patched, everything on it is down, no matter how expensive it was.</p>
+  <p><strong>Horizontal scaling</strong> adds machines. Cost grows roughly linearly with capacity, the ceiling is far away, and losing one box costs you a fraction of capacity instead of the service. The price is paid in design: work must be splittable, requests must be routed, and any state the machines share must be kept in agreement. A stateless web tier scales out almost for free. A database does not, which is why <a href="04-scaling-the-database.html">chapter 04</a> is long.</p>
+  <p>The default is to scale the stateless tiers out and the stateful tier up until it hurts, then split it. The exception: if you need to survive a machine failure with no downtime, you need at least two machines regardless of load, and that is a horizontal design from day one.</p>
+</section>
+
+<section id="littles-law">
+  <h2>Little's Law: how much is in flight</h2>
+  <p>Suppose redirects arrive at 1,200 per second and each takes 20 ms from arrival to response. How many are being handled at any instant? You do not need a simulation. Each second brings 1,200 requests, and each stays for 0.02 seconds, so the system holds 1,200 × 0.02 = 24 requests at a time on average. That is <strong>Little's Law</strong>:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">L = λ × W
+
+L  average number of requests in the system (concurrency)
+λ  average arrival rate (requests per second)
+W  average time each request spends in the system (seconds)</code></pre></div>
+  <p>The intuition is a queue at a bakery. If customers walk in at 2 per minute and each spends 5 minutes inside, the shop holds about 10 people. Speed up the baker and W falls, so fewer people are inside for the same arrivals. The law needs no assumptions about arrival patterns or service-time distribution. It holds for any stable system, which is why it works on a thread pool, a database connection pool, or a whole datacenter.</p>
+  <p>It becomes a sizing tool when you read L as "slots in use." At Snip's peak of 12,000 requests per second with 20 ms per request, L is 240, so the service needs capacity for roughly 240 concurrent requests. If each request holds a database connection for 2 ms of that 20, the connection pool needs about 12,000 × 0.002 = 24 connections, not 240. Sizing the pool from the connection's hold time, not the full request time, is how you avoid opening hundreds of idle connections that the database must then manage.</p>
+  <p>The same law predicts failure. A pool of <em>c</em> slots, each held for time <em>W</em>, can complete at most <em>c / W</em> requests per second. Give Snip's database a pool of 100 connections at 5 ms per query and it can serve 20,000 queries per second. If a slow disk or a lock stretches each query to 30 ms, capacity drops to 100 / 0.03 ≈ 3,300 per second. Arrivals at 12,000 per second now exceed it. The excess cannot vanish, so it waits, and the queue grows by about 8,700 requests every second until memory, timeouts or users give out. Longer waits also raise W for everyone behind, which pushes the queue up further. When arrival rate exceeds <em>c / W</em>, the queue is unbounded; there is no steady state to tune toward.</p>
+  <div class="callout warn">
+    <span class="callout-label">A slow dependency multiplies your concurrency</span>
+    <p>If a downstream call goes from 20 ms to 200 ms at constant traffic, L rises tenfold: 240 in flight becomes 2,400. Threads, sockets and memory run out long before CPU does. This is why timeouts and load shedding matter, and <a href="09-reliability-and-degradation.html">chapter 09</a> returns to them.</p>
+  </div>
+</section>
+
+<section id="latency-numbers">
+  <h2>The latency numbers worth memorizing</h2>
+  <p>You cannot predict a bottleneck without knowing what each operation costs. Exact figures change with hardware generation, so memorize the orders of magnitude and the ratios between them. These are rounded from the widely circulated list attributed to Jeff Dean and updated by Colin Scott; treat each as accurate to a factor of two or three.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Operation</th><th>Approx. time</th><th>Relative to memory</th></tr></thead>
+    <tbody>
+      <tr><td>L1 cache reference</td><td>~1 ns</td><td>1/100</td></tr>
+      <tr><td>L2 cache reference</td><td>~4 ns</td><td>1/25</td></tr>
+      <tr><td>Main memory reference</td><td>~100 ns</td><td>1×</td></tr>
+      <tr><td>SSD random read</td><td>~100 µs</td><td>1,000×</td></tr>
+      <tr><td>Round trip within a datacenter</td><td>~500 µs</td><td>5,000×</td></tr>
+      <tr><td>Spinning-disk seek</td><td>~10 ms</td><td>100,000×</td></tr>
+      <tr><td>Round trip across continents</td><td>~150 ms</td><td>1,500,000×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The useful part is the spacing. Memory to SSD is a factor of about 1,000, and SSD to a cross-region call is another factor of about 1,000. Each step down the list is a different kind of cost, not a slightly slower version of the same one.</p>
+  <p>Read the table as a set of design rules. A cache hit in the same process costs hundreds of nanoseconds; a hit in a cache server one network hop away costs about half a millisecond, dominated by the round trip, not the lookup. A database read that misses memory and goes to SSD adds roughly 100 µs per random read, and a query that touches 50 pages that way spends 5 ms before doing any computation. A call to another region costs 150 ms, which is already more than Snip's whole redirect budget by a factor of tens. So a redirect must never wait on a cross-region call, and the data it needs must be served from somewhere close. These ratios are why <a href="03-caching.html">caching</a> pays off: it swaps a slow tier for a fast one by a factor of hundreds or thousands.</p>
+  <p>Sequential operations add; parallel ones take the maximum. A redirect that makes four dependent calls inside the datacenter pays 4 × 0.5 ms = 2 ms in network time alone. That is most of a "few milliseconds" budget, and no code optimization recovers it.</p>
+</section>
+
+<section id="back-of-envelope">
+  <h2>Back-of-the-envelope estimation</h2>
+  <p>Before drawing an architecture, you want to know whether the data fits on one disk, whether one machine can take the traffic, and whether the hot set fits in memory. These questions have answers you can reach in a few minutes with rounded numbers, and the answers decide the design. The method has three rules. Round aggressively, to one significant digit or a power of ten: a day is 100,000 seconds, not 86,400. Carry units on every line, so a mismatch shows up as nonsense. And write down each assumption, so someone can challenge the input instead of the arithmetic.</p>
+  <p>Here is Snip end to end. The inputs from Start Here are 100 million redirects per day, 1 billion stored links, 1 million new links per day, and about 500 bytes per link row. The click size, hot-set size and response size below are assumptions, marked as such.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">TRAFFIC
+ redirects/sec (avg)   100M / ~86,000 s      = ~1,200 /s
+ redirects/sec (peak)  1,200 x 5 to 10        = 6,000 to 12,000 /s
+ new links/sec         1M / 86,000 s          = ~12 /s   (writes are tiny)
+ clicks recorded/sec   one per redirect       = ~1,200 /s avg, ~12,000 /s peak
+
+STORAGE
+ links                 1B x 500 B             = 500 GB
+ growth                1M/day x 500 B         = 500 MB/day = ~180 GB/year
+ clicks (assume 100 B) 100M/day x 100 B       = 10 GB/day  = ~3.6 TB/year
+
+BANDWIDTH (assume ~500 B per redirect response, headers included)
+ average               1,200 x 500 B          = 600 KB/s  = ~5 Mbit/s
+ peak                  12,000 x 500 B         = 6 MB/s    = ~48 Mbit/s
+
+CACHE (assume the hot 1% of links -- 10M -- take ~99% of traffic)
+ hot set               10M x 500 B            = 5 GB
+ lookups avoiding DB   hit rate 99%           = ~12 /s reach the DB at 1,200 /s
+                                                 ~120 /s at 12,000 /s peak</code></pre></div>
+  <p>Each line says something specific. Storage: 500 GB of links fits on one server's SSD, so the link table is not what forces sharding for size; the click log, at 3.6 TB per year and growing, is. Traffic: reads outnumber new-link writes by about 100 to 1 (1,200 against 12 per second), which says to optimize the read path. Clicks, though, write as often as redirects happen, 12,000 per second at peak. That write rate is what the database will feel first, and it is why <a href="06-async-work-and-queues.html">queues</a> exist. Bandwidth: tens of megabits, trivial for one network card, so bandwidth is not the bottleneck. Cache: a 5 GB hot set fits in the memory of a single cache node, and at a 99% hit rate the database sees only 1% of redirect lookups.</p>
+  <div class="callout tip">
+    <span class="callout-label">The estimate's job is to rank bottlenecks, not to be right</span>
+    <p>Being off by 2× rarely changes a decision. Being off by 100× does, and rounding will not cause that. Wrong units, a missing "per day," or a forgotten multiplier will. Check every result against the latency table: does a 6 MB/s peak look right against a network card that moves over 100 MB/s? If a number surprises you, find the cause before building on it.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A service answers every request in 2 ms, yet load tests show it tops out at 500 requests per second on a single worker thread, and your manager asks you to "make it faster." Which number is the problem, and what would you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Throughput is the problem, not latency. One thread finishing a 2 ms request at a time gives 1 / 0.002 = 500 requests per second. Shortening the request helps a little, but the direct fix is more concurrency: more threads, processes or machines. The tempting answer is to optimize code to cut latency, which would take a lot of effort to raise a ceiling that more workers raise cheaply. See <a href="#latency-throughput">latency and throughput</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Snip's redirect service receives 3,000 requests per second, each taking 50 ms end to end. How many requests are in flight on average, and what does that number tell you about the thread pool?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>L = 3,000 × 0.05 = 150 in flight. The service needs at least 150 concurrent slots (threads, or async tasks with their buffers) at that load, plus headroom for bursts, since this is only the average. A pool of 100 would queue requests even though the CPU may be idle. See <a href="#littles-law">Little's Law</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your database pool has 50 connections and queries average 4 ms, so it handles about 12,500 queries per second. At 3 a.m. a bad index change makes queries take 25 ms, and traffic is unchanged at 8,000 per second. Describe what happens over the next minute and why it does not recover on its own.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Capacity falls to 50 / 0.025 = 2,000 per second, below the arrival rate of 8,000. The backlog grows by about 6,000 requests per second. Callers wait longer, which raises time in the system and holds more of their own resources, so the problem spreads upstream. With arrivals above capacity the queue has no steady state, and it will not recover until the index is fixed, load is shed or capacity is added. See <a href="#littles-law">Little's Law</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague proposes caching Snip's link lookups in a Redis server on another host, arguing it must beat reading the row from the database's SSD. A call to Redis costs about 0.5 ms round trip, and the database read is a 100 µs SSD read. When is the colleague's claim wrong, and what does that suggest about where a cache should live?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The claim is wrong when the database read really is a single SSD read: 100 µs is cheaper than a 500 µs network round trip. The cache wins only against slower paths: a query that touches several pages, a network hop to the database itself (also about 0.5 ms), or a loaded database. An in-process cache avoids the hop entirely, at about 100 ns per lookup. Judge a cache by what the miss path costs and how many hops the hit saves, not by "memory beats disk." See <a href="#latency-numbers">the latency numbers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two designs for Snip's link table: one 2 TB server, or four 500 GB shards. Using the estimate in this chapter, what facts decide between them, and which would you start with?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The link data is 500 GB and grows ~180 GB per year, and the lookup load is modest once cached (around a hundred queries per second reach the database at peak), so one server fits for years. Start there: it is simpler and has no cross-shard routing. The facts that flip the choice are write volume (clicks, not links), the need to survive a machine loss without downtime (which calls for replicas, not necessarily shards), and any projected growth that would pass the single-machine ceiling. Either way you need at least one replica. See <a href="#up-vs-out">scaling up versus out</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You estimate Snip's storage as 1B links × 500 B = 500 TB. What went wrong, and how would you have caught it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A units slip: 10<sup>9</sup> × 500 B = 5 × 10<sup>11</sup> B = 500 GB, three orders of magnitude lower. Carrying units each line and comparing with a sanity check (500 TB for a table of short URLs would be several thousand large disks) exposes it. Rounding does not cause errors of this size; units do. See <a href="#back-of-envelope">back-of-the-envelope estimation</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Latency is the time one request takes; throughput is how many finish per second. They are separate axes, and the fix for one rarely helps the other.</li>
+    <li>Scale stateless tiers out and stateful ones up first; go horizontal on the stateful tier when you hit the price curve, the size ceiling, or a need to survive a machine failure.</li>
+    <li>Little's Law, L = λ × W, gives the average number of requests in flight. Use it to size thread and connection pools from how long each resource is held.</li>
+    <li>When arrivals exceed a pool's capacity (slots divided by hold time), the queue grows without bound. A slow dependency can push a healthy system there by raising W alone.</li>
+    <li>Memorize the ratios, not the digits: memory ~100 ns, SSD ~100 µs, same-datacenter round trip ~500 µs, cross-continent ~150 ms. Each step is roughly a factor of 1,000.</li>
+    <li>Estimate before you design: round hard, carry units, state assumptions. For Snip this shows 500 GB of links, ~12,000 click writes per second at peak, and a 5 GB hot set.</li>
+  </ul>
+  <p>With the numbers in hand, the first lever to pull is spreading requests across many identical servers: <a href="02-load-balancing-and-statelessness.html">Load Balancing &amp; Statelessness</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html" target="_blank" rel="noopener"><strong>Latency Numbers Every Programmer Should Know (interactive)</strong></a> — Colin Scott's version of the list popularized by Jeff Dean and Peter Norvig, with figures by hardware year. Good for seeing how the ratios hold as absolute numbers shift.</li>
+    <li><a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener"><strong>Latency Numbers Every Programmer Should Know (original gist)</strong></a> — Jonas Bonér's plain-text copy of the classic table. Good for a printable reference.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Little%27s_law" target="_blank" rel="noopener"><strong>Little's law</strong></a> — overview of the result, with the conditions under which it holds. Good for the statement and worked examples; the original proof is J. D. C. Little's 1961 paper in <em>Operations Research</em>.</li>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, O'Reilly, 2017, chapter 1 ("Reliable, Scalable, and Maintainable Applications"). Good for how to describe load and performance, including why percentiles beat averages.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

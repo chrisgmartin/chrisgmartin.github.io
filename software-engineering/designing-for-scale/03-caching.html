@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Caching — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A cache keeps a copy of an answer closer to the asker than the source of truth, so most requests never reach the source.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/03-caching">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Caching — Designing for Scale">
+<meta property="og:description" content="A cache keeps a copy of an answer closer to the asker than the source of truth, so most requests never reach the source.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/03-caching">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=17"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#hierarchy">The cache hierarchy</a>
+    <a href="#patterns">Read and write patterns</a>
+    <a href="#invalidation">Invalidation</a>
+    <a href="#stampede">The stampede</a>
+    <a href="#snip">Caching Snip</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-load-balancing-and-statelessness.html">← Previous</a>
+    <a href="04-scaling-the-database.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The building blocks</span>
+  <h1>Caching</h1>
+  <p class="subtitle">A cache keeps a copy of an answer closer to the asker than the source of truth, so most requests never reach the source. It is the highest-leverage scaling move you have, and it works by quietly accepting that some copies will be wrong. This chapter covers where copies live, how they get filled, how they go stale, and how a single expiry can take the database down.</p>
+</header>
+
+<section id="hierarchy">
+  <h2>The cache hierarchy</h2>
+  <p>A request to Snip passes through up to five places that can answer it before the database does. Each is a cache, each sits closer to a different audience, and each trades a different amount of freshness for speed. Reading them from the client inward shows where a hit saves the most.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>What lives there</th><th>Typical cost of a hit</th><th>Who it serves</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Browser cache</td><td>Whole HTTP responses, keyed by URL, kept by <code>Cache-Control</code></td><td>0 ms: no network at all</td><td>One user, one device</td></tr>
+      <tr><td class="term">CDN / edge</td><td>HTTP responses, in a data center near the user</td><td>5–30 ms, against 50–200 ms to your origin across an ocean</td><td>Everyone in that region</td></tr>
+      <tr><td class="term">In-process cache</td><td>Objects in the app server's own memory</td><td>Under 1 µs: a hash lookup</td><td>One app server (each holds its own copy)</td></tr>
+      <tr><td class="term">Shared cache (Redis, Memcached)</td><td>Key-value entries on a separate cache tier</td><td>About 0.2–1 ms: one network round trip inside the data center</td><td>Every app server</td></tr>
+      <tr><td class="term">Database buffer pool</td><td>Disk pages the database keeps in RAM</td><td>Skips a ~0.1 ms SSD read per page; the query still parses, plans and executes</td><td>Every query, automatically</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Two things in that table decide how you use it. First, the layers farther out save more and offer less control. A browser hit costs you nothing and you cannot reach into a user's laptop to evict it; a Redis entry you can delete in one command. Second, the in-process cache multiplies copies. Twenty app servers means twenty independent copies of a hot key, which can disagree for as long as their TTLs allow. In-process caches suit data that is small, read constantly and safe to be briefly stale, such as feature flags or configuration. Per-user and per-link data belongs in the shared tier.</p>
+  <p>The buffer pool is the one you never configure as a cache but should know about. If your working set of index and table pages fits in RAM, the database is already serving most reads from memory, and an application cache in front of it is saving query overhead and connections rather than disk seeks. That is still worth having. A database that serves 100 rps from memory is calm; one that serves 10,000 rps from memory is saturating its CPU and connection pool, the bottleneck <a href="01-the-numbers-and-the-laws.html">the numbers chapter</a> told you to watch for.</p>
+</section>
+
+<section id="patterns">
+  <h2>Read and write patterns</h2>
+  <p>"Use a cache" hides a decision about who talks to whom and in what order. Four patterns cover nearly every case.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Pattern</th><th>Mechanism</th><th>What it costs you</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Cache-aside (lazy loading)</td><td>The app reads the cache; on a miss it reads the database, writes the result to the cache, and returns it. Writes go to the database; the app deletes or updates the cache entry.</td><td>The first request for each key is slow. Between a database write and the cache delete, readers see the old value. A race can even re-insert the old value after the delete.</td></tr>
+      <tr><td class="term">Read-through</td><td>Same flow, but the cache library or service does the database read on a miss. The app only ever talks to the cache.</td><td>The same staleness and cold-start costs, plus a cache that needs a loader and credentials for your database.</td></tr>
+      <tr><td class="term">Write-through</td><td>Every write goes to the cache, which writes to the database synchronously before acknowledging.</td><td>Write latency is cache plus database. You fill the cache with keys that may never be read again.</td></tr>
+      <tr><td class="term">Write-back (write-behind)</td><td>Writes land in the cache, which acknowledges at once and flushes to the database later, in batches.</td><td>A window of acknowledged writes that exist only in cache RAM. If the node dies before the flush, they are gone.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>Default to cache-aside.</strong> It is the only pattern where a cache outage degrades the system instead of breaking it: the app falls through to the database, slower but correct. It also caches only what is read, so memory goes to keys that earn it, and the cache is a plain key-value store with no knowledge of your schema. Read-through is cache-aside with the loop moved into a library; pick it when a framework gives it to you, not for any change in behavior.</p>
+  <p>Write-through wins when a read immediately after a write must see the new value and the data is read far more than written, such as a user's profile settings. The write pays double, but there is no stale window and no extra invalidation code. Write-back wins only when writes are the bottleneck and loss is acceptable: counters, view tallies, "last seen" timestamps. If you would apologize to a customer for losing the write, do not use it. Snip's click counts fit the profile, and the next chapters will show why even they should not live in a simple cache.</p>
+  <div class="callout warn">
+    <span class="callout-label">Cache-aside has a race that no TTL hides</span>
+    <p>Reader A misses, reads the old row from the database, and stalls. A writer updates the row and deletes the cache key. Reader A then wakes and writes the old value into the cache. The key is now stale until its TTL expires, and no delete will fix it because the delete already happened. This is rare per request and certain at enough volume. A TTL is therefore not an optimization on top of invalidation; it is the backstop that bounds the damage.</p>
+  </div>
+</section>
+
+<section id="invalidation">
+  <h2>Invalidation, the hard part</h2>
+  <p>The old joke says there are two hard problems in computer science: cache invalidation and naming things. The reason is mechanical. A cache entry is a copy, and the system has two places that can change independently: the source, when someone writes, and the cache, when an entry expires or is evicted. Nothing connects the two unless you build the connection. Every drift between cache and source is a write that reached one and not the other, or reached them in a different order.</p>
+  <p>Three tactics cover most of the ground, and they stack.</p>
+  <p><strong>TTL expiry.</strong> Give every entry a time to live and let it die. It needs no coordination: even if you forget a code path, no entry stays wrong longer than its TTL. The cost is a staleness window equal to the TTL, and a miss at every expiry. Choose the TTL by asking how long a wrong answer is tolerable, not how long a right one stays right. Prices and permissions get seconds; a blog post gets hours.</p>
+  <p><strong>Explicit invalidation.</strong> On a write, delete (or overwrite) the affected keys. This shrinks the stale window to roughly the time between the database commit and the delete, usually milliseconds. It requires that every write path know every key that depends on the changed row, and that is where it fails in practice: someone adds a list view that caches a query result containing the row, and nothing evicts it. Delete rather than update on write. Deleting is idempotent and the next read rebuilds a correct value; updating needs you to compute the cached form correctly in two places.</p>
+  <p><strong>Versioned or immutable keys.</strong> Never change an entry; change the key. Put a version or content hash in it (<code>app.3f9a1c.js</code>, or <code>user:42:v17</code>), and bump the version on write. Old entries become unreachable and age out by TTL or eviction, so no invalidation message can arrive late or be lost. This is how static assets work behind a CDN, and it fits any data where a cheap version counter exists. The cost is that readers need the current version, which is itself a small piece of state to keep fresh.</p>
+  <p>Combine them: a TTL as the backstop, explicit deletes for the paths you control, and versioned keys for anything served from the edge where you cannot reach in and delete reliably. Treat a CDN purge as a request, not a guarantee; propagation takes seconds and can fail.</p>
+</section>
+
+<section id="stampede">
+  <h2>The stampede</h2>
+  <p>Cache-aside has a failure mode that appears only at scale. A hot key expires. In the next few milliseconds, before anyone refills it, every request for that key misses, and each one independently goes to the database to compute the same answer. If the key takes 1,000 requests per second and the query takes 50 ms, about 50 requests are in flight before the first returns, and they all run the same query. The database slows under the extra load, so the refill takes longer, so more requests pile up. This is the cache stampede, or thundering herd. A cache that absorbed 99% of reads becomes a synchronized burst aimed at the one component you built it to protect.</p>
+  <p>Three mitigations, usually used together.</p>
+  <ul>
+    <li><strong>One loader per key.</strong> On a miss, take a short per-key lock; the winner queries the database and fills the cache, and the others wait briefly or serve a slightly stale value. Inside one process this is request coalescing, called singleflight in Go: concurrent callers for the same key share one in-flight call. Across servers use a lock in the cache itself, with an expiry so a crashed holder cannot block the key forever.</li>
+    <li><strong>Recompute early.</strong> Refresh a hot key before it expires. The probabilistic version has each reader, as expiry nears, roll a die weighted by how long the recompute takes; one reader volunteers while everyone else still gets a hit. The expiry never arrives as a cliff.</li>
+    <li><strong>Jitter the TTLs.</strong> If you load 10,000 keys at startup with a 1-hour TTL, they all expire in the same second. Add random spread, say plus or minus 10%, and the expiries smear across six minutes instead of landing together.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>cache_aside.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">def get_url(code):
+    val = redis.get(f"u:{code}")
+    if val is not None:
+        return None if val == MISSING else val          # hit (maybe a cached "not found")
+
+    # miss: only one caller per key rebuilds; the rest briefly wait and retry
+    if redis.set(f"lock:{code}", 1, nx=True, px=2000):
+        row = db.fetch_url(code)                        # the expensive call
+        ttl = BASE_TTL * random.uniform(0.9, 1.1)       # jitter
+        redis.set(f"u:{code}", row.url if row else MISSING, ex=int(ttl if row else 60))
+        redis.delete(f"lock:{code}")
+        return row.url if row else None
+    time.sleep(0.02)
+    return get_url(code)</code></pre>
+  </div>
+  <p>The same code shows <strong>negative caching</strong>. A lookup for a code that does not exist is a miss every time, so a crawler guessing codes sends each guess to the database and never fills the cache. Store the "not found" answer too, with a short TTL (the 60 seconds above), so the database hears each bad code once a minute at most. Keep that TTL short: if the code is created a moment later, readers should not be told it does not exist for long.</p>
+</section>
+
+<section id="snip">
+  <h2>Caching Snip</h2>
+  <p>A redirect is the ideal cache workload: the answer for a code is a short string that rarely changes, and a small set of codes takes nearly all the traffic. Snip's design here has three parts.</p>
+  <p><strong>Size and hit rate.</strong> Snip stores 1 billion links at about 500 B per row, roughly 500 GB. You cannot serve that from RAM cheaply, and you do not need to. Traffic on short links is heavily skewed, so assume 1% of links (10 million) account for about 99% of redirects. At 500 B per entry, a generous figure since the cache stores only the code and URL, that hot set is about 5 GB, which fits on one Redis node with room to spare. This is the back-of-envelope sizing <a href="01-the-numbers-and-the-laws.html">the numbers chapter</a> teaches. At a 99% hit rate, the database sees about 12 of the 1,200 average redirects per second, and about 100 of a 10,000 rps peak. Without the cache it sees all of them. That ratio is what makes the cache the first thing you add, ahead of replicas.</p>
+  <p><strong>Two layers, two TTLs.</strong> Cache code to URL in Redis with a TTL of 24 hours plus jitter. The mapping is almost immutable, so the TTL is a backstop for missed invalidations and a way to let cold links fall out, not a freshness control. At the CDN, cache the redirect response for a short time, about 5 minutes. The edge absorbs viral bursts before they reach your servers, and the short TTL bounds how long an edited or deleted link keeps working somewhere you cannot reach. Return a <code>302</code>, not a <code>301</code>: browsers cache a <code>301</code> indefinitely, so an edit would never reach users who had visited, and Snip would also never see their repeat clicks.</p>
+  <p><strong>Edits and deletes.</strong> When a user edits or deletes a link, write the database first, then delete the Redis key, then purge the CDN path. For a delete, store a short-lived tombstone rather than leaving a gap, so the next read hits "not found" in the cache instead of racing the database. Accept that for up to 5 minutes some edge locations may still redirect to the old URL; for a link taken down for abuse, send the purge and treat the edge TTL as the worst case you quote.</p>
+  <div class="callout insight">
+    <span class="callout-label">The click counter is not a cache problem</span>
+    <p>It is tempting to "cache" click counts by incrementing a number in Redis. But a click is a write, and every one must be recorded; there is no repeated read to absorb. Caching helps when many reads share one answer, and a counter has one writer per click and a different answer each time. Counting 100 million clicks a day belongs to queues and batching, which <a href="06-async-work-and-queues.html">chapter 6</a> covers. Keep it out of the redirect path so a slow analytics store cannot slow a redirect.</p>
+  </div>
+  <p>What remains behind the cache is a database taking tens of reads per second and one million new links a day. That is a light load, but it is a single machine with all of your data, which is the next problem: <a href="04-scaling-the-database.html">scaling the database</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A cache-aside service deletes the cache key after every database write, yet a key is sometimes stale for its full TTL. Describe the sequence of events that causes it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A reader misses and reads the old row from the database. Before it writes to the cache, a writer commits the new row and deletes the key. The reader then writes its old value into the cache. The delete happened before the stale insert, so it cannot undo it. Only the TTL removes the entry, which is why every cache-aside entry needs one.</p></div></details>
+    </li>
+    <li>
+      <p>Why does a stampede make the database slower rather than just busier, and what does that do to the next refill?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Dozens of identical queries run at once and compete for CPU, locks and connections, so each takes longer than a single query would. The slower refill leaves the key empty for longer, which lets more requests miss and join the pile. The load feeds itself until the key is filled or the database is overwhelmed.</p></div></details>
+    </li>
+    <li>
+      <p>You choose write-back for a "likes" counter and the cache node restarts. What exactly did you lose, and what would make you decline write-back for the same data?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>You lose every acknowledged write that had not yet been flushed to the database, bounded by the flush interval. For a likes count that may be tolerable. Decline it if the count drives money or access, or if users can see a number go backward, because then the loss is a visible bug and not noise.</p></div></details>
+    </li>
+    <li>
+      <p>Snip sets a 24-hour TTL on Redis entries and 5 minutes at the CDN. Why not use 24 hours at both, and what does a user see when a link is deleted?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>You can delete a Redis key at once, but a CDN purge is slow and can fail, so the edge TTL is the worst-case time a deleted link keeps redirecting. A 24-hour edge TTL would make that a day. With 5 minutes, a deleted link may redirect for up to 5 minutes from some regions, and fails immediately wherever the purge landed.</p></div></details>
+    </li>
+    <li>
+      <p>A crawler requests 50,000 random 7-character codes per minute and your database load doubles even though the hit rate on real links is 99%. What is happening and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Codes that do not exist never get cached, so each probe misses and queries the database. Add negative caching: store a "not found" marker with a short TTL (about a minute) so each bad code costs one query. Rate limiting the crawler by IP also helps.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A cache is a copy, and any copy can drift from the source. Every caching decision is a decision about how wrong the copy may be and for how long.</li>
+    <li>Layers closer to the client save more latency and give you less control; the in-process layer multiplies copies across servers, so keep it for small, stale-tolerant data.</li>
+    <li>Default to cache-aside because a cache failure degrades the system rather than breaking it; choose write-through for read-after-write needs and write-back only when losing a short window of writes is acceptable.</li>
+    <li>Combine a TTL backstop, explicit deletes on write, and versioned keys at the edge. The TTL is required, because the cache-aside race can restore a stale value after the delete.</li>
+    <li>A hot key expiring can send thousands of identical queries at the database. Use per-key locking or coalescing, early recompute, and jittered TTLs, and cache "not found" briefly.</li>
+    <li>Snip's redirects need about 5 GB of cache for a 99% hit rate, cutting database reads from roughly 1,200 per second to about 12. Click counting is a write and does not belong in this cache.</li>
+  </ul>
+  <p>The cache takes most reads, but the database still holds every byte and takes every write, and one machine will run out. → <a href="04-scaling-the-database.html">Scaling the Database</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, 2017. The chapters on replication and consistency explain why copies drift, which is the root of every invalidation bug.</li>
+    <li><a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala" target="_blank" rel="noopener"><strong>Scaling Memcache at Facebook</strong></a> — Nishtala et al., NSDI 2013. Leases against stampedes and stale sets, at a scale where both were daily problems.</li>
+    <li><a href="https://www.vldb.org/pvldb/vol8/p886-vattani.pdf" target="_blank" rel="noopener"><strong>Optimal Probabilistic Cache Stampede Prevention</strong></a> — Vattani, Chierichetti and Lowenstein, VLDB 2015. The math behind early probabilistic recomputation.</li>
+    <li><a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener"><strong>Redis key eviction</strong></a> — Redis documentation. What happens when the cache fills: eviction policies such as LRU and LFU, and how to choose one.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>
