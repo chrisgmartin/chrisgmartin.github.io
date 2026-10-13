@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Errors & Validation — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="An error is part of the contract, not an afterthought. This chapter is a machine-readable error model (RFC 9457 problem details), field-level validation…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/04-errors-and-validation">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Errors &amp; Validation — Designing APIs">
+<meta property="og:description" content="An error is part of the contract, not an afterthought. This chapter is a machine-readable error model (RFC 9457 problem details), field-level validation…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/04-errors-and-validation">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#contract">The error is the contract</a>
+    <a href="#problem-details">Problem details</a>
+    <a href="#worked-example">A bad POST /v1/links</a>
+    <a href="#branch-on-type">Branch on type, not text</a>
+    <a href="#status-codes">Choosing the status code</a>
+    <a href="#status-table">Status code table</a>
+    <a href="#validation">Validation strategy</a>
+    <a href="#no-leaks">Do not leak internals</a>
+    <a href="#batch">Partial failure in batches</a>
+    <a href="#retries">Retriable or not</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-pagination-filtering-and-fields.html">← Prev</a>
+    <a href="05-versioning-and-evolution.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Evolve &amp; protect the contract</span>
+  <h1>Errors &amp; Validation</h1>
+  <p class="subtitle">An error is part of the contract, not an afterthought. This chapter is a machine-readable error model (RFC 9457 problem details), field-level validation, choosing the status code that matches what happened, and partial failure in batch requests.</p>
+</header>
+
+<section id="contract">
+  <h2>The error is the contract</h2>
+  <p>Callers write code against your errors as surely as they write code against your success bodies. A client that creates a short link has an <code>if</code> branch for "the custom code is taken" and another for "the token expired". Each branch reads something your server sent. If what it reads is a sentence like <code>"Oops, that code is already in use!"</code>, you have promised that sentence forever. The day someone fixes the typo, a client breaks.</p>
+  <p>So an error response needs three things a bare status or a prose blob cannot give: a stable identity the client can branch on, a human explanation the client can show or log, and enough structure to point at the exact field that failed. Everything in this chapter follows from that. Snip's API (<code>https://api.snip.ly/v1</code>, the control plane; the redirect path is the data plane and has its own, much smaller, error surface) uses one error model on every endpoint. Define it once, here, and every other chapter points back to it.</p>
+</section>
+
+<section id="problem-details">
+  <h2>Problem details: the shape</h2>
+  <p>You do not need to invent the model. RFC 9457 (which replaced RFC 7807) defines <em>problem details</em>: a JSON object sent with the media type <code>application/problem+json</code>. It has five standard members.</p>
+  <table>
+    <thead><tr><th>Member</th><th>Meaning</th><th>For whom</th></tr></thead>
+    <tbody>
+      <tr><td><code>type</code></td><td>A URI that names the kind of problem. The error's identity.</td><td>Machines</td></tr>
+      <tr><td><code>title</code></td><td>A short summary of the kind of problem. Same for every instance of that <code>type</code>.</td><td>Humans</td></tr>
+      <tr><td><code>status</code></td><td>The HTTP status, repeated in the body so it survives proxies and logs.</td><td>Both</td></tr>
+      <tr><td><code>detail</code></td><td>What went wrong in <em>this</em> request.</td><td>Humans</td></tr>
+      <tr><td><code>instance</code></td><td>A URI for this occurrence. Snip uses <code>urn:snip:request:&lt;request-id&gt;</code>.</td><td>Support, logs</td></tr>
+    </tbody>
+  </table>
+  <p>The key member is <code>type</code>. It is a URI such as <code>https://api.snip.ly/errors/invalid-url</code>, and it should resolve to a page that documents the error, its causes and its fix. Treat it as an opaque string for comparison: the client matches it exactly and never parses it. Because it is a URI under your own domain, you can mint new ones without a central registry and without collisions.</p>
+  <p>RFC 9457 lets you add extension members, and Snip adds two. <code>errors</code> is an array of field-level problems, each with a <code>field</code> (a JSON Pointer such as <code>/tags/1</code>), a stable <code>code</code> and a human <code>message</code>. <code>request_id</code> repeats the id from <code>instance</code> as a plain string, because support staff paste it into a search box and should not have to strip a prefix. Clients must ignore members they do not recognise; that rule lets you add more later without a new version.</p>
+  <div class="callout insight">
+    <p><strong>Use the standard, even for a private API.</strong> Every serious HTTP client library and gateway already knows <code>application/problem+json</code>. A custom <code>{"error": {"msg": …}}</code> envelope costs you the same design effort and gives you none of that tooling.</p>
+  </div>
+</section>
+
+<section id="worked-example">
+  <h2>A bad POST /v1/links, end to end</h2>
+  <p>A caller posts a new link with no <code>url</code> and a tag that contains a space.</p>
+<pre><code class="language-http">POST /v1/links HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_9f3a…
+Content-Type: application/json
+Idempotency-Key: 6c1e2b0a-51d4-4a7e-9b1d-0f2a7c3e8d11
+
+{"code": "launch", "tags": ["promo", "spring sale"]}</code></pre>
+  <p>The JSON parses, so this is not a 400. The content breaks the rules, so Snip answers 422, and it reports <em>both</em> problems:</p>
+<pre><code class="language-http">HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+Content-Language: en
+
+{
+  "type": "https://api.snip.ly/errors/validation-failed",
+  "title": "Request validation failed",
+  "status": 422,
+  "detail": "2 fields failed validation. See `errors`.",
+  "instance": "urn:snip:request:req_8Qm2vK1x",
+  "request_id": "req_8Qm2vK1x",
+  "errors": [
+    {
+      "field": "/url",
+      "code": "required",
+      "message": "url is required."
+    },
+    {
+      "field": "/tags/1",
+      "code": "invalid_tag",
+      "message": "Tags may contain letters, digits and hyphens only (got \"spring sale\")."
+    }
+  ]
+}</code></pre>
+  <p>Two levels of identity are at work. The top-level <code>type</code> says the request failed validation, which tells the client to read <code>errors</code>. Each entry's <code>code</code> says which rule failed, which tells a form to highlight one input. Neither depends on the English text. The <code>message</code> can be rewritten, shortened or localised next month without touching a single client.</p>
+  <p>A single-cause error uses the same shape without the array. Asking for a code someone owns already:</p>
+<pre><code class="language-json">{
+  "type": "https://api.snip.ly/errors/code-taken",
+  "title": "Custom code already in use",
+  "status": 409,
+  "detail": "The code \"launch\" belongs to another link.",
+  "instance": "urn:snip:request:req_3Zt9aP7c",
+  "request_id": "req_3Zt9aP7c"
+}</code></pre>
+</section>
+
+<section id="branch-on-type">
+  <h2>Branch on type, not on text</h2>
+  <p>The rule for clients is short: <strong>branch on <code>type</code> (and on <code>errors[].code</code>); show <code>detail</code> but never parse it.</strong> The rule for you is the mirror image: <code>type</code> and <code>code</code> values are permanent, and <code>title</code>, <code>detail</code> and <code>message</code> are free to change.</p>
+  <p>This makes the set of error types part of your API surface. Adding a new <code>type</code> is an additive change, but only if clients have a sensible default for types they do not know, such as "treat by status class". Renaming or splitting an existing <code>type</code> breaks callers exactly as renaming a response field would. <a href="05-versioning-and-evolution.html">Versioning &amp; Evolution</a> covers how to add and retire these without a new major version. The practical consequence is a review step: when someone adds an error, the pull request names a <code>type</code> URI, documents it, and lists which status it uses.</p>
+  <p>Keep the status and the type consistent. One <code>type</code> maps to exactly one status. If <code>code-taken</code> sometimes returns 409 and sometimes 400, clients cannot trust either number.</p>
+</section>
+
+<section id="status-codes">
+  <h2>Choosing the status code</h2>
+  <p>The status code is the coarse signal: it is what proxies, SDKs, dashboards and retry logic read before they look at the body. Pick the code that says <em>who is at fault and what to do</em>. Chapter <a href="02-resource-modeling.html">Resource Modeling</a> covers success codes and method semantics; this section covers failures.</p>
+
+  <h3>400 or 422: pick one rule and state it</h3>
+  <p>RFC 9110 defines 400 as a request the server will not process because of something it sees as a client error, and 422 as a request that is well-formed but cannot be followed because of semantic errors. Teams argue about which one validation failures deserve, and both answers work. What does not work is mixing them. Snip's rule is:</p>
+  <ul>
+    <li><strong>400</strong>: the server could not parse the request. Broken JSON, a body that is not an object, a wrong type for the whole document, an unknown query parameter syntax.</li>
+    <li><strong>422</strong>: the request parsed, but the values break a rule. Missing <code>url</code>, malformed URL, tag with a space, <code>expires_at</code> in the past.</li>
+  </ul>
+  <p>The advantage of this split is that 400 almost always means a bug in the client's serialisation, and 422 almost always means bad user input. They go to different people. If you prefer one code for both, choose 400 and put the whole distinction in <code>type</code>; say so in the docs. Just choose once for the whole API.</p>
+
+  <h3>401, 403 and 404</h3>
+  <ul>
+    <li><strong>401</strong> means "I do not know who you are": no credential, an expired token, a revoked key. Send a <code>WWW-Authenticate</code> header. The remedy is to authenticate again.</li>
+    <li><strong>403</strong> means "I know who you are, and you may not do this": a valid token without the <code>links:write</code> scope, or an action your plan does not include. Re-authenticating will not help. <a href="06-auth-and-scopes.html">Auth &amp; Scopes</a> covers what each scope allows.</li>
+    <li><strong>404</strong> means no such resource, and Snip also returns it when the resource exists but belongs to another account. A 403 on <code>GET /v1/links/abc123</code> tells an attacker that <code>abc123</code> exists; a 404 tells them nothing. Use this trade whenever existence is itself sensitive. Keep 403 for cases where the caller already knows the resource is there, such as a missing scope on an endpoint they can see.</li>
+  </ul>
+
+  <h3>The rest of the 4xx set</h3>
+  <ul>
+    <li><strong>409 Conflict</strong>: the request is valid but clashes with current state. The custom code is taken; the link was archived and cannot be edited. <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency</a> covers 409 for write races and idempotency-key reuse.</li>
+    <li><strong>412 Precondition Failed</strong>: an <code>If-Match</code> check failed because someone else changed the link first. The caller should re-read and retry; also see chapter 08.</li>
+    <li><strong>429 Too Many Requests</strong>: over quota, with <code>Retry-After</code>. See <a href="07-rate-limits-and-quotas.html">Rate Limits &amp; Quotas</a>.</li>
+    <li><strong>405 Method Not Allowed</strong> (with an <code>Allow</code> header) and <strong>415 Unsupported Media Type</strong> (a body that is not <code>application/json</code>) are cheap to get right and help people who are debugging with curl.</li>
+  </ul>
+
+  <h3>5xx: our fault</h3>
+  <p><strong>500</strong> is a bug in Snip. The body is a generic problem of type <code>https://api.snip.ly/errors/internal</code> with a request id and nothing else. <strong>503</strong> means Snip is overloaded or in maintenance; it carries <code>Retry-After</code>. Do not use 502 or 504 for your own application errors: those belong to gateways, and clients and monitors treat them as network trouble.</p>
+</section>
+
+<section id="status-table">
+  <h2>Status code table</h2>
+  <table>
+    <thead><tr><th>Code</th><th>Meaning in Snip</th><th>At fault</th><th>Retry?</th></tr></thead>
+    <tbody>
+      <tr><td>400</td><td>Cannot parse the request</td><td>Client</td><td>No; fix the request</td></tr>
+      <tr><td>401</td><td>No or invalid credential</td><td>Client</td><td>After re-authenticating</td></tr>
+      <tr><td>403</td><td>Authenticated, not permitted</td><td>Client</td><td>No</td></tr>
+      <tr><td>404</td><td>No such resource (or not yours)</td><td>Client</td><td>No</td></tr>
+      <tr><td>405 / 415</td><td>Wrong method / wrong media type</td><td>Client</td><td>No</td></tr>
+      <tr><td>409</td><td>Conflicts with current state</td><td>Client</td><td>Only after the state changes</td></tr>
+      <tr><td>412</td><td>Precondition (<code>If-Match</code>) failed</td><td>Client</td><td>After re-reading</td></tr>
+      <tr><td>422</td><td>Parsed, but a value breaks a rule</td><td>Client</td><td>No; fix the values</td></tr>
+      <tr><td>429</td><td>Rate or quota exceeded</td><td>Client</td><td>Yes, after <code>Retry-After</code></td></tr>
+      <tr><td>500</td><td>Server bug</td><td>Server</td><td>Maybe, with backoff</td></tr>
+      <tr><td>503</td><td>Overloaded or down</td><td>Server</td><td>Yes, after <code>Retry-After</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="validation">
+  <h2>Validation strategy</h2>
+  <p><strong>Validate at the edge, before any work.</strong> Check shape, types, lengths, formats and ranges in the request layer, before you open a transaction or call another service. These checks need no state, cost microseconds, and give the clearest messages. State-dependent checks (is the code taken?) come after, and they produce 409, not 422.</p>
+  <p><strong>Report every problem at once.</strong> The example above returned two errors in one response. Failing on the first error forces a caller with five bad fields to make five round trips, and a form UI cannot highlight the rest. The cost is that your validator must collect, not throw. Build it that way from the start; retrofitting is painful.</p>
+  <p><strong>Be strict on input, consistent on output.</strong> Reject unknown fields in a request body with a <code>unknown_field</code> code rather than silently ignoring them. A caller who sends <code>"expire_at"</code> for <code>"expires_at"</code> should learn so immediately, not discover months later that links never expired. Strictness has one cost: you cannot add a field to a request and let old clients send it. That is fine, since old clients do not know the field. On the response side, do the opposite of strict: always the same shape, the same member names, the same <code>errors</code> array even when it holds one item.</p>
+  <p><strong>Validate meaning, not only syntax.</strong> A <code>url</code> that parses as a URL still may not be shortenable: wrong scheme (<code>javascript:</code>), a private IP, or a host on your block list. Those are 422s with their own codes (<code>invalid_scheme</code>, <code>blocked_host</code>), not a generic "invalid".</p>
+</section>
+
+<section id="no-leaks">
+  <h2>Do not leak internals</h2>
+  <p>Error messages are an information channel to attackers and a support burden for you. A 500 that returns <code>psycopg2.errors.UniqueViolation: duplicate key value violates constraint "links_code_key" on host db-primary-3.internal</code> tells the world your database, your schema and your host naming. Never return stack traces, SQL, file paths, internal hostnames or library versions.</p>
+  <p>The pattern is: log the full detail on the server, keyed by a request id; return only the id and a generic problem.</p>
+<pre><code class="language-json">{
+  "type": "https://api.snip.ly/errors/internal",
+  "title": "Internal error",
+  "status": 500,
+  "detail": "Something went wrong on our side. Quote the request id if you contact support.",
+  "instance": "urn:snip:request:req_5Wd0nB2e",
+  "request_id": "req_5Wd0nB2e"
+}</code></pre>
+  <p>Generate the id at the edge, put it in a header (<code>Snip-Request-Id</code>) on every response, success or failure, and attach it to every log line and trace span for that request. Support then goes from the customer's id to the full server-side story in one search. Your own known failures follow the same rule: <code>code-taken</code> may say which code, since the caller sent it, but should not say which account owns it.</p>
+  <div class="callout warn">
+    <p><strong>Beware echoing input.</strong> Reflecting a bad value into <code>message</code> is useful, but cap its length and escape it. A 10 MB "invalid tag" in your error body is a cheap amplification attack, and unescaped input in an error shown in a dashboard is an injection vector.</p>
+  </div>
+</section>
+
+<section id="batch">
+  <h2>Partial failure in batch requests</h2>
+  <p>Suppose Snip offers <code>POST /v1/links:batch</code> with an array of up to 100 links. What does a response mean when 97 succeed and 3 fail? There are two honest designs.</p>
+  <p><strong>All or nothing.</strong> Validate everything, write in one transaction, return one status. If any item fails, nothing is written and the response is a single 422 whose <code>errors</code> paths include the index (<code>/items/41/url</code>). This is right when the items depend on each other or the set has one meaning, such as a campaign that must exist as a whole. It needs real transactions, which gets harder as the batch crosses shards.</p>
+  <p><strong>Per-item results.</strong> Each item is processed on its own and the response reports a status for each. This is right when the items are independent, which is the common case for link creation. Return 200 for the request itself (the batch was understood and processed) and put each outcome in the body:</p>
+<pre><code class="language-json">{
+  "results": [
+    { "index": 0, "status": 201, "link": { "code": "a1b2c3", "short_url": "https://snip.ly/a1b2c3" } },
+    { "index": 1, "status": 409,
+      "problem": {
+        "type": "https://api.snip.ly/errors/code-taken",
+        "title": "Custom code already in use",
+        "status": 409,
+        "detail": "The code \"launch\" belongs to another link."
+      } },
+    { "index": 2, "status": 422,
+      "problem": {
+        "type": "https://api.snip.ly/errors/validation-failed",
+        "title": "Request validation failed",
+        "status": 422,
+        "errors": [ { "field": "/url", "code": "required", "message": "url is required." } ]
+      } }
+  ],
+  "summary": { "succeeded": 1, "failed": 2 }
+}</code></pre>
+  <p>I recommend per-item results for independent items. Each <code>problem</code> is the same object the single-item endpoint returns, so clients reuse one error handler. The outer status stays honest about the request: 400 or 422 if the envelope itself is bad (not an array, over 100 items), 200 once it was processed. Some APIs use 207 Multi-Status, which comes from WebDAV; plain 200 with a per-item status is simpler and works with every client.</p>
+  <p>Retrying a partly failed batch is where the design is tested. The caller should resend only the failed items that are retriable, and each item should carry its own idempotency key so a resend cannot create a duplicate. See <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency</a>.</p>
+</section>
+
+<section id="retries">
+  <h2>Retriable or not: make it derivable</h2>
+  <p>A client deciding whether to retry has two inputs, the status and the <code>type</code>, and your job is to make the answer a pure function of them. The table above does that. Statuses 400, 401, 403, 404, 405, 415 and 422 are never retried without a change by the caller. 429 and 503 are retried after the time in <code>Retry-After</code>. 500 may be retried a few times. 409 and 412 are retried only after the caller has re-read state.</p>
+  <p>Where a status is ambiguous, let the <code>type</code> settle it, and document that. For example, <code>https://api.snip.ly/errors/upstream-timeout</code> may share status 503 with an overload but tells the client the write may have happened. That case, and why retrying a <code>POST</code> is only safe with an <code>Idempotency-Key</code>, belongs to <a href="08-caching-concurrency-and-idempotency.html">chapter 08</a>.</p>
+  <p>Retries themselves need discipline: exponential backoff with jitter, a cap on attempts, and honouring <code>Retry-After</code> over the client's own schedule. A fleet of clients that retry on the same beat turns a brief overload into a longer outage. <a href="../designing-for-scale/09-reliability-and-degradation.html">Reliability &amp; Degradation</a> explains that failure mode, retry budgets and load shedding in detail. Put the retry rules in your SDK so integrators do not each reinvent them wrongly.</p>
+</section>
+
+<section id="check-yourself">
+  <h2>✓ Check yourself</h2>
+  <p>Try each without scrolling up. The answers fold away.</p>
+  <ol>
+    <li>
+      <p>A client shows users the <code>detail</code> string and also checks <code>detail.includes("already in use")</code> to decide whether to suggest another code. What breaks, and what should it check?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The text is not part of the contract, so any rewording or translation silently breaks the branch. It should compare <code>type</code> to <code>https://api.snip.ly/errors/code-taken</code>. See <a href="#branch-on-type">Branch on type, not on text</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A caller sends valid JSON in which <code>expires_at</code> is a date in the past. Which status, and why not the other candidate?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>422: the body parsed, but a value breaks a rule. 400 is for requests the server cannot parse. Whichever you choose, apply it to the whole API. See <a href="#status-codes">Choosing the status code</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A token holder asks for <code>GET /v1/links/abc123</code>, a link owned by another account. Why might the API return 404 and not 403?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A 403 confirms the link exists, which lets an attacker enumerate codes or accounts. A 404 gives the same answer for "absent" and "not yours". See <a href="#status-codes">Choosing the status code</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your validator stops at the first bad field. Describe what a caller with a form of five fields experiences, and what you change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>They fix one field, resubmit, and meet the next error, up to five round trips, and the form cannot mark all bad inputs. Collect every failure into the <code>errors</code> array and return them together. See <a href="#validation">Validation strategy</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A batch of 50 links returns 200 with two failed items. How does a client decide what to resend?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It reads each failed item's <code>status</code> and <code>problem.type</code>, resends only those that are retriable (for example 503 or 429), and fixes or drops the rest. Per-item idempotency keys stop duplicates on resend. See <a href="#batch">Partial failure in batches</a> and <a href="#retries">Retriable or not</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A production 500 contains a database error message. List two harms and the fix.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It exposes schema and host names to attackers, and it ties clients to text you will want to change. Log the detail server-side under a request id and return a generic problem with that id. See <a href="#no-leaks">Do not leak internals</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>An error body is contract. Use RFC 9457 <code>application/problem+json</code> on every endpoint, with one extension, <code>errors[]</code>, for field-level problems.</li>
+    <li>Clients branch on <code>type</code> and <code>code</code>. <code>title</code>, <code>detail</code> and <code>message</code> are for people and may change.</li>
+    <li>Choose one rule for 400 versus 422 and state it. Snip: 400 cannot parse, 422 parsed but invalid. Return 404 where a 403 would reveal that a resource exists.</li>
+    <li>Validate at the edge, return every field error at once, reject unknown input fields, and keep the output shape constant.</li>
+    <li>Never leak stack traces or SQL. Log the detail with a request id and return the id in the body.</li>
+    <li>For independent batch items, return per-item results with the same problem objects. Make retriability a function of status and <code>type</code>.</li>
+  </ul>
+  <p>Next: how to change all of this later without breaking callers. <a href="05-versioning-and-evolution.html">Versioning &amp; Evolution →</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.rfc-editor.org/rfc/rfc9457.html" rel="noopener">RFC 9457: Problem Details for HTTP APIs</a> — the standard behind the error model, including extension members and the <code>type</code> rules.</li>
+    <li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-status-codes" rel="noopener">RFC 9110: HTTP Semantics, Status Codes</a> — the authoritative meaning of every code used here.</li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Status" rel="noopener">MDN: HTTP response status codes</a> — a readable reference with notes on when each code applies.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

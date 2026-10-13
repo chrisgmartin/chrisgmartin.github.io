@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Async: Webhooks & Streaming — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Not every answer is ready when the caller asks. This chapter is long-running operations, webhooks — delivery, signing, retries, and the consumer&#x27;s idempotency…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/09-async-webhooks-and-streaming">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Async: Webhooks &amp; Streaming — Designing APIs">
+<meta property="og:description" content="Not every answer is ready when the caller asks. This chapter is long-running operations, webhooks — delivery, signing, retries, and the consumer&#x27;s idempotency…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/09-async-webhooks-and-streaming">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#when-sync-fails">When request/response fails</a>
+    <a href="#long-running-operations">Long-running operations</a>
+    <a href="#webhook-model">The webhook model</a>
+    <a href="#event-payloads">Designing the event</a>
+    <a href="#delivery">Delivery: retries and order</a>
+    <a href="#signing">Signing and verifying</a>
+    <a href="#batched-clicks">Why link.clicked is batched</a>
+    <a href="#streaming">Streaming: SSE, WebSockets</a>
+    <a href="#events-are-contracts">Events are a contract</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-caching-concurrency-and-idempotency.html">← Prev</a>
+    <a href="10-design-first-and-a-worked-api.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Trust, limits &amp; speed</span>
+  <h1>Async: Webhooks &amp; Streaming</h1>
+  <p class="subtitle">Not every answer is ready when the caller asks. This chapter is long-running operations, webhooks — delivery, signing, retries, and the consumer's idempotency burden — streaming with SSE, and how to design the events themselves.</p>
+</header>
+
+<section id="when-sync-fails">
+<h2>When request/response fails</h2>
+<p>Request/response assumes the caller waits and the answer is ready in a few hundred milliseconds. Two situations break that assumption.</p>
+<ul>
+<li><strong>The work outlasts the connection.</strong> Importing 50,000 links takes minutes. Load balancers, proxies and clients time out long before that, and a held connection ties up a worker for the whole wait.</li>
+<li><strong>The event starts on the server.</strong> A link crosses a click threshold, an import finishes, a domain fails verification. No caller is waiting, so there is no response to carry the news.</li>
+</ul>
+<p>Each has a standard shape. Slow work gets an <em>operation resource</em> the client polls. Server-originated events get a <em>webhook</em> (push to a URL the client owns) or a <em>stream</em> (push down a connection the client opened). This chapter covers all three, then how to design the events so they survive change.</p>
+<p>Snip is the running example. Recall the split from the <a href="../designing-for-scale/index.html">scale guide</a>: the redirect <code>GET snip.ly/{code}</code> is the data plane; <code>https://api.snip.ly/v1</code> is the control plane. Everything here sits on the control plane, fed by the click pipeline described in <a href="../designing-for-scale/06-async-work-and-queues.html">Async Work &amp; Queues</a>.</p>
+</section>
+
+<section id="long-running-operations">
+<h2>Long-running operations</h2>
+<p>When a request cannot finish in the time a client will wait, accept it, say so, and give the client something to ask about. Return <code>202 Accepted</code> with a <code>Location</code> header pointing at an operation resource. This is the same move as in <a href="02-resource-modeling.html">Resource Modeling</a>: when an action takes time, model the action as a noun.</p>
+<pre><code class="language-http">POST /v1/imports HTTP/1.1
+Authorization: Bearer eyJ…
+Idempotency-Key: 7c1e9a52-3b0d-4c7e-9a41-0f5d2b6e8a10
+Content-Type: application/json
+
+{"source_url": "https://files.example.com/links.csv"}
+
+HTTP/1.1 202 Accepted
+Location: /v1/operations/op_8Hk2
+Retry-After: 5
+
+{"id": "op_8Hk2", "status": "pending", "created_at": "2026-10-12T09:14:03Z"}</code></pre>
+<p>The client polls the operation:</p>
+<pre><code class="language-http">GET /v1/operations/op_8Hk2
+
+HTTP/1.1 200 OK
+{
+  "id": "op_8Hk2",
+  "status": "succeeded",
+  "progress": {"done": 50000, "total": 50000},
+  "result": "/v1/imports/imp_41x",
+  "error": null
+}</code></pre>
+<p><code>status</code> moves one way: <code>pending</code> to <code>running</code> to <code>succeeded</code> or <code>failed</code>. On failure, <code>error</code> holds an RFC 9457 problem object, the same shape as every other error in the API. On success, <code>result</code> links to the created resource rather than embedding it, so there is one place to read the truth.</p>
+<p>Four details decide whether this works in practice:</p>
+<ul>
+<li><strong>Return <code>Retry-After</code>.</strong> It tells clients how often to poll, and lets you slow them down under load.</li>
+<li><strong>Keep the operation after it finishes.</strong> A client that was offline for an hour must still find the outcome. Expire operations after days, not seconds.</li>
+<li><strong>Make the <code>POST</code> idempotent.</strong> A retry of a slow request must not start a second import. See <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency</a>.</li>
+<li><strong>Offer a callback as well.</strong> Polling is the floor. A client that registers a webhook for <code>operation.completed</code> stops polling altogether, which is the next section.</li>
+</ul>
+<p>Do not block instead. A synchronous import that "usually" finishes in 20 seconds will one day take 200, and you will find out from the support queue. Exception: if the work has a hard, small upper bound (a few hundred milliseconds at the 99th percentile), stay synchronous. An operation resource is extra surface the client must learn.</p>
+</section>
+
+<section id="webhook-model">
+<h2>The webhook model</h2>
+<p>A webhook is an HTTP <code>POST</code> from your server to a URL the consumer registered. The consumer does not poll; you call them when something happens. The cost is that you now run a delivery system, and the consumer runs a public endpoint.</p>
+<p>Registration is a resource like any other:</p>
+<pre><code class="language-http">POST /v1/webhook-endpoints
+{
+  "url": "https://hooks.acme.example/snip",
+  "events": ["link.clicked", "operation.completed"]
+}
+
+HTTP/1.1 201 Created
+{
+  "id": "whe_3Qa9",
+  "url": "https://hooks.acme.example/snip",
+  "events": ["link.clicked", "operation.completed"],
+  "secret": "whsec_k3J…",
+  "status": "enabled"
+}</code></pre>
+<p>Three rules for the registration:</p>
+<ul>
+<li><strong>The consumer names the event types.</strong> Never send everything by default; a consumer who wants import results should not receive click summaries.</li>
+<li><strong>HTTPS only.</strong> Reject <code>http://</code> URLs at registration. Also reject URLs that resolve to private or link-local addresses, or your delivery workers become a way to probe your own network from inside it.</li>
+<li><strong>Show the secret once.</strong> It signs every delivery (see <a href="#signing">Signing and verifying</a>). Offer rotation, with both old and new secrets valid for a short overlap.</li>
+</ul>
+<p>Disable endpoints that fail for days, and say so in the API (<code>"status": "disabled"</code>) and by email. A dead endpoint otherwise burns retries forever.</p>
+</section>
+
+<section id="event-payloads">
+<h2>Designing the event</h2>
+<p>Every event has the same envelope, whatever it carries:</p>
+<pre><code class="language-json">{
+  "id": "evt_01JA4Z8M2K",
+  "type": "link.clicked",
+  "created": "2026-10-12T09:15:00Z",
+  "data": {
+    "link": "https://api.snip.ly/v1/links/q7Xk2",
+    "code": "q7Xk2",
+    "window": {"start": "2026-10-12T09:14:00Z", "end": "2026-10-12T09:15:00Z"},
+    "clicks": 18342,
+    "top_countries": [{"country": "US", "clicks": 9120}, {"country": "BR", "clicks": 2210}]
+  }
+}</code></pre>
+<p><code>id</code> is unique and stable across retries; it is what consumers de-duplicate on. <code>type</code> is a dotted name, <code>resource.past-tense-verb</code>. <code>created</code> is an RFC 3339 timestamp for when the event happened, not when it was delivered. <code>data</code> holds the payload.</p>
+<p>The design question is how much goes in <code>data</code>.</p>
+<ul>
+<li><strong>Thin events</strong> carry only identifiers: "link <code>q7Xk2</code> changed." The consumer calls <code>GET /v1/links/q7Xk2</code> to learn how. Always current, but every event costs a round-trip, and a burst of events becomes a burst of API calls.</li>
+<li><strong>Fat events</strong> carry the new state. The consumer can act at once. But the state is a snapshot, and with no ordering guarantee (next section) a snapshot can arrive after a newer one. A consumer who writes it straight to their database overwrites newer data with older.</li>
+</ul>
+<p>My default: carry enough to act on without a call, and always include the resource URL (<code>data.link</code> above) so the consumer can fetch current truth. Document the snapshot as "state as of <code>created</code>". A consumer who cares about correctness compares timestamps or re-fetches; one who only wants to notify a human reads the payload and moves on. For fields that change often, such as <code>total_clicks</code>, which is eventually consistent anyway, lean thin.</p>
+</section>
+
+<section id="delivery">
+<h2>Delivery: retries, replay and order</h2>
+<p>Delivery over HTTP can fail in a way the sender cannot tell apart: the consumer may have processed the event and crashed before replying, or never seen it. A sender can then pick one of two promises. At-most-once drops events silently. <strong>At-least-once</strong> retries until it gets a <code>2xx</code>, and may deliver the same event twice. Choose at-least-once; losing events is worse than seeing them twice. Exactly-once delivery is not available over a network, and a vendor who claims it means at-least-once plus de-duplication on their side.</p>
+<p>Snip's rules:</p>
+<ul>
+<li>Any <code>2xx</code> within 10 seconds is success. Anything else, including a timeout, is a failure.</li>
+<li>Retry with exponential backoff and jitter: roughly 1 minute, 5 minutes, 30 minutes, 2 hours, 8 hours, then every 24 hours.</li>
+<li>After 8 failed attempts the delivery goes to a dead-letter state and is no longer retried.</li>
+<li>Consumers can list deliveries and replay any of them:</li>
+</ul>
+<pre><code class="language-http">GET /v1/webhook-endpoints/whe_3Qa9/deliveries?status=failed
+POST /v1/webhook-endpoints/whe_3Qa9/deliveries/dlv_77/replay</code></pre>
+<p>The delivery log is not a nicety. A consumer that was down for a weekend needs a way to catch up that is not "ask support". Replay re-sends the same event with the same <code>id</code>.</p>
+<p>Two obligations follow for the consumer.</p>
+<p><strong>De-duplicate on <code>id</code>.</strong> Because delivery is at-least-once, the same <code>evt_…</code> will sometimes arrive twice. The consumer records processed ids and skips repeats, exactly the pattern in <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency</a>, with the event id as the idempotency key. Make the record and the side effect commit together, or a crash between them re-opens the gap.</p>
+<p><strong>Do not assume order.</strong> A retry of event 1 can land after event 2 was delivered first time. Snip does not promise order and consumers must not rely on it. Use <code>created</code> to detect staleness, or treat the event as a hint and re-fetch. Respond <code>2xx</code> fast and process the work on your own queue; a consumer that does slow work inline will time out and trigger the retries it dreads.</p>
+</section>
+
+<section id="signing">
+<h2>Signing and verifying</h2>
+<p>The consumer's endpoint is on the open internet. Anyone can <code>POST</code> to it. The consumer needs proof that Snip sent a request and that nobody altered it.</p>
+<p>This is a different problem from request auth in <a href="06-auth-and-scopes.html">Auth &amp; Scopes</a>. There, the client proves who it is to Snip with a bearer token. Here, the roles reverse and Snip proves itself to the client. Tokens are the wrong tool, because a bearer token is replayable by anyone who sees it. Use a message signature instead: an HMAC (RFC 2104) over the request body with a secret only the two parties know.</p>
+<p>Snip signs the <em>raw bytes</em> of the body together with a timestamp:</p>
+<pre><code class="language-http">POST /snip HTTP/1.1
+Content-Type: application/json
+Snip-Signature: t=1760260500,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+
+{"id":"evt_01JA4Z8M2K","type":"link.clicked", …}</code></pre>
+<p>The consumer verifies in five steps:</p>
+<pre><code class="language-text">header  = request.headers["Snip-Signature"]
+t, v1   = parse(header)                      # t=timestamp, v1=hex signature
+if abs(now() - t) &gt; 300 seconds:  reject    # stops replay of a captured request
+signed  = t + "." + raw_body                 # raw bytes, before any JSON parsing
+expect  = hex(HMAC_SHA256(secret, signed))
+if not constant_time_equal(expect, v1): reject
+accept; then de-duplicate on event id</code></pre>
+<p>Each step closes a specific hole:</p>
+<ul>
+<li><strong>Raw body.</strong> Parse the JSON first and re-serialize it, and key order or whitespace changes; the signature no longer matches. Verify before parsing.</li>
+<li><strong>Timestamp inside the signed string.</strong> Without it, an attacker who captures one valid delivery can replay it forever. With it, a replay older than five minutes fails. The attacker cannot edit <code>t</code> without breaking the signature.</li>
+<li><strong>Constant-time compare.</strong> An ordinary <code>==</code> exits at the first differing byte, and the timing leaks the signature one byte at a time.</li>
+<li><strong>Replays inside the window.</strong> Five minutes is still a window. The event-id de-duplication closes it.</li>
+</ul>
+<p>The <code>v1=</code> prefix is deliberate. It lets you add a new scheme later, sending both signatures during the change. The <a href="https://www.standardwebhooks.com/" rel="noopener">Standard Webhooks</a> project specifies a similar design if you would rather not invent one.</p>
+<div class="callout warn">
+<p><strong>Ship a test tool.</strong> Provide <code>POST /v1/webhook-endpoints/{id}/test</code>, which sends a signed sample event. Most signature bugs are in the consumer's first hour, and a button that reproduces them saves a support thread each.</p>
+</div>
+</section>
+
+<section id="batched-clicks">
+<h2>Why link.clicked is batched</h2>
+<p>The obvious design is one <code>link.clicked</code> delivery per redirect. For Snip that is a mistake. The data plane serves 100 million redirects a day, about 1,160 a second on average and several times that at peak. One webhook per click would hand each consumer a firehose their endpoint cannot absorb, and make Snip run a second system as large as the redirect service just to send the news. Retries on top multiply it.</p>
+<p>So <code>link.clicked</code> summarizes. An event says "link <code>q7Xk2</code> had 18,342 clicks between 09:14 and 09:15", as in the payload above, or flags a notable event: a spike over a threshold, the first click from a new country. The click pipeline in <a href="../designing-for-scale/06-async-work-and-queues.html">Async Work &amp; Queues</a> already aggregates clicks off a queue for analytics. The webhook sender reads those aggregates; it never sits in the redirect path, and a slow consumer cannot slow a redirect.</p>
+<p>Document the sampling and batching in the event's reference page: the window size, the threshold, and the fact that counts are eventually consistent, like <code>total_clicks</code> on the link. Consumers who need every click should pull an export or the analytics API, not wait for a webhook that was never designed to carry them. Say what an event is <em>for</em>. A webhook is a notification channel, not a replication log.</p>
+</section>
+
+<section id="streaming">
+<h2>Streaming: SSE, WebSockets and long-polling</h2>
+<p>Webhooks push to a server. A dashboard open in a browser has no URL to push to; it wants to <em>read live</em> from you, and the client starts the conversation. Three tools fit.</p>
+<table>
+<thead><tr><th>Option</th><th>Direction</th><th>Mechanism</th><th>Pick it when</th></tr></thead>
+<tbody>
+<tr><td>Server-Sent Events</td><td>Server to client</td><td>One kept-open HTTP response, <code>text/event-stream</code></td><td>The client only listens: dashboards, progress, feeds</td></tr>
+<tr><td>WebSocket</td><td>Both ways</td><td>HTTP upgrade to its own framed protocol (RFC 6455)</td><td>The client also sends a stream: chat, collaborative editing, games</td></tr>
+<tr><td>Long-polling</td><td>Server to client</td><td>Request held until data exists, then repeated</td><td>A proxy or client cannot do either of the above</td></tr>
+</tbody>
+</table>
+<p>Default to SSE. It is plain HTTP, so it passes proxies, reuses your auth and logging, and needs no new protocol. The browser's <code>EventSource</code> reconnects on its own and sends the last event id it saw in a <code>Last-Event-ID</code> header, so the server can resume where the stream broke. WebSockets cost more: a separate protocol, its own auth story (browsers cannot set headers on the handshake), sticky connections, and your own reconnect and resume logic. Take that cost only when the client really sends a stream back. Long-polling is the fallback, and it is what a poll against an operation resource already is.</p>
+<p>A live click stream for the Snip dashboard:</p>
+<pre><code class="language-http">GET /v1/links/q7Xk2/clicks/stream HTTP/1.1
+Accept: text/event-stream
+Authorization: Bearer eyJ…
+Last-Event-ID: 1042
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+id: 1043
+event: clicks
+data: {"window_end":"2026-10-12T09:15:05Z","clicks":312}
+
+id: 1044
+event: clicks
+data: {"window_end":"2026-10-12T09:15:10Z","clicks":297}
+
+: keep-alive</code></pre>
+<p>Each message is a block of <code>field: value</code> lines ended by a blank line. <code>id</code> is what the client echoes back on reconnect; the line starting with <code>:</code> is a comment, sent every 15 seconds or so to stop idle proxies from closing the connection. Note that the stream sends five-second aggregates, for the same reason as the webhook: the dashboard needs a number it can draw, not 1,160 messages a second.</p>
+<p>Three things to plan for. The server must <em>keep</em> a short buffer of recent events, or <code>Last-Event-ID</code> has nothing to resume from. Each open stream holds a connection, so cap streams per token. And streams are not a place to hide the data plane: serve them from the control plane's own tier, not the redirect fleet.</p>
+</section>
+
+<section id="events-are-contracts">
+<h2>Events are a contract</h2>
+<p>A webhook payload is an API response you cannot see the reader of. Consumers wrote parsers against it, deployed them, and will not touch them for a year. Everything in <a href="05-versioning-and-evolution.html">Versioning &amp; Evolution</a> applies, with the extra difficulty that you cannot ask the consumer to send a version header with each delivery.</p>
+<ul>
+<li><strong>Pin the version on the endpoint.</strong> Record the API version when the consumer registers (<code>"api_version": "2026-10-01"</code>), and render events in that shape until they upgrade. Include the version in the payload as well.</li>
+<li><strong>Add fields, never change or remove them.</strong> New optional fields are free. Renaming <code>clicks</code> to <code>click_count</code> breaks everyone.</li>
+<li><strong>Tell consumers to ignore what they do not know.</strong> Unknown fields and unknown event types must be skipped, not rejected. State this in the docs and in every sample. Otherwise adding <code>link.expired</code> next year breaks the consumers who subscribed to everything.</li>
+<li><strong>Treat enum values as additive too.</strong> A new <code>status</code> value is a breaking change for a consumer with a strict <code>switch</code>; warn them in the docs.</li>
+</ul>
+<p>If you would rather adopt a shared envelope than design your own, <a href="https://github.com/cloudevents/spec" rel="noopener">CloudEvents</a> defines <code>id</code>, <code>source</code>, <code>type</code> and <code>time</code> fields. It earns its place when events cross many systems and tools; for a single product API, the plain envelope above does the same job with less to explain.</p>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Answer before you open the folds. The answers are short and each links back to its section.</p>
+<ol>
+<li><p>A client retries <code>POST /v1/imports</code> after a network timeout. What stops Snip from starting a second import, and what does the client get back?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The <code>Idempotency-Key</code> header. The server stored the first request under that key, so the retry returns the original <code>202</code> and the same operation id. See <a href="#long-running-operations">Long-running operations</a>.</p></div></details></li>
+<li><p>Your fat <code>link.updated</code> event arrives at a consumer twice, and an older one arrives after a newer one. Name the two defences the consumer needs, and what each relies on.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>De-duplicate on the event <code>id</code> (at-least-once delivery), and compare <code>created</code> or re-fetch the resource URL (no ordering guarantee). See <a href="#delivery">Delivery</a>.</p></div></details></li>
+<li><p>Why must the consumer verify the signature against the raw body, and what goes wrong if it parses the JSON first?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The HMAC covers exact bytes. Parsing and re-serializing can change whitespace or key order, so a genuine delivery fails verification. See <a href="#signing">Signing and verifying</a>.</p></div></details></li>
+<li><p>An attacker records a valid delivery and re-sends it ten minutes later. Which two checks stop it, and which one covers a re-send inside the first minute?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The timestamp window rejects the ten-minute-old copy, because the timestamp is part of the signed string. Event-id de-duplication catches a re-send inside the window. See <a href="#signing">Signing and verifying</a>.</p></div></details></li>
+<li><p>A customer asks for a webhook on every click so they can count them. What do you say, and what do you offer instead?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not as one delivery per redirect: 100M a day would swamp them and Snip. Offer the batched <code>link.clicked</code> summary, or an export or analytics query for exact counts. See <a href="#batched-clicks">Why link.clicked is batched</a>.</p></div></details></li>
+<li><p>The dashboard needs live click counts and never sends data back. Which transport do you choose, and how does it recover from a dropped connection?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>SSE. <code>EventSource</code> reconnects and sends <code>Last-Event-ID</code>; the server replays from its short buffer. See <a href="#streaming">Streaming</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>When work outlasts a connection, return <code>202</code>, a <code>Location</code>, and an operation resource that ends in a link to the result.</li>
+<li>Webhooks are at-least-once and unordered. The consumer de-duplicates on event id, as in <a href="08-caching-concurrency-and-idempotency.html">idempotency</a>, and never trusts arrival order.</li>
+<li>Sign the raw body and a timestamp with HMAC-SHA256, verify in constant time, reject old timestamps. This is separate from request auth.</li>
+<li>Do not mirror your data plane into events. Batch and sample, and say what the event is for.</li>
+<li>For a client that only listens, use SSE. Pay for WebSockets only when the client streams back.</li>
+<li>Events are a contract: version them, add fields only, and tell consumers to ignore what they do not know.</li>
+</ul>
+<p>Next, every idea on one page — the full worked design. <a href="10-design-first-and-a-worked-api.html">Design-First: A Worked API →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://html.spec.whatwg.org/multipage/server-sent-events.html" rel="noopener">HTML Standard: Server-sent events</a> — the <code>text/event-stream</code> format, <code>EventSource</code> and <code>Last-Event-ID</code>, from the source.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6455" rel="noopener">RFC 6455: The WebSocket Protocol</a> — the handshake and framing, to judge what you take on.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc2104" rel="noopener">RFC 2104: HMAC</a> — the construction behind webhook signatures.</li>
+<li><a href="https://www.standardwebhooks.com/" rel="noopener">Standard Webhooks</a> — a shared specification for signing and delivering webhooks.</li>
+<li><a href="https://github.com/cloudevents/spec" rel="noopener">CloudEvents specification</a> — a common event envelope and its attribute rules.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rate Limits & Quotas — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A shared API needs a way to protect itself and share capacity fairly. This chapter is token-bucket versus window algorithms, the 429 and the headers that tell…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/07-rate-limits-and-quotas">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Rate Limits &amp; Quotas — Designing APIs">
+<meta property="og:description" content="A shared API needs a way to protect itself and share capacity fairly. This chapter is token-bucket versus window algorithms, the 429 and the headers that tell…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/07-rate-limits-and-quotas">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-limit">Why limit at all</a>
+    <a href="#rate-vs-quota">Rate versus quota</a>
+    <a href="#algorithms">Four algorithms</a>
+    <a href="#token-bucket">The token bucket</a>
+    <a href="#who-to-limit">Who you limit</a>
+    <a href="#contract">The response contract</a>
+    <a href="#client-side">What a good client does</a>
+    <a href="#where-to-enforce">Where to enforce</a>
+    <a href="#limits-vs-shedding">Limits versus load shedding</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-auth-and-scopes.html">← Prev</a>
+    <a href="08-caching-concurrency-and-idempotency.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Trust, limits &amp; speed</span>
+  <h1>Rate Limits &amp; Quotas</h1>
+  <p class="subtitle">A shared API needs a way to protect itself and share capacity fairly. This chapter is token-bucket versus window algorithms, the 429 and the headers that tell a client when to come back, quotas, and shedding load before it takes you down.</p>
+</header>
+
+<section id="why-limit">
+<h2>Why limit at all</h2>
+<p>A shared API has finite capacity: database connections, worker threads, a write path that one process owns. Without limits, the first caller to write a tight loop takes whatever it wants, and every other caller waits behind it. A limit does four jobs:</p>
+<ul>
+  <li><strong>Protects capacity.</strong> The limit is a ceiling you chose, rather than the ceiling the database picked when it fell over.</li>
+  <li><strong>Shares it fairly.</strong> One tenant's bug does not become every tenant's outage.</li>
+  <li><strong>Caps cost.</strong> Each request costs CPU, storage and sometimes a paid upstream call. A limit puts a bound on the bill.</li>
+  <li><strong>Blunts abuse and runaway clients.</strong> A scraper, a credential-stuffing run, or an importer stuck in a retry loop all hit the same wall.</li>
+</ul>
+<p>Snip's two planes need different treatment. The redirect (<code>snip.ly/abc123</code>) is the data plane: it is read-heavy, cached at the edge, and built to absorb spikes, so the per-key limit described here does not apply to it the same way. The API at <code>https://api.snip.ly/v1</code> is the control plane: it creates links, edits them, and reads analytics, and each call touches the primary database. That is what we limit.</p>
+<div class="callout tip">
+  <p><strong>Limits are part of the contract.</strong> A limit you do not document is a limit your customers find in production. Publish the numbers, return them in headers, and treat a change to them as a versioned change (see <a href="index.html">the guide hub</a> for how the rest of the contract evolves).</p>
+</div>
+</section>
+
+<section id="rate-vs-quota">
+<h2>Rate versus quota</h2>
+<p>The two words get mixed up, and they answer different questions.</p>
+<ul>
+  <li>A <strong>rate limit</strong> bounds requests per short unit of time: 100 per minute. It protects the system <em>now</em>. It resets quickly, so a client that is told to wait can usually be back in seconds.</li>
+  <li>A <strong>quota</strong> is a budget over a long window: 50,000 requests per month, or 10,000 links created per day. It protects the <em>business</em>: cost, plan boundaries, fair use. It resets on a calendar boundary, so a client that hits it may be locked out for days.</li>
+</ul>
+<p>Snip today has a per-minute rate by plan. A monthly quota is a natural addition for the free tier, and the two stack: a request must pass both. Return them differently. A rate-limit rejection says "retry in 30 seconds". A quota rejection says "upgrade, or wait until the first of the month", and a client should not retry it on a timer. Use a distinct problem <code>type</code> for each so a client can tell them apart without parsing prose (the body is covered in <a href="04-errors-and-validation.html">Errors &amp; Validation</a>).</p>
+</section>
+
+<section id="algorithms">
+<h2>Four algorithms</h2>
+<p>All four answer one question: given the requests this caller has made so far, may this one proceed? They differ in what state they keep and how they treat bursts.</p>
+
+<h3>Fixed window</h3>
+<p>Count requests per calendar window, for example per clock minute, and reject once the count passes 100. State is one counter and an expiry. It is the cheapest to build and the easiest to explain. Its flaw is the boundary: a client sends 100 requests at 12:00:59 and 100 more at 12:01:00. Each window is within its limit, yet the API took 200 requests in two seconds, twice the rate you meant to allow.</p>
+
+<h3>Sliding window</h3>
+<p>Count requests in the last 60 seconds from <em>now</em>, not from the top of the minute. Two ways to do it. A <em>log</em> keeps a timestamp per request and counts those younger than 60 seconds: exact, but memory grows with the limit. A <em>weighted counter</em> keeps two fixed-window counts and blends them by how far into the current window you are: for example, 30% of the way through, count 70% of the previous window plus all of the current one. It uses two numbers per caller and is approximate, but the boundary burst mostly disappears.</p>
+
+<h3>Token bucket</h3>
+<p>A bucket holds up to N tokens and refills at a steady rate. Each request spends one token; with none left, the request is rejected. The next section covers it in full, because it is the one to pick.</p>
+
+<h3>Leaky bucket</h3>
+<p>Requests join a queue and drain at a constant rate, so the output is smooth whatever the input looks like. This is traffic <em>shaping</em>, not rejection: it fits when you must feed a downstream that cannot take bursts, and it is a poor fit for an interactive API, where a queued request is a slow request.</p>
+
+<table>
+  <thead><tr><th>Algorithm</th><th>State per caller</th><th>Bursts</th><th>Weakness</th></tr></thead>
+  <tbody>
+    <tr><td>Fixed window</td><td>One counter</td><td>Up to 2x at the boundary</td><td>Boundary spike</td></tr>
+    <tr><td>Sliding log</td><td>One timestamp per request</td><td>None past the limit</td><td>Memory scales with the limit</td></tr>
+    <tr><td>Sliding counter</td><td>Two counters</td><td>Nearly none</td><td>Approximate</td></tr>
+    <tr><td>Token bucket</td><td>Token count and last-refill time</td><td>Up to bucket size, then steady</td><td>Two parameters to tune</td></tr>
+    <tr><td>Leaky bucket</td><td>A queue</td><td>None; output is constant</td><td>Adds latency</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section id="token-bucket">
+<h2>The token bucket</h2>
+<p>Use a token bucket unless you have a reason not to. Real clients are bursty: a dashboard loads and fires eight calls at once, then goes quiet. A strict "one request every 600 ms" rule punishes that harmless pattern. A bucket accepts it, and still enforces the average.</p>
+<p>Two parameters set the behaviour:</p>
+<ul>
+  <li><strong>Capacity</strong> is the most tokens the bucket holds. It sets the largest burst a caller can send after a quiet spell.</li>
+  <li><strong>Refill rate</strong> is how fast tokens return. It sets the long-run average, whatever the burst.</li>
+</ul>
+<p>You do not need a timer to refill the bucket. Store the token count and the time of the last update, and compute the refill when a request arrives:</p>
+<pre><code class="language-text">on request(key):
+    bucket = load(key)                      # tokens, updated_at
+    elapsed = now() - bucket.updated_at
+    tokens  = min(capacity, bucket.tokens + elapsed * refill_per_second)
+
+    if tokens &gt;= 1:
+        save(key, tokens - 1, now())
+        allow                               # RateLimit-Remaining = floor(tokens - 1)
+    else:
+        save(key, tokens, now())
+        reject                              # Retry-After = (1 - tokens) / refill_per_second</code></pre>
+<p>For Snip's free tier, set capacity to 100 and the refill to 100 per 60 seconds, about 1.67 tokens a second. A new key starts with a full bucket. A caller that sends 100 calls in one second gets all 100, then is held to one every 600 ms. A caller that sends one call a second never notices the limit. Pro is the same shape with capacity and refill at 1,000 per minute.</p>
+<div class="callout insight">
+  <p><strong>Capacity and refill are separate dials.</strong> To allow a larger burst without raising the average, grow the capacity and leave the refill alone. To protect a fragile endpoint, shrink the capacity: a bucket of 10 refilling at 100 per minute allows a small burst and the same average. Many APIs also charge more than one token for an expensive call, such as an analytics export at 10 tokens. That is a cost-weighted limit, and it is usually fairer than counting every request as equal.</p>
+</div>
+<p>One caution with bucket-based headers. <code>RateLimit-Remaining</code> is the whole tokens left, and <code>RateLimit-Reset</code> is the seconds until the bucket would be full again, or until a token returns if it is empty. Pick one meaning, document it, and keep to it on every response.</p>
+</section>
+
+<section id="who-to-limit">
+<h2>Who you limit</h2>
+<p>Limit by identity, not by address. Behind one office NAT or one mobile carrier gateway sit thousands of unrelated users, and a limit keyed on the IP punishes all of them for one. In the other direction, a hostile caller rotates through addresses at will. The identity you can trust is the one you authenticated in <a href="06-auth-and-scopes.html">Auth &amp; Scopes</a>:</p>
+<ol>
+  <li><strong>API key</strong> (<code>sk_live_…</code>) for server-to-server callers. One key, one bucket.</li>
+  <li><strong>OAuth client</strong> for an integration used by many people. Give the client its own bucket so one popular integration cannot starve the rest, and consider a smaller per-user bucket inside it.</li>
+  <li><strong>IP address</strong> only for unauthenticated routes, such as sign-up and token exchange, where no better identity exists. Keep that limit loose and treat it as a backstop.</li>
+</ol>
+<p>Set limits by plan. Snip's free tier gets 100 requests a minute and pro gets 1,000. The plan is a property of the key, so the limiter reads one record and picks the bucket parameters. Keep the tier table as configuration, not code, so support can raise one customer's limit in minutes without a deploy. Give write endpoints a tighter bucket than reads when the cost differs: creating a link writes to the primary, reading one usually hits a cache.</p>
+</section>
+
+<section id="contract">
+<h2>The response contract</h2>
+<p>A limit that clients cannot see is a trap. Three pieces make it a contract.</p>
+<p><strong>Status.</strong> Over the limit, answer <code>429 Too Many Requests</code> (RFC 6585). Do not use 403 or 503: a 403 says "you may not", and a 503 says "we are in trouble". A 429 says "you, specifically, are going too fast", and clients and proxies know what to do with it.</p>
+<p><strong>Retry-After.</strong> Tell the client when to come back. The header carries either a number of seconds or an HTTP date (RFC 9110). Seconds are simpler and not subject to clock skew, so prefer them.</p>
+<p><strong>The RateLimit headers, on every response.</strong> Send them on successful responses too, not only on the 429, so a client can slow down <em>before</em> it is refused:</p>
+<table>
+  <thead><tr><th>Header</th><th>Meaning in Snip</th></tr></thead>
+  <tbody>
+    <tr><td><code>RateLimit-Limit</code></td><td>The caller's ceiling for the window: 100 or 1,000</td></tr>
+    <tr><td><code>RateLimit-Remaining</code></td><td>Requests left before a 429</td></tr>
+    <tr><td><code>RateLimit-Reset</code></td><td>Seconds until the limit resets (or a token returns)</td></tr>
+  </tbody>
+</table>
+<p>A normal response from a free-tier key that is running hot:</p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+RateLimit-Limit: 100
+RateLimit-Remaining: 3
+RateLimit-Reset: 22
+Content-Type: application/json</code></pre>
+<p>And the rejection, a few calls later, with a problem body (the shape is defined in <a href="04-errors-and-validation.html">Errors &amp; Validation</a>):</p>
+<pre><code class="language-http">HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 30
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.snip.ly/errors/rate-limited",
+  "title": "Rate limit exceeded",
+  "status": 429,
+  "detail": "The free plan allows 100 requests per minute. Retry in 30 seconds.",
+  "instance": "/v1/links"
+}</code></pre>
+<p>The body is for the human reading a log. The headers are for the program. Never make a client parse <code>detail</code> to learn how long to wait.</p>
+<div class="callout warn">
+  <p><strong>The header names are a moving target.</strong> The three <code>RateLimit-*</code> headers follow the early IETF draft. Many APIs, GitHub among them, still send the older <code>X-RateLimit-*</code> names. Later drafts of that specification restructure them into <code>RateLimit</code> and <code>RateLimit-Policy</code> fields. The draft is not yet an RFC. Ship the three, document their meaning, and be ready to add the new form beside them.</p>
+</div>
+</section>
+
+<section id="client-side">
+<h2>What a good client does</h2>
+<p>The headers only help if the client reads them. A good Snip client does three things, in this order.</p>
+<ol>
+  <li><strong>Stay under the limit.</strong> Read <code>RateLimit-Remaining</code> on every response. When it nears zero, wait out <code>RateLimit-Reset</code> before the next call. Do not wait for the 429.</li>
+  <li><strong>On a 429, obey <code>Retry-After</code>.</strong> It is the server's own number, and it beats any guess.</li>
+  <li><strong>If there is no <code>Retry-After</code>, or a 5xx arrives, back off exponentially with jitter.</strong> Wait a random time up to <code>min(cap, base * 2^attempt)</code>, then try again, and give up after a bounded number of attempts.</li>
+</ol>
+<p>Jitter is not optional. If 500 clients all hit the limit at the same second and all sleep exactly 30 seconds, all 500 return at the same second, and the API is flattened again. That is a thundering herd, and it is the retry storm that turns a short overload into a long outage. Randomising the wait spreads the return over time.</p>
+<p>Take the batch importer. A customer loads 40,000 links from a CSV through <code>POST /v1/links</code> on a free key. A naive loop fires as fast as it can, burns the 100 tokens in a second, collects 429s, and retries immediately, which just consumes the tokens as they refill. A well-behaved importer paces itself:</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+# Import links; sleep for RateLimit-Reset when the bucket is nearly empty.
+while IFS=, read -r url slug; do
+  headers=$(curl -s -D - -o /dev/null -X POST https://api.snip.ly/v1/links \
+    -H "Authorization: Bearer $SNIP_KEY" \
+    -H "Idempotency-Key: $(uuidgen)" \
+    -H "Content-Type: application/json" \
+    -d "{\"url\":\"$url\",\"slug\":\"$slug\"}")
+  remaining=$(echo "$headers" | awk -F': ' 'tolower($1)=="ratelimit-remaining"{print $2+0}')
+  reset=$(echo "$headers"     | awk -F': ' 'tolower($1)=="ratelimit-reset"{print $2+0}')
+  if [ "${remaining:-1}" -le 2 ]; then sleep "${reset:-1}"; fi
+done &lt; links.csv</code></pre>
+<p>At 100 a minute, 40,000 links take about 400 minutes. That is the honest arithmetic, and it is a good moment to point the customer at pro (1,000 a minute) or at a bulk endpoint, which spends one token for many links. A retry must not create a link twice: every write above carries an <code>Idempotency-Key</code>, covered with retries in <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency</a>.</p>
+</section>
+
+<section id="where-to-enforce">
+<h2>Where to enforce</h2>
+<p>Enforce as early as you can, before the request does any work. A limiter inside the handler has already spent the CPU, the connection and the auth lookup on a request it was going to refuse. Put it at the edge or the API gateway, just after authentication has identified the caller, and reject there. A rejected request then costs a counter lookup, not a database query.</p>
+<p>The catch is that you run many gateway instances, and the caller's requests are spread across them. A counter held in each process's memory lets a caller send 100 requests to <em>each</em> of 10 instances. The counters need a shared home, and the usual choice is a fast in-memory store such as Redis. Each check is one round trip: read the bucket, compute, write it back. Do that as a single atomic script on the store, or two requests that race will both read "one token left" and both pass.</p>
+<p>Shared state brings the distributed-counter problem. An exact global count needs every check to coordinate, and the coordinator becomes a bottleneck and a new single point of failure. Most APIs should accept approximate counters instead:</p>
+<ul>
+  <li>Let each instance keep a local bucket and sync with the store every few hundred milliseconds. The limit may be exceeded by a small, bounded amount.</li>
+  <li>Shard keys across the store so one hot customer does not pin one node.</li>
+  <li>Decide what happens when the store is down. For most APIs, <strong>fail open</strong> (allow the request, log it, alert), because refusing all traffic over a limiter fault is worse than briefly having no limit. For a sensitive endpoint such as login, fail closed.</li>
+</ul>
+<p>An error of 2% on a limit of 100 a minute hurts nobody. A limiter that adds 40 ms to every call, or takes the API down with it, hurts everybody. The trade is the same one as for any shared cache, discussed in <a href="../designing-for-scale/03-caching.html">Caching</a> in the scale guide: you buy speed with a small, bounded amount of staleness.</p>
+</section>
+
+<section id="limits-vs-shedding">
+<h2>Limits versus load shedding</h2>
+<p>These look alike, since both refuse requests, but they answer different questions.</p>
+<ul>
+  <li>A <strong>rate limit</strong> is policy about <em>one caller</em>. It fires when that caller exceeds its share, however healthy the system is. The response is 429, and the caller can fix it by slowing down.</li>
+  <li><strong>Load shedding</strong> is a reliability mechanism about <em>the system</em>. It fires when the whole service is near its limit, whoever is calling: queues are deep, latency is climbing, CPU is saturated. The response is 503, with <code>Retry-After</code>, and no single caller is at fault.</li>
+</ul>
+<p>You need both. Per-caller limits sum to more than your capacity, by design, because not every caller is at its limit at once. If 300 free keys and 40 pro keys all run flat out, the sum is over 70,000 requests a minute, whatever the server can take. Limits keep any one caller from starving the others, but they do not promise that the total fits. Shedding is the backstop for that case: drop the least important work first (analytics reads before link creation), and keep the system answering. The mechanics, and how to choose what to drop, are in <a href="../designing-for-scale/09-reliability-and-degradation.html">Reliability &amp; Degradation</a>.</p>
+<p>Keep the two signals distinct on the wire. A client that gets a 429 should slow itself down. A client that gets a 503 should back off and may try another region. If you answer both with the same status, you lose the information that tells a client which one to do.</p>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Work through these before the next chapter. Answer in your own words first, then open the answer.</p>
+<ol>
+  <li><p>A fixed-window limiter allows 100 requests per clock minute. Describe a request pattern that gets 200 requests through in about two seconds, and name a limiter that would stop it.</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Send 100 requests in the last second of one minute and 100 in the first second of the next. Each window counts 100, so both pass. A sliding window (or a token bucket with capacity 100) sees the 200 requests inside one rolling minute and refuses the second batch. See <a href="#algorithms">Four algorithms</a>.</p></div></details></li>
+  <li><p>You set a token bucket to capacity 100, refill 100 per minute. A key has been idle for an hour, then sends 150 requests in one second. How many succeed, and what does the caller see for the rest?</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 100 succeed, as the bucket is full after an hour, plus one or two for tokens that refill during the second. The rest get 429 with a <code>Retry-After</code> of the time until one token returns, about one second here. See <a href="#token-bucket">The token bucket</a>.</p></div></details></li>
+  <li><p>Why key the limit on the API key or OAuth client rather than the IP address? Name one case where the IP is still the right key.</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Many users share an IP (NAT, carrier gateways), so IP limits punish the innocent, and an attacker can rotate IPs, so they miss the guilty. A key is authenticated and tied to a plan. The IP is still right on unauthenticated routes such as sign-up or token exchange, where no identity exists yet. See <a href="#who-to-limit">Who you limit</a>.</p></div></details></li>
+  <li><p>Your 429 response has a clear body but no headers. What does the client lose, and which three headers would you add to every response?</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The client cannot learn how long to wait without parsing prose, and it cannot slow down before it is refused. Add <code>Retry-After</code> to the 429, and <code>RateLimit-Limit</code>, <code>RateLimit-Remaining</code> and <code>RateLimit-Reset</code> to every response. See <a href="#contract">The response contract</a>.</p></div></details></li>
+  <li><p>500 clients hit a 429 at the same moment and each sleeps exactly <code>Retry-After</code> seconds. What happens when they wake, and what change fixes it?</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>They all return at the same instant and exhaust the limit again, which repeats on each cycle. Add random jitter to the wait, and use exponential backoff with a cap and a maximum attempt count when no <code>Retry-After</code> is given. See <a href="#client-side">What a good client does</a>.</p></div></details></li>
+  <li><p>Every key is within its limit, yet the API is slow and queues are growing. Which mechanism applies, what status does it return, and why did the limits not prevent this?</p>
+  <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Load shedding, returning 503 with <code>Retry-After</code>. Per-caller limits sum to more than total capacity, so many callers each within their share can still overload the system. See <a href="#limits-vs-shedding">Limits versus load shedding</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+  <li>Limit to protect capacity, share it fairly, cap cost and contain runaway clients. A rate bounds requests per minute; a quota bounds a budget per month, and they fail differently.</li>
+  <li>Default to a token bucket: capacity sets the burst, refill sets the average. Fixed windows allow a 2x spike at the boundary.</li>
+  <li>Key limits on the authenticated API key or OAuth client and set them by plan. Use the IP only where no identity exists.</li>
+  <li>Return <code>RateLimit-Limit</code>, <code>RateLimit-Remaining</code> and <code>RateLimit-Reset</code> on every response, and 429 with <code>Retry-After</code> and a problem body when over.</li>
+  <li>Clients read the headers, obey <code>Retry-After</code>, and back off with jitter. Without jitter, a retry herd undoes the limit.</li>
+  <li>Enforce at the edge with a shared counter, accept approximate counts, and add load shedding (503) for when the system, not a caller, is the problem.</li>
+</ul>
+<p>Next, the other half of speed and safety: keeping reads cheap and making retries harmless. <a href="08-caching-concurrency-and-idempotency.html">Caching, Concurrency &amp; Idempotency →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+  <li><a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/" rel="noopener">RateLimit header fields for HTTP (IETF draft)</a> — the standardisation effort behind the <code>RateLimit-*</code> headers, including the newer <code>RateLimit-Policy</code> form.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc6585" rel="noopener">RFC 6585: Additional HTTP Status Codes</a> — defines 429 Too Many Requests.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9110#name-retry-after" rel="noopener">RFC 9110, Retry-After</a> — the header's two forms, seconds and HTTP date.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9457" rel="noopener">RFC 9457: Problem Details for HTTP APIs</a> — the body shape for the 429 response.</li>
+  <li><a href="https://stripe.com/blog/rate-limiters" rel="noopener">Stripe: Scaling your API with rate limiters</a> — a production account of request limiters and load shedders working together.</li>
+  <li><a href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api" rel="noopener">GitHub REST API rate limits</a> — a public example of per-identity limits, headers and retry guidance.</li>
+  <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" rel="noopener">AWS Builders' Library: Timeouts, retries and backoff with jitter</a> — why jitter matters and how to apply it.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

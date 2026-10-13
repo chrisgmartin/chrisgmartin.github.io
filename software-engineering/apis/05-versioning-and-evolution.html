@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Versioning & Evolution — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Every API has a version two. This chapter is the line between a change that is safe and one that breaks callers, the versioning strategies and what each really…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/05-versioning-and-evolution">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Versioning &amp; Evolution — Designing APIs">
+<meta property="og:description" content="Every API has a version two. This chapter is the line between a change that is safe and one that breaks callers, the versioning strategies and what each really…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/05-versioning-and-evolution">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#core-tension">The core tension</a>
+    <a href="#breaking-vs-additive">Breaking or additive</a>
+    <a href="#robustness">The robustness principle</a>
+    <a href="#strategies">Versioning strategies</a>
+    <a href="#why-path">Why Snip uses the path</a>
+    <a href="#two-versions">Running two versions</a>
+    <a href="#deprecation">Deprecation and sunset</a>
+    <a href="#snip-in-practice">Snip in practice</a>
+    <a href="#forward-compatible-clients">Forward-compatible clients</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-errors-and-validation.html">← Prev</a>
+    <a href="06-auth-and-scopes.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Evolve &amp; protect the contract</span>
+  <h1>Versioning &amp; Evolution</h1>
+  <p class="subtitle">Every API has a version two. This chapter is the line between a change that is safe and one that breaks callers, the versioning strategies and what each really costs, how to add without breaking, and how to deprecate and sunset.</p>
+</header>
+
+<section id="core-tension">
+<h2>The core tension</h2>
+<p>You ship a server. Callers ship clients. You cannot deploy both in the same minute, and some callers will never update: a cron job someone wrote in 2024, a mobile build still on a phone, a partner's integration with no owner left. Your API is the only place the two sides meet, so whatever you change there lands on code you cannot see.</p>
+<p>That is why most of versioning is not about version numbers. It is the discipline of changing the contract by adding to it. A version number is the expensive fallback for the changes you could not make additively.</p>
+<p>Snip's API gives a concrete case. Callers create short links with <code>POST /v1/links</code> and read them back as a <code>link</code> object. Thousands of scripts parse that object. Every field in it is a promise, and so are the status codes and error types around it (<a href="04-errors-and-validation.html">errors are contract too</a>).</p>
+
+<div class="callout insight">
+<p><strong>Insight.</strong> The contract is everything a client can observe, not only the schema. Field names, types, meaning, defaults, ordering guarantees, pagination behaviour, status codes and error <code>type</code> URIs all count. If a client can depend on it, assume one does.</p>
+</div>
+</section>
+
+<section id="breaking-vs-additive">
+<h2>Breaking or additive</h2>
+<p>Decide this per change, with a fixed list, not by feel. A change is <strong>breaking</strong> if a correct client written against the old behaviour can fail after it.</p>
+<table>
+<thead><tr><th>Breaking</th><th>Why it breaks</th></tr></thead>
+<tbody>
+<tr><td>Remove or rename a response field</td><td>Clients read it and get nothing.</td></tr>
+<tr><td>Change a field's type or meaning</td><td><code>created_at</code> from an ISO string to epoch seconds fails every parser; a changed meaning fails silently.</td></tr>
+<tr><td>Add a required request field</td><td>Every existing request is now invalid.</td></tr>
+<tr><td>Tighten validation</td><td>Input that passed yesterday gets a <code>422</code> today.</td></tr>
+<tr><td>Remove an endpoint</td><td>Calls return <code>404</code>.</td></tr>
+<tr><td>Change an error's status or <code>type</code></td><td>Retry and handling logic keys on these.</td></tr>
+<tr><td>Change a default</td><td>Callers who omitted the parameter get new behaviour.</td></tr>
+<tr><td>Change pagination behaviour</td><td>Page size, ordering or cursor format changes can skip or repeat items (see <a href="02-resource-modeling.html">resource modeling</a>).</td></tr>
+</tbody>
+</table>
+<p>A change is <strong>additive</strong> if a correct client does not notice it: a new optional response field, a new endpoint, a new optional request parameter, a new optional enum value.</p>
+<p>The last one needs care. A new enum value is additive on the wire and breaking in a client that does <code>switch (link.status)</code> with no default branch, or that deserialises into a closed enum type and throws. So the rule has two halves, and you must publish both: you may add enum values at any time, and clients must tolerate values they do not know. Put that sentence in the reference docs next to every enum. Without it, you promised nothing and the strict client is within its rights.</p>
+<p>Loosening is usually safe and tightening is not. Accepting a longer <code>tags</code> list is fine. Rejecting a <code>url</code> you used to accept is a break, even when the old behaviour was a bug. Fix bugs that way only with the deprecation process below.</p>
+</section>
+
+<section id="robustness">
+<h2>The robustness principle</h2>
+<p>RFC 1122 states Postel's rule: be conservative in what you send, liberal in what you accept. For an evolving API it gives two useful halves.</p>
+<ul>
+<li><strong>Server, conservative in what you send.</strong> Emit exactly the documented shape. Never leak a field you may want to drop; once it is in a response, someone reads it.</li>
+<li><strong>Client, liberal in what you accept.</strong> Ignore fields you do not know. Tolerate enum values you do not know. This is what makes additive change safe.</li>
+</ul>
+<p>The principle has a limit. A server that is liberal in what it accepts hides bugs: a misspelled <code>tagz</code> field is silently dropped, a string <code>"true"</code> is coerced, and callers build on the accident. Later you cannot tighten without a break. So be liberal on responses (clients ignore the unknown) and strict on requests (reject unknown fields and wrong types with a clear <code>422</code>, as in <a href="04-errors-and-validation.html">Errors &amp; Validation</a>). Strictness on day one is free. Strictness on day 900 is a version bump.</p>
+<p>The working rule is short: <strong>add, don't change.</strong> If you need different behaviour, add a new field or endpoint beside the old one, and deprecate the old one later.</p>
+</section>
+
+<section id="strategies">
+<h2>Versioning strategies</h2>
+<p>When an additive path does not exist, you need a way to ship two behaviours at once. There are four common ways to name them.</p>
+<h3>URL path</h3>
+<pre><code class="language-http">GET https://api.snip.ly/v1/links/q7Xk2
+GET https://api.snip.ly/v2/links/q7Xk2</code></pre>
+<p>The version is visible in logs, docs, support tickets and browser address bars. Routing is trivial, caches key on the URL with no extra work, and any developer can try it with <code>curl</code>. The cost is bluntness: the version covers the whole surface, so a break in one resource tends to mean a <code>v2</code> of everything, or a confusing mix where <code>/v2/links</code> sits beside <code>/v1/domains</code>.</p>
+<h3>Header or media type</h3>
+<pre><code class="language-http">GET /links/q7Xk2 HTTP/1.1
+Accept: application/vnd.snip.v2+json</code></pre>
+<p>This is granular: you can version one representation without touching the others, and the URL names the resource, not its format. It fits the HTTP model well. In practice it is harder to try in a browser, easy for callers to forget (what happens when the header is missing?), invisible in most logs, and needs <code>Vary: Accept</code> so caches do not mix versions. Routing and docs get more complex.</p>
+<h3>Query parameter</h3>
+<pre><code class="language-http">GET /links/q7Xk2?version=2</code></pre>
+<p>Simple to add and simple to try. It clutters URLs, muddies cache keys (is <code>?version=2</code> the same resource as the bare URL?), and callers drop it when they build links by hand. It is the weakest of the four.</p>
+<h3>Date-based versions</h3>
+<p>Stripe pins each account to the date of its first request and lets callers override per request with a version header. Changes ship behind a date, and each old behaviour stays available through small transforms. It gives very fine-grained, low-drama upgrades, and it needs serious machinery: a registry of changes, a transform per change, and tests across every date. Consider it once you have the staff to run it.</p>
+</section>
+
+<section id="why-path">
+<h2>Why Snip uses the path</h2>
+<p>Snip's API is at <code>https://api.snip.ly/v1</code>, with the <strong>major version in the path</strong>. For a public API that is the right default, for three reasons.</p>
+<ol>
+<li><strong>Visibility.</strong> A support engineer reading a log line, or a user pasting a failing request, sees the version at once. With a header you ask them to paste more.</li>
+<li><strong>Cheap to operate.</strong> A gateway routes <code>/v1/*</code> and <code>/v2/*</code> to different handlers with one rule, and rate limits, auth and analytics split by prefix for free.</li>
+<li><strong>Honest cost.</strong> The bluntness is a feature: a new major version is expensive to ship and to retire, so it should be rare and a little painful. That pressure keeps you adding in <code>v1</code>.</li>
+</ol>
+<p>Only the <em>major</em> version goes in the path. There is no <code>v1.3</code>. Minor and patch changes are additive by definition, so they need no address; they go in the changelog.</p>
+<p>Exceptions: if your callers are a small set of known partners, a header costs little and buys granularity. If you expect frequent breaking change across many independent resources, date-based pinning scales better than a stream of majors. Most public APIs are in neither case.</p>
+<p>One boundary matters: the version belongs to the <strong>control plane</strong>. The redirect itself, <code>snip.ly/q7Xk2</code>, is the <strong>data plane</strong>. It is a public URL printed on posters and embedded in old emails, and it has no version and no sunset. Break the API and you annoy developers. Break a redirect and you break every link ever published.</p>
+</section>
+
+<section id="two-versions">
+<h2>Running two versions at once</h2>
+<p>The wrong way is to copy the codebase into <code>v1/</code> and <code>v2/</code> directories. Every bug fix then lands twice, and the two drift apart within a quarter.</p>
+<p>The right way is one core and a thin adapter per version:</p>
+<pre><code class="language-text">request /v1/links  →  v1 adapter  →  core domain model  →  v1 adapter  →  response
+request /v2/links  →  v2 adapter  →  core domain model  →  v2 adapter  →  response</code></pre>
+<p>The core holds the business rules, storage and authorisation. Each adapter does three things: parse that version's request shape into core types, call the core, and render the core's result in that version's response shape. Keep adapters free of logic. If an adapter starts making decisions, the decision belongs in the core.</p>
+<p>This also tells you what a break costs. If <code>v2</code> differs only in shape, its adapter is a few hundred lines. If <code>v2</code> changes what the system <em>does</em>, the core must support both behaviours, and you are carrying a real fork behind a flag. Prefer breaks of shape over breaks of semantics.</p>
+<p>Test both versions against the same core scenarios. A contract test suite per version, run on every change, is the only reliable way to know a core change did not alter <code>v1</code>.</p>
+</section>
+
+<section id="deprecation">
+<h2>Deprecation and sunset</h2>
+<p>You cannot delete what you cannot measure. Deprecation is a process with steps you can run, not a notice you post.</p>
+<ol>
+<li><strong>Instrument first.</strong> Log every request with version, endpoint, API key or client ID, and, for field-level changes, which deprecated fields or parameters it used. You need to answer "who still calls this?" with a list of names, before you announce anything.</li>
+<li><strong>Announce with a date.</strong> Publish a changelog entry that says what changes, why, what to use instead, and when the old behaviour stops. Email the owners of keys that call it.</li>
+<li><strong>Signal in every response.</strong> Machines read headers; humans read logs. Send both:
+<pre><code class="language-http">HTTP/1.1 200 OK
+Deprecation: @1803859200
+Sunset: Wed, 01 Mar 2028 00:00:00 GMT
+Link: &lt;https://snip.ly/docs/migrate-v2&gt;; rel="deprecation"; type="text/html"
+Content-Type: application/json</code></pre>
+<p><code>Deprecation</code> (RFC 9745) says the endpoint is deprecated, from a date. <code>Sunset</code> (RFC 8594) says when it will stop responding. A <code>Link</code> header points to the migration guide. For a deprecated field in an otherwise live endpoint, add a <code>warnings</code> note to the body only if your schema already reserves a place for it; do not bolt one on later.</p></li>
+<li><strong>Chase the stragglers.</strong> Watch the usage numbers fall. Contact the keys that remain. Brown-outs (short, scheduled periods of errors a few weeks before the sunset) turn a missed email into a failing build someone notices.</li>
+<li><strong>Remove, then keep the tombstone.</strong> After the sunset date, return <code>410 Gone</code> with a problem-details body that links to the migration guide, instead of a bare <code>404</code>.</li>
+</ol>
+<p>Pick the timeline for the slowest honest caller, not the average one. For a public API, twelve months from deprecation to sunset is a reasonable floor; for a mobile client you cannot force to update, longer. Whatever you promise, keep it. Callers forgive a long window and never forgive a short one.</p>
+
+<div class="callout warn">
+<p><strong>Watch out.</strong> The "no traffic" signal can lie. A job that runs once a quarter or once a year will not show in a two-week window. Measure over at least one full cycle of your slowest caller, and email key owners regardless of what the logs say.</p>
+</div>
+
+<p>Events follow the same rules. A webhook payload is a response that someone else's server parses, so version it and deprecate it the same way. See <a href="09-async-webhooks-and-streaming.html">Async, Webhooks &amp; Streaming</a>.</p>
+</section>
+
+<section id="snip-in-practice">
+<h2>Snip in practice</h2>
+<p>Here is a <code>v1</code> link on launch day:</p>
+<pre><code class="language-json">{
+  "code": "q7Xk2",
+  "url": "https://example.com/pricing",
+  "short_url": "https://snip.ly/q7Xk2",
+  "created_at": "2026-03-02T09:14:00Z"
+}</code></pre>
+<p>Customers ask for organisation and for click counts. Both are additive, so both ship inside <code>v1</code> with no new version:</p>
+<pre><code class="language-json">{
+  "code": "q7Xk2",
+  "url": "https://example.com/pricing",
+  "short_url": "https://snip.ly/q7Xk2",
+  "created_at": "2026-03-02T09:14:00Z",
+  "tags": ["launch", "pricing"],
+  "total_clicks": 1284
+}</code></pre>
+<p><code>tags</code> is an optional request field on create and update (<code>PATCH /v1/links/q7Xk2</code>) and an array that is empty when unset. <code>total_clicks</code> is read-only and appears in responses only. Old clients see two extra fields and ignore them. The changelog gets two lines. Nothing else happens, which is the point.</p>
+<p>Now a true break. Snip wants a link to carry more than one destination rule, plus metadata such as a title and preview image. The honest model is to split <code>url</code>:</p>
+<pre><code class="language-json">{
+  "code": "q7Xk2",
+  "destination": { "url": "https://example.com/pricing" },
+  "metadata": { "title": "Pricing", "image": null },
+  "short_url": "https://snip.ly/q7Xk2",
+  "created_at": "2026-03-02T09:14:00Z",
+  "tags": ["launch", "pricing"],
+  "total_clicks": 1284
+}</code></pre>
+<p>You cannot do this in <code>v1</code>. Removing <code>url</code> breaks every reader; keeping <code>url</code> as an alias means two sources of truth for one value. This change finally forces <code>/v2</code>. Because the core already stores a destination and metadata separately, the work is a new adapter: <code>v2</code> renders the split, <code>v1</code> keeps rendering <code>url</code> from <code>destination.url</code>. Then the deprecation process above runs on <code>/v1/links</code>, with the headers and dates shown there.</p>
+<p>Notice what did not need <code>v2</code>: the two additive changes, and everything on the redirect plane.</p>
+</section>
+
+<section id="forward-compatible-clients">
+<h2>Forward-compatible clients</h2>
+<p>The additive rule only works if clients cooperate. Put this in your docs as a short, numbered "what we promise, what we ask" list, and put it in your SDKs by default.</p>
+<ol>
+<li><strong>Ignore unknown fields.</strong> Configure the JSON parser to skip them. Do not fail on extra keys.</li>
+<li><strong>Tolerate unknown enum values.</strong> Map them to an "unknown" case and keep going. Never <code>throw</code> in a <code>default</code> branch for a value you merely have not seen.</li>
+<li><strong>Do not depend on field order.</strong> JSON objects are unordered.</li>
+<li><strong>Do not depend on string formats you were not promised.</strong> A <code>code</code> is an opaque string; its length may grow.</li>
+<li><strong>Treat cursors as opaque.</strong> Pass them back unchanged; do not decode them.</li>
+<li><strong>Read the deprecation headers.</strong> Log any response with a <code>Deprecation</code> or <code>Sunset</code> header, so the warning reaches a human before the sunset date does.</li>
+</ol>
+<p>Ship your own SDKs with these defaults on. Most callers use the SDK, so the SDK is where the promise is kept or lost. For modelling choices that make these changes easier to absorb, see <a href="02-resource-modeling.html">Resource Modeling</a>.</p>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Answer before you open the folds. Each answer points back to the section that covers it.</p>
+<ol>
+<li><p>Snip adds a new value, <code>archived</code>, to the <code>status</code> enum of a link. The change is additive on the wire. Under what condition can it still break a caller, and what should you have published beforehand?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A client that treats the enum as closed (a <code>switch</code> with no default, or a strict deserialiser) fails on the unknown value. You should have documented that clients must tolerate unknown enum values. See <a href="#breaking-vs-additive">Breaking or additive</a>.</p></div></details></li>
+<li><p>Why does the robustness principle argue for strict request validation on day one, even though it says to be liberal in what you accept?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A liberal server hides caller bugs, and callers then build on the accident. Tightening later is a breaking change. The liberal half belongs to the client reading responses. See <a href="#robustness">The robustness principle</a>.</p></div></details></li>
+<li><p>A teammate proposes <code>?version=2</code> because it is the quickest to ship. Give two concrete costs you would raise, and say which strategy you would pick for a public API and why.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It muddies cache keys and clutters URLs; callers also drop it when they build URLs by hand. For a public API, the path is the default: visible in logs, one routing rule, easy to try with <code>curl</code>. See <a href="#strategies">Versioning strategies</a> and <a href="#why-path">Why Snip uses the path</a>.</p></div></details></li>
+<li><p>You run <code>/v1</code> and <code>/v2</code>. A bug fix in link creation must apply to both. How should the code be arranged so you fix it once, and where would a business rule in an adapter signal a problem?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>One core holds the rules; each version has a thin adapter that translates request and response shapes. A rule in an adapter means the rule belongs in the core, or <code>v2</code> changes semantics, not only shape. See <a href="#two-versions">Running two versions</a>.</p></div></details></li>
+<li><p>Your logs show no <code>/v1/links</code> calls from key <code>k_8812</code> in the past two weeks, and the sunset is next week. What could make removal still unsafe, and what do you do?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The key may belong to a job that runs quarterly or yearly. Measure over the slowest caller's full cycle, email the key owner, and use a brown-out before removal. See <a href="#deprecation">Deprecation and sunset</a>.</p></div></details></li>
+<li><p>Classify each as additive or breaking: adding <code>total_clicks</code> to the link; making <code>tags</code> required on create; changing the default page size from 20 to 50; adding <code>GET /v1/links/{code}/qr</code>.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Additive, breaking, breaking (a changed default and pagination behaviour), additive. See <a href="#breaking-vs-additive">Breaking or additive</a> and <a href="#snip-in-practice">Snip in practice</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>The contract is everything a client can observe. Most evolution should be additive: add fields, endpoints and optional parameters, and leave the old ones alone.</li>
+<li>Adding an enum value is additive only if you told clients to tolerate unknown values. Publish that rule next to every enum.</li>
+<li>Be strict on requests from day one and liberal on responses. Loosening later is safe; tightening is a break.</li>
+<li>Put the major version in the path for a public API. It is visible, cheap to route and cache, and its cost keeps new majors rare.</li>
+<li>Run versions as one core plus thin adapters, never as a forked codebase.</li>
+<li>Deprecate by measuring first, then announce with a date, send <code>Deprecation</code> and <code>Sunset</code> headers, and hold the timeline. You cannot delete what you cannot measure.</li>
+</ul>
+<p>Next, who may call these endpoints, and with what rights. <a href="06-auth-and-scopes.html">Authentication &amp; Scopes →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8594" rel="noopener">RFC 8594: The Sunset HTTP Header Field</a> — the header that tells callers when a resource will stop responding.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9745" rel="noopener">RFC 9745: The Deprecation HTTP Response Header Field</a> — the standard form of the deprecation signal, including the date format.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc1122" rel="noopener">RFC 1122: Requirements for Internet Hosts</a> — section 1.2.2 states the robustness principle.</li>
+<li><a href="https://stripe.com/blog/api-versioning" rel="noopener">Stripe: APIs as infrastructure, future-proofing with versioning</a> — how date-based versions and per-change transforms work in production.</li>
+<li><a href="https://docs.stripe.com/api/versioning" rel="noopener">Stripe API reference: Versioning</a> — account pinning and the per-request override.</li>
+<li><a href="https://google.aip.dev/180" rel="noopener">Google AIP-180: Backwards compatibility</a> — Google's list of what counts as a compatible change.</li>
+<li><a href="https://docs.github.com/en/rest/about-the-rest-api/api-versions" rel="noopener">GitHub REST API: API versions</a> — a header-based, date-named version scheme and its support policy.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

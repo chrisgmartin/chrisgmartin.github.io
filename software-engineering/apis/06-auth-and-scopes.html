@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Authentication & Scopes — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Two different questions hide in one word: who is calling, and what may they do? This chapter is API keys, OAuth 2.0 with PKCE for third-party apps, scopes that…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/06-auth-and-scopes">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Authentication &amp; Scopes — Designing APIs">
+<meta property="og:description" content="Two different questions hide in one word: who is calling, and what may they do? This chapter is API keys, OAuth 2.0 with PKCE for third-party apps, scopes that…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/06-auth-and-scopes">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#two-questions">Two questions</a>
+    <a href="#api-keys">API keys</a>
+    <a href="#oauth-pkce">OAuth 2.0 with PKCE</a>
+    <a href="#scopes">Scopes and least privilege</a>
+    <a href="#where-credentials-go">Where credentials go</a>
+    <a href="#opaque-vs-jwt">Opaque tokens vs JWTs</a>
+    <a href="#common-failures">Common failures</a>
+    <a href="#snip">Snip, end to end</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-versioning-and-evolution.html">← Prev</a>
+    <a href="07-rate-limits-and-quotas.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Trust, limits &amp; speed</span>
+  <h1>Authentication &amp; Scopes</h1>
+  <p class="subtitle">Two different questions hide in one word: who is calling, and what may they do? This chapter is API keys, OAuth 2.0 with PKCE for third-party apps, scopes that bound a token, and the secrets you must never leak.</p>
+</header>
+
+<section id="two-questions">
+<h2>Two questions</h2>
+<p>"Auth" names two separate checks. <strong>Authentication</strong> asks who is calling. <strong>Authorization</strong> asks what that caller may do. A valid key answers the first. It says nothing about whether the caller may delete a link, read another team's clicks, or change billing.</p>
+<p>Keep the two apart in code. Authentication runs once, at the edge of the request, and produces a <em>principal</em>: a team, or a user acting through an app, plus a set of granted scopes. Authorization runs per endpoint and per object, against that principal. Most serious API breaches are not stolen passwords. They are authorization gaps: a caller who is properly authenticated reads an object that belongs to someone else. OWASP lists broken object-level authorization first for this reason.</p>
+<p>Snip's API is the <em>control plane</em>: it creates and manages links. The redirect at <code>snip.ly/abc123</code> is the <em>data plane</em>, and it needs no credential at all. Everything below applies to <code>https://api.snip.ly/v1</code> only.</p>
+<p>Snip supports two credential types, and each fits one situation:</p>
+<table>
+<thead><tr><th>Caller</th><th>Credential</th><th>Acts as</th></tr></thead>
+<tbody>
+<tr><td>A team's own servers</td><td>API key, <code>sk_live_…</code> or <code>sk_test_…</code></td><td>The team</td></tr>
+<tr><td>A third-party app</td><td>OAuth 2.0 access token (authorization code + PKCE)</td><td>A user, limited to the scopes they granted</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="api-keys">
+<h2>API keys</h2>
+<p>An API key is a long random string that stands for a team. It is the right model when the caller and the owner are the same party: a team's backend creating links, a cron job pulling reports. There is no user to ask for consent, so a protocol that asks for it adds nothing.</p>
+<pre><code class="language-http">POST /v1/links HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_9fT3k…
+Content-Type: application/json
+
+{"url": "https://example.com/spring-sale"}</code></pre>
+<h3>Design the key, not just the check</h3>
+<ul>
+<li><strong>Prefix it.</strong> <code>sk_live_</code> and <code>sk_test_</code> tell a human which environment a key opens. They also let secret scanners (GitHub's, your own pre-commit hook) recognise a leaked Snip key by pattern and alert, or revoke it, within minutes. A bare 32-byte hex string is invisible to a scanner.</li>
+<li><strong>Show it once.</strong> Display the full key at creation and never again. Afterwards show only the last four characters.</li>
+<li><strong>Store a hash.</strong> Treat keys like passwords. Keep a SHA-256 of the key, not the key. Keys are high-entropy random values, so a fast hash is enough here; a slow password hash such as bcrypt would only add latency to every request. A database leak then does not hand over working credentials.</li>
+<li><strong>Support two active keys per team.</strong> Rotation without downtime needs overlap: create key B, deploy it, confirm traffic has moved (log the key's last four characters or its id, never the key), then revoke key A. With a one-key limit, every rotation is an outage, so nobody rotates.</li>
+<li><strong>Make revocation instant and cheap.</strong> One call, effective on the next request. Record <code>last_used_at</code> per key so teams can find forgotten ones.</li>
+</ul>
+<div class="callout danger">
+<p><strong>Never put a secret key in client code or a URL.</strong> A key in a browser bundle, a mobile app or a <code>?api_key=</code> parameter is public. Anyone can read a bundle, decompile an app, or find the URL in a proxy log, a browser history or a <code>Referer</code> header. A <code>sk_live_</code> key lives on a server and nowhere else. If a browser must call Snip, put your own backend between them, or use OAuth so the token is scoped and short-lived.</p>
+</div>
+</section>
+
+<section id="oauth-pkce">
+<h2>OAuth 2.0 with PKCE</h2>
+<p>A partner builds a dashboard for Snip users. Asking those users to paste their team's <code>sk_live_</code> key into a third party hands over everything, forever, with no way to see or limit what the partner does. OAuth 2.0 fixes this with <em>delegation</em>: the user approves a narrow set of scopes, and the app receives a token that carries exactly that.</p>
+<h3>The flow, step by step</h3>
+<p>The authorization code flow with PKCE (Proof Key for Code Exchange, pronounced "pixie"):</p>
+<ol>
+<li><strong>The app makes a secret.</strong> It generates a random <code>code_verifier</code> and computes <code>code_challenge = BASE64URL(SHA256(code_verifier))</code>.</li>
+<li><strong>The app sends the user to Snip</strong> with the challenge, never the verifier.
+<pre><code class="language-text">GET https://snip.ly/oauth/authorize
+  ?response_type=code
+  &amp;client_id=app_7Hq2
+  &amp;redirect_uri=https%3A%2F%2Fdash.example.com%2Fcallback
+  &amp;scope=analytics%3Aread
+  &amp;state=xyz123
+  &amp;code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &amp;code_challenge_method=S256</code></pre></li>
+<li><strong>The user signs in and consents</strong> to the listed scopes. Snip shows them in plain words: "Read link analytics".</li>
+<li><strong>Snip redirects back</strong> to the registered <code>redirect_uri</code> with a short-lived, single-use <code>code</code> and the same <code>state</code>. The app checks that <code>state</code> matches what it sent, which blocks forged callbacks.</li>
+<li><strong>The app exchanges the code</strong> on the back channel, and now proves it started the flow by sending the verifier:
+<pre><code class="language-http">POST /oauth/token HTTP/1.1
+Host: api.snip.ly
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&amp;code=SplxlOBeZQQYbYS6WxSbIA
+&amp;redirect_uri=https%3A%2F%2Fdash.example.com%2Fcallback
+&amp;client_id=app_7Hq2
+&amp;code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</code></pre></li>
+<li><strong>Snip answers with tokens.</strong> It hashes the verifier and compares it with the stored challenge. Only a match gets tokens.
+<pre><code class="language-json">{
+  "access_token": "snip_at_2YotnFZFEjr1zCsicMWpAA",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "snip_rt_tGzv3JOkF0XG5Qx2TlKWIA",
+  "scope": "analytics:read"
+}</code></pre></li>
+</ol>
+<h3>Why PKCE</h3>
+<p>The <code>code</code> travels through the browser, where a malicious app, a browser extension or a logged redirect can copy it. Without PKCE, whoever holds the code can swap it for tokens. With PKCE the thief has the code but not the verifier, which never left the app, so the exchange fails. The original spec required PKCE only for public clients such as mobile and single-page apps. The current security guidance recommends it for <em>all</em> clients, including server-side ones, because it costs almost nothing. Snip requires it for every app.</p>
+<h3>Why not the implicit flow</h3>
+<p>The implicit flow returned the access token directly in the redirect URL fragment. That puts a bearer token into browser history, logs and any script on the page, with no way to bind it to the app that asked. The security guidance now says not to use it. If you meet it in an older tutorial, skip it.</p>
+<h3>Access tokens, refresh tokens</h3>
+<p>Keep access tokens short-lived: Snip uses one hour. A leaked access token then expires on its own. The <em>refresh token</em> is long-lived and lets the app get a new access token without bothering the user. It is more valuable, so protect it more: store it server-side, and <strong>rotate it on every use</strong>. Each refresh returns a new refresh token and invalidates the old one. If an old one is ever replayed, someone has copied it, and the server revokes the whole grant.</p>
+<p>Two companion endpoints round this out. <em>Revocation</em> (RFC 7009) lets an app, or the user from their settings page, kill a token. <em>Introspection</em> (RFC 7662) lets a resource server ask the authorization server whether a token is active and what it allows.</p>
+</section>
+
+<section id="scopes">
+<h2>Scopes and least privilege</h2>
+<p>A scope is a named permission. The token carries the scopes the user granted, and the API checks them on every request. The principle is <strong>least privilege</strong>: a credential gets the smallest set that does the job. A dashboard that charts clicks needs <code>analytics:read</code>. It does not need to create or delete links, so it must not be able to.</p>
+<table>
+<thead><tr><th>Scope</th><th>Allows</th><th>Example endpoints</th></tr></thead>
+<tbody>
+<tr><td><code>links:read</code></td><td>List and fetch links</td><td><code>GET /v1/links</code>, <code>GET /v1/links/{code}</code></td></tr>
+<tr><td><code>links:write</code></td><td>Create, update and delete links</td><td><code>POST /v1/links</code>, <code>PATCH /v1/links/{code}</code>, <code>DELETE /v1/links/{code}</code></td></tr>
+<tr><td><code>analytics:read</code></td><td>Read click statistics</td><td><code>GET /v1/links/{code}/clicks</code></td></tr>
+</tbody>
+</table>
+<p>Three rules keep scopes useful:</p>
+<ul>
+<li><strong>Enforce per endpoint, on the server.</strong> A scope list in the consent screen means nothing if the handler never checks it. Put the check in middleware that maps each route to the scope it needs, so a new endpoint without a mapping fails closed.</li>
+<li><strong>Scopes narrow; they never widen.</strong> A token's effective permission is the <em>intersection</em> of its scopes and what the user may do. A team member who cannot delete links cannot grant an app <code>links:write</code> and make it so.</li>
+<li><strong>Split by risk, not by endpoint.</strong> Read and write are different risks, so they are different scopes. A scope per route is unusable: no one will review thirty checkboxes. Three scopes are enough to start; add one only when a real caller needs the split.</li>
+</ul>
+<p>A request outside the token's scope gets <code>403 Forbidden</code>, with a problem body that names the missing scope. A missing or invalid credential gets <code>401</code> instead. The line between them is the subject of <a href="04-errors-and-validation.html">Errors &amp; Validation</a>: 401 means "I do not know who you are", 403 means "I know, and the answer is no".</p>
+<pre><code class="language-http">HTTP/1.1 403 Forbidden
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.snip.ly/errors/insufficient-scope",
+  "title": "Insufficient scope",
+  "status": 403,
+  "detail": "This token has analytics:read. DELETE /v1/links/{code} needs links:write.",
+  "required_scope": "links:write"
+}</code></pre>
+<p>Scopes bound the <em>kind</em> of action. They do not bound <em>which objects</em>. A token with <code>links:read</code> must still see only the links of the team that granted it. Check object ownership on every lookup, even when the scope check passed.</p>
+</section>
+
+<section id="where-credentials-go">
+<h2>Where credentials go</h2>
+<p>Send the credential in the <code>Authorization</code> header, using the <code>Bearer</code> scheme from RFC 6750, on every request. Snip uses the same header for API keys and OAuth tokens, so client code does not branch on credential type.</p>
+<p>Do not accept credentials in the query string. URLs are logged by proxies, load balancers and CDNs, stored in browser history, copied into bug reports, and sent onward in <code>Referer</code> headers. Headers are not logged by default. RFC 6750 allows a query-string token but warns against it. Do not offer it.</p>
+<p>Require TLS for every call and refuse plain HTTP outright. Do not redirect it: a client that sent <code>Authorization</code> over HTTP has already leaked the credential, and a redirect hides the mistake. Bearer means exactly this: whoever <em>bears</em> the token can use it. TLS is the only thing that keeps a passive observer from becoming the caller.</p>
+<div class="callout tip">
+<p>Return <code>WWW-Authenticate: Bearer error="invalid_token"</code> with a 401, and never echo a submitted credential back in an error body or a log line. Log the key id or last four characters instead.</p>
+</div>
+</section>
+
+<section id="opaque-vs-jwt">
+<h2>Opaque tokens vs JWTs</h2>
+<p>An access token is just a string the API must be able to trust. There are two ways to make that work, and the trade is real.</p>
+<p>An <strong>opaque token</strong> is a random string with no meaning. The server looks it up in a database or cache (or asks the authorization server by introspection) to find its owner, scopes and expiry. Revocation is trivial: delete the row, and the next request fails. The cost is a lookup per request.</p>
+<p>A <strong>JWT</strong> (JSON Web Token, RFC 7519) carries its claims inside: subject, scopes, expiry, signed by the issuer. Any service holding the public key can verify it with no network call. That is fast and stateless, and it suits many services that all need to check the same token. The cost is revocation. The token stays valid until it expires, because nothing is looking anything up. You can bolt on a deny-list, but that restores the lookup you removed.</p>
+<table>
+<thead><tr><th></th><th>Opaque</th><th>JWT</th></tr></thead>
+<tbody>
+<tr><td>Verify</td><td>Lookup or introspection</td><td>Signature check, no network</td></tr>
+<tr><td>Revoke before expiry</td><td>Immediate</td><td>Hard; wait for expiry or keep a deny-list</td></tr>
+<tr><td>Contents visible to client</td><td>No</td><td>Yes (signed, not encrypted)</td></tr>
+<tr><td>Fits</td><td>One API, fast revocation, API keys</td><td>Many services, short lifetimes</td></tr>
+</tbody>
+</table>
+<p>My default: opaque tokens and API keys for a single API like Snip's, where one cached lookup is cheap and instant revocation matters. Reach for JWTs when many internal services must verify the same token without calling home, and keep them short, five to fifteen minutes. Whichever you choose, verify the signature <em>and</em> the algorithm you expect, check <code>exp</code>, <code>iss</code> and <code>aud</code>, and never put secrets in the payload. Anyone can decode it.</p>
+</section>
+
+<section id="common-failures">
+<h2>Common failures</h2>
+<p>Most auth incidents come from a short list. Check yours against it.</p>
+<ol>
+<li><strong>Keys in git or client bundles.</strong> Fix: a prefix so scanners find them, a pre-commit secret scan, and fast revocation. Assume any key that touched a repo is burned.</li>
+<li><strong>Credentials in logs.</strong> Fix: redact the <code>Authorization</code> header in request logging by default, and never log query strings that could carry secrets.</li>
+<li><strong>No rotation path.</strong> Fix: two active keys per team and a documented rotation step. A key nobody can replace without downtime lives forever.</li>
+<li><strong>No expiry.</strong> Fix: access tokens in minutes to an hour, refresh tokens rotated, and an idle timeout on grants nobody has used in months.</li>
+<li><strong>Overbroad scopes.</strong> Fix: default to the narrowest scope, show users what they grant in plain words, and let API keys carry scopes too, so a reporting job gets a read-only key.</li>
+<li><strong>Missing TLS.</strong> Fix: HTTPS only, HSTS on the hostname, and no HTTP listener that redirects.</li>
+<li><strong>Confused deputy.</strong> The API acts with its own broad authority on behalf of a caller who has less. Fix: always authorise against the <em>caller's</em> principal and scopes, never the service's. Validate <code>redirect_uri</code> against an exact registered value, so an attacker cannot send codes to their own endpoint.</li>
+</ol>
+<div class="callout warn">
+<p>Prompt-injected or buggy AI agents calling your API are a fresh instance of the confused deputy. Give an agent its own narrow credential. Do not lend it a developer's key.</p>
+</div>
+</section>
+
+<section id="snip">
+<h2>Snip, end to end</h2>
+<p>Three callers, three credentials:</p>
+<ul>
+<li><strong>The marketing team's script</strong> creates a link for each campaign email. It runs on the team's server and uses an <code>sk_live_</code> key, held in a secret manager and rotated each quarter with two keys overlapping. Staging uses an <code>sk_test_</code> key that cannot touch production data.</li>
+<li><strong>A partner's analytics dashboard</strong> shows click charts to Snip users. It uses OAuth with PKCE and asks for <code>analytics:read</code> only. If the partner is breached, the attacker can read click counts and nothing else. No link can be changed or deleted.</li>
+<li><strong>A user-facing integration</strong>, such as a newsletter tool that shortens every URL in a draft, asks for <code>links:write</code>. Its consent screen says so in plain words, and the user can revoke it from their Snip settings.</li>
+</ul>
+<p>One more mechanism looks like auth but is not request auth. Snip's <em>webhooks</em> flow the other way: Snip calls <em>your</em> server. Your server cannot present a bearer token to Snip's callback, so Snip signs each delivery with HMAC-SHA256 in a <code>Snip-Signature</code> header and you verify it with a shared secret. That proves the message came from Snip, and it is a separate secret from any API key. <a href="09-async-webhooks-and-streaming.html">Async, Webhooks &amp; Streaming</a> covers the verification step by step.</p>
+<p>After auth, the next question is how much a valid caller may do in a given minute. That is <a href="07-rate-limits-and-quotas.html">Rate Limits &amp; Quotas</a>.</p>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Answer from the mechanism, then open the answer.</p>
+<ol>
+<li><p>A teammate proposes letting the mobile app call Snip directly with the team's <code>sk_live_</code> key, to save building a backend endpoint. What goes wrong, and what are two better options?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Anyone can extract the key from the app binary or its network traffic, and it grants the whole team's access with no way to narrow it. Better: route calls through your own backend that holds the key, or use OAuth with PKCE so the app holds a scoped, short-lived token for the signed-in user. See <a href="#api-keys">API keys</a>.</p></div></details></li>
+<li><p>An attacker copies the authorization <code>code</code> from a redirect URL. Why can they not turn it into tokens when PKCE is in use?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The token endpoint requires the <code>code_verifier</code>, whose hash matches the <code>code_challenge</code> sent at the start. The verifier never travelled through the browser, so the attacker has the code but cannot prove they began the flow. See <a href="#oauth-pkce">OAuth 2.0 with PKCE</a>.</p></div></details></li>
+<li><p>A token with only <code>analytics:read</code> sends <code>DELETE /v1/links/42</code>. Which status code do you return, and what would a missing <code>Authorization</code> header get?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>403: the caller is known but not permitted, so the body should name <code>links:write</code> as the missing scope. A missing or invalid credential gets 401 with a <code>WWW-Authenticate</code> header. See <a href="#scopes">Scopes and least privilege</a> and <a href="04-errors-and-validation.html">Errors &amp; Validation</a>.</p></div></details></li>
+<li><p>Your security team wants to revoke a compromised access token within seconds. Why does that favour opaque tokens over long-lived JWTs, and what could you do if you must use JWTs?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A JWT is verified from its signature alone, so it works until <code>exp</code>; an opaque token is looked up, so deleting the record ends it at once. With JWTs, keep lifetimes to minutes and add a deny-list checked on each request, which gives back some of the lookup cost. See <a href="#opaque-vs-jwt">Opaque tokens vs JWTs</a>.</p></div></details></li>
+<li><p>A user with read-only rights on a team approves an app asking for <code>links:write</code>. What should the resulting token be able to do, and why?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nothing beyond reads. Effective permission is the intersection of the granted scopes and the user's own rights, so delegation cannot widen access; otherwise the API becomes a confused deputy. See <a href="#scopes">Scopes and least privilege</a> and <a href="#common-failures">Common failures</a>.</p></div></details></li>
+<li><p>Why does Snip support two active API keys per team, and what would you see in practice if it allowed only one?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Rotation needs overlap: deploy the new key while the old one still works, then revoke the old one. With one key, each rotation causes an outage, so teams skip rotation and old keys live on. See <a href="#api-keys">API keys</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>Authentication says who is calling; authorization says what they may do. Check both, and check object ownership as well as scope.</li>
+<li>Use API keys for a team's own servers and OAuth 2.0 with PKCE for apps that act for a user. Never use the implicit flow.</li>
+<li>Prefix keys, show them once, store only a hash, and allow two active keys so rotation causes no outage.</li>
+<li>Grant the narrowest scope that works. A missing scope is a 403; a missing or invalid credential is a 401.</li>
+<li>Credentials go in the <code>Authorization</code> header over TLS, never in a URL, a client bundle or a log.</li>
+<li>Opaque tokens revoke fast; JWTs verify fast. For a single API, start opaque.</li>
+</ul>
+<p>Next, how much a valid caller may do per minute. <a href="07-rate-limits-and-quotas.html">Rate Limits &amp; Quotas →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6749" rel="noopener">RFC 6749: The OAuth 2.0 Authorization Framework</a> — the core spec: roles, grants, tokens, scopes.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7636" rel="noopener">RFC 7636: Proof Key for Code Exchange (PKCE)</a> — the verifier and challenge mechanism, with the attack it stops.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9700" rel="noopener">RFC 9700: Best Current Practice for OAuth 2.0 Security</a> — why PKCE for all clients, why not implicit, refresh token rotation.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6750" rel="noopener">RFC 6750: OAuth 2.0 Bearer Token Usage</a> — the <code>Authorization: Bearer</code> header and why to avoid the query string.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7519" rel="noopener">RFC 7519: JSON Web Token (JWT)</a> — the claim set and validation rules.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7009" rel="noopener">RFC 7009: OAuth 2.0 Token Revocation</a> and <a href="https://www.rfc-editor.org/rfc/rfc7662" rel="noopener">RFC 7662: Token Introspection</a> — the two companion endpoints.</li>
+<li><a href="https://owasp.org/API-Security/editions/2023/en/0x11-t10/" rel="noopener">OWASP API Security Top 10 (2023)</a> — the common authorization and authentication failures, ranked.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>
