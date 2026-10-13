@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Choosing a Data Store by Shape — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapters 3 to 6 changed how Snip reads, writes and queues its data. This chapter asks where each kind of data should live.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/07-choosing-a-data-store">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Choosing a Data Store by Shape — Designing for Scale">
+<meta property="og:description" content="Chapters 3 to 6 changed how Snip reads, writes and queues its data. This chapter asks where each kind of data should live.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/07-choosing-a-data-store">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=16" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=16" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=16">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=16">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=16"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#access-pattern-first">Access pattern first</a>
+    <a href="#relational">Relational</a>
+    <a href="#key-value">Key-value</a>
+    <a href="#document-wide-column">Document and wide-column</a>
+    <a href="#specialized">Specialized stores</a>
+    <a href="#polyglot">Polyglot persistence</a>
+    <a href="#snip">Snip's stores</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-async-work-and-queues.html">← Previous</a>
+    <a href="08-tail-latency-and-capacity.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Consistency, flow &amp; failure</span>
+  <h1>Choosing a Data Store by Shape</h1>
+  <p class="subtitle">Chapters 3 to 6 changed how Snip reads, writes and queues its data. This chapter asks where each kind of data should live. Most store families exist because one access pattern was too expensive on a relational database, so the choice starts with the pattern, not the product.</p>
+</header>
+
+<section id="access-pattern-first">
+  <h2>Ask for the access pattern first</h2>
+  <p>"Which database should we use?" is the wrong first question, because a database is a bundle of trade-offs and you cannot weigh them until you know what the data will be asked to do. The first question is "what is the access pattern?" Five answers decide most of the choice.</p>
+  <ul>
+    <li><strong>The reads and writes.</strong> A point lookup (give me the row for this key), a range scan (all events for this key between two times), a full scan or aggregation (sum a column across a billion rows), a text search (documents containing these words), or a traversal (friends of friends). Each has an index or layout built for it, and each is slow on the others' layouts.</li>
+    <li><strong>Query flexibility.</strong> Will you know every query in advance, or will someone write one you did not plan? A store that only answers "by key" is fast because it refuses everything else.</li>
+    <li><strong>Consistency.</strong> Whether a write must be visible to the next read, and whether several rows must change together. <a href="05-consistency-and-its-price.html">Chapter 5</a> priced these; many stores sell their speed by weakening them.</li>
+    <li><strong>Scale and growth.</strong> Gigabytes or terabytes, hundreds of writes a second or hundreds of thousands, and how fast each doubles. <a href="01-the-numbers-and-the-laws.html">The numbers chapter</a> gives you the arithmetic.</li>
+    <li><strong>What you can operate.</strong> A store you cannot restore, upgrade or debug at 3 a.m. is a liability, however well it fits the pattern.</li>
+  </ul>
+  <p>The history supports this order. Key-value, wide-column, search and columnar stores were each built because a team hit one pattern a relational database served badly at their scale. None replaced it. Each took one pattern off it.</p>
+</section>
+
+<section id="relational">
+  <h2>Relational: the default</h2>
+  <p>Postgres and MySQL store rows in tables, index them with B-trees, and let you ask questions you did not plan for. That last property is the one to value. A relational database answers a join, a filter on any indexed column, a group-by and a multi-row transaction from the same data, with no schema change and no second system. When the access pattern is unknown or will change, which describes most products in their first two years, nothing else buys as much flexibility.</p>
+  <p>It is strongest when data has relationships (orders have items, users have teams), when several rows must change atomically, and when people need ad hoc queries. With the tools of <a href="04-scaling-the-database.html">chapter 4</a> (replicas, pooling, then sharding) it goes a long way.</p>
+  <p>Its limits are the ones chapter 4 already named. All writes go through one primary until you shard, and once you shard, joins and transactions that span shards become expensive or impossible. Those limits matter only for the access patterns that hit them: a point lookup by key never needs a join, so it pays for relational power it does not use. That is the opening for the next family.</p>
+</section>
+
+<section id="key-value">
+  <h2>Key-value: one question, answered fast</h2>
+  <p>A key-value store maps a key to a value and offers little else: get, put, delete, sometimes an atomic increment or a time-to-live. There is no join, no secondary index, and often no way to find a value except by its key. In return the lookup is O(1) in the key (a hash, then one read), data partitions cleanly across machines by that same hash, and latency stays flat as the dataset grows. Redis keeps everything in memory and answers in well under a millisecond; DynamoDB keeps data on SSDs across partitions and documents single-digit-millisecond reads at almost any size.</p>
+  <p>This is Snip's redirect exactly: given a 7-character code, return a URL. The query never changes, it needs no join, and it makes up 100 million requests a day. A relational table serves it fine, and <a href="03-caching.html">chapter 3</a> put Redis in front of it for that reason. The question is whether a key-value store should be the primary store, not only the cache.</p>
+  <p>It should when the only query is by key, the data must scale past one machine without you running a sharding layer, and you can live with the store's consistency options. A managed store such as DynamoDB shards, replicates and rebalances for you, which is its main selling point at Snip's 1 billion links and 500 GB. It should not when you will need other queries. "All links created by user 42, newest first" is not a lookup by code. In DynamoDB you answer it with a secondary index, which is a second copy of the data keyed differently, or with a table designed around that query up front. You choose your queries at design time, and changing them later is a migration, not a new <code>WHERE</code> clause.</p>
+  <p>Redis as a cache may lose everything and be rebuilt. Redis as a primary store must survive a restart, which means persistence settings, replication and a plan for the failover window.</p>
+</section>
+
+<section id="document-wide-column">
+  <h2>Document and wide-column: grouping by unit and by partition</h2>
+  <p><strong>Document stores</strong> such as MongoDB keep a self-contained record, usually JSON, with nested fields and arrays. The design idea is the aggregate: store together what you read together, so an order with its line items and shipping address comes back in one read with no join. Records in a collection need not share a schema, and you can query and index fields inside the document. This fits catalogs and content, where the unit of access is the whole object. It fits poorly when you constantly query across documents or when one fact lives in many of them, because you must update every copy.</p>
+  <p><strong>Wide-column stores</strong> (Cassandra, ScyllaDB, Bigtable) are a different bet, and they are the right one for Snip's click stream. Data is addressed by a partition key, which picks the node, and within a partition rows are kept sorted by a clustering key. You can read one row, or a slice of a partition in order, such as "clicks for link <code>aB3xK9z</code>, newest 100". You cannot join, and you cannot query without the partition key except by scanning every node. As with sharding in <a href="04-scaling-the-database.html">chapter 4</a>, the key picks your queries; the difference is that here the store forces the choice on you.</p>
+  <p>Their speed on writes comes from the storage engine. A relational B-tree updates pages in place: to insert a row, find its page, read it from disk if it is not cached, modify it, and write it back, plus a log entry for durability. Writes land at random places on disk, so sustained write throughput is bounded by random I/O. An LSM tree (log-structured merge tree) never updates in place.</p>
+  <div class="flow">B-tree write                           LSM-tree write
+  ──────────                           ──────────────
+  find page for key                    append to commit log (sequential)
+     ↓ (random read if not cached)        ↓
+  modify page in place                 insert into memtable (sorted, in RAM)
+     ↓                                    ↓  when full
+  write page back + log entry          flush as an immutable sorted file
+  (random write)                          ↓  in the background
+                                       compact files, drop overwritten data
+  read: one tree walk                  read: memtable + several files
+                                             (Bloom filters skip most)</div>
+  <p>A write appends to a commit log and inserts into a sorted in-memory table. When that fills, the store flushes it to disk as one immutable sorted file, and a background compaction merges files. Every disk write is sequential, which is why one node can ingest tens of thousands of small writes per second and why the cluster scales by adding nodes. The price falls on reads and on background work. A read may need to check the memtable and several files, which Bloom filters (a compact structure that says "definitely not here" for most files) limit, and compaction consumes I/O and CPU that you have to budget for. Overwrites and deletes leave old versions and tombstones until compaction removes them.</p>
+  <p>Click events match this profile: append-only, never updated, high volume, and read in key order. At 100 bytes each, 100 million a day is 10 GB a day, about 3.6 TB a year, with a write rate of 1,200 per second on average and several times that at peak. One Postgres primary could take that rate, but it would hold 3.6 TB of rows nobody updates in a structure designed for updates. Partitioned by link and day, a wide-column store takes the same stream across several nodes with room to add more.</p>
+</section>
+
+<section id="specialized">
+  <h2>Specialized stores: one pattern each</h2>
+  <p><strong>Search</strong> (Elasticsearch, OpenSearch). The access pattern is "find documents containing these words, ranked by relevance, filtered by facets." The mechanism is an inverted index, a map from each term to the list of documents that contain it, so a query intersects a few lists instead of scanning text. A relational <code>LIKE '%word%'</code> cannot use a B-tree and scans the table. Treat it as a derived index fed from your primary store, not a source of truth.</p>
+  <p><strong>Time-series</strong> (Prometheus, TimescaleDB, InfluxDB). The pattern is a steady stream of timestamped measurements, queried by recent range and aggregated over windows. These stores compress runs of similar values heavily, expire old data by retention rules, and downsample (keep one-minute averages after a week and drop the raw points).</p>
+  <p><strong>Blob and object storage</strong> (S3, GCS). The pattern is large, immutable files: images, backups, exports, log archives. An object store is not a database. It has no query beyond key prefix and no partial update: you replace the whole object. In exchange it is very cheap per gigabyte and extremely durable. Keep the bytes there and a pointer to them in your database.</p>
+  <p><strong>Analytical columnar stores</strong> (ClickHouse, BigQuery, Snowflake). The pattern is scanning and aggregating a few columns across billions of rows: "clicks per country per day for last quarter." Storing each column contiguously means a query reads only the columns it names, compresses them well because neighbors are alike, and spreads the scan over many cores or nodes. They are poor at single-row lookups and frequent updates, so they sit beside your operational store, not in place of it. The design of that analytical side is the subject of <a href="../../data-engineering/data-systems-design/index.html">the data systems design guide</a>.</p>
+  <p><strong>Graph</strong> (Neo4j). The pattern is traversal: friends of friends, shortest path, "who is connected to this account within three hops". In a relational database each hop is a join, and cost grows with the number of hops. A graph store keeps direct pointers from node to node, so a hop costs about the same however large the graph is. Reach for it when traversal depth is the query; most relationships are one or two joins deep and Postgres handles them.</p>
+</section>
+
+<section id="polyglot">
+  <h2>Polyglot persistence and what it costs</h2>
+  <p>Using several stores, each for the pattern it fits, is polyglot persistence. It is the right end state for many large systems, and the cost is easy to underestimate. Each store is one more thing to deploy, monitor, back up, upgrade and staff, with failure modes of its own.</p>
+  <p>The deeper cost is that there are no transactions across stores. If a link is created in the primary database and must also reach the search index and the analytics store, you have a write to two systems and no mechanism making both succeed or both fail. The naive version, writing to each in turn, is the dual-write problem: a crash between the writes leaves them disagreeing, and nothing notices. The fix is the one <a href="06-async-work-and-queues.html">chapter 6</a> gave: commit the change and an outbox row in one local transaction, and let a relay publish to the other stores, which must then tolerate duplicates. That is correct, and it is also machinery you now own.</p>
+  <p>Third, data is duplicated and denormalized. The same link exists as a row, a cache entry, a search document and an analytics record, in different shapes, updated at different times. Decide before you build which copy wins when they disagree.</p>
+  <div class="callout insight">
+    <span class="callout-label">Every added store is a derived copy you must keep in step</span>
+    <p>One store holds the truth. Everything else is a projection of it, rebuilt from the source or from its event log, and a projection that cannot be rebuilt is a second source of truth by accident.</p>
+  </div>
+  <p><strong>Start with one well-run store, usually Postgres, and add a specialized one only when a specific access pattern proves too expensive on it.</strong> "Proves" means a measurement: query time, write saturation, a storage bill, or an index that cannot be built. It does not mean a blog post. Postgres does full-text search, JSON documents and time-partitioned tables well enough for a long time, and one store means one backup and one transaction boundary. The exception is when the pattern is known to exceed the general store from the start and the numbers show it. Ingesting terabytes a year of events is not a pattern you wait to discover; you can see it in the arithmetic on day one.</p>
+</section>
+
+<section id="snip">
+  <h2>Snip's stores, pattern by pattern</h2>
+  <p>Each of Snip's data sets has its own access pattern, and the store follows from it.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Data</th><th>Access pattern</th><th>Store</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Links (1B rows, ~500 GB)</td><td>Point lookup by code; create; occasional edit; list by user</td><td>Relational sharded by hash(code), or a managed key-value store</td><td>Lookup by key shards cleanly (<a href="04-scaling-the-database.html">chapter 4</a>). Relational keeps the "list by user" query and migrations easy; key-value removes the sharding work but needs a secondary index for it.</td></tr>
+      <tr><td class="term">Hot redirects (~5 GB)</td><td>Point lookup, about 99% of reads</td><td>Redis, as a cache</td><td>Disposable copy, rebuilt from links (<a href="03-caching.html">chapter 3</a>)</td></tr>
+      <tr><td class="term">Click events (~3.6 TB a year)</td><td>Append-only, high volume, read in bulk or by link and time</td><td>A durable log first, then a wide-column or columnar store</td><td>The log absorbs bursts and decouples the redirect (<a href="06-async-work-and-queues.html">chapter 6</a>); the sink is built for sequential writes</td></tr>
+      <tr><td class="term">Click aggregates</td><td>Scans and group-bys: clicks per link per day, per country</td><td>Counters for live totals, a columnar store for analytics</td><td>Scans over billions of rows are what columnar layouts are for</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>On links I would choose the relational shards unless the team has no appetite to run them. At 1,200 reads per second, almost all absorbed by the cache, and 1 million writes a day (about 12 per second), the database is lightly loaded. Its size is the only reason to shard, and a managed key-value store trades query flexibility for not owning that work. Either is defensible, and the deciding factor is whether you will want queries beyond "by code".</p>
+  <p>The click path has the strongest case for a separate store, and it is a case from the arithmetic, not from fashion. The redirect handler publishes an event to a log and returns. A consumer writes events to a wide-column store for per-link history and rolls them into counters, the aggregation <a href="06-async-work-and-queues.html">chapter 6</a> described. For "which countries clicked this campaign last quarter" across all links, a columnar OLAP engine reads two columns instead of whole rows. How that analytical layer is built, and when a warehouse belongs beside the product database, is covered in <a href="../../data-platform/data-platform-systems-design/index.html">the data platform guide</a>.</p>
+  <p>That is four kinds of store, and it stays tolerable because only the links database is a source of truth. The cache is disposable, the log can be replayed, and the sink can be rebuilt from the log. The next problem is not where data lives but how slow the slowest requests are: <a href="08-tail-latency-and-capacity.html">tail latency</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Click events are append-only at about 1,200 writes per second on average, yet your team's Postgres primary could probably absorb that rate. Give the mechanism that makes an LSM-based store a better fit anyway, and the cost you accept.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An LSM tree appends to a log and a sorted in-memory table, then flushes immutable sorted files, so every disk write is sequential and the cluster scales out by adding nodes. A B-tree updates pages in place with random I/O, built for data that changes, while clicks are never updated. The cost is on reads, which may check several files (Bloom filters limit this), and on background compaction I/O. See <a href="#document-wide-column">document and wide-column</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague proposes making Redis the primary store for links because the redirect is a pure key lookup. What do you ask before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask whether the data can be rebuilt from elsewhere: if Redis is the only copy, it needs persistence, replication and a failover plan, not cache-style settings. Ask which other queries will appear, such as listing a user's links; Redis has no secondary index, so each needs a second structure you maintain. Ask whether 500 GB in memory is worth its cost against a disk-based store with a cache in front. See <a href="#key-value">key-value</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Product wants "search links by words in the title". Someone suggests adding Elasticsearch. What do you measure or decide first, and how would the data reach it safely?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>First check whether the existing database's full-text indexes serve the load and latency; if they do, a second store is cost with no gain. If not, treat the search index as a derived copy fed from the source of truth, not a second place to write. Writing to both in turn is the dual-write problem; use an outbox plus a relay, with idempotent index updates. See <a href="#polyglot">polyglot persistence</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why is a graph store the wrong answer for "users and the links they own", but plausibly right for "accounts linked by shared devices within four hops"?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Users to links is one join, which a relational database does well. A graph store pays off when traversal depth is the query: in a relational database each hop is another join and cost grows with depth, while a graph store follows direct pointers at about constant cost per hop. Having relationships in the data is not enough; the question is how many hops the query takes.</p></div></details>
+    </li>
+    <li>
+      <p>A document store holds each campaign with its links embedded. Marketing now asks for the total clicks per country across all campaigns. Where does the model strain, and what would you do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The aggregate model optimizes for reading one campaign as a unit. A query across every document is a scan, and it competes with the operational workload. Move the analytical question to a columnar store fed from the same events, so the scan reads only the columns it needs and leaves the document store alone. See <a href="#specialized">specialized stores</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Snip adds three specialized stores in a year and the click counts in the dashboard begin to disagree with the sink. Which design rule was probably broken, and how do you restore trust?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Some store other than the source of truth was written independently, or by dual writes, so it stopped being a pure projection. Make one store (or the event log) authoritative, feed every other store from it with an outbox or log consumer, and rebuild the diverged one by replaying from the source. A projection you cannot rebuild is a second source of truth.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Choose a store from the access pattern (point, range, scan, text, traversal), query flexibility, consistency, scale and what you can operate, in that order of questions, not from the product's reputation.</li>
+    <li>Relational is the default because it answers queries you did not plan; its limits are one write primary and expensive cross-shard joins and transactions.</li>
+    <li>Key-value gives O(1) lookup by key at any size by refusing other queries, which fits Snip's redirect; as a primary store it needs durability and a planned set of queries, and as a cache it needs neither.</li>
+    <li>Wide-column stores use LSM trees, which turn writes into sequential appends and so suit append-only event data such as Snip's 3.6 TB a year of clicks, at the cost of slower reads and background compaction.</li>
+    <li>Search, time-series, object, columnar and graph stores each take one pattern off the relational database, and each is a derived copy you must keep in step with the source of truth.</li>
+    <li>Start with one well-run store, usually Postgres, and add another only when a measured access pattern is too expensive on it, or when the arithmetic shows it will be before launch.</li>
+  </ul>
+  <p>A store chosen to fit the pattern still has a slow tail: a few requests in a hundred will take many times the average, and that tail sets what users feel. → <a href="08-tail-latency-and-capacity.html">Tail Latency &amp; Capacity</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, 2017. Chapter 2 compares relational, document and graph models; chapter 3 explains B-trees against LSM-trees and row against column storage.</li>
+    <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener"><strong>Dynamo: Amazon's Highly Available Key-value Store</strong></a> — DeCandia et al., SOSP 2007. Why Amazon gave up query power and strong consistency for availability, in the paper that shaped most key-value stores since.</li>
+    <li><a href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/" target="_blank" rel="noopener"><strong>Bigtable: A Distributed Storage System for Structured Data</strong></a> — Chang et al., OSDI 2006. The origin of the wide-column model and of the memtable and sorted-file write path.</li>
+    <li><a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html" target="_blank" rel="noopener"><strong>Cassandra storage engine</strong></a> — Apache Cassandra documentation. The commit log, memtable, SSTable and compaction path described concretely.</li>
+    <li><a href="https://martinfowler.com/bliki/PolyglotPersistence.html" target="_blank" rel="noopener"><strong>Polyglot Persistence</strong></a> — Martin Fowler. The short case for several stores, and the argument that the operational cost is the thing to weigh.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

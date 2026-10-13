@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Worked Design: Snip at Scale — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="One design, start to finish, spending every lever from the previous chapters on Snip. We size it, draw the read and write paths, pick the consistency and…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/10-a-worked-design">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="A Worked Design: Snip at Scale — Designing for Scale">
+<meta property="og:description" content="One design, start to finish, spending every lever from the previous chapters on Snip. We size it, draw the read and write paths, pick the consistency and…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/10-a-worked-design">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=16" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=16" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=16">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=16">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=16"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#requirements">Requirements and scope</a>
+    <a href="#estimates">The estimate</a>
+    <a href="#api-schema">API, codes, and schema</a>
+    <a href="#read-path">The read path</a>
+    <a href="#write-paths">The write paths</a>
+    <a href="#consistency-failure">Consistency and failure</a>
+    <a href="#ladder">The scaling ladder</a>
+    <a href="#defend">Defending it</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="09-reliability-and-degradation.html">← Previous</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Put it together</span>
+  <h1>A Worked Design: Snip at Scale</h1>
+  <p class="subtitle">One design, start to finish, spending every lever from the previous chapters on Snip. We size it, draw the read and write paths, pick the consistency and failure behavior, and then walk the ladder from a single box to millions of redirects a day — reaching for each tool only when a bottleneck demands it.</p>
+</header>
+
+<section id="requirements">
+  <h2>Requirements and scope</h2>
+  <p>A design review starts by pinning down what the system must do and how much, because those numbers decide every later choice. Snip is a URL shortener with click analytics. The functional requirements are small: create a short code for a long URL, redirect a code to its URL, and count clicks. Edits and deletes exist; custom codes are a feature a user can request. Everything else — accounts, billing, a web UI — is out of scope for the design that has to scale.</p>
+  <p>The non-functional requirements are where the work is. A redirect must be fast, because a person is waiting for the destination page: target a p99 under 50&nbsp;ms of server time (<a href="08-tail-latency-and-capacity.html">chapter 08</a>). Links must be durable — losing a user's short link is losing their data, so it must survive a machine failure. Redirects must stay available even when analytics or the dashboard is down. Counts may be approximate and a little behind; nobody audits a click total to the unit.</p>
+  <p>The scale is the one Start Here fixed: <strong>100 million redirects a day</strong> (about 1,200 per second average, 6,000–12,000 at peak), <strong>1 billion stored links</strong>, and <strong>1 million new links a day</strong>. That read-heavy, write-light, count-everything shape is the whole reason the design looks the way it does.</p>
+</section>
+
+<section id="estimates">
+  <h2>The estimate</h2>
+  <p>Before any boxes, the back-of-the-envelope pass from <a href="01-the-numbers-and-the-laws.html">chapter 01</a> tells us which resource runs out first.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">TRAFFIC   reads  100M/day  = ~1,200 /s avg, 6,000-12,000 /s peak
+          writes 1M links/day = ~12 /s   (creates are a rounding error)
+          clicks 1 per redirect = ~1,200 /s avg, ~12,000 /s peak
+
+STORAGE   links   1B x 500 B        = 500 GB  (+ ~180 GB/year)
+          clicks  100M/day x 100 B  = 10 GB/day = ~3.6 TB/year
+
+CACHE     hot 1% of links (10M) take ~99% of reads
+          hot set 10M x 500 B       = 5 GB  -> fits one Redis node
+          at 99% hit, DB sees ~12 /s avg, ~120 /s peak
+
+BANDWIDTH ~500 B per response x 12,000 /s = ~6 MB/s = ~48 Mbit/s peak</code></pre></div>
+  <p>Read it off: bandwidth is trivial. The link table at 500&nbsp;GB fits on one server for size, but 1 billion rows and a growing click log do not, and the click <em>write</em> rate — up to 12,000 a second — is what a single primary feels first. The hot set is 5&nbsp;GB, so a cache turns 1,200 reads a second into roughly a dozen at the database. The design follows from those four facts: cache hard, keep the redirect path short, separate the click writes, and shard the store.</p>
+</section>
+
+<section id="api-schema">
+  <h2>API, codes, and schema</h2>
+  <p>Two endpoints carry the traffic:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">POST /api/links   {url, custom_code?}  -> 201 {code, short_url}
+GET  /{code}                            -> 302 Location: &lt;original url&gt;</code></pre></div>
+  <p>A short code is 7 characters of base62 (<code>[0-9A-Za-z]</code>), which is 62<sup>7</sup> ≈ 3.5&nbsp;trillion values — a thousand times the billion links we expect, so random codes almost never collide. Generating a code randomly and inserting it with a uniqueness constraint (retry on the rare clash) avoids a central counter and leaks nothing about volume, unlike sequential IDs that let anyone enumerate every link by counting up. A <strong>custom code</strong> is the one case that needs a real uniqueness check: two users must not both claim <code>/launch</code>, which is the single place a stronger guarantee earns its cost (<a href="05-consistency-and-its-price.html">chapter 05</a>).</p>
+  <p>The schema is deliberately plain. The <code>links</code> table is the source of truth, sharded by <code>hash(code)</code> (<a href="04-scaling-the-database.html">chapter 04</a>). A second table keyed by owner answers "all my links" as a single-shard query, a deliberate denormalization. Click counts live in their own counter store, fed asynchronously; raw events go to a log and then an analytics store.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-sql">-- sharded by hash(code)
+links(code PK, long_url, owner_id, created_at, status)
+-- denormalized for the dashboard, sharded by owner_id
+links_by_owner(owner_id, code, title, created_at)
+-- counters, updated by the click consumers (eventual)
+link_counts(code PK, clicks)</code></pre></div>
+</section>
+
+<section id="read-path">
+  <h2>The read path</h2>
+  <p>A redirect is the request we optimize for everything, because it is 99% of the traffic and the one with a human waiting. The path is kept deliberately short — no fan-out, so the tail stays close to the tail of its parts (<a href="08-tail-latency-and-capacity.html">chapter 08</a>):</p>
+  <div class="flow">GET /a3Xk9
+   ↓
+[CDN edge]     cached 302 for a hot link? → return  (~5 min TTL)
+   ↓ miss
+[load balancer]  L7, least-connections, health-checked   (chapter 02)
+   ↓
+[app server]   stateless, any replica                     (chapter 02)
+   ↓
+[Redis]        GET u:a3Xk9   → ~99% hit → 302             (chapter 03)
+   ↓ miss (~1%)
+[router]       hash("a3Xk9") → logical shard → server
+   ↓
+[shard replica]  SELECT long_url … WHERE code = $1  (one row)
+   ↓
+302 → original URL,  write-back into Redis</div>
+  <p>Every stage is a lever from an earlier chapter. The app servers hold no session or local state, so the load balancer can send a request to any of them and we add replicas as traffic grows (<a href="02-load-balancing-and-statelessness.html">chapter 02</a>). The redirect returns a <strong>302</strong>, not a 301, so browsers keep asking us and we keep seeing clicks. Redis absorbs about 99% of lookups; the 1% that miss do a single-shard point read on a replica, a few milliseconds when healthy. At the 12,000-per-second peak that leaves only about 120 reads a second reaching the shards — light enough that they run with plenty of headroom.</p>
+</section>
+
+<section id="write-paths">
+  <h2>The write paths</h2>
+  <p>There are two writes, and they could not be more different. <strong>Creating a link</strong> is rare — about 12 a second — and must be durable and immediately usable by its creator. It writes to the shard's primary, and for a short window after, that user's reads go to the primary so they never get a "not found" from a lagging replica: read-your-writes, bought with a routing rule rather than a protocol (<a href="05-consistency-and-its-price.html">chapter 05</a>).</p>
+  <p><strong>Recording a click</strong> is the hard write: up to 12,000 a second, bursty, and on the hot path of the request we just promised to keep fast. So it does not touch the database synchronously. The redirect handler appends a small click event to a durable log and returns the 302 without waiting; consumers aggregate the events into counters off to the side (<a href="06-async-work-and-queues.html">chapter 06</a>):</p>
+  <div class="flow">[redirect handler] ──click event {id, code, ts, geo} ~100 B──▶ [log: Kafka/SQS]
+                                                                   │
+                                   ┌───────────────────────────────┴───────────┐
+                                   ▼                                            ▼
+                         [aggregator consumers]                        [raw-event archive]
+                         batch, dedup on event id,                     → analytics store
+                         counts += N per code  → [link_counts]            (columnar)</div>
+  <p>The log absorbs the burst the database could not (<a href="08-tail-latency-and-capacity.html">chapter 08</a>). Consumers batch a few thousand events and issue one update per code, so a viral link becomes a single <code>clicks = clicks + N</code> instead of ten thousand updates fighting over one row. Events carry an id so a redelivery under at-least-once counts once. The counts are eventual and approximate, which the requirements allowed. The raw events roll up into a columnar analytics store — the data-side problem, covered in <a href="../../data-engineering/data-systems-design/index.html">Data Systems Design</a> — chosen because its access pattern is scans over billions of rows (<a href="07-choosing-a-data-store.html">chapter 07</a>).</p>
+</section>
+
+<section id="consistency-failure">
+  <h2>Consistency and failure</h2>
+  <p>With copies in a cache, replicas, and shards, the design has to say what each read may see and what happens when a part dies. Snip spends strong consistency in exactly one place and degrades everywhere else.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Data path</th><th>Guarantee</th><th>When it fails</th></tr></thead>
+    <tbody>
+      <tr><td>Create then open your own link</td><td>Read-your-writes (primary window)</td><td>—</td></tr>
+      <tr><td>Redirect someone else's link</td><td>Eventual (replica + cache)</td><td>Edits take a few seconds to show; the 5-min edge TTL is the outer bound</td></tr>
+      <tr><td>Click counts</td><td>Eventual, approximate</td><td>Dashboard lags the true count by seconds to minutes</td></tr>
+      <tr><td>Shard map / primary ownership</td><td>Linearizable (consensus store)</td><td>Must never have two owners; a few KB, changed rarely</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Failure follows one rule: <strong>the redirect is the product; everything else is optional</strong> (<a href="09-reliability-and-degradation.html">chapter 09</a>). If the click pipeline is down, redirects do not wait — events are buffered in the log, and if even that backs up they are sampled or dropped. If a shard's primary dies, a replica is promoted behind fencing; reads keep serving from cache and the surviving replicas, and only new links on that shard pause for the tens of seconds it takes to fail over. If Redis restarts empty, cache-aside falls through to the database — correct but slower, and dangerous, because the shards sized for ~120 reads a second would suddenly meet thousands. So the fall-through is guarded with per-key request coalescing and load shedding, and the cache is re-warmed rather than left to a stampede (<a href="03-caching.html">chapter 03</a>).</p>
+</section>
+
+<section id="ladder">
+  <h2>The scaling ladder</h2>
+  <p>You do not build the diagram above on day one. You reach the end of it by removing one bottleneck at a time, which is the loop <a href="00-START-HERE.html">Start Here</a> promised. The same product grows through these rungs:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Stage</th><th>Bottleneck that forces the move</th><th>The move</th></tr></thead>
+    <tbody>
+      <tr><td>1. One box</td><td>Nothing yet — app and Postgres on one server</td><td>Ship it. It serves real traffic.</td></tr>
+      <tr><td>2. Split tiers</td><td>App and database contend for CPU and memory</td><td>App servers behind a load balancer; database on its own box; make the app stateless (ch 02)</td></tr>
+      <tr><td>3. Cache</td><td>Redirect reads swamp the database</td><td>Redis in front; ~99% of reads never reach the DB (ch 03)</td></tr>
+      <tr><td>4. Replicas + CDN</td><td>Read volume and a single point of failure</td><td>Read replicas; a CDN at the edge; survive a node loss (ch 04, ch 09)</td></tr>
+      <tr><td>5. Async clicks</td><td>Click writes contend with link lookups</td><td>Clicks to a log, aggregated into counters off the hot path (ch 06)</td></tr>
+      <tr><td>6. Shard</td><td>Dataset and write rate pass one primary's ceiling</td><td>Shard links by hash(code); router tier; per-shard replicas (ch 04)</td></tr>
+      <tr><td>7. Harden</td><td>The tail, overload, and abuse</td><td>Timeouts, circuit breakers, rate limits, load shedding, capacity headroom (ch 08, ch 09)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Most products never climb past rung 3 or 4, and that is the point: you spend the next lever's complexity only when a measured bottleneck forces it, never because the diagram has more boxes. Each rung bought headroom against the resource that ran out, and exposed the next one.</p>
+</section>
+
+<section id="defend">
+  <h2>Defending it</h2>
+  <p>In a review — or an interview — the design is only as good as the trade-offs you can name. The ones this design would be challenged on:</p>
+  <ul>
+    <li><strong>Why shard by <code>hash(code)</code> and not by owner?</strong> Because the hot query is the redirect, keyed by code; sharding by code makes it a single-shard point lookup. The dashboard query ("my links") is served by the owner-keyed copy instead. You optimize the shard key for the 99% path and denormalize for the rest.</li>
+    <li><strong>Why eventual counts?</strong> Because exact, synchronous counts would put 12,000 contended writes a second on the lookup path, trading the redirect's latency for a precision nobody needs. The requirement said approximate was fine; the design cashes that in.</li>
+    <li><strong>What breaks first under 10× growth?</strong> The click pipeline's consumers and the analytics store, not the redirect path — the log absorbs the burst, but aggregation and storage grow with total volume. That is where the next capacity work goes.</li>
+    <li><strong>Single region?</strong> This design is one region. Going multi-region adds cross-region replication lag and the hard question of where writes are accepted — a real jump in consistency complexity (<a href="05-consistency-and-its-price.html">chapter 05</a>), taken only when latency for distant users or regional failure justifies it.</li>
+  </ul>
+  <p>Notice that every answer is a sentence about a bottleneck and the price of the move that cleared it. That is the whole method of this guide, applied until the design is done.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Snip returns a <code>302</code> for redirects, not a <code>301</code>, even though a <code>301</code> would let browsers and the CDN cache the redirect harder and cut load. Why is that the right call here?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A <code>301</code> is permanent: browsers cache it indefinitely, so an edited or deleted link would keep sending old visitors to the old URL, and — just as important for Snip — repeat visits would never reach the server, so clicks would go uncounted. The <code>302</code> keeps every visit coming back to us, which the analytics product depends on. The small extra load is the price of correctness and counting.</p></div></details>
+    </li>
+    <li>
+      <p>A reviewer says: "clicks are writes at up to 12,000 a second, and links are only 500 GB, so the database is write-bound, not size-bound — why shard the links at all?" How do you answer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>They are right that the click <em>writes</em> are the heavy write load, which is exactly why those do not go to the links database at all — they go to a log and are aggregated into a separate counter store. The links database is left with ~12 creates a second and cached reads. Links are sharded for size and row count (1 billion rows, growing) and to survive node loss with per-shard replicas, not for the click write rate. Separating the two write paths is what lets each be sized for its real load.</p></div></details>
+    </li>
+    <li>
+      <p>You are at rung 3 (one database, a Redis cache, no replicas) and a load test shows the redirect p99 is fine at the 99% hit rate but spikes badly whenever Redis is restarted for maintenance. What is happening, and which rung do you climb, and how do you make the restart safe in the meantime?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An empty cache sends the full read load — thousands a second — straight at the one database, a stampede the single primary cannot absorb. Climb to rung 4 (read replicas) so reads have somewhere to go, and add request coalescing so concurrent misses for the same key hit the DB once. In the meantime, re-warm Redis before taking traffic, or fail over to a replica cache, rather than restarting cold under load.</p></div></details>
+    </li>
+    <li>
+      <p>Product asks for a live, exact, to-the-click counter shown on each link's page, updating in real time. What do you tell them, and what would you offer instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Exact, synchronous, per-click updates would put every click as a contended write on one row — a hot-key problem that would also drag the redirect path if it shared the store. You offer near-real-time instead: counters updated every second or few from the aggregators, which looks live to a human and keeps the write path cheap. If a specific view truly needs the exact number, compute it on demand from the raw event store, not on the hot path.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate proposes jumping straight to the rung-7 design — sharded, multi-tier, async, circuit-breakered — for a brand-new product expecting a few thousand links a day. What is the argument against it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>At that load a single box with a cache handles everything with room to spare, and the complex design costs real money and operational burden (routing tiers, consumers, a consensus store, more failure modes) to remove bottlenecks that do not exist yet. Each rung should be climbed when a measured bottleneck forces it. Building the top of the ladder first is paying the whole cost up front for headroom you may never use, and carrying the complexity slows every change in the meantime.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Start a design by fixing the numbers; Snip's read-heavy, write-light, count-everything shape dictates every later choice.</li>
+    <li>Keep the hot path short and cached: a redirect is CDN, load balancer, stateless app, Redis (~99%), and at most one single-shard read — no fan-out, so the tail stays small.</li>
+    <li>Separate the two writes. Link creates are rare and durable with read-your-writes; clicks are a high-volume stream that goes to a log and is aggregated off the hot path, eventual and approximate.</li>
+    <li>Spend strong consistency in one place — the shard map — and let redirects and counts be eventual. The redirect is the product; everything else may degrade.</li>
+    <li>You reach the full design one rung at a time: split tiers, cache, replicate, go async, shard, harden — each move forced by a measured bottleneck, never by the shape of the diagram.</li>
+    <li>In a review, defend each choice as "this bottleneck, this move, this price." A design you can defend that way is a design that scales for reasons, not by hope.</li>
+  </ul>
+  <p>That is the whole guide in one system. Go back to the <a href="index.html">chapter list</a> to revisit any lever, or <a href="00-START-HERE.html">Start Here</a> for the mental model that ties them together.</p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, O'Reilly, 2017. The single best companion to this guide; every lever here is treated in depth there.</li>
+    <li><a href="https://sre.google/sre-book/table-of-contents/" target="_blank" rel="noopener"><strong>Site Reliability Engineering</strong></a> — Google, O'Reilly, 2016. How these designs are actually run: SLOs, overload, and cascading failures, free online.</li>
+    <li><a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener"><strong>The System Design Primer</strong></a> — an open collection of system-design patterns and worked examples; good for seeing the same levers applied to other products.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

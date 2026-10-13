@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Load Balancing &amp; Statelessness — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The laws in the last chapter said a single machine runs out; this chapter is how you add more without the machines disagreeing.">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/02-load-balancing-and-statelessness">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Load Balancing &amp; Statelessness — Designing for Scale">
+<meta property="og:description" content="The laws in the last chapter said a single machine runs out; this chapter is how you add more without the machines disagreeing.">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/02-load-balancing-and-statelessness">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=16" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=16" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=16">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=16">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=16"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-stateless">Why statelessness comes first</a>
+    <a href="#load-balancers">What a load balancer does</a>
+    <a href="#health-checks">Health checks and ejection</a>
+    <a href="#affinity">Session affinity</a>
+    <a href="#snip">Snip in this light</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-the-numbers-and-the-laws.html">← Previous</a>
+    <a href="03-caching.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · The building blocks</span>
+  <h1>Load Balancing &amp; Statelessness</h1>
+  <p class="subtitle">The laws in the last chapter said a single machine runs out; this chapter is how you add more without the machines disagreeing. Scaling out works only when any worker can serve any request, and a load balancer is the part that exploits that. Here is what makes workers interchangeable, how the balancer picks one, and how it stops sending traffic to a dead one.</p>
+</header>
+
+<section id="why-stateless">
+  <h2>Why statelessness comes first</h2>
+  <p>Put two copies of a server behind a balancer and you have made a bet: that either copy can answer any request. The bet holds only if a request carries, or can fetch from a shared place, everything the server needs. Once a server keeps something in its own process that a later request depends on, the bet fails. Server A remembers the login; server B has never heard of it, and the balancer can no longer route freely.</p>
+  <p>So a <strong>stateless</strong> worker is one whose answer depends only on the request and on stores shared by every worker. The state still exists. It moves to one of two places:</p>
+  <ul>
+    <li><strong>A shared store.</strong> A session ID in a cookie, with the session itself in Redis or the database. Every worker looks it up; none owns it. The cost is a round trip per request and a store that must itself scale.</li>
+    <li><strong>The client.</strong> A signed token (a JWT, or any HMAC-signed blob) that holds the user ID and expiry. The worker verifies the signature with a shared key and needs no lookup. The cost is that you cannot revoke a token before it expires without a shared denylist, which puts a store back in the path.</li>
+  </ul>
+  <p>The state that bites is the kind nobody labeled as state:</p>
+  <ul>
+    <li><strong>In-memory sessions</strong> that work perfectly with one server and log users out at random with two.</li>
+    <li><strong>Local disk.</strong> An upload written to <code>/tmp</code> on one node and read back from another that does not have it. Use object storage.</li>
+    <li><strong>In-process rate limits.</strong> A limit of 100 a minute counted in each process becomes 100 × N across N workers, and shifts every time you scale. The counter belongs in a shared store (<a href="03-caching.html">chapter 03</a> covers that kind).</li>
+    <li><strong>Scheduled jobs inside the app.</strong> A cron-style timer in the service runs on every replica, so the nightly cleanup runs N times. Run it once, from a scheduler or with a lock.</li>
+    </ul>
+  <div class="callout insight">
+    <span class="callout-label">Stateless does not mean storeless</span>
+    <p>Statelessness does not remove state; it moves it somewhere built to hold it. The scaling problem moves with it: the session store or database is now the single shared thing every worker leans on. That is the right trade, because you can scale a store with the tools in <a href="04-scaling-the-database.html">chapter 04</a>, and you cannot scale state trapped inside a worker.</p>
+  </div>
+</section>
+
+<section id="load-balancers">
+  <h2>What a load balancer does</h2>
+  <p>A load balancer holds a list of healthy backends, accepts connections on one address, and forwards each to a backend it chooses. It spreads load, hides the failure of any one backend, and gives you one place to add capacity. The first decision is which layer it works at.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th></th><th>L4 (transport)</th><th class="pick">L7 (application)</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Sees</td><td>IPs, ports, TCP/UDP connection</td><td class="pick">The parsed HTTP request: host, path, headers, cookies</td></tr>
+      <tr><td class="term">Routes on</td><td>The connection; the choice is made once per connection</td><td class="pick">Each request, so <code>/api</code> and <code>/static</code> can go to different pools</td></tr>
+      <tr><td class="term">Can also do</td><td>Little beyond forwarding; very low overhead</td><td class="pick">TLS termination, retries, header rewriting, per-route limits, HTTP health checks</td></tr>
+      <tr><td class="term">Cost</td><td>Cheap, handles very high connection rates</td><td class="pick">More CPU and memory per request; it must buffer and parse</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The subtle consequence is connection reuse. With HTTP keep-alive or HTTP/2, one client holds one long connection and sends thousands of requests down it. An L4 balancer picks a backend once, so all of that client's requests land on the same server, and a few busy clients can skew the load badly. An L7 balancer sees each request and can spread them. Most web services want L7 at the front.</p>
+  <p>Then the balancer needs a rule for picking among healthy backends:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Algorithm</th><th>How it picks</th><th>Choose it when</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Round-robin</td><td>Next backend in order</td><td>Requests cost about the same and backends are identical. The default for a reason.</td></tr>
+      <tr><td class="term">Least-connections</td><td>Backend with the fewest open requests</td><td>Request durations vary a lot; a slow request keeps a connection open, so the balancer steers away from busy servers on its own.</td></tr>
+      <tr><td class="term">Least-response-time</td><td>Lowest recent latency, often combined with open requests</td><td>Backends differ in speed or one is degrading. It reacts fastest, and can herd traffic onto a node that only looks fast.</td></tr>
+      <tr><td class="term">Hash / consistent hash</td><td>Hash of a key (client IP, URL, user ID) picks the backend</td><td>The same key should reach the same backend, usually for cache locality. Consistent hashing remaps only about 1/N of keys when a node joins or leaves; a plain <code>hash % N</code> remaps nearly all of them.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Start with round-robin, and move to least-connections the day your p99 shows that some requests are much slower than the rest. Hashing is a deliberate act: you are choosing to bind keys to servers, which is the opposite of statelessness, so see <a href="#affinity">session affinity</a> before you do it.</p>
+</section>
+
+<section id="health-checks">
+  <h2>Health checks and ejection</h2>
+  <p>A balancer that keeps sending traffic to a dead node turns one failure into a share of failed requests equal to 1/N. Health checks prevent that, in two forms. <strong>Active</strong> checks have the balancer probe each backend on a timer (an HTTP <code>GET /healthz</code> every few seconds) and mark it down after several consecutive failures. <strong>Passive</strong> checks watch real traffic: if a backend returns connection errors or 5xx responses, count them and eject it for a while. Active checks find a dead node that has no traffic. Passive checks find a node that passes the probe but fails real requests. In open-source NGINX the built-in checks are passive (<code>max_fails</code>, <code>fail_timeout</code>); active probing is a commercial feature there, while Envoy has both (active health checking and outlier detection).</p>
+  <p>The dangerous part is what the probe asks. If <code>/healthz</code> only returns 200, it proves the process is alive and nothing else. If it also queries the database, it ties every node's health to a shared dependency. Now picture the database getting slow. Every node's probe times out at roughly the same moment; the balancer ejects all of them; and with zero healthy backends it either returns errors to everyone or sends traffic to ejected nodes anyway. The database was slow, not down, and the health checks converted a degraded system into a total outage.</p>
+  <div class="callout warn">
+    <span class="callout-label">Aggressive checks plus a shared dependency eject the whole fleet</span>
+    <p>Keep the liveness probe cheap and local, and never fail it for a problem every node shares. Cap how much of the pool may be ejected at once; Envoy's outlier detection defaults to ejecting at most 10% of hosts, and its panic threshold (50% by default) sends traffic to all hosts again when too few are healthy. A balancer that refuses to eject the last nodes is a feature. Failing in a degraded way is the subject of <a href="09-reliability-and-degradation.html">chapter 09</a>.</p>
+  </div>
+  <p>The same machinery handles deploys. To replace a node, first mark it as <strong>draining</strong>: the balancer stops sending it new requests but lets in-flight ones finish, up to a timeout. Then you stop it. Killing a process mid-request gives a burst of 502s on every release.</p>
+</section>
+
+<section id="affinity">
+  <h2>Session affinity</h2>
+  <p><strong>Session affinity</strong> (sticky sessions) makes the balancer send one client to the same backend repeatedly. It works by cookie (the balancer sets one naming the backend) or by hashing the client IP. It patches the in-memory-session problem: keep the user on the server that holds the state.</p>
+  <p>It hurts at scale for three reasons that share a root. First, load goes uneven: a few heavy users or one office behind a NAT address pin to one node, and the balancer cannot move them without breaking their sessions, so you cannot even out the load. Second, state dies with the node: when that backend crashes or is drained, every user stuck to it loses their session, so a routine deploy logs people out. Third, new nodes receive only new sessions, so existing hot nodes stay hot.</p>
+  <p>The recommendation is to be stateless and use no affinity. The exception is cache warmth. If each node holds a large local cache that is expensive to rebuild, for example a per-user model or a big in-memory index, then sending the same key to the same node can raise the hit rate a great deal. Do that with consistent hashing on the cache key, not with a cookie, accept that it is an optimization (a miss must still produce the right answer), and make sure a lost node costs you speed and not correctness.</p>
+</section>
+
+<section id="snip">
+  <h2>Snip in this light</h2>
+  <p>Snip's redirect path is a pure function of the request: take the 7-character code, look up the URL, return a 301 or 302 with a <code>Location</code> header. It stores nothing per user, writes no session, and does not care which replica answered. That is why it scales out so cleanly,. The one thing a redirect does besides the lookup, recording the click, is not state the next request needs; it is an event sent onward (<a href="06-async-work-and-queues.html">chapter 06</a>), so it does not break the property.</p>
+  <p>The request path from the edge in looks like this:</p>
+  <div class="flow">  client
+    ↓  DNS: snip.ly → nearest edge (anycast / geo-DNS)
+  [edge / L4 load balancer]
+    ↓  TLS terminated, connection spread
+  [L7 load balancer]  round-robin or least-connections
+    ↓  health-checked, draining on deploy
+  [redirect replica 1] [replica 2] ... [replica N]
+    ↓  code → URL lookup (cache, then database)
+  [cache] → [database]</div>
+  <p>The load is easy to size. Average traffic is about 1,200 requests per second, with peaks of 5 to 10 times that, so call it 6,000 to 12,000 rps. A small replica doing a cache lookup can plausibly serve a couple of thousand rps (measure yours; this is an assumption), so about 6 replicas cover the peak. Add headroom so losing or draining one leaves the rest under 70% busy, and you land near 8 to 10. Going from 10 to 20 is a config change with no data movement.</p>
+  <p>Above the balancer sits DNS. Geo-DNS returns the nearest region's address, and anycast announces the same IP from many locations so the network routes each client to the closest one. That balances across regions, but resolvers cache DNS answers for their TTL, so it is coarse and slow to steer; the balancer makes the per-request choice below it. The cost now sits in the lookup, where <a href="03-caching.html">caching</a> and the database come in. The sizing method is from <a href="01-the-numbers-and-the-laws.html">chapter 01</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A service stores login sessions in each process's memory. It works in staging with one instance. In production with four, users report being logged out every few clicks. What is happening, and name two different fixes with the cost of each?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The balancer sends successive requests to different instances, and only the one that created the session knows it. Fix one: move sessions to a shared store such as Redis; the cost is a lookup per request and a store you must keep up. Fix two: a signed token the client carries; the cost is that you cannot revoke it early without a shared denylist. See <a href="#why-stateless">why statelessness comes first</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A browser client opens one HTTP/2 connection and sends 5,000 requests over it. Why might an L4 balancer send all 5,000 to one backend, and what changes with L7?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>L4 chooses a backend per connection, not per request, so every request on that connection follows it. An L7 balancer parses each request and can pick a backend for each one. This is why a few busy long-lived clients can skew load behind an L4 balancer. See <a href="#load-balancers">what a load balancer does</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The database behind a 12-node service slows to 8-second queries. Each node's <code>/healthz</code> runs a quick query with a 2-second timeout and the balancer ejects after 3 failures. Describe what the users see and what you would change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>All 12 nodes fail the probe within seconds of each other and get ejected, so users see errors for the whole service, though the database was only slow. Nodes that would have served cached or degraded answers are removed too. Make the liveness probe local and cheap, cap the share of hosts the balancer may eject, and handle the slow dependency in the request path with timeouts and fallbacks. See <a href="#health-checks">health checks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team proposes sticky sessions to keep a 4 GB per-user lookup structure warm on each node. When is that sound, and what would you do differently from a cookie?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is sound when the structure is a cache: a miss still gives a correct answer, only slower, and rebuilding is expensive enough that locality pays. Route by consistent hashing on the user ID rather than a cookie, so removing a node remaps only about 1/N of users. It is unsound if the structure holds the only copy of anything. See <a href="#affinity">session affinity</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Horizontal scaling works only when any worker can serve any request, which means no request-relevant state in the process.</li>
+    <li>Statelessness moves state to a shared store or into a signed client token, and each choice has a price: a lookup per request, or no early revocation.</li>
+    <li>The hidden state to hunt for is in-memory sessions, local disk, per-process rate limits, in-app scheduled jobs and caches that change the answer.</li>
+    <li>L4 balancers route per connection and L7 balancers route per request, so long-lived connections skew load behind L4.</li>
+    <li>Start with round-robin, use least-connections when request times vary, and use consistent hashing only to bind keys to nodes on purpose.</li>
+    <li>Health probes should be cheap and local; a probe that checks a shared dependency can eject every node when that dependency slows, so cap ejection and drain nodes before deploys.</li>
+    <li>Prefer no session affinity; the exception is a local cache whose misses cost speed and not correctness, routed by consistent hashing.</li>
+  </ul>
+  <p>The redirect tier now scales by adding replicas, which pushes the load onto the lookup behind it; the next move is to keep most lookups from reaching the database at all. → <a href="03-caching.html">Caching</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, O'Reilly, 2017. The scalability and shared-nothing discussion, and the best treatment of why state placement drives architecture.</li>
+    <li><a href="https://12factor.net/processes" target="_blank" rel="noopener"><strong>The Twelve-Factor App: Processes</strong></a> — Heroku. The short, direct statement of stateless processes with state in backing services.</li>
+    <li><a href="https://nginx.org/en/docs/http/load_balancing.html" target="_blank" rel="noopener"><strong>NGINX: Using nginx as HTTP load balancer</strong></a> — the algorithms, passive health checks and session persistence as one real balancer implements them.</li>
+    <li><a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers" target="_blank" rel="noopener"><strong>Envoy: Load balancing</strong></a> — least-request, ring hash and Maglev, panic threshold, and how ejection limits work. Pair with its health checking and outlier detection pages.</li>
+    <li><a href="https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf" target="_blank" rel="noopener"><strong>Consistent Hashing and Random Trees</strong></a> — Karger et al., STOC 1997. The original paper behind consistent hashing; read the introduction for why <code>hash % N</code> fails.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>

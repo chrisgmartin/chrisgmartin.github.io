@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tail Latency &amp; Capacity — Designing for Scale</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The average response time hides the requests users remember. The slowest 1% (p99) and 0.1% (p99.9) set how the service feels, and any request that calls many…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/designing-for-scale/08-tail-latency-and-capacity">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Tail Latency &amp; Capacity — Designing for Scale">
+<meta property="og:description" content="The average response time hides the requests users remember. The slowest 1% (p99) and 0.1% (p99.9) set how the service feels, and any request that calls many…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/designing-for-scale/08-tail-latency-and-capacity">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=16" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=16" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=16">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=16">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="../../assets/script.js?v=16"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why-average-lies">Why the average lies</a>
+    <a href="#fan-out">Fan-out amplifies the tail</a>
+    <a href="#causes">Where the tail comes from</a>
+    <a href="#mitigations">Cutting the tail</a>
+    <a href="#capacity">Capacity and headroom</a>
+    <a href="#snip">Snip's tail budget</a>
+    <a href="#check">Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-choosing-a-data-store.html">← Previous</a>
+    <a href="09-reliability-and-degradation.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Consistency, flow &amp; failure</span>
+  <h1>Tail Latency &amp; Capacity</h1>
+  <p class="subtitle">The average response time hides the requests users remember. The slowest 1% (p99) and 0.1% (p99.9) set how the service feels, and any request that calls many backends turns a rare slow reply into a routine one. This chapter covers why, where slow replies come from, how to cut them, and how to leave enough headroom that load never pushes you up the steep part of the curve.</p>
+</header>
+
+<section id="why-average-lies">
+  <h2>Why the average lies</h2>
+  <p>A <strong>percentile</strong> answers "what fraction of requests were at least this fast." The p50 (median) is the time half the requests beat. The p95 is beaten by 95 of every 100, the p99 by 99 of 100, and the p99.9 by 999 of 1,000. Read the p99 as "the slowest 1% start here."</p>
+  <p>Latency is not bell-shaped. Most requests take about the same short time, then a thin tail stretches out to ten or a hundred times that: a page fault, a retry, a pause, a queue. The mean is pulled toward the tail without describing it, and it describes no real request. Take 100 requests to one endpoint:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Requests</th><th>Time each</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">98 of them</td><td>20 ms</td></tr>
+      <tr><td class="term">1</td><td>400 ms</td></tr>
+      <tr><td class="term">1</td><td>2,000 ms</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The mean is (98 × 20 + 400 + 2,000) / 100 = <strong>43.6 ms</strong>. The p50 is 20 ms. The p95 is also 20 ms. The p99, the 99th value in sorted order, is 400 ms, and the worst is 2,000 ms. The mean says "a bit over 40 ms," and not one request took that long. A dashboard that charts only the mean would show a healthy 44 ms while one user in a hundred waits twenty times longer.</p>
+  <p>A p99 of "1 in 100 is slow" is not exotic. It is ordinary for a single call. A user who loads a page making 40 requests meets a p99 event on 1 − 0.99<sup>40</sup> ≈ 33% of page loads. The slow experience belongs to a third of your sessions, not 1%, and it is not random bad luck. Heavy users, who make the most requests, hit the tail most often and are usually the users you most want to keep.</p>
+  <div class="callout warn">
+    <span class="callout-label">Never average percentiles</span>
+    <p>The mean of ten servers' p99s is not the p99 of the fleet, and the p99 of per-minute p99s is not the p99 of the hour. Percentiles do not combine by arithmetic. Aggregate the raw samples or use histograms with fixed buckets, which can be summed, and compute the percentile afterward. Alerting on a pre-averaged p99 can hide a single sick server completely.</p>
+  </div>
+</section>
+
+<section id="fan-out">
+  <h2>Fan-out amplifies the tail</h2>
+  <p>Many requests do not touch one backend. A search query fans out to 100 index shards; a feed page calls ten services; a checkout calls auth, inventory, pricing and fraud. The response is ready only when the <strong>slowest</strong> reply arrives. The request's latency is the maximum of its parts, not the average.</p>
+  <p>That changes the arithmetic. Suppose each backend answers within its fast range 99% of the time (its p99 is the edge of "fast"). For a request to be fast, every call must be fast. If the calls are independent, the chance of that is 0.99<sup>N</sup>:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Backends called (N)</th><th>P(all fast) at 99%</th><th>P(at least one slow)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">1</td><td>99%</td><td>1%</td></tr>
+      <tr><td class="term">10</td><td>90.4%</td><td>9.6%</td></tr>
+      <tr><td class="term">100</td><td>36.6%</td><td><strong>63.4%</strong></td></tr>
+      <tr><td class="term">500</td><td>0.7%</td><td>99.3%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>At N = 100, nearly two requests in three hit a backend's slow tail. One component's p99 has become the whole request's <em>median</em>. The backends did not get worse; the request got a hundred chances to draw a bad number. Making each component's p99.9 good matters more than shaving its average, because at fan-out 100, 0.999<sup>100</sup> ≈ 90.5% of requests are fast, against 36.6% at p99.</p>
+  <div class="callout insight">
+    <span class="callout-label">Fan-out turns a rare event into a typical one</span>
+    <p>The tail you tolerate in a component is the tail the user sees, raised to the number of components in the path. This is why mature systems at scale optimize p99.9 of the parts, and why the cheapest way to improve the whole is often to shrink N: fewer calls on the hot path.</p>
+  </div>
+</section>
+
+<section id="causes">
+  <h2>Where the tail comes from</h2>
+  <p>Slow requests have causes you can name. Most are one of six mechanisms.</p>
+  <ul>
+    <li><strong>Queueing near saturation.</strong> A server handles one request in 5 ms. Arrivals are random, not evenly spaced, so sometimes three land within 5 ms of each other and the third waits for two. The busier the server, the more often it has a line, and a request that joins the line pays the wait on top of its own work. This is the largest source of tail and the subject of <a href="#capacity">the capacity section</a>.</li>
+    <li><strong>Garbage collection and runtime pauses.</strong> A managed runtime must sometimes stop the threads that run your code to reclaim memory. A stop-the-world pause of 200 ms freezes every in-flight request on that process, then releases a burst of queued ones. The median does not move; the p99.9 gets a 200 ms floor. Databases show the same effect through checkpoints, compaction and vacuum.</li>
+    <li><strong>Head-of-line blocking.</strong> When requests share a connection, a thread or a queue served in order, one slow request holds up everything behind it, even requests that would take 1 ms alone. A single 1-second query on a worker that serves a FIFO queue delays every request queued behind it by up to a second. HTTP/1.1 pipelining and single-threaded event loops fail this way.</li>
+    <li><strong>Lock contention.</strong> If a hot row, mutex or connection pool is held by one slow request, waiters stack up. A pool of 20 database connections where 20 requests are each stuck on a slow query leaves request 21 waiting for a connection before its own query even starts.</li>
+    <li><strong>Cold caches.</strong> A freshly started instance, or a key that just expired, has to do the full work: load pages from disk, JIT-compile code, open connections. These requests are 10 to 100 times slower than warm ones, and a deploy or autoscale event makes them all happen at once. The <a href="03-caching.html">caching chapter</a> showed how a single expiry becomes a stampede.</li>
+    <li><strong>Retries adding load.</strong> A client times out and retries, so the server now holds the abandoned original and the retry. If 5% of requests time out and each retries three times, the extra load is small. Once the service is slow, though, more requests time out, which adds load, which slows it further. Retries turn a brief stall into a sustained one. <a href="09-reliability-and-degradation.html">The reliability chapter</a> covers how to bound this.</li>
+  </ul>
+  <p>Notice what the list lacks: "the code is slow." The average path is often well optimized. The tail comes from <em>sharing</em>, such as a queue, a pause, a lock or a connection, and from the system being busy.</p>
+</section>
+
+<section id="mitigations">
+  <h2>Cutting the tail</h2>
+  <p>You cannot remove every source of variance in a shared system, so the practical goal is a service that stays fast <em>despite</em> slow parts. Dean and Barroso's "The Tail at Scale" gives the standard toolkit.</p>
+  <p><strong>Timeouts on every call.</strong> A call without a deadline inherits the slowest behavior of what it calls. Set a timeout per call a bit above the callee's p99.9 (not far above, or it protects nothing), and pass the remaining budget down so a call three levels deep does not outlive a user who has given up. A timeout is only safe with a plan for what happens next: fail fast, serve a default, or retry once. A timeout followed by an immediate retry is the retry-load problem again.</p>
+  <p><strong>Hedged requests.</strong> Send the request to one replica. If no answer arrives within a short delay, send a copy to a second replica and take whichever returns first. Set the delay near the call's p95, so only the slowest ~5% ever send a second copy. The extra load is about 5%, and a request is slow only if both replicas are slow, which for independent slowness has probability 0.05 × 0.01 or less. In the paper's BigTable measurement, a 10 ms hedge delay cut the p99.9 of reading 1,000 keys from 1,800 ms to 74 ms for about 2% more requests.</p>
+  <p><strong>Tied requests.</strong> A hedge still wastes work, because both replicas run the request to completion. A tied request sends the copies to two replicas at once, each told about the other. When one starts executing, it cancels its twin. You pay a small cross-server message, not duplicate execution, and the two queues race, so you get the shorter one.</p>
+  <div class="callout tip">
+    <span class="callout-label">Hedging fixes variance, not overload</span>
+    <p>Hedge when slowness is random and local: one replica is in a GC pause, one disk is busy, one queue is briefly long. A second replica is likely fine. Do not hedge when the whole tier is saturated, because every copy adds load to a system that is already slow, and you speed the collapse. Do not hedge writes unless they are idempotent, and do not hedge when slowness follows the request (a pathological query is slow on every replica). Cap hedges at a few percent of traffic, and turn them off when the backend signals overload.</p>
+  </div>
+  <p><strong>Shrink the fan-out.</strong> The cheapest tail is the call you do not make. Keep the user-facing path to one or two hops, precompute joins, and move anything optional (recommendations, counters, analytics) off the request path or behind a deadline that lets the page render without it. If you must scatter to many shards, return partial results at the deadline rather than wait for the last shard.</p>
+  <p><strong>Balance load well.</strong> A balancer that picks replicas blindly sends new work to a server already in a pause. Choosing the replica with the fewest in-flight requests, or the better of two random picks, steers around slow instances, as <a href="02-load-balancing-and-statelessness.html">the load balancing chapter</a> describes. Pair it with health checks that eject a replica whose latency, not just availability, has degraded.</p>
+  <p><strong>Cut head-of-line blocking.</strong> Give slow and fast work separate pools or queues so a 1-second report cannot sit in front of 2 ms lookups. Cap each request's CPU and time. Break long operations into small slices so shorter requests can interleave between them.</p>
+</section>
+
+<section id="capacity">
+  <h2>Capacity and headroom</h2>
+  <p><strong>Plan for the peak, not the average.</strong> Average load tells you the monthly bill; the peak tells you whether you stay up. Snip averages 1,200 rps but peaks at 6,000 to 12,000, and the peak is not a surprise: it follows a viral link or a daily cycle. A system sized for the average spends its peak hours past saturation.</p>
+  <p><strong>Latency is flat, then it is not.</strong> A server with utilization ρ (the fraction of time it is busy) and random arrivals has an average wait that grows like 1 / (1 − ρ) times the service time. That is a first-order model of a single queue, not a prediction for your system, but the shape is real:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Utilization</th><th>Time in system, in units of one service time</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">50%</td><td>2×</td></tr>
+      <tr><td class="term">80%</td><td>5×</td></tr>
+      <tr><td class="term">90%</td><td>10×</td></tr>
+      <tr><td class="term">95%</td><td>20×</td></tr>
+      <tr><td class="term">99%</td><td>100×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The last 10% of utilization costs more latency than the first 80%. This is <a href="01-the-numbers-and-the-laws.html">Little's Law</a> at work: in-flight requests L equal arrival rate λ times time in system W. When the arrival rate approaches what the server can finish, the line stops draining, L climbs, and so does W. The tail climbs faster than the mean, because a long line is a rare event that grows with load. That is why you set a utilization target well below 100%. A common choice is 50% to 70% at the expected peak, so a surprise of 1.5× to 2× lands on the flat part of the curve and not past the knee.</p>
+  <p>Headroom also covers failure. If you run three servers each at 70% and one dies, the survivors take 105% of a server's load each. Size for the peak <em>after</em> losing the largest unit you can lose, whether a server or an availability zone.</p>
+  <p><strong>Load-test with an open model.</strong> A <em>closed</em> test runs a fixed number of virtual users who each send a request, wait for the reply, then send the next. When the server stalls, those users also stall, so the test sends less load exactly when the server is struggling. It politely backs off. Real traffic is <em>open</em>: users arrive at a rate that does not care how slow you are. Gil Tene calls the resulting error <strong>coordinated omission</strong>, where the test omits the very samples that would have been slow. Use a generator that sends at a fixed arrival rate, record latency from the intended send time, and step the rate up until the p99 crosses your target. The rate just before it does is your real capacity.</p>
+  <p><strong>Autoscaling lags.</strong> It reacts to a signal, and the signal arrives late. A typical chain is a metric scraped every 30 to 60 seconds, a rule that needs a few consecutive breaches, then 1 to 3 minutes for a new instance to start, warm its caches and pass health checks. Three to five minutes is routine. A spike that doubles traffic in one minute will hit your existing capacity long before new capacity arrives. Autoscaling handles slow ramps like daily cycles. For sudden spikes you need the buffer already running, from headroom, queues that smooth bursts (see <a href="06-async-work-and-queues.html">async work and queues</a>), or scheduled scaling before a known event.</p>
+</section>
+
+<section id="snip">
+  <h2>Snip's tail budget</h2>
+  <p>Snip's redirect is short on purpose, and this chapter is why. The hot path is: load balancer, one app server, a Redis lookup, and at most one single-shard point read when the cache misses (<a href="03-caching.html">chapter 3</a> and <a href="04-scaling-the-database.html">chapter 4</a>). There is no fan-out. Each request draws from the tail of two or three components, not a hundred, so Snip's p99 stays close to the p99 of its parts and does not become their median.</p>
+  <p>Set a budget. Say the redirect must finish in under 50 ms at p99, measured at the server. A Redis hit costs roughly 0.2 to 1 ms, as in the <a href="01-the-numbers-and-the-laws.html">latency table</a>, and the rest is parsing and the network. A miss adds one point read on a single shard, a few milliseconds when healthy. That fits easily, and the budget leaves room to absorb a pause.</p>
+  <p>Now the subtle part. With a 99% hit rate, exactly 1% of requests take the miss path. The p99 is therefore the boundary where the hit path ends and the miss path begins, so <strong>the miss path sets Snip's p99</strong> and the hit path barely affects it. If the hit rate slips to 98%, the p99 sits inside the miss distribution, and a slow shard shows up directly in it. Watching the cache hit rate is watching the tail.</p>
+  <p>A miss that finds the shard slow is the worst case. At the 12,000 rps peak, a 99% hit rate sends 120 rps to the shards, light enough that they should have large headroom. But if Redis restarts empty and the hit rate falls to 20%, 9,600 rps lands on the database at once, with queues, cold pages, and client retries layered on top. That is a stampede, and the tail it creates reaches every request, even those that would have hit.</p>
+  <p>Sizing the app tier follows from a load test, not a guess. Suppose a test shows one app server holds the p99 target up to about 3,000 rps (an assumed figure; yours comes from the test). Twelve thousand rps needs four servers at 100% utilization. Planning for 60% at peak gives 12,000 / (3,000 × 0.6) ≈ 7 servers, and 8 spread across zones survives losing one with room to spare. The cost of that headroom is four extra servers; the cost of skipping it is a redirect service that is slowest during a viral spike, which is when the most people are watching.</p>
+  <p>What you actually load-test is not the cache hit, which is fast and proves little. Test at an open arrival rate up to 1.5× the 12,000 rps peak, and test these cases:</p>
+  <ul>
+    <li><strong>The miss path and the shard read.</strong> Force a 1% to 5% miss rate against a shard loaded with realistic data, and record p99 and p99.9.</li>
+    <li><strong>A cold cache.</strong> Start Redis empty under peak load and see whether the database survives the refill.</li>
+    <li><strong>One slow dependency.</strong> Add 200 ms of delay to one shard or one Redis node and check that timeouts, not queues, contain it.</li>
+  </ul>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A dashboard shows a mean latency of 45 ms and the team says the service is healthy, yet support gets complaints about 2-second loads. How can both be true, and what would you chart instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Latency is long-tailed, so a small share of very slow requests moves the mean only slightly: 1% of requests at 2 seconds adds about 20 ms to an otherwise 25 ms average. Chart p95, p99 and p99.9 from histograms, not an average of averages. See <a href="#why-average-lies">why the average lies</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Each of 40 backend calls on a page is fast 99.9% of the time. A colleague says the page's tail is "basically fine." What fraction of page loads still hit a slow call, and what would you change first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>1 − 0.999<sup>40</sup> ≈ 3.9%, so about one page load in 26 is slow, which is far above the 0.1% any single call suggests. First reduce the number of calls on the path or make them parallel with a deadline, then improve the p99.9 of the slowest component. See <a href="#fan-out">fan-out</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A service at 90% utilization has p99 of 300 ms. You add 10% more traffic and p99 goes to about 3 seconds. Explain why a 10% load increase caused a tenfold change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Near saturation, waiting time scales like 1 / (1 − ρ). Going from 90% to 99% utilization takes that factor from 10 to 100. The queue stops draining between bursts, so each request waits behind more others. The fix is capacity or shedding load, not faster code. See <a href="#capacity">capacity</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team proposes hedged requests for a database tier that is already at 85% CPU during peak. What is your objection, and for which tier would hedging make sense?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Hedging adds load, and the tier has little headroom, so extra copies lengthen the queues that cause the slowness and can tip it into collapse. Hedging suits a tier with spare capacity where slowness is random and local, such as a read-only replica set with occasional GC or disk pauses, and only for idempotent reads. See <a href="#mitigations">cutting the tail</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A load test with 500 virtual users, each waiting for a reply before sending again, reports a p99 of 80 ms at the point where the server was frozen for 3 seconds. Why is that number wrong, and how do you fix the test?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The users that were blocked by the freeze sent no requests during it, so the test recorded few slow samples and omitted the requests real users would have sent. This is coordinated omission. Use an open model with a fixed arrival rate and measure each latency from the time the request should have been sent.</p></div></details>
+    </li>
+    <li>
+      <p>Snip's cache hit rate drops from 99% to 97% with no change in traffic. Redirect p50 stays flat but p99 doubles. Why, and where do you look?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>At 99%, the p99 sat on the edge of the hit path. At 97%, 3% of requests take the miss path, so the p99 now lies inside the miss distribution, and it includes the shard read and any queueing there. The median still hits the cache. Look at the miss rate by key, TTL expiry patterns, and Redis evictions.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Latency is long-tailed, so the mean describes no real request. Track p95, p99 and p99.9, and aggregate from histograms rather than averaging percentiles.</li>
+    <li>A request that waits on N backends is as slow as the slowest, so at N = 100 a component's p99 becomes about the request's median. Improve the tail of the parts and reduce N.</li>
+    <li>Most tail latency comes from sharing: queues near saturation, runtime pauses, head-of-line blocking, lock contention, cold caches and retries. Fixing the average path rarely touches it.</li>
+    <li>Use deadlines on every call, hedge or tie requests to idempotent reads when slowness is random and capacity is spare, and never hedge a saturated tier.</li>
+    <li>Waiting time grows like 1 / (1 − ρ), so plan for the peak at 50% to 70% utilization with one unit of failure removed, and test with an open arrival model to avoid coordinated omission.</li>
+    <li>Autoscaling reacts minutes after the signal, so spike absorption has to come from headroom, queues or scheduled capacity. Snip keeps its redirect to one cache lookup and at most one shard read, so its p99 is set by the miss path.</li>
+  </ul>
+  <p>Headroom keeps a healthy system fast, but parts will still fail and slow down, and a slow dependency can drag everything with it. → <a href="09-reliability-and-degradation.html">Reliability &amp; Graceful Degradation</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener"><strong>The Tail at Scale</strong></a> — Jeffrey Dean and Luiz André Barroso, Communications of the ACM, 2013. The source for fan-out amplification, hedged and tied requests; short and worth reading in full.</li>
+    <li><a href="https://www.youtube.com/watch?v=lJ8ydIuPFeU" target="_blank" rel="noopener"><strong>How NOT to Measure Latency</strong></a> — Gil Tene, conference talk. Coordinated omission and why most latency charts understate the tail.</li>
+    <li><a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener"><strong>Handling Overload</strong></a> — Google SRE Book. Load shedding, utilization targets and why retries make overload worse.</li>
+    <li><a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener"><strong>Addressing Cascading Failures</strong></a> — Google SRE Book. How a slow dependency and retry load spread through a system, and the limits that stop it.</li>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener"><strong>Designing Data-Intensive Applications</strong></a> — Martin Kleppmann, 2017. Chapter 1 on describing load and performance, including percentiles and tail latency amplification.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>
