@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Caching, Concurrency & Idempotency — Designing APIs</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Conditional requests buy three things at once. This chapter is HTTP caching with ETags and Cache-Control, optimistic concurrency with If-Match, and idempotency…">
+<link rel="canonical" href="https://christopherm.xyz/software-engineering/apis/08-caching-concurrency-and-idempotency">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Caching, Concurrency &amp; Idempotency — Designing APIs">
+<meta property="og:description" content="Conditional requests buy three things at once. This chapter is HTTP caching with ETags and Cache-Control, optimistic concurrency with If-Match, and idempotency…">
+<meta property="og:url" content="https://christopherm.xyz/software-engineering/apis/08-caching-concurrency-and-idempotency">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=17" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=17" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=17">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=17">
+<script defer src="../../assets/script.js?v=17"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#validators">One idea: validators</a>
+    <a href="#http-caching">Caching the control plane</a>
+    <a href="#conditional-get">The conditional GET</a>
+    <a href="#lost-update">The lost update</a>
+    <a href="#if-match">If-Match and 412</a>
+    <a href="#idempotency-keys">Idempotency keys</a>
+    <a href="#safe-retries">Safe retries, end to end</a>
+    <a href="#check-yourself">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-rate-limits-and-quotas.html">← Prev</a>
+    <a href="09-async-webhooks-and-streaming.html">Next →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Trust, limits &amp; speed</span>
+  <h1>Caching, Concurrency &amp; Idempotency</h1>
+  <p class="subtitle">Conditional requests buy three things at once. This chapter is HTTP caching with ETags and Cache-Control, optimistic concurrency with If-Match, and idempotency keys that make a retried write safe to send twice.</p>
+</header>
+
+<section id="validators">
+<h2>One idea: validators</h2>
+<p>Three problems in this chapter look unrelated. A client wants to skip a download it already has. Two clients edit the same link and one erases the other. A client times out on a create and cannot tell if it worked. All three come down to the same question: what state does the client think the server is in, and does the server agree?</p>
+<p>HTTP answers with <em>validators</em> and <em>preconditions</em>. A validator is a short token that names one version of a resource. The best one is the <code>ETag</code>. A precondition is a request header that says "do this only if the validator still matches". The server checks the match before it acts. The same ETag serves two jobs, depending on which header carries it.</p>
+<table>
+<thead><tr><th>Header</th><th>Sent on</th><th>Means</th><th>On failure</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>If-None-Match: "v7"</code></td><td>GET</td><td>Send the body only if it is not <code>v7</code></td><td><code>304 Not Modified</code></td><td>Caching</td></tr>
+<tr><td><code>If-Match: "v7"</code></td><td>PATCH, PUT, DELETE</td><td>Apply this write only if it is still <code>v7</code></td><td><code>412 Precondition Failed</code></td><td>Concurrency</td></tr>
+<tr><td><code>Idempotency-Key: &lt;uuid&gt;</code></td><td>POST</td><td>Run this write at most once</td><td>Stored response replayed</td><td>Retries</td></tr>
+</tbody>
+</table>
+<p>The first two read opposite ways. <code>If-None-Match</code> asks "tell me only if it changed". <code>If-Match</code> asks "act only if it did not change". Mix them up and a write silently skips its check.</p>
+<p>The scope here is the control plane of Snip, the API that creates and edits links at <code>https://api.snip.ly/v1</code>. The data plane, the redirect that millions of people hit, has its own caching with CDNs and Redis. That is a different problem with different tools, covered in <a href="../designing-for-scale/03-caching.html">Designing for Scale: Caching</a>. Here the cache sits between an SDK or dashboard and the API itself.</p>
+</section>
+
+<section id="http-caching">
+<h2>Caching the control plane</h2>
+<p>An HTTP cache stores a response and reuses it under rules the response states. The server states them in <code>Cache-Control</code>. Four directives carry most of the weight.</p>
+<ul>
+<li><code>max-age=N</code>: the response is fresh for N seconds. A cache serves it without asking the server.</li>
+<li><code>private</code> or <code>public</code>: <code>private</code> lets only the end client cache it (a browser or an SDK). <code>public</code> also lets shared caches such as a CDN or corporate proxy keep it.</li>
+<li><code>no-cache</code>: store it, but ask the server before every reuse. The name misleads.</li>
+<li><code>no-store</code>: do not keep it at all.</li>
+</ul>
+<p>Add <code>must-revalidate</code> to forbid serving a stale copy when the server cannot be reached. Without it, a cache may serve stale data in some cases, which is the wrong default for anything a user might act on.</p>
+<p>The rule that causes real incidents: an authenticated response must never be <code>public</code>. A shared cache would key it by URL and hand one customer's link data to the next caller. Snip's responses depend on the bearer token, so they carry <code>private</code>, and <code>Vary: Authorization</code> as a second guard.</p>
+<p>What to cache in Snip:</p>
+<ul>
+<li><code>GET /v1/links/{code}</code>: yes. A link changes rarely and the shape is small. <code>Cache-Control: private, max-age=30, must-revalidate</code> plus an ETag. Thirty seconds is short enough that a dashboard shows its own edits quickly.</li>
+<li>Click totals: cache briefly or not at all. <code>total_clicks</code> is eventually consistent, so a 5 to 10 second <code>max-age</code> costs nothing the data was not already costing.</li>
+<li>Responses that contain secrets, such as a newly issued API key: <code>no-store</code>.</li>
+<li>Any write response: none of it is reusable. Leave <code>Cache-Control</code> off, or send <code>no-store</code>.</li>
+</ul>
+<p>A short <code>max-age</code> has a cost you should name in the docs. For those 30 seconds a client can read its own stale write. If a client PATCHes a link and then GETs it, it may see the old destination. Two fixes: the client updates its local copy from the PATCH response (which returns the new representation), or sends <code>Cache-Control: no-cache</code> on the read that follows a write. Prefer the first.</p>
+<div class="callout tip">
+<strong>Freshness is a promise you cannot recall.</strong> Once a response goes out with <code>max-age=3600</code>, you cannot reach into a thousand caches and revoke it. Start short. Lengthen it only when you have measured that the revalidation traffic hurts.
+</div>
+</section>
+
+<section id="conditional-get">
+<h2>The conditional GET</h2>
+<p>When <code>max-age</code> runs out, the cache does not have to throw the copy away. It holds a validator, so it can ask: "I have version <code>"a41c"</code>. Is it current?"</p>
+<pre><code class="language-http">GET /v1/links/q7Zk2 HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_…
+</code></pre>
+<pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: private, max-age=30, must-revalidate
+ETag: "a41c"
+Vary: Authorization
+
+{"code":"q7Zk2","url":"https://example.com/spring-sale","short_url":"https://snip.ly/q7Zk2",
+ "created_at":"2026-09-30T14:02:11Z","tags":["promo"],"total_clicks":1840}
+</code></pre>
+<p>Later, after the 30 seconds, the client revalidates:</p>
+<pre><code class="language-http">GET /v1/links/q7Zk2 HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_…
+If-None-Match: "a41c"
+</code></pre>
+<pre><code class="language-http">HTTP/1.1 304 Not Modified
+Cache-Control: private, max-age=30, must-revalidate
+ETag: "a41c"
+</code></pre>
+<p>No body. The client keeps its copy and the freshness clock restarts. If the link had changed, the server would send a full <code>200</code> with a new ETag.</p>
+<p>Be honest about what this saves. A <code>304</code> saves <em>bandwidth</em>. It does not by itself save the database read, because the server must still learn whether the resource changed. To save the lookup too, keep the current ETag where it is cheap to read. The simplest way is a <code>version</code> column on the row, bumped on every write, and the ETag is a hash of it. Then the check is an index lookup and the server skips serialising the body. If your ETag is a hash of the full response, you compute the whole response to produce it, and you save only the bytes on the wire. For a 400-byte link that is nearly nothing. Conditional GET pays off on big payloads such as a link list with 1,000 rows.</p>
+<h3>Last-Modified, the weaker option</h3>
+<p><code>Last-Modified</code> with <code>If-Modified-Since</code> does the same job with a timestamp. It has one-second resolution, so two edits inside the same second look identical. It also ties you to a clock. Use it when you already have an <code>updated_at</code> column and cannot build an ETag. Otherwise use the ETag. If both are present, a server must check <code>If-None-Match</code> and ignore <code>If-Modified-Since</code>.</p>
+<h3>Strong and weak</h3>
+<p>An ETag is strong (<code>"a41c"</code>) when two responses with the same tag are byte-for-byte equal. It is weak (<code>W/"a41c"</code>) when they are equivalent in meaning but may differ in bytes, for example after a proxy recompresses the body. Caching can use weak tags. <code>If-Match</code> must use the strong comparison, which a weak tag never passes. If you want write protection, issue strong tags.</p>
+</section>
+
+<section id="lost-update">
+<h2>The lost update</h2>
+<p>Ana and Ben both open link <code>q7Zk2</code> in the Snip dashboard. It points at <code>spring-sale</code> and carries the tag <code>promo</code>. Ana changes the destination to the summer page. Ben, whose copy is older, adds a tag. Both clients send a <code>PATCH</code>.</p>
+<p>The trouble depends on how the client builds the request. A well-behaved PATCH sends only the changed field, and then the two edits merge cleanly. But dashboards and SDKs often send the whole object back, because that is the simplest code to write. Ben's request then carries the old <code>url</code>. The server applies it, and Ana's change vanishes. Neither request failed. No log line says anything went wrong. The last write wins, and nobody is told they lost.</p>
+<p>The problem is the gap between read and write. Locks do not fix it in HTTP, because the gap is a human thinking for ten minutes, and a lock held across a user's coffee break is a bug. The usual fix is <em>optimistic concurrency</em>: let everyone read, and make each write prove it saw the latest version.</p>
+</section>
+
+<section id="if-match">
+<h2>If-Match and 412</h2>
+<p>The ETag from the earlier GET is the proof. The client sends it back on the write:</p>
+<pre><code class="language-http">PATCH /v1/links/q7Zk2 HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_…
+Content-Type: application/json
+If-Match: "a41c"
+
+{"url":"https://example.com/summer-sale"}
+</code></pre>
+<p>Ana goes first. The server sees the stored version still matches, applies the change, and returns the new representation with a new tag:</p>
+<pre><code class="language-http">HTTP/1.1 200 OK
+ETag: "b7e2"
+
+{"code":"q7Zk2","url":"https://example.com/summer-sale", …}
+</code></pre>
+<p>Ben's request carries <code>"a41c"</code>, which no longer matches. The check and the write must be one atomic step, for example <code>UPDATE links SET … , version = version + 1 WHERE code = $1 AND version = $2</code>. If it touches zero rows, the precondition failed. A read-then-write in application code reopens the race you are closing.</p>
+<pre><code class="language-http">HTTP/1.1 412 Precondition Failed
+Content-Type: application/problem+json
+ETag: "b7e2"
+
+{
+  "type": "https://api.snip.ly/errors/precondition-failed",
+  "title": "The link changed since you read it",
+  "status": 412,
+  "detail": "If-Match \"a41c\" does not match the current version.",
+  "code": "q7Zk2"
+}
+</code></pre>
+<p>The client's job is to re-read, show the user the conflict or merge it, and retry with the new tag. Returning the current <code>ETag</code> on the 412 saves one round trip for clients that merge automatically. The error body follows the format from <a href="04-errors-and-validation.html">Errors &amp; Validation</a>.</p>
+<h3>428: make the check mandatory</h3>
+<p>Optional protection protects nobody, because the lazy client skips it. If a lost update on your resource is a real harm, reject writes that omit the header with <code>428 Precondition Required</code>. Snip does this on <code>PATCH /v1/links/{code}</code>. The 428 body should say how to fix it: "GET the link and send its ETag in If-Match."</p>
+<p>Do not confuse 412 with 409. A <code>412</code> says a precondition the client named has failed. A <code>409 Conflict</code> says the request clashes with current state in a way the client did not guard against, for example creating a custom code that already exists. <a href="04-errors-and-validation.html">Errors &amp; Validation</a> covers when to use each.</p>
+<h3>ETag or a version field in the body?</h3>
+<p>You can do the same with <code>{"version": 7}</code> in the JSON and a check on write. It works, and some teams prefer it because the number is visible. It has three costs. Every client must learn your field name, where <code>If-Match</code> is standard and many HTTP libraries and gateways already understand it. A version in the body mixes server state with client input, so a client can send the wrong value by accident. And it does not help for <code>DELETE</code>, which has no body. Use the header. Keep a <code>version</code> column in the database and derive the tag from it.</p>
+<div class="callout insight">
+<strong>Same validator, two directions.</strong> The ETag you served for caching in the last section is the one you now require for concurrency. You build the mechanism once.
+</div>
+</section>
+
+<section id="idempotency-keys">
+<h2>Idempotency keys</h2>
+<p>Conditional requests protect an existing resource. Creation has no version to match yet, so it needs a different guard.</p>
+<p>A client sends <code>POST /v1/links</code> and the connection drops before the response arrives. The link may exist. It may not. The server could have crashed before the insert, or after the insert and before the reply. The client cannot tell which. Retrying risks two links for one intent. Not retrying risks none. With payments, that is a double charge. With Snip, it is a duplicate short link, which pollutes analytics and burns a custom code.</p>
+<p>The cause is the method. As <a href="02-resource-modeling.html">Resource Modeling</a> explains, <code>GET</code>, <code>PUT</code> and <code>DELETE</code> are idempotent by definition: doing them twice leaves the same state as doing them once. <code>POST</code> is not, and neither is a <code>PATCH</code> that increments something. The fix is to give the client a way to say "this is the same attempt" so the server can recognise it.</p>
+<pre><code class="language-http">POST /v1/links HTTP/1.1
+Host: api.snip.ly
+Authorization: Bearer sk_live_…
+Content-Type: application/json
+Idempotency-Key: 8f14e45f-ceea-467a-9575-0f2c7a5d3b1e
+
+{"url":"https://example.com/spring-sale","tags":["promo"]}
+</code></pre>
+<pre><code class="language-http">HTTP/1.1 201 Created
+Location: /v1/links/q7Zk2
+
+{"code":"q7Zk2","url":"https://example.com/spring-sale","short_url":"https://snip.ly/q7Zk2", …}
+</code></pre>
+<p>The connection drops. The client retries with the <em>same key and same body</em>:</p>
+<pre><code class="language-http">HTTP/1.1 201 Created
+Location: /v1/links/q7Zk2
+Idempotency-Replayed: true
+
+{"code":"q7Zk2","url":"https://example.com/spring-sale","short_url":"https://snip.ly/q7Zk2", …}
+</code></pre>
+<p>Same status, same body, same <code>code</code>. Nothing new was created. The <code>Idempotency-Replayed</code> header is a convenience for debugging and not required.</p>
+<h3>What the server does</h3>
+<ol>
+<li>Read the key. Scope it to the caller's account, so two customers cannot collide.</li>
+<li>Look it up. If there is no record, insert one as <em>in progress</em> with a hash (the fingerprint) of the method, path and body. Do this with a unique constraint so two simultaneous requests cannot both win.</li>
+<li>Run the handler. Store the status and body against the key.</li>
+<li>On a later request with the same key, compare fingerprints, then answer as below.</li>
+</ol>
+<table>
+<thead><tr><th>Same key, and&hellip;</th><th>Server responds</th></tr></thead>
+<tbody>
+<tr><td>Finished earlier, same fingerprint</td><td>The stored response, replayed</td></tr>
+<tr><td>Finished earlier, different body</td><td><code>422 Unprocessable Content</code>. The client reused a key for a different request, which is a bug</td></tr>
+<tr><td>Still running</td><td><code>409 Conflict</code>, with <code>Retry-After</code>. Do not start a second copy</td></tr>
+<tr><td>Older than the window</td><td>Treated as a new key</td></tr>
+</tbody>
+</table>
+<p>Keep records for a fixed window. 24 hours is common and Snip uses it. The window must outlast any realistic retry loop. Document it, because a retry after 25 hours creates a duplicate and the client must know that.</p>
+<p>Three design choices matter more than they look.</p>
+<ul>
+<li><strong>The client generates the key.</strong> A UUID v4 per intent, not per attempt. The retry loop must reuse the key. An SDK that makes a fresh key on each try gives you nothing.</li>
+<li><strong>Store the outcome, including errors, once the handler ran.</strong> If a first attempt returned <code>500</code> after a partial write, replaying the 500 is honest. Do not store failures that happened before any work, such as a <code>401</code> or a validation error, because the client should be free to fix the request and reuse the key.</li>
+<li><strong>Make key write and business write one transaction.</strong> If the link insert commits and the key record does not, the next retry creates a duplicate. Put both in the same database transaction, or build the record into the insert itself.</li>
+</ul>
+<h3>Which methods need it</h3>
+<p><code>POST</code> always, when a duplicate would hurt. Non-idempotent <code>PATCH</code> operations such as "add 1 to a counter" too. <code>PUT</code> and <code>DELETE</code> do not: a repeated <code>DELETE /v1/links/q7Zk2</code> leaves the link gone either way. The first returns <code>204</code>; the second may return <code>404</code>, which is fine, since the <em>state</em> is the same. Accept the header on them anyway if it makes SDKs simpler, but do not make clients depend on it.</p>
+<p>Accept the key as optional on <code>POST</code> and say so loudly in the reference. Requiring it breaks every existing client the day you ship it. If the cost of duplicates is high, as with payments, require it for new API versions.</p>
+</section>
+
+<section id="safe-retries">
+<h2>Safe retries, end to end</h2>
+<p>A retry is safe only when three separate pieces work together, and each lives in a different chapter.</p>
+<ol>
+<li><strong>The request can be repeated.</strong> That is this chapter: idempotent methods, or <code>Idempotency-Key</code> on <code>POST</code>, and <code>If-Match</code> so a retried <code>PATCH</code> after a lost response fails with <code>412</code> and not a second silent change.</li>
+<li><strong>The error says whether to retry.</strong> A <code>503</code> or a dropped connection: retry. A <code>422</code> or a <code>404</code>: never. <a href="04-errors-and-validation.html">Errors &amp; Validation</a> shows how the problem body marks this.</li>
+<li><strong>The retry does not become an attack.</strong> Clients wait with exponential backoff and random jitter, and honour <code>Retry-After</code> on a <code>429</code>. Without jitter, every client that failed at 12:00:00 retries together at 12:00:01. <a href="07-rate-limits-and-quotas.html">Rate Limits &amp; Quotas</a> covers the schedule.</li>
+</ol>
+<p>Remove any one and the others fail. Idempotency without backoff turns a brief outage into a stampede. Backoff without idempotency spreads duplicates over a longer time.</p>
+<p>The burden also flows the other way. When Snip sends a webhook to a customer, delivery is at-least-once: if the customer's server answers slowly or errors, Snip sends again. Snip is now the retrying client, and the customer is the server that must tolerate repeats. They need their own idempotency, typically a stored event ID checked before acting. <a href="09-async-webhooks-and-streaming.html">Async: Webhooks &amp; Streaming</a> picks this up.</p>
+<div class="callout warn">
+<strong>Idempotency is not deduplication by content.</strong> Two different users who create a link to the same URL <em>should</em> get two links. The key identifies one <em>attempt</em>, not one URL. If you want one link per URL, that is a uniqueness rule in the data model, and it returns <code>409</code>.
+</div>
+</section>
+
+<section id="check-yourself">
+<h2>✓ Check yourself</h2>
+<p>Try each before you open the answer.</p>
+<ol>
+<li><p>A client sends <code>GET /v1/links/q7Zk2</code> with <code>If-None-Match: "a41c"</code> and gets a <code>304</code>. What did the server avoid, and what might it still have done?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It avoided sending the body. It may still have read the row and built the whole response to compute the ETag. To skip the read, keep a version number where it is cheap to fetch and derive the tag from it. See <a href="#conditional-get">The conditional GET</a>.</p></div></details></li>
+<li><p>Ana and Ben both edit one link. Their SDK sends the whole object on each PATCH. Walk through what happens without <code>If-Match</code>, and then with it.</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Without it, the second write overwrites the first with old values and nobody sees an error. With it, the second request carries a stale tag, the conditional update touches zero rows, and the server returns <code>412</code>. Ben re-reads, merges and retries. See <a href="#lost-update">The lost update</a> and <a href="#if-match">If-Match and 412</a>.</p></div></details></li>
+<li><p>Why must the version check and the write be a single statement?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If application code reads the version, compares, then writes, another request can slip between the read and the write. Both pass the check and one update is lost again. A single <code>UPDATE … WHERE version = $n</code> makes the database do the compare and write atomically. See <a href="#if-match">If-Match and 412</a>.</p></div></details></li>
+<li><p>A client reuses one <code>Idempotency-Key</code> for two <code>POST</code> requests with different URLs. What should the server return, and why not just replay the first response?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p><code>422</code>. The stored fingerprint no longer matches the body. Replaying the first response would tell the client its second link was created when it was not, which hides a client bug. See <a href="#idempotency-keys">Idempotency keys</a>.</p></div></details></li>
+<li><p>Why does an idempotency key not protect you if the SDK generates a new key on every retry?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The server sees each attempt as a new intent and creates a link each time. The key must name the intent, so the client makes it once, before the first try, and reuses it on every retry. See <a href="#idempotency-keys">Idempotency keys</a>.</p></div></details></li>
+<li><p>A retry loop has idempotency keys and backoff with jitter but treats every non-2xx as retriable. What goes wrong?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It keeps retrying errors that can never succeed, such as <code>422</code> or <code>404</code>, wasting quota and delaying the real failure report. The loop must read the error and retry only transient ones. See <a href="#safe-retries">Safe retries, end to end</a>.</p></div></details></li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>One validator, the ETag, serves two jobs: <code>If-None-Match</code> for caching and <code>If-Match</code> for concurrency. They guard opposite outcomes.</li>
+<li>Authenticated responses are <code>private</code>, never <code>public</code>. Start with a short <code>max-age</code>; you cannot recall a long one.</li>
+<li>A <code>304</code> saves bytes, not the lookup, unless the version is cheap to read.</li>
+<li>Silent last-write-wins is a bug. Require <code>If-Match</code> on writes (<code>428</code> when absent), answer stale ones with <code>412</code>, and do the check inside the write statement.</li>
+<li>Make <code>POST</code> retry-safe with a client-made <code>Idempotency-Key</code>: replay the stored response, <code>422</code> on a changed body, <code>409</code> while in flight.</li>
+<li>Safe retries need all three parts: idempotency, error classification and jittered backoff.</li>
+</ul>
+<p>Next, work that outlives one request. <a href="09-async-webhooks-and-streaming.html">Async: Webhooks &amp; Streaming →</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9111" rel="noopener">RFC 9111: HTTP Caching</a> — the rules for <code>Cache-Control</code>, freshness and revalidation.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110" rel="noopener">RFC 9110: HTTP Semantics</a> — ETag, <code>If-Match</code>, <code>If-None-Match</code>, strong and weak comparison, and <code>412</code>.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6585" rel="noopener">RFC 6585: Additional HTTP Status Codes</a> — defines <code>428 Precondition Required</code> and <code>429</code>.</li>
+<li><a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/" rel="noopener">The Idempotency-Key HTTP Header Field (IETF draft)</a> — the standardisation effort for the header, including the 409 and 422 cases.</li>
+<li><a href="https://docs.stripe.com/api/idempotent_requests" rel="noopener">Stripe: Idempotent requests</a> — the best-known production design, with its key lifetime and replay behaviour.</li>
+<li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Conditional_requests" rel="noopener">MDN: HTTP conditional requests</a> — a plain walk through validators and both precondition uses.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+</body>
+</html>
