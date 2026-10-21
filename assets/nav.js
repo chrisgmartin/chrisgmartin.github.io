@@ -86,6 +86,7 @@ window.FG = (function () {
       });
       h += '</div></div>';
     });
+    h += '<div class="nav-item about"><a class="nav-btn" href="' + esc(base + 'about.html') + '">About</a></div>';
     h += '<div class="nav-item mobile right"><button class="nav-btn" type="button" aria-expanded="false">Menu ' + CHEV + '</button><div class="dropdown" role="menu" aria-label="Domains">';
     DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/index.html') + '">' + esc(d.name) + '</a>'; });
     h += '</div></div>';
@@ -187,7 +188,7 @@ window.FG = (function () {
     var main = document.querySelector('main');
     if (main && !document.querySelector('.fg-legal')) {   // site-wide legal line; home and 404 carry it in their own footers
       var legal = document.createElement('p'); legal.className = 'fg-legal';
-      legal.innerHTML = 'Field Guides · <a href="' + esc(base + 'privacy.html') + '">Privacy</a> · <a href="' + esc(base + 'terms.html') + '">Terms</a>';
+      legal.innerHTML = 'Field Guides · <a href="' + esc(base + 'about.html') + '">About</a> · <a href="' + esc(base + 'privacy.html') + '">Privacy</a> · <a href="' + esc(base + 'terms.html') + '">Terms</a>';
       main.appendChild(legal);
     }
     var g = opts.guidePath && CHAPTERS[opts.guidePath];
