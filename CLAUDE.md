@@ -131,3 +131,4 @@ perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=14/$1?v=15/g' assets/script.js  
   cannot screenshot localhost.
 - Run the `audit` skill before a PR. Keep `job-finder/` (ignored) and any personal material out of commits.
 - Commit/PR attribution lines are provided by the session; add them verbatim.
+- Models: chapter backfill and mechanical fixes (`write-chapter` on a planned outline, asset bumps, audit fixes) run on `/model sonnet` with the advisor (`advisorModel` in `.claude/settings.json`) checking plans and the final diff. Design, editorial review and anything the owner judges by eye stay on the default model.
