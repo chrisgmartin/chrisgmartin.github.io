@@ -9,7 +9,8 @@ everywhere else and the tool is idempotent:
   <!-- LATEST:strip -->   one line under the hero: the newest guide
   <!-- LATEST:list -->    the five most recent guides, dated, under the atlas
 
-Data comes from the repo itself — recency from each hub's first commit (`git log --diff-filter=A`),
+Data comes from the repo itself — recency from each hub's first commit (`git log --diff-filter=A`; the full
+commit timestamp orders hubs added on the same day),
 names/domains/counts from the CHAPTERS manifest in assets/nav.js, and the one-line summary from the
 hub's own <p class="subtitle"> trimmed at its first clause. Nothing is hand-maintained, so the
 section stays correct as guides are added; run it after `tools/nav/build-chapters.py`.
@@ -43,16 +44,19 @@ def guides():
         if not os.path.exists(hub):
             print(f"  ! missing hub {key}", file=sys.stderr); continue
         added = subprocess.run(
-            ["git", "-C", ROOT, "log", "--diff-filter=A", "--format=%cs", "-1", "--", f"{key}/index.html"],
+            ["git", "-C", ROOT, "log", "--diff-filter=A", "--format=%cs %ct", "-1", "--", f"{key}/index.html"],
             capture_output=True, text=True).stdout.strip()
-        if not added:                       # not committed yet — treat as today so new work surfaces
-            added = datetime.date.today().isoformat()
+        if added:
+            added, ts = added.split()
+            ts = int(ts)
+        else:                               # not committed yet — treat as now so new work surfaces
+            added, ts = datetime.date.today().isoformat(), 2**62
         m = re.search(r'<p class="subtitle">(.*?)</p>', open(hub, encoding="utf-8").read(), re.S)
         sub = re.sub(r"\s+", " ", re.sub("<[^>]+>", "", html.unescape(m.group(1)))).strip() if m else ""
-        out.append(dict(key=key, date=added, domain=g["domain"], name=g["name"],
+        out.append(dict(key=key, date=added, ts=ts, domain=g["domain"], name=g["name"],
                         n=sum(len(s["chapters"]) for s in g["sections"]),
                         unit=g.get("unit", "chapters"), sub=sub))
-    out.sort(key=lambda r: (r["date"], r["key"]), reverse=True)
+    out.sort(key=lambda r: (r["ts"], r["key"]), reverse=True)   # full timestamp: same-day hubs keep commit order
     return out
 
 
