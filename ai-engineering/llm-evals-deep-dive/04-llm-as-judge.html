@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM-as-Judge — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Position, verbosity and self-preference bias with the evidence, calibrating a judge against human labels, agreement statistics, pairwise versus absolute…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/04-llm-as-judge">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="LLM-as-Judge — Evals for LLM Systems">
+<meta property="og:description" content="Position, verbosity and self-preference bias with the evidence, calibrating a judge against human labels, agreement statistics, pairwise versus absolute…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/04-llm-as-judge">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#overview">Overview</a>
+    <a href="#mechanism">Three ways to judge</a>
+    <a href="#biases">Biases with evidence</a>
+    <a href="#calibration">Calibrating a judge</a>
+    <a href="#choosing">Choosing the judge model</a>
+    <a href="#wrong-tool">When a judge is the wrong tool</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-graders.html">← Previous: Graders</a>
+    <a href="05-the-ship-decision.html">Next: The Ship Decision →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Foundations</span>
+  <h1>LLM-as-Judge</h1>
+  <p class="subtitle">Position, verbosity and self-preference bias with the evidence, calibrating a judge against human labels, agreement statistics, pairwise versus absolute scoring, and when a judge is the wrong tool.</p>
+</header>
+
+<section id="overview">
+  <h2>Overview</h2>
+  <p>A rubric model grader is the only layer of the <a href="03-graders.html#combining">grader stack</a> that can read prose for meaning at the scale of thousands of items a night. It is also the layer most likely to produce a confident, reproducible, wrong number. A judge is a measuring instrument, and an uncalibrated instrument gives you precision without accuracy: the same bias on every run, so differences between runs look real.</p>
+  <p>This chapter covers what the judge does mechanically, the biases that have published evidence behind them, how to calibrate a judge against human labels at Harbourline, how to choose the judge model, and where a judge is the wrong tool and a programmatic check should replace it.</p>
+</section>
+
+<section id="mechanism">
+  <h2>Three ways to ask a model to judge</h2>
+  <p>Zheng et al. (2023) set out the three modes still in use. Which one you pick decides which biases you inherit.</p>
+  <ul>
+    <li><strong>Pointwise (single-answer) scoring.</strong> The judge sees one answer and returns a score or a pass/fail against a rubric. It scales linearly with items and gives an absolute number you can track over time. Its weakness is that scores drift with the prompt and compress toward the middle, so a 4.1 from last month and a 4.2 today may mean nothing.</li>
+    <li><strong>Pairwise comparison.</strong> The judge sees two answers and picks the better one or calls a tie. Relative judgements are easier for models and people alike, and they give you a win rate directly. The cost is that it scales with the number of pairs, and it tells you nothing about whether the winner is acceptable. Two bad answers still produce a winner.</li>
+    <li><strong>Reference-guided grading.</strong> The judge sees the answer plus a gold answer or the source clause and checks one against the other. This is the mode that suits Harbourline's labelled set, because the 400 items already carry gold answers and cited clauses. It turns an open-ended judgement into an entailment check, which is the easiest thing to ask of a model.</li>
+  </ul>
+  <p>Use reference-guided pointwise grading for regression tests against a labelled set. Use pairwise for choosing between two candidates when you have no gold answer, such as comparing two phrasings of a claims explanation. The exception is anything where "acceptable" matters more than "better": a pairwise win says nothing about a floor.</p>
+  <p>A related technique, G-Eval (Liu et al., 2023), has the model write out evaluation steps and then fill a form with the score, rather than emit a bare number. With GPT-4 as the judge it reached a Spearman correlation of 0.514 with human judgements on summarisation, and the authors flag a bias toward text written by language models. Treat 0.514 as the state of 2023 for open-ended summaries, not as a benchmark for your task: Harbourline's questions have gold answers, which is an easier setting.</p>
+</section>
+
+<section id="biases">
+  <h2>Biases with evidence</h2>
+  <p>Four biases matter, and they have different cures. Only some of them are documented well enough to quote numbers. The figures below are from 2023 models, and they show the shape of each failure, not what today's judges score.</p>
+  <h3>Position bias</h3>
+  <p>In a pairwise prompt the judge tends to prefer one slot. Zheng et al. swapped the order of two answers and measured how often the judge gave the same verdict both times. On their default prompt, GPT-4 was consistent in 65.0% of cases, GPT-3.5 in 46.2%, and Claude-v1 in 23.8%, with Claude-v1 favouring the first position in 75% of cases. A few-shot prompt lifted GPT-4's consistency to 77.5% but made calls about four times more expensive, and the authors note that consistency is not accuracy.</p>
+  <p>The remedy is mechanical: run every pair twice with the order swapped, and count a verdict only when both orders agree. Disagreement across orders is the judge telling you it cannot tell, so score it as a tie and report the tie rate. The code below shows this.</p>
+  <h3>Verbosity bias</h3>
+  <p>Judges favour longer answers. Zheng et al. built a "repetitive list" attack: take 23 answers containing a numbered list, ask a model to rephrase the list without adding information, and prepend the rephrasing so the answer says the same thing twice. A judge that prefers the padded version has been fooled by length. GPT-4 failed on 8.7% of the answers, while Claude-v1 and GPT-3.5 failed on 91.3%. The effect is large enough that benchmark authors now correct for it: length-controlled AlpacaEval (Dubois et al., 2024) raised the Spearman correlation with Chatbot Arena from 0.94 to 0.98.</p>
+  <p>At Harbourline this matters because a longer help-centre answer includes more claims, and more claims are more chances to be wrong. A judge that rewards length will rank a verbose, hedged prompt above a precise one. Control for it by checking the correlation between judge score and answer length on your own set, and by telling the judge in the rubric that length and formatting carry no credit.</p>
+  <h3>Self-preference</h3>
+  <p>A judge may favour answers from its own model family. Zheng et al. looked for it and found suggestive numbers: GPT-4 favoured itself with a 10% higher win rate than humans gave it, and Claude-v1 with 25% higher. But the judges also favoured other models, GPT-3.5 did not favour itself, and the authors say the data cannot settle whether the effect is real. Do not claim more than they do. The practical response is cheap: do not let a model be the only judge of its own output when you are choosing between model vendors, and spot-check the judge's picks against humans on the comparisons that decide a purchase.</p>
+  <h3>Prompt sensitivity</h3>
+  <p>Rewording the rubric, reordering criteria or changing the score scale can shift verdicts. There is no single number for this, because it depends on your prompt. Measure it on your own set: rephrase the rubric two ways, re-run, and look at how many verdicts flip. If 10% flip, a 3-point change in your headline metric is within the noise of the judge prompt alone. Freeze the judge prompt and model, version them with the eval set from <a href="02-building-the-eval-set.html">chapter 02</a>, and re-calibrate whenever either changes.</p>
+</section>
+
+<section id="calibration">
+  <h2>Calibrating a judge against human labels</h2>
+  <p>Calibration answers one question: on items where humans have decided, how often does the judge decide the same way, and where does it differ? You need a human-labelled subset, and you already have one. The 400 help-centre items carry human labels; hold out a stratified 150 to 200 of them as the calibration set and never tune the judge prompt on the rest.</p>
+  <p>Report three things, never one.</p>
+  <ol>
+    <li><strong>Raw agreement.</strong> The share of items where judge and human give the same verdict. Zheng et al. report GPT-4 agreeing with human experts 85% of the time on MT-bench when ties are excluded, against 81% between two humans. With ties allowed, the figures were 66% and 63%. Note the baselines: random agreement is 50% without ties and 33% with them. A judge at 66% is not a judge at 66% of the way to perfect.</li>
+    <li><strong>Cohen's kappa.</strong> Agreement corrected for chance. For two raters with agreement <em>p<sub>o</sub></em> and chance agreement <em>p<sub>e</sub></em>, kappa is (<em>p<sub>o</sub></em> − <em>p<sub>e</sub></em>) / (1 − <em>p<sub>e</sub></em>), where <em>p<sub>e</sub></em> comes from each rater's marginal rates. If 90% of answers pass and both raters say so, 90% raw agreement is a kappa of about 0.44. A common reading is that 0.6 to 0.8 is substantial and above 0.8 is near-perfect; these bands are conventions, not laws, so set your own bar from the cost of an error. For three or more raters or missing labels, use Krippendorff's alpha.</li>
+    <li><strong>Agreement by slice.</strong> The overall number hides the slice that fails. Zheng et al. found GPT-4 agreed with humans more as the quality gap between the two models grew, from 70% to nearly 100%, so the judge is least reliable exactly where the choice is close. At Harbourline, split by limits and deductibles, exclusions, procedures, definitions and identifiers. A judge that scores 0.8 kappa on definitions and 0.3 on identifiers should not grade identifiers.</li>
+  </ol>
+  <p>Look also at the direction of disagreement. A judge that is lenient on exclusions passes wrong answers; one that is strict fails right ones. The first is dangerous in a ship decision and the second is merely expensive, so the confusion matrix matters more than the accuracy.</p>
+  <p>Here is the position-swap procedure with the agreement and kappa computation. The judge is simulated, so the file runs offline; replace <code>judge_once</code> with a model call. The simulated judge is right 80% of the time and answers "first" 15% of the time regardless of content, so it has a position bias built in.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>judge.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import random
+from collections import Counter
+
+def judge_once(question, first, second):
+    """Return 'first', 'second' or 'tie'. Replace with a real model call."""
+    raise NotImplementedError
+
+def pairwise(question, a, b, judge=judge_once):
+    r1 = judge(question, a, b)            # a shown first
+    r2 = judge(question, b, a)            # b shown first
+    v1 = {"first": "A", "second": "B", "tie": "tie"}[r1]
+    v2 = {"first": "B", "second": "A", "tie": "tie"}[r2]
+    return v1 if v1 == v2 else "tie"      # disagreement across orders counts as a tie
+
+def cohen_kappa(x, y):
+    n = len(x)
+    po = sum(a == b for a, b in zip(x, y)) / n
+    cx, cy = Counter(x), Counter(y)
+    pe = sum(cx[k] * cy[k] for k in set(x) | set(y)) / n**2
+    return po, (po - pe) / (1 - pe)
+
+if __name__ == "__main__":
+    rng = random.Random(7)
+    # Simulated judge: right 80% of the time, but 15% of the time it just says "first".
+    def fake(q, first, second):
+        if rng.random() &lt; 0.15:
+            return "first"
+        better = "first" if first["q"] &gt;= second["q"] else "second"
+        if rng.random() &lt; 0.2:
+            better = "second" if better == "first" else "first"
+        return better
+    items = [({"q": rng.random()}, {"q": rng.random()}) for _ in range(300)]
+    human = ["A" if a["q"] &gt; b["q"] else "B" for a, b in items]
+    single_order = [{"first": "A", "second": "B"}[fake(None, a, b)] for a, b in items]
+    swapped = [pairwise(None, a, b, fake) for a, b in items]
+    for name, pred in [("one order", single_order), ("swapped", swapped)]:
+        keep = [(p, h) for p, h in zip(pred, human) if p != "tie"]
+        po, k = cohen_kappa([p for p, _ in keep], [h for _, h in keep])
+        print(f"{name:10s} decided={len(keep):3d}/300  agreement={po:.2f}  kappa={k:.2f}")</code></pre>
+  </div>
+  <p>Running it against 300 simulated pairs gave this output:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">one order  decided=300/300  agreement=0.73  kappa=0.47
+swapped    decided=194/300  agreement=0.91  kappa=0.82</code></pre></div>
+  <p>Swapping raised agreement on the decided items from 0.73 to 0.91, and it did so by abstaining on 106 of 300 pairs. That is the trade. The swapped judge is more accurate where it speaks and silent where it is unreliable, and the 35% tie rate is itself information about how hard the set is. If you only report agreement, the swapped judge looks like a miracle. Report the coverage with it.</p>
+</section>
+
+<section id="choosing">
+  <h2>Choosing the judge model</h2>
+  <p>The usual rule is that the judge should be at least as capable as the system it grades, and that it should not be the same model. Anthropic's guidance says it is generally best practice to evaluate with a different model from the one that produced the output. The reasoning is mechanical: a weaker model cannot reliably spot an error it could not avoid, and a model grading itself shares its blind spots and may share its preferences.</p>
+  <p>Two exceptions. First, grading is easier than generating. A smaller model checking whether an answer entails a given clause is doing a narrow comparison, not open-ended reasoning, and it can work well when you supply the reference. Reference-guided grading narrows the capability gap, and Zheng et al. found it cut GPT-4's failure rate on a set of ten math questions from 70% to 15%. Ten questions is a small sample, so read it as a direction. Second, when the judge sees a programmatic gate's output, it has less to do.</p>
+  <p>Whatever you pick, calibrate that specific judge on your own set, because the rule is only a prior. Put a reasoning step ahead of the verdict, since Zheng et al. found that having the judge answer the question itself first (a chain-of-thought judge) helped on reasoning tasks, and a reasoning trace makes audits fast. Keep the trace in the report. The cost is more output tokens per item, so for a nightly run on 400 items it is cheap, and for a monitoring sample at production volume you may choose the bare verdict on a calibrated, narrower rubric.</p>
+</section>
+
+<section id="wrong-tool">
+  <h2>When a judge is the wrong tool</h2>
+  <p>A judge reads for plausibility. Plausibility is the wrong signal for several things Harbourline cares about most.</p>
+  <ul>
+    <li><strong>Exact numbers and identifiers.</strong> A deductible of $1,000 and one of $1,500 are equally fluent. Check them with the gate in <a href="03-graders.html#deterministic">chapter 03</a>. A judge asked "is this deductible correct?" with the gold value in the prompt will usually get it right, but "usually" is the wrong tolerance when a program is exact and free.</li>
+    <li><strong>Anything programmatically checkable.</strong> Citations that resolve, schema validity, forbidden actions, tool-call order. If you can write the rule, write the rule.</li>
+    <li><strong>Safety-critical or regulated statements.</strong> A coverage determination goes to a deterministic check and a human audit. A judge can triage and prioritise human review, but it should not be the last line of defence.</li>
+    <li><strong>Grading reasoning the judge cannot do.</strong> Zheng et al. showed GPT-4 misgrading an elementary maths answer it could solve when asked separately, because the wrong answer in front of it pulled its verdict. Where the judge must reason about the answer, give it the reference.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">A calibrated judge is calibrated for one distribution</span>
+    <p>Agreement measured on the set you calibrated on does not carry to a new product line, a new model version or a new rubric. Re-run calibration when the system's outputs change character, for example after the <a href="08-model-and-prompt-changes.html">model change</a> that makes answers longer, and keep a small human-audited sample in production so drift in the judge shows up before a quarter has passed.</p>
+  </div>
+  <p>The judge's output feeds <a href="05-the-ship-decision.html">the ship decision</a>, where small differences are compared against noise. A judge with a 10% verdict flip rate adds that noise to every comparison, which is why its calibration is part of the evidence for the decision. The interview-prep view of the same decision is in <a href="../ai-engineer-interview-prep/07-eval-set-and-ship-decision.html">eval set and ship decision</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>You compare two prompts for the help-centre assistant with a pairwise judge and prompt B wins 62% of 200 pairs. A colleague swaps the order of every pair and B wins 51%. What happened, and which number do you report?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The judge favoured one position, and B was shown in the favoured slot more often in the first run, which inflated its win rate. The swapped run shows near-parity. Report the result counting only pairs where both orders agree, with the tie rate beside it. See <a href="#biases">biases</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A judge agrees with your human labels on 88% of items, and the team wants to ship it. What three questions do you ask before you accept that number?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>What is the base rate: if 85% of items pass, a judge that always says "pass" agrees 85% of the time, so ask for kappa. How does agreement split by slice, since one slice may be near chance? Which direction do the errors run: lenient errors pass wrong answers, strict ones fail right answers. See <a href="#calibration">calibration</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The new prompt makes answers about 40% longer, and the judge score rises two points. What do you check before you call it an improvement?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Verbosity bias is the tempting explanation, and it is documented: judges can prefer padded answers that add no information. Check the correlation between answer length and judge score, compare with a length-controlled subset or a rubric that explicitly gives no credit for length, and spot-check with human labels on the items that moved. See <a href="#biases">biases</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You have a small model that is cheap to run nightly and a larger model that is expensive. When is the small one an acceptable judge for the exclusions slice?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>When the task is reference-guided and narrow, such as checking whether an answer is entailed by the cited clause, and when calibration on that slice shows an acceptable kappa against human labels. Without the reference the judge must reason about exclusions itself, and then the capability gap matters. See <a href="#choosing">choosing the judge model</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The claims-intake agent must never state that a loss is covered. A teammate proposes a judge prompt asking "does this response promise coverage?" and shipping on its pass rate. What is the weakness, and what do you use instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A judge reads for plausibility and misses paraphrased promises, and a miss here is a regulatory issue. Use phrase and structure checks plus a human audit for what they miss, and use the judge to prioritise which outputs humans read first. See <a href="#wrong-tool">when a judge is the wrong tool</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your swapped-order judge reports 0.91 agreement but decides only 65% of pairs. Your manager says the other 35% are noise and can be dropped. Do you agree?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Dropping them selects the easy pairs, so the headline agreement describes only easy cases. The undecided pairs are where the two prompts are close or the judge is unreliable, which is the case a ship decision turns on. Report coverage with agreement, and send a sample of the undecided pairs to human review.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Match the mode to the job: reference-guided pointwise grading for regression against a labelled set, pairwise for choosing between candidates when no gold answer exists.</li>
+    <li>Position bias is real and large for some judges, so run every pair in both orders and count only verdicts that survive the swap, reporting the tie rate.</li>
+    <li>Judges can reward length and may favour their own family, so control for length and do not let a model be the only judge of itself in a vendor decision.</li>
+    <li>Calibrate each judge on your own held-out labelled set with raw agreement, a chance-corrected statistic and a per-slice breakdown; re-calibrate when the system, rubric or judge changes.</li>
+    <li>Use a reference and a different model by default; a smaller judge can work for narrow entailment checks if its kappa on that slice holds up.</li>
+    <li>Do not use a judge for exact figures, identifiers, anything programmatically checkable or a regulated statement; use it to prioritise human review there.</li>
+  </ul>
+  <p>With graders chosen and calibrated, the question becomes whether a measured difference is large enough to act on. → <a href="05-the-ship-decision.html">The Ship Decision</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener"><strong>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</strong></a> — Zheng et al., 2023. The source for the position, verbosity and self-enhancement experiments, the agreement figures and the reference-guided judge.</li>
+    <li><a href="https://arxiv.org/abs/2303.16634" target="_blank" rel="noopener"><strong>G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment</strong></a> — Liu et al., 2023. Form-filling rubric scoring with evaluation steps, and the reported bias toward model-written text.</li>
+    <li><a href="https://arxiv.org/abs/2404.04475" target="_blank" rel="noopener"><strong>Length-Controlled AlpacaEval</strong></a> — Dubois et al., 2024. A worked correction for verbosity bias in an automatic evaluator.</li>
+    <li><a href="https://platform.claude.com/docs/en/test-and-evaluate/develop-tests" target="_blank" rel="noopener"><strong>Define success criteria and build evaluations</strong></a> — Anthropic docs. Grader selection and the advice to grade with a different model from the generator.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
