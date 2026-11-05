@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>An LLM Behind a Reliable Contract — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="How to put a probabilistic model behind an API your callers can depend on: schemas, validation, retries, timeouts, fallbacks, idempotency and versioning.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/13-llm-behind-a-reliable-contract">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="An LLM Behind a Reliable Contract — AI Engineer Interview Prep">
+<meta property="og:description" content="How to put a probabilistic model behind an API your callers can depend on: schemas, validation, retries, timeouts, fallbacks, idempotency and versioning.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/13-llm-behind-a-reliable-contract">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#failures">Four failures</a>
+    <a href="#schema">The schema</a>
+    <a href="#repair">Validate and repair</a>
+    <a href="#retries">Retries and deadlines</a>
+    <a href="#fallbacks">Fallbacks</a>
+    <a href="#idempotency">Idempotency</a>
+    <a href="#versioning">Versioning</a>
+    <a href="#slo">SLO</a>
+    <a href="#answer">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="12-real-time-voice-application.html">← Previous: A Real-Time Voice Application</a>
+    <a href="14-the-agent-that-loops-forever.html">Next: The Agent That Loops Forever →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section F · Production and debugging</span>
+  <h1>An LLM Behind a Reliable Contract</h1>
+  <p class="subtitle">How to put a probabilistic model behind an API your callers can depend on: schemas, validation, retries, timeouts, fallbacks, idempotency and versioning.</p>
+</header>
+
+<section id="question">
+  <h2>The question and what it scores</h2>
+  <p><em>"Harbourline's claims workflow calls an LLM to decide whether a claim falls under a policy clause. The workflow engine expects a function, not a chatbot. How do you put the model behind a contract the engine can depend on?"</em></p>
+  <p>The interviewer is scoring four things. First, whether you treat the model as an unreliable dependency, like a flaky third-party API, and not as a magic function. Second, whether you know each failure has its own remedy: malformed output, slow output, no output, wrong output. Third, whether you can say what the caller sees when everything fails. Fourth, whether you version the prompt and the model with the discipline you apply to code. Candidates who talk only about prompts score low. This question is about the layer around the prompt.</p>
+</section>
+
+<section id="failures">
+  <h2>Four ways the call fails, and why one fix cannot cover them</h2>
+  <p>Start from the failure, because the contract is just the list of failures you chose to handle. The coverage-check service takes a claim and a policy clause set and returns a verdict. It can fail in four distinct ways.</p>
+  <ul>
+    <li><strong>Transport failure.</strong> The request errors or times out. The Claude API returns 429 for rate limits, 500 for internal errors, 504 for timeouts and 529 when it is overloaded (docs, as of November 2026). These are retryable.</li>
+    <li><strong>Shape failure.</strong> The call succeeds but the body is not what you asked for: prose around the JSON, a missing field, a decision outside your enum, or a response cut off at the token limit.</li>
+    <li><strong>Semantic failure.</strong> The body is valid and wrong, for example a clause id that does not exist in this policy. No schema catches this; <a href="15-confident-and-wrong-in-high-risk-work.html">chapter 15</a> covers it.</li>
+    <li><strong>Drift.</strong> Nothing errors, but a model or prompt change last Tuesday moved the answers. This is a versioning problem, not a retry problem.</li>
+  </ul>
+  <p>Retrying fixes the first. Constrained decoding and validation fix the second. Cross-checks fix the third. Pinning and canaries fix the fourth. A retry loop wrapped around all four turns drift and semantic failure into more cost and the same wrong answer.</p>
+  <div class="flow">  claims workflow
+        │  CoverageRequest (typed, versioned, idempotency key, deadline)
+        ▼
+  ┌──────────────── coverage-check service ────────────────┐
+  │ 1 build prompt  ──►  2 call model (timeout ≤ deadline) │
+  │                           │ transport error ──► retry w/ jitter
+  │                           ▼                            │
+  │ 3 parse + validate ◄── raw output                      │
+  │      │ invalid ──► repair once with the error text     │
+  │      ▼                                                 │
+  │ 4 cross-check (clause exists? quote in clause?)        │
+  └──────┬────────────────────────────────────┬────────────┘
+         │ ok                                 │ out of budget / still invalid
+         ▼                                    ▼
+   verdict, source=model              verdict=needs_review, source=fallback</div>
+</section>
+
+<section id="schema">
+  <h2>The schema is the contract, and the model gets only part of it</h2>
+  <p>Define the request and response as typed objects, version them, and publish them to the caller. For the response, three fields carry the design: a <code>decision</code> from a closed enum (<code>covered</code>, <code>not_covered</code>, <code>needs_review</code>), a <code>clause_id</code>, and a <code>source</code> field that says whether the verdict came from the model or a fallback. The last one is the part candidates forget. A caller that cannot tell a model verdict from a default cannot measure how often the default fires.</p>
+  <p>To get the model to emit the shape, use the API's structured outputs. On the Claude API you pass a JSON schema in <code>output_config.format</code> with <code>type: "json_schema"</code>, and constrained decoding makes the output match it. The feature is stable as of November 2026, but read the limits. Objects need <code>additionalProperties: false</code>. Recursive schemas, <code>minLength</code>/<code>maxLength</code> and numeric <code>minimum</code>/<code>maximum</code> are rejected with a 400. The first request with a new schema pays a grammar-compile cost, and the compiled grammar is cached for 24 hours after last use, so a schema edit means a cold start in production. The output can still miss the schema when <code>stop_reason</code> is <code>refusal</code> or <code>max_tokens</code>, both of which return HTTP 200.</p>
+  <p>Two consequences follow. Your own validator still runs on every response, because it enforces what the schema cannot express: length bounds, "clause_id is required unless the decision is needs_review", and the cross-field rules. And the validator reads <code>stop_reason</code> before it reads the body, because a truncated body that parses is the most dangerous kind of success.</p>
+  <div class="callout warn">
+    <span class="callout-label">A schema-valid answer is not a correct answer</span>
+    <p>Constrained decoding guarantees the shape, not the truth. A strict schema can even make wrong answers look more official, because the enum forces a choice. Always include an explicit escape value such as <code>needs_review</code>, or the model must pick a wrong decision when it should abstain.</p>
+  </div>
+</section>
+
+<section id="repair">
+  <h2>Validate, then repair once, then stop</h2>
+  <p>When validation fails, the cheapest recovery is a repair call: send the original input, the bad output and the validator's message, and ask for a corrected object. This works because the failure is usually narrow, a missing field or an enum miss, and the error text names it. Allow one repair, maybe two. A model that failed twice with the error in front of it will mostly fail a third time, and each attempt costs a full round trip against a deadline.</p>
+  <p>Keep the repair loop separate from the transport-retry loop, with its own counter. Mixing them is how a service ends up making nine calls per request. The sketch below shows the whole contract in one function, with stdlib only so it runs as written.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>coverage_check.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import json
+import random
+import time
+
+DECISIONS = {"covered", "not_covered", "needs_review"}
+
+
+class Deadline:
+    """One budget for the whole request, passed down every layer."""
+
+    def __init__(self, seconds):
+        self.end = time.monotonic() + seconds
+
+    def left(self):
+        return self.end - time.monotonic()
+
+
+def validate(raw):
+    """Return (obj, None) if raw is a valid verdict, else (None, reason)."""
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"not JSON: {e.msg}"
+    if obj.get("decision") not in DECISIONS:
+        return None, "decision must be one of " + ", ".join(sorted(DECISIONS))
+    if obj["decision"] != "needs_review" and not obj.get("clause_id"):
+        return None, "clause_id is required unless decision is needs_review"
+    return obj, None
+
+
+def coverage_check(call_model, claim, deadline, max_attempts=3):
+    """call_model(claim, timeout, feedback) -&gt; raw string. Raises TimeoutError, ConnectionError."""
+    feedback = None
+    for attempt in range(max_attempts):
+        timeout = min(8.0, deadline.left())
+        if timeout &lt;= 0.5:                       # not enough time for another try
+            break
+        try:
+            raw = call_model(claim, timeout, feedback)
+        except (TimeoutError, ConnectionError):
+            pause = random.uniform(0, min(2.0, 0.25 * 2 ** attempt))   # full jitter
+            time.sleep(min(pause, max(deadline.left() - 0.5, 0)))
+            continue
+        obj, problem = validate(raw)
+        if obj:
+            return {**obj, "source": "model"}
+        feedback = problem                       # repair: tell the model what was wrong
+    # fallback: a deterministic default the caller can act on
+    return {"decision": "needs_review", "clause_id": None, "source": "fallback"}
+
+
+if __name__ == "__main__":
+    random.seed(1)
+    replies = iter([ConnectionError(), "Sure! Covered.", '{"decision": "covered", "clause_id": "4.2"}'])
+
+    def flaky(claim, timeout, feedback):
+        r = next(replies)
+        if isinstance(r, Exception):
+            raise r
+        print("model saw feedback:", feedback)
+        return r
+
+    print(coverage_check(flaky, {"claim_id": "C-1"}, Deadline(20)))
+    def dead(claim, timeout, feedback):
+        raise TimeoutError()
+    print(coverage_check(dead, {"claim_id": "C-2"}, Deadline(3)))</code></pre>
+</div>
+</section>
+
+<section id="retries">
+  <h2>Retries, jitter and deadlines</h2>
+  <p>Retry only what is transient: 429 with a <code>retry-after</code> header, 500, 504, 529 and dropped connections. Do not retry a 400, and do not retry a 429 that is a monthly spend cap; the API docs say that one carries no <code>retry-after</code> header and keeps failing until access resumes. The official SDK already retries transient errors twice by default with exponential backoff and honours <code>retry-after</code>. So decide where retries live. If the SDK retries twice, your service retries three times and the workflow engine retries three times, one slow dependency becomes 27 calls. Amazon's builders' library makes the same point with a five-deep stack and three retries per layer: 243 times the load on the bottom layer. Retry at one layer, and cap it with a budget, such as a token bucket that allows retries only while recent calls are mostly succeeding.</p>
+  <p>Add jitter. Exponential backoff alone makes every client that failed together retry together. Random delay in <code>[0, backoff]</code> spreads them out.</p>
+  <p>Timeouts need a number. Amazon's guidance is to pick an acceptable false-timeout rate, say 0.1%, and set the timeout at the matching latency percentile, p99.9, measured on the real dependency. For an LLM call that percentile is far above the median, because output length varies, so a fixed 30 seconds is a guess. Use streaming for long generations, which the Claude docs recommend for requests that may run past ten minutes, and enforce a timeout per attempt inside an overall deadline. The deadline travels with the request: if the workflow engine gave this call ten seconds and the first attempt took eight, the service must not start a second ten-second attempt. In the sketch, <code>Deadline</code> does that job.</p>
+  <p>Harbourline's engine routes about 6,000 new claims a day, and the coverage check sits on the intake path, so the deadline is ten seconds and the engine does not retry. That keeps one retry layer. The case where this flips: the nightly batch classification jobs have no human waiting. They can use the Message Batches API and retry whole batches hours later, because latency does not matter there.</p>
+</section>
+
+<section id="fallbacks">
+  <h2>What the caller sees when the model cannot answer</h2>
+  <p>Decide the failure behaviour before the first incident, in this order of preference.</p>
+  <ol>
+    <li><strong>A cached verdict</strong>, when the same claim and policy version were already decided. Safe only if the cache key includes the prompt version and the policy version.</li>
+    <li><strong>A smaller or different model</strong>, behind the same schema. It is cheaper and faster, and a cross-vendor fallback also survives a provider outage. It will be less accurate, so record <code>source</code> and the model id, and expect a higher human-review rate downstream.</li>
+    <li><strong>A deterministic default</strong>. For coverage that is <code>needs_review</code>. A wrong auto-decision is a regulatory issue, so the default must be the conservative one, never <code>covered</code> or <code>not_covered</code>.</li>
+    <li><strong>An explicit error</strong> with a retryable flag, when even the default makes no sense. A claim missing its policy number gets a 422, not a guess.</li>
+  </ol>
+  <p>The caller's contract then has two outcomes it can program against: a valid verdict with a source, or a typed error. It never receives free text and never has to parse a hope.</p>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency, because retries meet side effects</h2>
+  <p>The coverage check is a pure function of its inputs, but the service around it is not: it writes an audit record and may create an adjuster task. A retry from the workflow engine after a timeout can double-write both. The fix is an idempotency key sent by the caller, one per logical request, stored with the saved result. A retry with the same key returns the saved result and runs nothing.</p>
+  <p>Stripe's API is the reference design. The key travels in an <code>Idempotency-Key</code> header, up to 255 characters, and the server saves the status code and body of the first request. Keys can be pruned after 24 hours, and the server compares parameters on a reused key and errors if they differ, which catches a caller that reuses a key for a different claim. Copy that last behaviour. A reused key with different input must fail loudly, not return the old answer.</p>
+  <p>Idempotency does not make the model deterministic. Two fresh calls with the same input can differ, even at temperature 0. That is the argument for saving the first result and replaying it, instead of regenerating on retry.</p>
+</section>
+
+<section id="versioning">
+  <h2>Version prompts and models like code</h2>
+  <p>Model and prompt are two dependencies of the service, and both change behaviour without a code diff. Treat them as such.</p>
+  <ul>
+    <li><strong>Pin.</strong> Use a dated model id where one exists, not an alias that moves. Store the prompt in the repo, with a version string that appears in every log line and every saved verdict.</li>
+    <li><strong>Changelog.</strong> Each prompt or model change is a pull request that links an eval run, using the labelled set from <a href="07-eval-set-and-ship-decision.html">chapter 07</a> and the practices in <a href="../ai-engineer-compliance/07-evals.html">the evals chapter of the compliance guide</a>.</li>
+    <li><strong>Canary.</strong> Send 5% of traffic to the new version, and compare fallback rate, validation-failure rate, latency and, once labels arrive, verdict agreement with the old version. Promote or roll back on those numbers.</li>
+    <li><strong>Deprecations.</strong> Providers retire models on a published schedule. Put the retirement date in the calendar when you pin, not when the 404 arrives.</li>
+  </ul>
+  <p>Remember that a schema change invalidates the compiled grammar and, if you use prompt caching, a change to <code>output_config.format</code> invalidates the cache for that thread. Schema edits are deploys, with warm-up.</p>
+</section>
+
+<section id="slo">
+  <h2>An SLO that matches the contract</h2>
+  <p>Define the service level on what the caller experiences: the share of requests that return a schema-valid verdict or a typed error within the deadline. Say it is 99.9% over four weeks. Google's SRE workbook gives the arithmetic: a 99.9% objective leaves 0.1% of requests as budget, so a million requests allow a thousand failures. At 6,000 claims a day, four weeks is about 168,000 requests and the budget is about 168 failures. Its example policy says that when the budget is spent, changes stop except for urgent fixes. For this service that rule has teeth: a prompt change that raises validation failures freezes the next prompt change.</p>
+  <p>Add a second, separate measure: fallback rate. A service can meet its availability target while falling back on 15% of claims, which is a quality outage hidden inside an availability number. Alert on both.</p>
+</section>
+
+<section id="answer">
+  <h2>The worked answer</h2>
+  <div class="talking-point">
+    <span class="label">About 90 seconds aloud</span>
+    <p>"I start from the failures, not the prompt. The coverage check can fail on transport, on shape, on meaning and by drift, and each gets a different tool. The request and response are typed and versioned. The model is called with structured outputs so the shape is enforced, and my own validator runs anyway for the rules a schema cannot express. If validation fails I do one repair call with the error text. Transport errors retry with jittered backoff, at one layer only, inside a deadline the workflow engine passed down. If the budget runs out, the caller gets a conservative default, needs-review, marked as a fallback, never a guessed decision. Every request carries an idempotency key so a timeout retry cannot double-write. Prompt and model are pinned and versioned, changes ship behind an eval and a canary, and I track availability and fallback rate as separate numbers. [In my last project, I measured X.]"</p>
+  </div>
+  <p>The trade-offs to name: more repair attempts raise success and cost, and eat the deadline. A cache saves money and risks serving a verdict from an old prompt. A smaller fallback model keeps the pipeline moving and shifts load to human reviewers. The recommendation flips for the nightly batch jobs, as noted above, and for any caller that wants a streamed answer: then the contract is a stream of events, validation happens at the end, and a mid-stream error arrives after a 200 status.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "If structured outputs guarantee the schema, why validate again?"</summary>
+    <div class="reveal-body">
+      <p><em>"Three reasons. The guarantee has holes: a refusal or a max-tokens stop returns 200 with output that may not match. The schema language is limited, so rules like a length bound or 'clause id required unless needs-review' live in my code. And shape is the smallest part of correctness. My validator also checks that the clause id exists in the policy I sent, which no schema can do. I treat structured outputs as removing a class of parse errors and my validator as the contract."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "The model returns invalid JSON 2% of the time. What do you do?"</summary>
+    <div class="reveal-body">
+      <p><em>"First I check why. If it is truncation, I raise max tokens or shorten the output. If I am not using constrained decoding, I turn it on. Then one repair call with the validator message, which usually clears most of what is left. I never loop beyond two, because the third attempt rarely differs and it spends the deadline. I log every repair so I can see whether a prompt change moved the rate. If 2% remains after that, the remainder goes to the fallback, and I treat the number as a quality metric to drive down, not a retry problem."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "How do you stop retries from taking down the provider, or you?"</summary>
+    <div class="reveal-body">
+      <p><em>"Retries at exactly one layer, so they cannot multiply. Exponential backoff with full jitter so clients that failed together do not return together. A retry budget, so when most calls are failing I stop adding load and fail fast to the fallback. And I honour retry-after on a 429. I do not retry a 400 or a spend-cap 429, since they will not heal."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "What is your timeout, and how did you pick it?"</summary>
+    <div class="reveal-body">
+      <p><em>"I do not pick a round number. I measure the latency distribution of this prompt on this model with realistic outputs, choose a false-timeout rate I can accept, say 0.1%, and set the per-attempt timeout near that percentile. Then I cap it by the remaining deadline from the caller. For long generations I stream, so a slow response is detected by stalled tokens and not only by total time. [For Harbourline's intake path the overall deadline was ten seconds.]"</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "A prompt change went out and complaints rose a week later. What was missing?"</summary>
+    <div class="reveal-body">
+      <p><em>"Three things. A version string in every saved verdict, so I can find the affected claims. An eval gate on the change, because a labelled set would have shown the shift before release. And a canary, which would have compared the new version against the old on live traffic at 5% and rolled back on the first sign. After the fix I would add the missed cases to the eval set, and replay the affected claims through the old version to repair them."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "Primary model is down. What does the workflow engine receive?"</summary>
+    <div class="reveal-body">
+      <p><em>"Whichever comes first within the deadline: a cached verdict for the same claim, policy version and prompt version; a verdict from the secondary model, tagged with its source; or a needs-review default tagged as a fallback. Never an unmarked guess. The engine routes needs-review to an adjuster queue, so the failure becomes slower handling, not a wrong decision. I also page on fallback rate, since availability alone would look fine."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A response arrives with HTTP 200, parses as JSON, and passes your schema, yet the <code>decision</code> field is wrong in an obvious way. Name two reasons the schema could not have prevented it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Constrained decoding enforces shape, not truth, so a valid enum value can still be the wrong one, and the clause it cites may not exist in this policy. A truncated or refused response can also come back with 200. See <a href="#schema">the schema section</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The SDK retries twice, your service wraps it in three attempts, and the workflow engine retries three times. The provider is slow, not down. How many calls does one claim produce, and what should you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Up to 3 × 3 × 3 = 27, each waiting out a timeout, which deepens the slowness. Keep retries in one layer and cap them with a budget. See <a href="#retries">retries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A caller times out at 10 seconds and retries with the same idempotency key, but the first request was still running and finishes. What should the server do, and what if the retry arrives with a different claim under that key?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Return the saved result of the first request for the same key, without a second model call or a second audit write. If the parameters differ, reject loudly, because reusing the old answer for a different claim is worse than failing. See <a href="#idempotency">idempotency</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Over four weeks the service shows 99.95% availability, yet adjusters complain that more claims land in their queue. Which number did you fail to watch, and how can the first number look healthy while this one is bad?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Fallback rate. A needs-review default is a valid, on-time response, so it counts as success in availability while shifting work to humans. Track the two separately. See <a href="#slo">the SLO section</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your colleague proposes pointing the production alias at the provider's newest model on release day, since "it is strictly better". What do you ask for before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An eval run on the labelled set against the pinned version, a canary slice comparing fallback rate, validation failures and verdict agreement, and a rollback path. Better on benchmarks does not mean better on Harbourline's clauses. See <a href="#versioning">versioning</a>.</p></div></details>
+    </li>
+    <li>
+      <p>When would you choose a long retry horizon over a short deadline for the same model call, and what changes in the design?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>When no human waits, as in the nightly claim classification. Use the batch API, retry whole batches later, and drop the fallback-to-default behaviour in favour of requeueing, since a late correct answer beats a fast conservative one. Idempotency keys still apply to downstream writes.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A reliable LLM service is a list of failures chosen in advance: transport, shape, meaning and drift each get their own remedy.</li>
+    <li>Structured outputs remove most parse errors, but refusals and token-limit stops still return 200, so your own validator stays.</li>
+    <li>Repair once with the validator's message, then fall back; a third attempt rarely differs from the second.</li>
+    <li>Retry at one layer, with jitter, a budget and a deadline that travels with the request.</li>
+    <li>On failure the caller gets a verdict tagged with its source, a conservative default, or a typed error, never an unmarked guess.</li>
+    <li>Idempotency keys make retries safe around side effects, and a reused key with different input must fail.</li>
+    <li>Prompt and model are versioned dependencies: pin, eval, canary, and measure fallback rate beside availability.</li>
+  </ul>
+  <p>The next failure is one no retry fixes, an agent that keeps calling tools without ever finishing. → <a href="14-the-agent-that-loops-forever.html">The Agent That Loops Forever</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs" target="_blank" rel="noopener"><strong>Structured outputs</strong></a> — Anthropic docs. Parameter names, unsupported schema features, and the refusal and token-limit exceptions.</li>
+    <li><a href="https://platform.claude.com/docs/en/api/errors" target="_blank" rel="noopener"><strong>Claude API errors</strong></a> — Anthropic docs. Which status codes are transient, SDK default retries, and long-request guidance.</li>
+    <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener"><strong>Timeouts, retries and backoff with jitter</strong></a> — Amazon Builders' Library. Retry amplification, percentile-based timeouts, retry budgets.</li>
+    <li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener"><strong>Idempotent requests</strong></a> — Stripe API reference. A concrete idempotency-key design to copy.</li>
+    <li><a href="https://sre.google/workbook/error-budget-policy/" target="_blank" rel="noopener"><strong>Example error budget policy</strong></a> — Google SRE Workbook. How an SLO becomes a release rule.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

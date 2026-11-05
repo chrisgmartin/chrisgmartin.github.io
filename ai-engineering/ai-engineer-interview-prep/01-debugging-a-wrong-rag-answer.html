@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Wrong Answer When the Right Document Exists — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A RAG answer is wrong even though the correct document is in the index. The six places it can fail, the trace that tells you which one, and the fix for each.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Wrong Answer When the Right Document Exists — AI Engineer Interview Prep">
+<meta property="og:description" content="A RAG answer is wrong even though the correct document is in the index. The six places it can fail, the trace that tells you which one, and the fix for each.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#tree">The fault tree</a>
+    <a href="#bisect">Bisect first</a>
+    <a href="#faults">Six faults, one by one</a>
+    <a href="#worked">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous: Start Here</a>
+    <a href="02-chunk-size-and-overlap.html">Next: Chunk Size and Overlap →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · RAG and retrieval</span>
+  <h1>The Wrong Answer When the Right Document Exists</h1>
+  <p class="subtitle">A RAG answer is wrong even though the correct document is in the index. The six places it can fail, the trace that tells you which one, and the fix for each.</p>
+</header>
+
+<section id="question">
+  <h2>The question, and what is being scored</h2>
+  <p>The interviewer says: <em>"Your RAG assistant gave a customer the wrong answer, but the right document is in the index. Walk me through how you find out why."</em></p>
+  <p>At Harbourline Insurance, the help-centre assistant answers questions over policy documents and internal procedures. A customer asks what the deductible is for water damage. The assistant says $500. The 2026 policy says $1,000. The $500 figure is from the 2025 wording, which is still in the index. A wrong deductible is a complaint, not a regulatory event, but it is the kind of error that ends up in a screenshot.</p>
+  <p>Four things are being scored:</p>
+  <ul>
+    <li><strong>Do you localise before you fix?</strong> A candidate who says "I would improve the prompt" has skipped the diagnosis. The strong answer starts with a bisection.</li>
+    <li><strong>Do you know the fault tree?</strong> Retrieval pipelines fail in a small number of distinct places. Naming them in order is what separates experience from a tutorial.</li>
+    <li><strong>Can you name the evidence for each fault?</strong> Each failure leaves a different mark in the trace. Saying which field you would open is the proof you have done this.</li>
+    <li><strong>Do you turn one bug into a regression test?</strong> The case joins the labelled set so it cannot return.</li>
+  </ul>
+</section>
+
+<section id="tree">
+  <h2>The fault tree</h2>
+  <p>A RAG answer passes through five stages, and the correct fact can be lost at each. Hold this picture in your head, because the debugging order follows it:</p>
+  <div class="flow">source file
+   ↓  parse                (1) text lost or mangled
+chunks
+   ↓  split                (2) fact separated from its context
+vectors + metadata
+   ↓  embed, filter        (3) query and passage do not match
+                           (6) filter excludes the passage
+candidate list
+   ↓  rank, cut at k       (4) relevant passage below the cut
+prompt
+   ↓  generate             (5) model ignores or overrides it
+answer</div>
+  <p>The first four faults are retrieval faults: the model never saw the fact. Fault 6 sits between stages but is also a retrieval fault, since the passage is removed before ranking. Only fault 5 is a generation fault. This split matters because the fixes live in different teams' code, and because retrieval faults are usually the majority. The exact share depends on your corpus, so measure it on your own failures rather than quoting a number.</p>
+  <div class="callout insight">
+    <span class="callout-label">"The document is in the index" proves almost nothing</span>
+    <p>It says the file was ingested. It does not say the passage was parsed intact, split with its context, embedded near the question, allowed by the filter, ranked inside k, and then used. Five conditions have to hold after the one the interviewer gave you. Say this early; it shows you do not treat the index as a black box.</p>
+  </div>
+</section>
+
+<section id="bisect">
+  <h2>Bisect first: retrieval or generation?</h2>
+  <p>Before reading any code, split the system in half. Take the failing question, find the gold passage by hand (the 2026 deductible table), and run the generator again with that passage forced into the context in place of whatever retrieval returned.</p>
+  <ul>
+    <li><strong>The answer is now right.</strong> Retrieval is at fault. Move to faults 1, 2, 3, 4 and 6.</li>
+    <li><strong>The answer is still wrong.</strong> Generation is at fault: fault 5, or a prompt problem. Retrieval work will not help.</li>
+  </ul>
+  <p>This costs one model call and removes half the search space. A sketch of the harness:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>bisect.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def bisect(question, gold_passage, retrieve, generate, grade):
+    """Return which half of the pipeline owns the failure. Sketch, not a library."""
+    retrieved = retrieve(question)                      # what production saw
+    as_shipped = generate(question, retrieved)
+    forced = generate(question, [gold_passage])         # oracle retrieval
+    return {
+        "gold_in_retrieved": gold_passage.id in {p.id for p in retrieved},
+        "shipped_ok": grade(as_shipped),
+        "forced_ok": grade(forced),
+        # forced_ok False  -> generation fault (5)
+        # forced_ok True and gold_in_retrieved False -> retrieval fault (1,2,3,4,6)
+        # forced_ok True and gold_in_retrieved True  -> ranking or prompt-order fault
+    }</code></pre>
+  </div>
+  <p>The third case is the quiet one. The passage was retrieved, the oracle run works, yet the shipped run failed. Something about position or competing text in the shipped prompt is to blame, and that points to fault 4 or fault 5.</p>
+  <p>Do this at scale and it becomes a metric. On a labelled set of question to gold-passage pairs, <strong>recall@k</strong> is the fraction of questions where the gold passage is in the top k. <strong>Faithfulness</strong> is the fraction of answer claims supported by the retrieved context, usually scored by a model grader (<a href="../ai-engineer-compliance/06-rag-applied.html#evals">RAG evaluation metrics</a> covers the Ragas definitions). Low recall@k with decent faithfulness means retrieval is the problem. High recall@k with low faithfulness means the generator is.</p>
+</section>
+
+<section id="faults">
+  <h2>Six faults, one by one</h2>
+  <p>For each: where it leaves a mark, a one-line test, the fix.</p>
+
+  <h3>1. Parsing lost or mangled the passage</h3>
+  <p>PDF extraction reads text in the order the file stores it, not the order a person reads it. A two-column page interleaves its columns. A table flattens into a stream of cells where "Water damage" and "$1,000" are no longer adjacent. Headers and footers repeat on every page and pollute chunks. Scanned pages have no text layer at all.</p>
+  <ul>
+    <li><strong>Trace field:</strong> the stored chunk text for the source page, not the original PDF.</li>
+    <li><strong>Test:</strong> search the chunk store for the exact sentence from the PDF. If it is absent or scrambled, ingestion is the fault.</li>
+    <li><strong>Fix:</strong> a layout-aware parser, tables extracted as structured rows (a Markdown table or one row per chunk), OCR for scans, and a parse-quality check at ingestion that flags pages with a very low text-to-image ratio.</li>
+  </ul>
+
+  <h3>2. Chunking split the fact from its context</h3>
+  <p>The chunk says "The deductible is $1,000" but the heading that said "Water damage, Home Plus policy, effective 1 January 2026" is in the previous chunk. The text is present; the meaning is not. <a href="02-chunk-size-and-overlap.html">Chapter 02</a> covers how to choose chunking; here the point is only how to recognise it.</p>
+  <ul>
+    <li><strong>Trace field:</strong> the retrieved chunk text.</li>
+    <li><strong>Test:</strong> read the chunk with no other context. Could a person tell which policy and year it belongs to? If not, it is orphaned.</li>
+    <li><strong>Fix:</strong> keep tables and sections whole, and prepend the document title, version and section path to each chunk.</li>
+  </ul>
+
+  <h3>3. The question and the passage do not match in embedding space</h3>
+  <p>Embedding models place text near other text that is about the same thing. They are weaker at exact strings. A customer writes "my pipe burst" and the policy says "escape of water"; a dense model usually bridges that, but a customer who quotes "form HL-204" is relying on an exact token. Negations are a second trap: "what is not covered" lands near "what is covered".</p>
+  <ul>
+    <li><strong>Trace field:</strong> the query text actually embedded, plus the similarity score of the gold passage when you score it directly.</li>
+    <li><strong>Test:</strong> embed the gold passage and the query yourself and compute the cosine similarity, then compare it to the score of the top result. A gold score well below the winners confirms a mismatch.</li>
+    <li><strong>Fix:</strong> add lexical search (<a href="03-hybrid-search-and-reranking.html">chapter 03</a>), rewrite the query before embedding, or expand acronyms and product codes in a glossary applied to both queries and chunks.</li>
+  </ul>
+
+  <h3>4. Retrieved, but ranked below the cut</h3>
+  <p>The gold passage is candidate 14 and the prompt takes 5. This is the most common finding in a first debugging pass, and it hides because the passage is "in the index" and even "in the search results" if you look far enough.</p>
+  <ul>
+    <li><strong>Trace field:</strong> the full ranked candidate list with scores, not only the top k that went to the prompt.</li>
+    <li><strong>Test:</strong> find the gold passage's rank. Rank 6 to 50 means a ranking problem; absent from the top 100 means faults 1 to 3 or 6.</li>
+    <li><strong>Fix:</strong> retrieve wider and rerank (<a href="03-hybrid-search-and-reranking.html#rerank">reranking</a>), or raise k if the context budget allows.</li>
+  </ul>
+  <p>This is Harbourline's deductible bug. Both policy years are in the index and near-identical in wording, so the 2025 chunk scores slightly higher than the 2026 one. The fix is not a better embedding. It is a metadata field, <code>effective_year</code>, and a filter on it, which brings us to fault 6 from the other side.</p>
+
+  <h3>5. Retrieved, but the generator ignored or overrode it</h3>
+  <p>Three variants. <strong>Position:</strong> models use information at the start and end of a long context better than the middle (Liu et al., <em>Lost in the Middle</em>, 2023), so a correct passage in slot 4 of 8 can lose to a weaker one in slot 1. <strong>Conflict:</strong> two retrieved passages disagree, such as both deductible years, and the model picks one without saying so. <strong>Memory:</strong> the model's training data held an answer that the context contradicts, and it trusts its memory, which is likelier for well-known facts than for a company's private rules.</p>
+  <ul>
+    <li><strong>Trace field:</strong> the exact assembled prompt, in order, with the answer.</li>
+    <li><strong>Test:</strong> the bisect above. Forced gold context still fails, or fails only when a distractor is added.</li>
+    <li><strong>Fix:</strong> fewer, better passages; put the strongest first or last; tell the model to cite the passage it used and to say when sources conflict; require the effective date in the citation.</li>
+  </ul>
+
+  <h3>6. An access or metadata filter excluded it</h3>
+  <p>Filters are retrieval's invisible edge. A tenant filter, a jurisdiction filter (US versus UK Harbourline policies), or a date filter can silently drop the right passage. The filter can also be too loose: no date filter at all, which is Harbourline's actual bug.</p>
+  <ul>
+    <li><strong>Trace field:</strong> the filter expression applied to the query, and the count of candidates before and after it.</li>
+    <li><strong>Test:</strong> re-run the query with the filter removed. If the gold passage appears, the filter excluded it. If a wrong-year passage disappears when you add a date filter, the filter was missing.</li>
+    <li><strong>Fix:</strong> derive filters from the user's session and the question (policy number gives product and year), log them on every request, and test them with cases that should be excluded as well as included.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Log the candidates, not only the answer</span>
+    <p>Most teams log the question, the final prompt and the answer. Faults 3, 4 and 6 are invisible in that record. The trace needs the filter, the top 50 candidates with scores, and which went into the prompt. Add that before the first incident, because after it you cannot reproduce the state of the index.</p>
+  </div>
+</section>
+
+<section id="worked">
+  <h2>A worked answer</h2>
+  <p>A strong answer to the opening question runs about two minutes and has this shape.</p>
+  <ol>
+    <li><strong>Reproduce and capture.</strong> Pull the trace for that session: question, filter, ranked candidates, assembled prompt, answer. If the trace cannot show these, say that is the first gap to close.</li>
+    <li><strong>Bisect.</strong> Find the correct passage by hand, force it into the context and re-run. Here the answer flips to $1,000, so retrieval is at fault.</li>
+    <li><strong>Walk the retrieval faults in order.</strong> The passage is parsed correctly (fault 1 clear), its chunk carries its heading (fault 2 clear), and it sits at rank 9 behind the 2025 passage (fault 4). No date filter was applied (fault 6, on the loose side).</li>
+    <li><strong>Fix the cause, not the instance.</strong> Add <code>effective_year</code> to chunk metadata, derive it from the customer's policy, and filter. Do not special-case the deductible question.</li>
+    <li><strong>Lock it in.</strong> Add the question and its gold passage to the labelled set, along with sibling questions about other limits for the same policy. Report recall@5 before and after, plus the count of questions that changed answer.</li>
+  </ol>
+  <p><strong>The trade-off to name:</strong> a hard date filter is right for a customer asking about their current policy. It is wrong for a claims adjuster asking what the policy said on the date of loss, which may be last year. The same corpus needs the filter as a parameter derived from the question's intent, not a fixed rule. State that unprompted.</p>
+  <p><strong>When the recommendation flips:</strong> if the bisect shows the forced-gold run also fails, stop touching retrieval. Look at the prompt, the model and whether the gold passage is itself ambiguous. If failures spread across many unrelated questions, suspect an ingestion change, such as a new parser version, before suspecting the model. For the broader catalogue of RAG failure modes and mitigations, see <a href="../ai-engineer-compliance/06-rag-applied.html">RAG Applied</a>.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "You cannot reproduce the failure. The same question now works. What now?"</summary>
+    <div class="reveal-body">
+      <p><em>"First I ask what changed between the two runs, because RAG systems are not deterministic end to end. The index may have been refreshed, the model may sample differently, or the filter may depend on session data that differs. If I have the original trace, I replay its exact prompt against the generator, which isolates sampling. If I do not have a trace, that is the finding: I cannot debug what I did not record. I would then run the question twenty times at production temperature. A flaky failure at 10% is still a defect at 40k chats a day, so I would treat the rate as the thing to fix, and add the question to the labelled set with several samples per item."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "What goes in the trace, and what does it cost?"</summary>
+    <div class="reveal-body">
+      <p><em>"Per request: the raw question, the rewritten query if there is one, the metadata filter, the top 50 candidate IDs with scores and their ranks, which IDs went into the prompt, the index version, the full prompt and the answer. The text of candidates is the expensive part, so I store IDs and look up text by index version when needed. That keeps a record small. I sample full traces at a few percent, keep every trace for thumbs-down feedback and for refusals, and redact PII at write time. Storage is cheap next to the cost of a wrong-answer incident I cannot explain."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "Retrieval looks fine on your metrics but users still complain. Why?"</summary>
+    <div class="reveal-body">
+      <p><em>"Three candidates. The labelled set may not match real traffic: it was written by engineers in tidy language, and customers write misspellings and half-questions. I would sample recent production questions and compare their distribution. Second, recall@k says the gold passage was in the top k, not that the model used it, so I would check faithfulness and the position of the gold passage in the prompt. Third, the metric may be averaged over easy questions while one slice, say UK policies or scanned documents, is bad. I would break recall down by slice before trusting the average."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "Would you just increase k and put more in the prompt?"</summary>
+    <div class="reveal-body">
+      <p><em>"Sometimes, and it is the cheapest first experiment. It fixes fault 4 when the gold passage sits just past the cut. But it has costs: more tokens per request, more distractors, and the position effect gets worse as the context grows, so fault 5 can get worse while fault 4 improves. I would try it on the labelled set and watch both recall@k and faithfulness. If recall rises and faithfulness falls, I would retrieve wide and rerank down to a small k instead."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "Two retrieved documents contradict each other. What should the assistant do?"</summary>
+    <div class="reveal-body">
+      <p><em>"Prevent it where I can: filter on effective date so superseded wording is not a candidate for a current-policy question. Where both are legitimately in scope, the assistant should say so rather than pick one. The prompt tells it to name the source and date of each claim and to state a conflict. For Harbourline, a customer-facing answer that cannot resolve the conflict hands over to a person with both passages attached. Silently picking one is the worst outcome, because the answer reads confident and is a coin flip."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "Fastest way to check whether the problem is the embedding model?"</summary>
+    <div class="reveal-body">
+      <p><em>"Score the gold passage directly against the query with that model and look at its rank among all chunks, not only the retrieved ones. If it ranks in the top 5 on a brute-force scan but missed the production search, the model is fine and the approximate index or the filter is at fault. If it ranks poorly even on the brute-force scan, then the model, the query phrasing or the chunk is the problem. I would try a query rewrite and a lexical retriever before I swapped embedding models, since both are cheaper to test."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A forced-gold run of the generator gives the right answer, yet the production run was wrong and the gold passage was in the retrieved set. Where would you look next, and why is "retrieval is broken" the wrong conclusion?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Look at the order and contents of the assembled prompt: the gold passage's position and any conflicting passage ahead of it. The tempting answer is a retrieval fault, but the passage was retrieved, so the loss happens at generation time through position or conflict. See <a href="#bisect">Bisect first</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The 2025 and 2026 versions of a policy are both indexed and nearly identical. Why does a better embedding model not reliably fix wrong-year answers?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Embeddings measure topical similarity, and the two versions differ in a number or a date, which is a small part of the text. Year is a structured fact, so it belongs in metadata and a filter. See <a href="#faults">fault 4 and fault 6</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Recall@5 on your labelled set is 0.92, faithfulness is 0.71. What does that pair tell you, and where do you spend the next week?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retrieval mostly finds the gold passage, but the answers are not supported by it, so the generator is the weak half. Spend the week on prompt structure, passage order, citation requirements and conflict handling, not on retrieval. See <a href="#bisect">Bisect first</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A table row "Water damage | $1,000 | $2,500" is stored as three separate chunks after a PDF upgrade. Which trace field shows this, and what is the one-line test?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The stored chunk text for that page. Search the chunk store for the exact row from the PDF; a missing or fragmented hit confirms an ingestion fault. A new parser version is the first suspect when failures cluster on tables. See <a href="#faults">fault 1</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You are asked to add a date filter to stop wrong-year answers. An adjuster tool shares the same index. What goes wrong, and what is the design that avoids it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Adjusters often need the wording in force on the date of loss, so a fixed "latest only" filter hides what they need. Make the effective date a parameter derived from the use case: today for customers, the loss date for adjusters. See <a href="#worked">the worked answer</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>"The document is in the index" shows only that it was ingested; five further conditions must hold before the model can use it.</li>
+    <li>Bisect before you fix: force the gold passage into the context and see whether the answer flips, which tells you retrieval or generation in one call.</li>
+    <li>Retrieval faults are parsing, chunk context, query mismatch, rank below the cut and filters; generation faults are position, conflict and model memory.</li>
+    <li>Each fault leaves its evidence in a different trace field, so a trace without the filter and the ranked candidates cannot diagnose faults 3, 4 or 6.</li>
+    <li>Version-like facts such as effective year belong in metadata and filters, not in the hope that an embedding separates them.</li>
+    <li>Every diagnosed failure becomes a labelled item, and the fix is reported as a change in recall@k and faithfulness, not as an anecdote.</li>
+  </ul>
+  <p>Once you know retrieval is the culprit and a chunk lost its context, the next question is how to cut documents in the first place. → <a href="02-chunk-size-and-overlap.html">Chunk Size and Overlap</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener"><strong>Lost in the Middle: How Language Models Use Long Contexts</strong></a> — Liu et al., TACL 2023. Evidence for the position effect behind fault 5.</li>
+    <li><a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener"><strong>Introducing Contextual Retrieval</strong></a> — Anthropic, 2024. Fixes for fault 2, with failure-rate numbers on a retrieval benchmark.</li>
+    <li><a href="https://docs.ragas.io/" target="_blank" rel="noopener"><strong>Ragas documentation</strong></a> — lists the RAG metrics (context recall, context precision, faithfulness), each linked to its definition.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

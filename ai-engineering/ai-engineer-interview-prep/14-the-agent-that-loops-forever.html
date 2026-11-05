@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Agent That Loops Forever — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A live-debugging round: an agent that never terminates on some inputs. How to find the cause from traces and how to make the loop impossible, not just unlikely.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/14-the-agent-that-loops-forever">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Agent That Loops Forever — AI Engineer Interview Prep">
+<meta property="og:description" content="A live-debugging round: an agent that never terminates on some inputs. How to find the cause from traces and how to make the loop impossible, not just unlikely.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/14-the-agent-that-loops-forever">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#causes">Six causes</a>
+    <a href="#traces">Debugging from traces</a>
+    <a href="#fixes">Fixes</a>
+    <a href="#answer">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="13-llm-behind-a-reliable-contract.html">← Previous: An LLM Behind a Reliable Contract</a>
+    <a href="15-confident-and-wrong-in-high-risk-work.html">Next: Confident and Wrong in a High-Risk Workflow →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section F · Production and debugging</span>
+  <h1>The Agent That Loops Forever</h1>
+  <p class="subtitle">A live-debugging round: an agent that never terminates on some inputs. How to find the cause from traces and how to make the loop impossible, not just unlikely.</p>
+</header>
+
+<section id="question">
+  <h2>The question and what it scores</h2>
+  <p><em>"Harbourline's claims-intake agent never finishes on about one claim in two hundred. It burns tokens until something upstream kills it. Walk me through finding the cause and making sure it cannot happen again."</em></p>
+  <p>This is a live-debugging round, so the interviewer scores process more than recall. Do you ask for traces before theorising? Do you know the handful of ways agent loops actually form? And does your fix make the loop impossible, or only less likely? "Tell the model to stop after three tries" is a less-likely fix, and it gets a polite nod and a follow-up. A step cap enforced in code is an impossible fix, and that is the difference they are listening for.</p>
+</section>
+
+<section id="causes">
+  <h2>Six ways an agent loops</h2>
+  <p>An agent is a loop: the model picks an action, code runs it, the result goes back into context, repeat until the model says it is done. Everything that goes wrong comes from the fact that "done" is a decision the model makes, not the code. Anthropic's agent guidance says as much when it recommends stopping conditions, such as a maximum number of iterations, to keep control. These are the six causes that account for nearly every runaway.</p>
+  <ol>
+    <li><strong>No termination condition outside the model.</strong> The loop ends only when the model emits a final answer. If it never does, nothing else ends it.</li>
+    <li><strong>An error the model tries to fix by repeating.</strong> The policy lookup returns <code>timeout</code>. The model reasons that it should try again, and the same call comes back with the same error. Each pass looks reasonable alone.</li>
+    <li><strong>State not updated between steps.</strong> A tool that writes (say, "request missing photos") returns a success message that does not change what the next read tool shows. The model sees "photos still missing" and requests them again.</li>
+    <li><strong>Two tools undoing each other.</strong> One normalises the address to UK format, another corrects it to the policy's US format. Each step is a valid response to the last.</li>
+    <li><strong>The same plan, reworded.</strong> The model writes "I will check coverage" in fifteen phrasings. The action hashes differ in the arguments' free-text fields while the intent is identical, which defeats naive duplicate detection.</li>
+    <li><strong>Context growth until the goal is lost.</strong> Every step appends a tool result. By step 40 the original instruction is a tiny fraction of the window and a long way back, and the model starts pursuing a sub-task it found along the way. This one is slow and often shows up as drift before it shows up as a loop.</li>
+  </ol>
+  <p>Note what separates them. Causes 2 to 4 are environment bugs, so a smarter model does not fix them. Cause 5 is a model behaviour that detection must see through. Cause 1 is the missing guard that lets any of the others run forever. That is why the answer has a diagnosis half and a guard half.</p>
+</section>
+
+<section id="traces">
+  <h2>Debug from traces, not from the prompt</h2>
+  <p>Ask for the traces of the stuck runs before reading any prompt. Every step should log: run id, step number, tool name, arguments, result status, input and output tokens, and elapsed time. Then compute three signals per run.</p>
+  <ul>
+    <li><strong>Step counter.</strong> The distribution of steps per run. Healthy intake runs for Harbourline might finish in 4 to 9 steps. The stuck ones sit at the cap, or past it.</li>
+    <li><strong>Repeated <code>(tool, args)</code> hash.</strong> Hash the tool name and canonicalised arguments. A count of three or more on the same hash is a loop of causes 2 or 3. If the hash never repeats yet the tool names cycle in a pattern A, B, A, B, you have cause 4.</li>
+    <li><strong>Token growth per step.</strong> Plot input tokens by step. A line climbing steadily while the work stays flat is cause 6, or a tool returning a huge payload each time.</li>
+  </ul>
+  <p>Then group the stuck runs by what they share: the same tool, the same error string, the same claim type. Six hundred failures with one cause is a bug in one tool. If they are spread across tools, suspect the missing guard and the context. Reproduce one stuck run from its recorded tool results, since replaying recorded results removes the live environment from the question.</p>
+  <div class="callout tip">
+    <span class="callout-label">The first question is "what did the tool say?"</span>
+    <p>Most loops are a tool result the model could not act on. Read the last three tool results in a stuck trace before you touch the prompt. If they are identical errors, you have found it.</p>
+  </div>
+</section>
+
+<section id="fixes">
+  <h2>Fixes that make the loop impossible</h2>
+  <p>Fixes come in two kinds: those that remove causes and those that bound the damage. You need both, and the bounds go first because they work whatever the cause turns out to be.</p>
+  <h3>Bounds, enforced in code</h3>
+  <ul>
+    <li><strong>A hard step cap and a hard token cap per run.</strong> The cap lives in the harness, not the prompt. The Claude Agent SDK exposes <code>max_turns</code> and <code>max_budget_usd</code> as options, and a run that hits one ends with a result subtype of <code>error_max_turns</code> or <code>error_max_budget_usd</code>. The docs note the cost estimate can overshoot the budget, so leave headroom. Choose the cap from the trace distribution: if healthy runs finish in 9 steps, a cap of 15 to 20 stops waste and rarely cuts a real run.</li>
+    <li><strong>Loop detection on action hashes.</strong> Stop, or inject a "you already tried this" message and then stop, when the same hash appears more than twice.</li>
+    <li><strong>A wall-clock timeout</strong> on the whole run and on each tool call. Token caps do not catch a tool that hangs.</li>
+    <li><strong>A per-step budget.</strong> Truncate tool results to a sensible size, so one step cannot add 80,000 tokens.</li>
+  </ul>
+  <h3>Causes, removed at the source</h3>
+  <ul>
+    <li><strong>Tool errors are classified.</strong> A retryable error (timeout) is retried by the tool wrapper with backoff, once, not by the model. A terminal error (<code>policy_not_found</code>) ends the run in a named state, <code>failed</code>, with the reason attached, and the claim goes to a human. The model is never asked to decide whether to keep banging on a closed door. Anthropic's guidance on tool design applies here: change the tool so mistakes are harder to make.</li>
+    <li><strong>Idempotent tools.</strong> A repeated "request missing photos" returns the existing request instead of sending a second email. Repetition then costs a step and nothing else. See the same idea for services in <a href="13-llm-behind-a-reliable-contract.html#idempotency">chapter 13</a>.</li>
+    <li><strong>State the model can see.</strong> A write tool returns the new state, not "ok", so the next step starts from the changed world.</li>
+    <li><strong>Progress checks.</strong> Every N steps, compare the set of facts gathered so far to the last check. No new facts in 3 steps means stop, or ask for human help.</li>
+    <li><strong>Compact the context.</strong> Summarise old tool results and re-state the task at the end of the context, so the goal does not drift out of reach.</li>
+  </ul>
+  <p>The harness below shows the bounds and the terminal-error rule in about fifty lines. It uses a fake model so it runs as written.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>loop_guard.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import hashlib
+import json
+from collections import Counter
+
+
+class Stop(Exception):
+    """Raised by the guard. The run ends in a named terminal state."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class Guard:
+    def __init__(self, max_steps=12, max_tokens=60_000, max_repeats=2):
+        self.max_steps, self.max_tokens, self.max_repeats = max_steps, max_tokens, max_repeats
+        self.steps, self.tokens, self.seen = 0, 0, Counter()
+
+    def check(self, tool, args, tokens_used):
+        self.steps += 1
+        self.tokens += tokens_used
+        if self.steps &gt; self.max_steps:
+            raise Stop("max_steps")
+        if self.tokens &gt; self.max_tokens:
+            raise Stop("max_tokens")
+        key = hashlib.sha256(json.dumps([tool, args], sort_keys=True).encode()).hexdigest()
+        self.seen[key] += 1
+        if self.seen[key] &gt; self.max_repeats:
+            raise Stop(f"repeated_call:{tool}")
+
+
+def run(model_step, tools, task):
+    """model_step(history) -&gt; {"tool", "args", "tokens"} or {"final": str}"""
+    guard, history = Guard(), [task]
+    try:
+        while True:
+            step = model_step(history)
+            if "final" in step:
+                return {"state": "done", "answer": step["final"], "steps": guard.steps}
+            guard.check(step["tool"], step["args"], step["tokens"])
+            result = tools[step["tool"]](**step["args"])
+            if result.get("terminal"):               # tool error the model cannot fix
+                return {"state": "failed", "reason": result["error"], "steps": guard.steps}
+            history.append(result)
+    except Stop as s:
+        return {"state": "stopped", "reason": s.reason, "steps": guard.steps}
+
+
+if __name__ == "__main__":
+    # a model that keeps asking for a policy the lookup tool cannot find
+    always_same = lambda h: {"tool": "lookup_policy", "args": {"policy_id": "HX-001"}, "tokens": 900}
+    flaky = lambda policy_id: {"error": "timeout"}                      # retryable, but never succeeds
+    print(run(always_same, {"lookup_policy": flaky}, "check claim C-9"))
+    missing = lambda policy_id: {"error": "policy_not_found", "terminal": True}
+    print(run(always_same, {"lookup_policy": missing}, "check claim C-9"))</code></pre>
+</div>
+  <p>The two demo runs end in different named states. The first, a flaky tool the model keeps retrying, is stopped on the third identical call. The second, a missing policy, fails at step one because the tool declared the error terminal. Both produce an outcome the claims workflow can route, which is the point: a stuck run is turned into a result.</p>
+</section>
+
+<section id="answer">
+  <h2>The worked answer</h2>
+  <div class="talking-point">
+    <span class="label">About 90 seconds aloud</span>
+    <p>"First I'd pull traces for the stuck runs and compute steps per run, repeated tool-and-argument hashes, and tokens per step. That tells me which of six causes I'm in: no outside termination, a retry on an error the model can't fix, state that doesn't change between steps, two tools fighting, the same plan reworded, or a context that has swallowed the goal. I'd read the last three tool results of a stuck run, because it is usually a tool error. Then I'd fix in two layers. Bounds in code: a step cap and token cap from the healthy distribution, loop detection on action hashes, a wall-clock timeout. Then causes: classify tool errors so terminal ones end the run with a reason and a human handoff, make write tools idempotent, return new state from writes. Every stuck run ends in a named state the workflow can route. I'd alert on cap hits, since a cap that fires often is a bug report. [In my own project this surfaced as X.]"</p>
+  </div>
+  <p>Name the trade-offs. A tight cap saves money and sometimes cuts a legitimate long claim, so route cap hits to a person, never a silent retry. Loop detection by exact hash misses reworded plans, so pair it with the progress check. Compaction saves tokens and can drop a detail the agent needs later. The recommendation flips for open-ended research agents, where long runs are normal: there the cap is a budget in dollars, set by the task, with a checkpoint for human approval at intervals. The related design question, whether to use an agent at all, is in <a href="04-agent-or-workflow.html">chapter 04</a>, and the budget angle is in <a href="05-claims-agent-under-a-token-budget.html">chapter 05</a>.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Why not just tell the model in the system prompt to stop after three failed attempts?"</summary>
+    <div class="reveal-body">
+      <p><em>"Because the prompt is a request and the harness is a guarantee. The model has to count its own attempts across a growing context, and the loop is exactly the situation where it has lost track. I'd still keep the sentence in the prompt, since it cuts the rate of loops. But the limit that matters is the step cap in code, which holds when the model is confused."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "How do you set the step cap?"</summary>
+    <div class="reveal-body">
+      <p><em>"From the data. I take the step counts of successful runs, look at the 99th percentile, and set the cap a little above it. If successful intake runs top out near 9 steps, 15 or 20 is a cap that almost never cuts a good run and stops a bad one early. Then I watch the cap-hit rate. If it climbs, either the task changed or a tool broke, and both are worth knowing."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "The hashes never repeat, but the run still goes on forever. What now?"</summary>
+    <div class="reveal-body">
+      <p><em>"Then the arguments differ in a free-text field, or the cycle is across tools. I'd canonicalise the arguments to the fields that matter, such as the claim and policy ids, and drop the model's free-text reasoning from the key. I'd also look for a repeating tool-name sequence. And I'd add the progress check: if three steps add no new facts to the working state, stop. That works whatever the surface form of the actions."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "When the cap fires, what does the user or workflow see?"</summary>
+    <div class="reveal-body">
+      <p><em>"A terminal state with a reason, not a timeout. The claim moves to an adjuster queue with the trace link, the steps taken and the reason, say max steps or repeated call. For a customer-facing chat I'd give a short honest message and a handoff, not another attempt. Partial work is kept, so the human does not start over."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "Should the model retry a failed tool call, or the code?"</summary>
+    <div class="reveal-body">
+      <p><em>"The code, for transient errors, once or twice with backoff, invisible to the model. The model sees only the final outcome. For errors that will not heal, the tool says so with a terminal flag. If I leave retries to the model, every retry costs a full model call and context, and the model has no reliable way to tell a transient error from a permanent one."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "How would you catch this class of bug before production?"</summary>
+    <div class="reveal-body">
+      <p><em>"Replay tests with fault injection: run the agent against recorded cases where I make one tool time out, return an empty result, or return the same error forever, and assert the run ends in a named state within the cap. I'd add the stuck production traces to that suite. <a href="08-evaluating-agents-beyond-the-answer.html">Chapter 08</a> covers evaluating the path an agent took and not only its answer, which is where these checks belong."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A trace shows the agent calling <code>request_photos</code> five times for one claim, each time with a slightly different message text, and each reply says "sent". What are two separate bugs here?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The write tool is not idempotent, so every call sends another request, and its reply does not change the state the next step reads, so the model cannot see the work is done. Exact-argument hashing also misses the loop because the message text differs. See <a href="#fixes">fixes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Token usage per step rises by about 4,000 each step while tool names vary and no hash repeats. Which cause is this, and what do you do first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Context growth. Check whether a tool returns large payloads and truncate them, then compact old results and restate the goal. A token cap bounds it in the meantime. See <a href="#causes">causes</a> and <a href="#traces">traces</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team lead wants to raise the step cap from 15 to 50 "because some claims need more steps". What do you check before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether those claims succeed past step 15 in the traces. If successful runs end by step 9, claims reaching 15 are almost all loops, and 50 turns each into three times the waste. If a real class needs more steps, raise the cap for that class, with a token cap alongside.</p></div></details>
+    </li>
+    <li>
+      <p>The policy tool returns <code>503</code> for four minutes, then recovers. The agent's run is 90 seconds. Design the tool's behaviour so the run neither loops nor fails needlessly.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The wrapper retries twice with jittered backoff inside the tool call, then returns a terminal error with a retryable flag for the workflow, which requeues the claim after a delay. The model never sees repeated 503s to react to. See <a href="#fixes">fixes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why can a loop detector that compares the last two actions pass an A, B, A, B cycle, and what catches it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Consecutive actions always differ, so a last-two comparison never fires. A count of each hash across the whole run catches it by the third repeat, and a progress check catches it when no new facts arrive.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Agent loops form because "done" is the model's decision; most cases are an unusable tool result, a state that does not change, or two tools in conflict.</li>
+    <li>Debug from traces: steps per run, repeated tool-and-argument hashes, and tokens per step show the cause before you read a prompt.</li>
+    <li>The step, token and time caps live in the harness; a prompt instruction lowers the rate but cannot bound the loop.</li>
+    <li>Set caps from the distribution of healthy runs, and treat every cap hit as a signal to investigate.</li>
+    <li>Classify tool errors: transient ones retry inside the tool, terminal ones end the run with a named state and a human handoff.</li>
+    <li>Idempotent tools that return the new state make repetition cheap and visible.</li>
+  </ul>
+  <p>Loops are visible failures; the harder one is a fluent answer that is wrong and looks fine, covered next. → <a href="15-confident-and-wrong-in-high-risk-work.html">Confident and Wrong in a High-Risk Workflow</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener"><strong>Building effective agents</strong></a> — Anthropic engineering, 2024. Stopping conditions, human checkpoints, tool design, and why to prefer simple workflows.</li>
+    <li><a href="https://code.claude.com/docs/en/agent-sdk/python" target="_blank" rel="noopener"><strong>Agent SDK reference for Python</strong></a> — Anthropic docs. <code>max_turns</code>, <code>max_budget_usd</code> and the error result subtypes.</li>
+    <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener"><strong>Timeouts, retries and backoff with jitter</strong></a> — Amazon Builders' Library. Why retries belong at one layer, which also applies to retries inside an agent.</li>
+    <li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener"><strong>Idempotent requests</strong></a> — Stripe API reference. The model for making a repeated tool call harmless.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

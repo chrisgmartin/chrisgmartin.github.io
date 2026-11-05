@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Batching System for LLM Queries — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Design end-to-end batching for LLM work: the request path, queues and windows, continuous batching at the server, provider batch APIs, and the latency the…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/09-batching-system-for-llm-queries">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="A Batching System for LLM Queries — AI Engineer Interview Prep">
+<meta property="og:description" content="Design end-to-end batching for LLM work: the request path, queues and windows, continuous batching at the server, provider batch APIs, and the latency the…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/09-batching-system-for-llm-queries">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#two-layers">Two layers of batching</a>
+    <a href="#provider-batch">Provider batch APIs</a>
+    <a href="#continuous">Continuous batching</a>
+    <a href="#design">The Harbourline design</a>
+    <a href="#failure">Failure and idempotency</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-evaluating-agents-beyond-the-answer.html">← Previous: Evaluating an Agent Beyond Its Final Answer</a>
+    <a href="10-latency-and-cost-at-scale.html">Next: Latency and Cost at Scale →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · LLM system design</span>
+  <h1>A Batching System for LLM Queries</h1>
+  <p class="subtitle">Design end-to-end batching for LLM work: the request path, queues and windows, continuous batching at the server, provider batch APIs, and the latency the batching costs.</p>
+</header>
+
+<section id="question">
+  <h2>The question, and what is being scored</h2>
+  <div class="talking-point">
+    <span class="label">As asked</span>
+    <p><em>"Design a batching system for LLM queries."</em></p>
+  </div>
+  <p>The sentence is deliberately ambiguous, and the first thing a strong candidate does is say so. Two different systems answer it. One is application-level: you hold work in a queue and send it to a model in bulk, because nobody is waiting. The other is inside the inference server: the engine groups many in-flight requests into one GPU forward pass, because the GPU is wasted otherwise. A good answer covers both, says which one the interviewer's workload needs, and does not let one leak into the other.</p>
+  <p>Interviewers score four things:</p>
+  <ul>
+    <li><strong>Segmentation.</strong> You split traffic by how long the caller can wait before choosing any mechanism.</li>
+    <li><strong>Mechanism at both layers.</strong> You can explain why provider batches are cheap and slow, and why continuous batching raises throughput and costs latency.</li>
+    <li><strong>Failure handling.</strong> Partial failure, expiry, retries and idempotency are designed in, not bolted on.</li>
+    <li><strong>Arithmetic and SLOs.</strong> You size the cost for a stated volume and give separate latency targets for interactive and batch work, including what happens under overload.</li>
+  </ul>
+  <p>The running example is Harbourline's nightly job that classifies and summarises the day's claims: about 6,000 new claims a day, to be ready before adjusters start work. The same company also serves about 40,000 chat sessions a day, which is the contrast case.</p>
+</section>
+
+<section id="two-layers">
+  <h2>Two layers, one rule: batching trades latency for efficiency</h2>
+  <p>Every form of batching spends waiting time to buy efficiency. What differs is who waits and what is bought.</p>
+  <div class="flow">  APPLICATION LAYER (your code)           SERVER LAYER (the inference engine)
+  ─────────────────────────────           ───────────────────────────────────
+  Waits:   minutes to hours               Waits:   milliseconds, per decode step
+  Buys:    a lower price per token,       Buys:    GPU utilisation: one weight
+           separate rate-limit pool,               read serves many sequences
+           no capacity planning
+  Unit:    a request in a file            Unit:    a sequence in a running set
+  Who:     you, with a provider API       Who:     vLLM, SGLang, TensorRT-LLM
+  Caller:  nobody is waiting              Caller:  a user may be watching</div>
+  <p>The rule that keeps the design honest: <strong>never put a batch window in front of a person.</strong> A provider batch can take up to 24 hours. A window you add to a chat path, even 200 ms, lands directly on time to first token. Interactive traffic gets the server layer only, where the "window" is a single scheduler step. Deferred traffic gets the application layer.</p>
+  <p>For Harbourline that gives three classes. Chat and the claims-intake agent are interactive: a person or a phone call is waiting. The adjuster's "re-summarise this file" button is near-interactive: a few seconds is fine, minutes is not. The nightly classification and summary is deferred: the deadline is 06:00, not "now". Only the third class goes to a batch API.</p>
+</section>
+
+<section id="provider-batch">
+  <h2>Provider batch APIs: what the contract actually is</h2>
+  <p>Both major providers sell the same deal. You trade a completion guarantee measured in hours for half the price and a separate rate-limit pool. The details matter when you design the retry logic, so know them. All figures below are from the vendors' documentation as of November 2026.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Property</th><th>Anthropic Message Batches</th><th>OpenAI Batch API</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Price</td><td>50% of standard input and output prices</td><td>50% lower than the synchronous API</td></tr>
+      <tr><td class="term">Size limit</td><td>100,000 requests or 256 MB per batch, whichever comes first</td><td>50,000 requests or 200 MB per input file</td></tr>
+      <tr><td class="term">Turnaround</td><td>Most batches finish within 1 hour; the batch expires if not done in 24 hours</td><td>24-hour completion window; often sooner</td></tr>
+      <tr><td class="term">Result order</td><td>Any order; match on <code>custom_id</code></td><td>May differ from input; match on <code>custom_id</code></td></tr>
+      <tr><td class="term">Per-request outcome</td><td><code>succeeded</code>, <code>errored</code>, <code>canceled</code>, <code>expired</code></td><td>Successes in an output file; failures in a separate error file</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Three consequences follow from that contract.</p>
+  <p><strong>Cost is per request, not per batch.</strong> Anthropic does not bill <code>errored</code>, <code>canceled</code> or <code>expired</code> requests. Retrying them is therefore free of double-charging, but the retry costs you wall-clock time. <strong>Order is not preserved</strong>, so a deterministic <code>custom_id</code> is the only join key you have. Anthropic keeps results downloadable for 29 days and limits it to 1 to 64 characters of letters, digits, hyphens and underscores, which is enough for <code>claim-8841207-v3-20261104</code>. <strong>Prompt caching is best-effort inside a batch.</strong> Requests run concurrently and in any order, so a cache write by one request may not exist yet when another runs. The Anthropic docs suggest the one-hour cache duration for batches that share a long prefix.</p>
+  <p>Two smaller limits catch people out. A batch cannot stream, and Anthropic notes that processing can slow with demand and your own volume, which shows up as more requests expiring. Treat the 24-hour figure as a ceiling that your own deadline must beat, not as a service level.</p>
+  <div class="callout warn">
+    <span class="callout-label">The 24-hour expiry is not your deadline</span>
+    <p>Harbourline needs summaries by 06:00 and submits at 01:00. A batch that has not finished by 04:00 will not finish in time even though the provider still considers it healthy. Your scheduler needs its own cut-off: at 04:00 it cancels what is unfinished and sends the remainder through the synchronous API at full price, or flags those claims "summary pending" in the adjuster's queue.</p>
+  </div>
+</section>
+
+<section id="continuous">
+  <h2>Server-side: what continuous batching buys and what it costs</h2>
+  <p>If you self-host, the question moves inside the engine. Start from the bottleneck: during decode, each generated token requires reading the model's weights from GPU memory once. If you decode one sequence at a time, that read is amortised over one token. If you decode 64 sequences together, the same read serves 64 tokens. That is the whole throughput argument for batching, and it is why a lightly loaded GPU is an expensive GPU.</p>
+  <p>The older approach, static batching, collected N requests, padded them, and returned all N when the longest finished. With variable output lengths, 19 finished sequences wait idly for the 20th. Orca (Yu et al., OSDI 2022) fixed this with <em>iteration-level scheduling</em>: the scheduler decides the batch membership at every forward pass, so a finished sequence leaves and a waiting one joins immediately. vLLM combined that with PagedAttention (Kwon et al., SOSP 2023), which makes joining and leaving cheap because KV-cache memory is allocated in blocks; the authors report 2 to 4 times the throughput of the prior systems at the same latency. The <a href="../paged-attention-deep-dive/index.html#continuous-batching">PagedAttention deep dive</a> walks through the scheduler loop step by step. This chapter only needs the consequences.</p>
+  <p><strong>What it buys.</strong> No window and no padding. A new request starts at the next iteration, so under light load its time to first token is close to the unbatched case, and under heavy load throughput climbs without the caller doing anything.</p>
+  <p><strong>What it costs.</strong> Each iteration now does the work of every running sequence, so the time between tokens rises with batch size. Prefill is the sharper problem: a long prompt processed in one go stalls everyone's decode. vLLM's V1 engine turns on chunked prefill by default, schedules pending decodes first, and fills the rest of the per-step token budget with prefill chunks. The knob is <code>max_num_batched_tokens</code>. Per the vLLM docs, smaller values such as 2048 give better inter-token latency, and larger values give better time to first token, with throughput best above 8192. That is the latency-throughput dial in one parameter. When the KV cache fills, vLLM preempts and recomputes requests, which shows up as latency spikes. The cure is more cache memory or a lower <code>max_num_seqs</code>, not more patience.</p>
+  <p>Harbourline's chat traffic averages about 0.5 sessions a second. A single replica does not need a deep batch for that, so the right setting favours inter-token latency over peak throughput. The <a href="../build-inference-gateway-rust/03-batching-and-coalescing.html">inference gateway guide</a> covers the layer above the engine: coalescing identical in-flight prompts into one upstream call, and <a href="../build-inference-gateway-rust/03-batching-and-coalescing.html#limits">when not to</a>.</p>
+</section>
+
+<section id="design">
+  <h2>The worked answer: Harbourline's nightly claims job</h2>
+  <p>Say the structure aloud, in this order: segment the traffic, give each class its path, state SLOs, size the cost, then walk the failures.</p>
+  <div class="flow">  CHAT / INTAKE AGENT (interactive)         NIGHTLY CLAIMS (deferred)
+  ─────────────────────────────────         ─────────────────────────
+  gateway                                   scheduler, 01:00
+    │ bounded queue, per-class limits         │ select claims with no summary
+    │ full → 429 + Retry-After                ▼
+    ▼                                       ledger table (one row per claim)
+  vLLM replicas (or provider, sync)           │ status: pending → submitted
+    │ continuous batching, no extra window    ▼
+    ▼                                       provider batch API (50% price)
+  stream tokens to the user                   │ poll every 60 s; own cut-off 04:00
+                                              ▼
+                                            reconcile on custom_id
+                                              │ succeeded → write summary
+                                              │ errored   → classify, retry once
+                                              │ expired   → resubmit or sync
+                                              ▼
+                                            adjuster queue ready by 06:00</div>
+  <p><strong>SLOs.</strong> Interactive traffic gets latency targets: a p95 time to first token and a p95 total time per surface. These are budgets you set; the next chapter shows how to measure them. Batch traffic gets a completion deadline and a success ratio instead: "at least 99.5% of claims summarised by 06:00, the rest visibly marked". Mixing the two in one SLO hides the real problem, because a batch job that finishes in 50 minutes tells you nothing about chat.</p>
+  <p><strong>Back-pressure.</strong> On the interactive path, put a bounded queue in the gateway and reject early when it fills, with a 429 and a <code>Retry-After</code>, rather than let the engine's waiting queue grow until time to first token is ten seconds. Shed the lowest class first. On the batch path, back-pressure is the scheduler itself: it submits one batch of 6,000 requests, not 6,000 calls, and it never submits a second night's batch while the first is unreconciled.</p>
+  <p><strong>Cost.</strong> Assume, and say you are assuming, 12,000 input tokens and 600 output tokens per claim. That is 72 million input and 3.6 million output tokens a day. Using standard prices as of November 2026:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Option</th><th>Per day</th><th>Per 30 days</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Sonnet 5.5, synchronous ($2 in, $10 out per MTok)</td><td>$180</td><td>$5,400</td></tr>
+      <tr><td class="term">Sonnet 5.5, batch ($1 in, $5 out)</td><td>$90</td><td>$2,700</td></tr>
+      <tr><td class="term">Haiku 5.5, synchronous ($0.10 in, $0.50 out)</td><td>$9</td><td>$270</td></tr>
+      <tr><td class="term">Haiku 5.5, batch ($0.05 in, $0.25 out)</td><td>$4.50</td><td>$135</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The batch discount saves $90 a day on the larger model. Picking the smaller model saves more, but that is a quality decision, and it belongs to the eval set, not to the cost sheet: see <a href="07-eval-set-and-ship-decision.html">the eval-set chapter</a>. A sensible shape is a cascade: the small model classifies every claim, the larger one summarises only those routed as complex. The 12,000-token prompt probably carries a shared instruction block; if 3,000 tokens are identical across claims, a one-hour cache write could save about $17 a day at best, because batch cache hits are best-effort. Worth turning on, not worth designing around.</p>
+  <div class="callout insight">
+    <span class="callout-label">At this volume the API beats self-hosting</span>
+    <p>6,000 claims a day is one request every 14 seconds on average. A GPU you rent to run vLLM for this job idles for most of the day, and you pay for idle. Self-hosting starts to win when volume keeps accelerators busy around the clock, when data may not leave your network, or when you need a fine-tuned model. Interactive and batch traffic can then share one fleet, with the batch job filling the troughs. None of that is true at 6,000 a day.</p>
+  </div>
+</section>
+
+<section id="failure">
+  <h2>Partial failure and idempotency</h2>
+  <p>A batch of 6,000 does not succeed or fail. It produces 6,000 individual outcomes, and the design question is what happens to each.</p>
+  <ul>
+    <li><strong>succeeded</strong>: write the result keyed by <code>custom_id</code>. Applying twice must be harmless, so write with an upsert, not an insert.</li>
+    <li><strong>errored with an invalid-request error</strong>: the payload is bad. Retrying the same request fails again. Log it, count it, and fix the input (a 300-page document over the limit, a malformed attachment).</li>
+    <li><strong>errored with a server error</strong>: transient. Put the claim back in the pending state for the next submission.</li>
+    <li><strong>expired or canceled</strong>: never sent to the model, not billed. Resubmit, or fall back to the synchronous path if the deadline is close.</li>
+  </ul>
+  <p>Idempotency comes from the ledger, not the provider. Derive <code>custom_id</code> from the claim ID, the prompt version and the run date, so the same logical job always has the same key. Record the batch ID in the ledger the moment the API returns it, and on restart look the ledger up before submitting. If the process dies between "API accepted the batch" and "ledger updated", you will have an orphan batch; a reconciliation step that lists recent batches in the workspace and matches them to ledger rows closes that gap. I would not assume the create call de-duplicates for you.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>nightly_claims.py (sketch)</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import time
+import anthropic
+
+client = anthropic.Anthropic()
+CUTOFF = 4 * 3600          # seconds after submission; our deadline, not the provider's
+PROMPT_VERSION = "v3"
+
+def custom_id(claim_id: str, run_date: str) -> str:
+    return f"claim-{claim_id}-{PROMPT_VERSION}-{run_date}"   # &lt;= 64 chars, [A-Za-z0-9_-]
+
+def submit(claims: list[dict], run_date: str, ledger) -&gt; str:
+    requests = [
+        {
+            "custom_id": custom_id(c["id"], run_date),
+            "params": {
+                "model": "claude-sonnet-5-5",
+                "max_tokens": 800,
+                "system": c["system_prompt"],
+                "messages": [{"role": "user", "content": c["claim_text"]}],
+            },
+        }
+        for c in claims
+    ]
+    batch = client.messages.batches.create(requests=requests)
+    ledger.record_batch(batch.id, [r["custom_id"] for r in requests])  # before anything else
+    return batch.id
+
+def reconcile(batch_id: str, started: float, ledger) -&gt; None:
+    while time.time() - started &lt; CUTOFF:
+        if client.messages.batches.retrieve(batch_id).processing_status == "ended":
+            break
+        time.sleep(60)
+    else:
+        client.messages.batches.cancel(batch_id)       # leftovers go to the sync path
+    for entry in client.messages.batches.results(batch_id):
+        kind = entry.result.type
+        if kind == "succeeded":
+            ledger.upsert_summary(entry.custom_id, entry.result.message)
+        elif kind == "errored":
+            ledger.mark_error(entry.custom_id, entry.result.error)  # split by error type
+        else:                                           # expired or canceled
+            ledger.mark_pending(entry.custom_id)</code></pre>
+  </div>
+  <p>The sketch leaves out pagination of the claim list, the sync fallback and metrics. In the interview, name those omissions rather than pretend they are not there.</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+  <p>Expect these after your first pass. Answer aloud before opening each one.</p>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Batch APIs are half price. Why not send the chat traffic through them?"</summary>
+    <div class="reveal-body">
+      <p><em>"Because the discount is paid for with time. A batch finishes in minutes to hours and cannot stream, and a customer on web chat leaves after a few seconds. The right test is who is waiting, not how many requests there are. Chat and intake stay on the synchronous path, where the server batches for me at the iteration level. The one exception is work that only looks interactive, like generating a weekly digest of chat transcripts for quality review. That has a deadline of days, so it goes to the batch API."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "Your job crashes after submitting the batch. What stops you submitting twice or applying results twice?"</summary>
+    <div class="reveal-body">
+      <p><em>"Two keys and one ledger. The <code>custom_id</code> is derived from claim ID, prompt version and run date, so a re-run produces the same IDs. The ledger records the batch ID before the job does anything else and a status per claim, so on restart I look for an in-flight batch before I create one. Applying results is an upsert on <code>custom_id</code>, so a second pass writes the same rows. The gap is a crash between the API accepting the batch and my ledger write; I close it with a reconciliation step that lists recent batches and matches them to the ledger. I would not rely on the create call being idempotent."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "You raise the server's batch size. Throughput doubles and users complain. Why?"</summary>
+    <div class="reveal-body">
+      <p><em>"Every decode iteration now computes more sequences, so the gap between tokens grows. Also, more concurrent sequences means more KV cache in use, and when it fills the engine preempts and recomputes requests, which looks like random stalls. Throughput is measured across all users; latency is felt by one. I would size the batch to the p95 inter-token latency target, not to peak tokens per second. In vLLM that means tuning <code>max_num_batched_tokens</code> and <code>max_num_seqs</code> against a load test that matches real prompt lengths, and watching the preemption counter."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "It is 04:00 and 20% of the batch is unfinished. What do you do?"</summary>
+    <div class="reveal-body">
+      <p><em>"The provider's 24-hour limit is irrelevant; my deadline is 06:00. At the cut-off I cancel the batch, which leaves unprocessed requests unbilled, and send the remainder through the synchronous API, prioritised by claim severity so the large losses are done first. If the remainder is too large for my rate limit, I mark those claims 'summary pending' in the adjuster queue so nobody mistakes a missing summary for a clean claim. Then I raise the incident: why did this batch run slow, and should submission move earlier?"</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "When would you move the nightly job onto your own vLLM cluster?"</summary>
+    <div class="reveal-body">
+      <p><em>"Not at 6,000 claims a day: that is one request every 14 seconds, and a rented GPU would idle most of the day. I would move for one of three reasons. Data residency, if claim documents may not leave our network. Volume, if sustained load keeps the accelerators busy and the API bill passes the cost of the fleet plus the people to run it. Or a fine-tuned model the API does not offer. In that case the batch job becomes a low-priority tenant on the same fleet as chat, filling the overnight trough, and the continuous batching I get for free replaces the provider's batch API."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "Describe back-pressure for the chat path."</summary>
+    <div class="reveal-body">
+      <p><em>"A bounded queue per class at the gateway, sized from the latency budget: if p95 time to first token must stay under [N seconds], the queue can only be as deep as the engine can drain in that time. When it is full, reject immediately with a 429 and a Retry-After, and shed the lowest class first. Letting the engine's own waiting queue grow is the failure mode, because every user then gets a slow answer instead of a few getting a fast refusal. Autoscaling helps over minutes; the queue limit protects the next ten seconds."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague says, "batching always adds latency, so we should avoid it on the chat path." Where is the claim right, and where is it wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is right for application-level windows and provider batches, which add waiting time directly. It is wrong for server-side continuous batching, where a new request joins at the next iteration, so under light load the added wait is about one scheduler step. The cost shows up under load, as slower inter-token time. See <a href="#two-layers">two layers</a> and <a href="#continuous">continuous batching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Results from a 6,000-request batch come back with the second request first. Your code zips results against the input list. What breaks, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Summaries get written against the wrong claims, which is silent and serious in insurance. Providers return results in any order, so the only safe join is a deterministic <code>custom_id</code>. See <a href="#provider-batch">provider batch APIs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vLLM replica serves chat well until adjusters upload 300-page PDFs for summarising, and then chat users see long pauses mid-answer. Explain the mechanism and name the setting you would adjust.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A long prefill occupies the iteration, and every running decode waits for it. Chunked prefill splits the prompt and schedules decodes first, and <code>max_num_batched_tokens</code> sets how much prefill fits per step; a smaller value protects inter-token latency at the cost of slower first tokens for the long prompt. Better still, move the PDF work to a separate pool. See <a href="#continuous">continuous batching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The nightly job's cost is $90 a day on the larger model. Finance asks you to cut it in half. List the options in the order you would try them, and say what each risks.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>First, trim the input: 12,000 tokens per claim is probably carrying text the model does not need, and this risks losing facts. Second, route simple claims to the smaller model, which risks quality on edge cases and needs the eval set to decide. Third, cache the shared instruction block, which saves little and is best-effort in a batch. Moving to self-hosting is last, since it adds fixed cost. See <a href="#design">the worked answer</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The tempting design is one retry loop: any non-success result goes back into the next batch. Why is that wrong for <code>errored</code> results?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An invalid-request error is deterministic: the same payload fails every night and the loop never ends. Only transient server errors, expired and canceled requests are safe to retry. Invalid requests need a fix and an alert. See <a href="#failure">partial failure</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>"Batching" means two systems: application-level queues and provider batch APIs trade hours of waiting for half the price, while server-side continuous batching trades a little inter-token latency for GPU utilisation.</li>
+    <li>Segment traffic by how long the caller can wait before choosing a mechanism, and never put a batch window in front of a person.</li>
+    <li>A provider batch yields thousands of individual outcomes in any order, so the design needs a deterministic <code>custom_id</code>, a ledger, upserts and a separate path for each failure type.</li>
+    <li>The provider's 24-hour expiry is a ceiling; your own deadline sets the real cut-off, with a synchronous fallback for what is unfinished.</li>
+    <li>In an engine like vLLM the batch-size knobs set a latency-throughput dial, so size them to the p95 inter-token target and watch preemptions, not to peak throughput.</li>
+    <li>At 6,000 claims a day the API beats self-hosting; the case flips on data residency, sustained volume, or a model you must fine-tune.</li>
+  </ul>
+  <p>Batching is one lever for cost and latency, and not the first one to pull. → <a href="10-latency-and-cost-at-scale.html">Latency and Cost at Scale</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/batch-processing" target="_blank" rel="noopener"><strong>Anthropic: Batch processing</strong></a> — limits, pricing, result types and the 29-day retention. Good for the retry design.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/batch" target="_blank" rel="noopener"><strong>OpenAI: Batch API guide</strong></a> — file format, limits, the separate error file. Good for comparing contracts.</li>
+    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener"><strong>Orca: A Distributed Serving System for Transformer-Based Generative Models</strong></a> — Yu et al., OSDI 2022. The origin of iteration-level scheduling.</li>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener"><strong>Efficient Memory Management for LLM Serving with PagedAttention</strong></a> — Kwon et al., SOSP 2023. Why paged KV memory makes continuous batching practical.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener"><strong>vLLM: Optimization and tuning</strong></a> — chunked prefill, <code>max_num_batched_tokens</code> and preemption. Good for the latency-throughput dial.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

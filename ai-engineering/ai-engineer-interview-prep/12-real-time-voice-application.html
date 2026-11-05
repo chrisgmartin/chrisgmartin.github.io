@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Real-Time Voice Application — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Design voice in and voice out with a model in the middle: the latency budget, streaming STT and TTS versus speech-to-speech models, turn-taking, interruption…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/12-real-time-voice-application">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="A Real-Time Voice Application — AI Engineer Interview Prep">
+<meta property="og:description" content="Design voice in and voice out with a model in the middle: the latency budget, streaming STT and TTS versus speech-to-speech models, turn-taking, interruption…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/12-real-time-voice-application">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#budget">The latency budget</a>
+    <a href="#architectures">Cascaded or speech-to-speech</a>
+    <a href="#turns">Turn-taking and barge-in</a>
+    <a href="#tools">Tools and fillers</a>
+    <a href="#telephony">Telephony transport</a>
+    <a href="#safety">Handoff, recording, consent</a>
+    <a href="#worked">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="11-multimodal-file-uploader.html">← Previous: A Large-File Uploader for a Multimodal Chat</a>
+    <a href="13-llm-behind-a-reliable-contract.html">Next: An LLM Behind a Reliable Contract →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · LLM system design</span>
+  <h1>A Real-Time Voice Application</h1>
+  <p class="subtitle">Design voice in and voice out with a model in the middle: the latency budget, streaming STT and TTS versus speech-to-speech models, turn-taking, interruption and tools.</p>
+</header>
+
+<section id="question">
+  <h2>The question and what it scores</h2>
+  <p>The interviewer says: <em>"Harbourline is moving its claims phone line to voice AI. A caller reports a car accident, the system takes the first notice of loss, and hands the case on. Design it."</em></p>
+  <p>They are scoring four things. Do you reason from a latency budget, in milliseconds per stage, instead of saying "it should be fast"? Can you choose between a cascaded pipeline and a speech-to-speech model and name what each costs you? Do you understand that conversation is a timing problem, with turn detection and interruption, not a text chat with a microphone? And do you know when the machine must stop and a person must take over?</p>
+</section>
+
+<section id="budget">
+  <h2>The latency budget</h2>
+  <p>People leave very short gaps between turns. Stivers and colleagues compared ten languages in 2009 and found that all of them minimise silence between turns, and that the average gap in each language lies within 250&nbsp;ms of the cross-language mean. The figure usually quoted is a gap of about 200&nbsp;ms; I did not verify that exact number in the paper, so say "a few hundred milliseconds" if challenged. A voice agent cannot match that. It can only be fast enough that the pause reads as thinking and not as a dropped call.</p>
+  <p>Production targets are looser than the human gap. Twilio's published guide for cascaded agents, as of November 2025, sets a mouth-to-ear turn gap of 1,115&nbsp;ms as the target for a launch and 1,400&nbsp;ms as the limit. Mouth-to-ear means from the moment the caller stops speaking to the moment they hear the reply, network included. You may hear 500 to 800&nbsp;ms quoted in interviews; I found no primary source for it, so treat it as a stretch goal that usually needs speech-to-speech models, not as the bar for a first launch.</p>
+  <p>The same guide gives per-stage figures. The three model stages take 825&nbsp;ms at target and the rest of the 1,115&nbsp;ms is transport and buffering:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Stage</th><th>Target</th><th>Upper limit</th></tr></thead>
+    <tbody>
+      <tr><td>Speech-to-text, final transcript</td><td>350&nbsp;ms</td><td>500&nbsp;ms</td></tr>
+      <tr><td>Model, time to first token</td><td>375&nbsp;ms</td><td>750&nbsp;ms</td></tr>
+      <tr><td>Text-to-speech, time to first byte</td><td>100&nbsp;ms</td><td>250&nbsp;ms</td></tr>
+      <tr><td>Transport, buffering, decoding</td><td>290&nbsp;ms</td><td>not stated</td></tr>
+      <tr><td><strong>Mouth to ear</strong></td><td><strong>1,115&nbsp;ms</strong></td><td><strong>1,400&nbsp;ms</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The useful move is to run the arithmetic live. This small program does it:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>budget.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">TARGET = {"stt": 350, "llm_ttft": 375, "tts_ttfb": 100}
+LIMIT = {"stt": 500, "llm_ttft": 750, "tts_ttfb": 250}
+MOUTH_TO_EAR_TARGET, MOUTH_TO_EAR_LIMIT = 1115, 1400
+
+
+def turn_gap(stages: dict[str, int], transport_ms: int, tool_ms: int = 0) -&gt; int:
+    return sum(stages.values()) + transport_ms + tool_ms
+
+
+transport = MOUTH_TO_EAR_TARGET - sum(TARGET.values())
+print("transport and buffering:", transport, "ms")                       # 290
+print("all stages at limit:", turn_gap(LIMIT, transport), "ms")            # 1790
+slow_llm = {**TARGET, "llm_ttft": LIMIT["llm_ttft"]}
+print("LLM alone at limit:", turn_gap(slow_llm, transport), "ms")         # 1490, over 1,400
+print("on target + 800 ms tool call:", turn_gap(TARGET, transport, 800))  # 1915</code></pre>
+  </div>
+  <p>Two lessons come out. One slow stage breaks the whole budget: the model alone at its upper limit puts the turn over 1,400&nbsp;ms. And a single 800&nbsp;ms tool call sends an on-target turn to nearly two seconds, which is why tool calls need their own strategy, below. Measure the tail, not the average. A caller remembers the one 3-second silence, so track the 95th percentile turn gap per stage. Chapter&nbsp;10 covers the model-side levers: <a href="10-latency-and-cost-at-scale.html">streaming, caching and routing</a>.</p>
+</section>
+
+<section id="architectures">
+  <h2>Cascaded or speech-to-speech</h2>
+  <p>A <strong>cascaded</strong> pipeline streams caller audio to a speech-to-text service, passes text to a language model, and streams the reply tokens to a text-to-speech service. You own every seam. A <strong>speech-to-speech</strong> API takes audio in and returns audio out from one model, and the session handles turns, tools and interruptions for you. OpenAI's Realtime API is an example, offered over WebRTC for browsers and WebSocket for servers; its guide says to choose the chained path when each stage must be inspectable or replaceable, and otherwise to use the single-model session.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th></th><th class="pick">Cascaded</th><th>Speech-to-speech</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Latency</td><td class="pick">Sum of three stages plus seams; streaming everywhere is mandatory</td><td>One hop; usually the lower floor</td></tr>
+      <tr><td class="term">Transcript</td><td class="pick">Exact text between stages, free</td><td>Needs a separate transcription pass, and it may differ from what the model heard</td></tr>
+      <tr><td class="term">Control</td><td class="pick">Swap any stage; filter or rewrite text; use your own model and guardrails</td><td>Vendor's model and voices; fewer places to intervene</td></tr>
+      <tr><td class="term">Tone and prosody</td><td class="pick">Text-to-speech can only voice what the text says</td><td>Hears hesitation, stress and interruptions directly</td></tr>
+      <tr><td class="term">Audit and eval</td><td class="pick">Text at every stage is loggable and testable</td><td>Audio evals are harder to build</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>For Harbourline I recommend <strong>cascaded</strong>, and the reason is not latency. A first notice of loss is a regulated record. The company needs the exact words the caller said, a text-level guardrail on every reply, and the ability to run the claims logic with its own model and prompts. Those are control and audit properties, and cascaded gives them by construction. It flips when the product is a conversational companion where feel matters more than record, or when a speech-to-speech model meets your latency target and your compliance team accepts a vendor-transcribed record. A hybrid is common: speech-to-speech for the conversation, with a parallel transcription stream saved as the record.</p>
+</section>
+
+<section id="turns">
+  <h2>Turn-taking: endpointing, barge-in and the cost of getting it wrong</h2>
+  <p>Before the model can answer, something must decide the caller has finished. That decision is <strong>endpointing</strong>, and it is the single biggest controllable part of the gap. A fixed silence threshold has a sharp trade-off. Set it short and the agent cuts in when the caller pauses to recall a plate number; set it long and every turn drags. Deepgram's endpointing parameter is in milliseconds; its docs, as of November 2026, say the default of 10&nbsp;ms suits short chatbot utterances and recommend 300 to 500&nbsp;ms for callers who pause mid-thought. Reading a policy number aloud is exactly that case.</p>
+  <p>Better systems stop relying on silence alone. Semantic turn detection looks at what was said, so "my policy number is" waits and "yes" does not. Another useful trick is to start the model on the interim transcript and discard the work if the caller keeps talking. That trades compute for latency. Streaming speech-to-text also returns two flags that are easy to confuse: <code>is_final</code> marks a finalised segment, and <code>speech_final</code> marks a detected pause. A long utterance produces several final segments before the pause, so concatenate segments until the pause arrives instead of acting on the first final one.</p>
+  <p><strong>Barge-in</strong> is the caller talking over the agent. Handling it takes four steps and candidates usually name only the first.</p>
+  <ol>
+    <li>Detect speech while the agent is speaking, and require a minimum duration, perhaps 200 to 300&nbsp;ms of voiced audio, so a cough or the echo of the agent's own voice does not cut it off. Tune on real calls; the right value depends on the line.</li>
+    <li>Stop playback at once. On a Twilio Media Stream, the <code>clear</code> message empties audio Twilio has buffered; without it, queued audio plays to the end.</li>
+    <li>Cancel the model and speech generation in flight, or you keep paying for a reply nobody hears.</li>
+    <li>Correct the conversation history to what the caller actually heard. If the agent produced three sentences and the caller interrupted during the second, the history should hold one and a half, not three, or the model will assume the caller heard a deductible figure they did not. Twilio's <code>mark</code> messages make this possible: send one after each sentence of audio, and the marks that return before the clear are the sentences that played.</li>
+  </ol>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-python"># Sketch, not run here: barge-in on a Twilio bidirectional media stream (asyncio + a websocket).
+async def on_caller_speech_start(ws, state):
+    if not state.agent_speaking:
+        return
+    await ws.send_json({"event": "clear", "streamSid": state.stream_sid})   # stop buffered audio
+    state.tts_task.cancel(); state.llm_task.cancel()                        # stop paying for it
+    # state.heard holds marks echoed back before the clear: those sentences were played in full
+    state.history[-1] = " ".join(state.sentences[: len(state.heard)])      # keep only what was heard
+    state.agent_speaking = False</code></pre></div>
+  <p>Backchannels such as "mm-hm" are the hard case. A caller saying "yes" while the agent reads a figure is agreeing, not interrupting. Most stacks do not treat short acknowledgements as barge-in at all; say that you would test this with recorded calls.</p>
+</section>
+
+<section id="tools">
+  <h2>Tools mid-conversation, and filling the silence</h2>
+  <p>The first notice of loss needs tools: look up the policy, check it was in force on the date of loss, create the claim. A tool call costs hundreds of milliseconds to seconds, and silence on a phone is worse than in chat. The budget above shows an 800&nbsp;ms call pushing the turn to nearly two seconds.</p>
+  <p>Three techniques, in order of preference. First, make the call earlier: look up the policy as soon as the caller gives a name or number, while they are still describing the accident, so the answer is waiting. Second, speak a short filler that is true, such as "Let me pull up your policy", the moment a slow tool starts, and make sure the filler is cancelled by barge-in like any other speech. Third, keep tools that run over a second off the live path, and say "I will have someone confirm that" instead. Do not use a filler for every turn; callers notice the pattern.</p>
+  <p>Voice changes tool design in two further ways. Tool results must be written for the ear: read back a policy number in groups, never as a 20-character string, and confirm digits and dates before writing them to the claim. Speech-to-text will mishear them. For long identifiers, offer keypad entry; Twilio streams report keypad presses as separate <code>dtmf</code> messages on bidirectional streams. The same loop and permissions design applies as in text; see <a href="06-customer-service-agent.html">the customer-service agent</a> and <a href="04-agent-or-workflow.html">agent or workflow</a>. The phone agent should gather facts and create the claim. It should not decide coverage; that stays with the claims system and an adjuster, as in the <a href="05-claims-agent-under-a-token-budget.html">claims agent chapter</a>.</p>
+</section>
+
+<section id="telephony">
+  <h2>Getting the call to your code</h2>
+  <p>Two transports matter. A phone caller arrives over the public telephone network, and the provider hands you the audio. Twilio Media Streams opens a WebSocket to your server and sends base64 audio as 8,000&nbsp;Hz, single-channel, mu-law, with <code>connected</code>, <code>start</code>, <code>media</code> and <code>stop</code> events. That detail matters: telephone audio is narrowband, so a speech-to-text model trained on 16&nbsp;kHz or wideband audio will do worse on it, and the text-to-speech output has to be encoded back to mu-law at the same rate. Test your recogniser on 8&nbsp;kHz recordings of real accents and car noise, not studio audio.</p>
+  <p>For app and web users, WebRTC gives wideband audio, built-in echo cancellation and lower latency, and is what browser-side speech-to-speech APIs use. A SIP trunk into your own media server is the third route, when Harbourline has an existing contact-centre platform and wants calls to arrive through it. For the phone line, I would start with a provider's media stream: it removes the telephony work, and the cost is a WebSocket hop and the provider's per-minute price. Moving to SIP into your own stack pays off at scale, or when you need control over where the call is routed and recorded.</p>
+</section>
+
+<section id="safety">
+  <h2>Handoff to a human, recording and consent</h2>
+  <p>Decide the handoff triggers before the prompt. Injury, a fire, a child in the car or a caller in distress goes to emergency guidance and a human immediately, ahead of any claim script. Other triggers are measurable: the caller asks for a person, the agent fails to capture a field twice, speech-to-text confidence stays low for several turns, or the caller sounds angry. The handoff must carry context, so the adjuster sees the transcript and the fields gathered, and the caller does not repeat the story. Always keep a path to a person; a voice agent with no exit is a complaint generator.</p>
+  <p>Recording is a legal question as well as an engineering one. Some jurisdictions require every party's consent to record a call and others only one; Harbourline operates in the US and the UK, so the rules differ by state and country. Practice is to say at the start of the call that it is recorded and that an automated assistant is on the line, and to take legal advice on the wording. Then treat the audio as sensitive personal data: separate retention for the audio and the transcript, redaction of card and bank details before they reach logs, and access limited to the claims and quality teams. Speaking the disclosure also costs seconds of every call, so keep it short.</p>
+</section>
+
+<section id="worked">
+  <h2>A strong answer, in order</h2>
+  <ol>
+    <li>Set the constraint: callers expect an answer within about a second and a half at most, so the budget is 1,115&nbsp;ms mouth to ear with a 1,400&nbsp;ms ceiling, tracked at the 95th percentile.</li>
+    <li>Pick cascaded, because the first notice of loss is a record that needs exact text, text-level guardrails and the company's own claims logic. Say when you would choose speech-to-speech.</li>
+    <li>Stream every stage. Endpoint at about 400&nbsp;ms with semantic help, because callers read out numbers slowly.</li>
+    <li>Handle barge-in in four steps: detect, clear, cancel, correct the history.</li>
+    <li>Prefetch the policy early, use short true fillers for slow tools, and never decide coverage on the call.</li>
+    <li>Carry the call over a provider media stream, tune the recogniser for 8&nbsp;kHz audio, and escalate on injury, repeated failure or request, with context.</li>
+    <li>Disclose recording, retain audio and transcript separately, and evaluate on recorded calls before launch.</li>
+  </ol>
+  <div class="callout insight">
+    <span class="callout-label">Evaluate the audio path, not only the answer</span>
+    <p>A text eval on the model passes while the phone line fails: speech-to-text mishears a plate number, the agent interrupts a slow speaker, a filler talks over the caller. Build the eval set from recorded calls and score word error rate on digits, the 95th percentile turn gap, false barge-ins per call and task completion. The method is in <a href="07-eval-set-and-ship-decision.html">the eval set chapter</a>.</p>
+  </div>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Where does the latency go, and what do you cut first?"</summary>
+    <div class="reveal-body">
+      <p><em>"In a cascaded stack the published targets are about 350 ms for speech-to-text, 375 for the model's first token and 100 for text-to-speech, with roughly 290 for transport, which sums to about 1.1 seconds. The first thing I measure is endpointing, because it is the wait before any of that starts and it is mine to tune. Second is the model's first token: a smaller model, a cached prompt prefix, and no tool call before the first words. Third is streaming everything, so text-to-speech starts on the first clause. I would not touch transport until the first three are done, since I rarely control it."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "The caller interrupts mid-sentence. Walk me through it."</summary>
+    <div class="reveal-body">
+      <p><em>"Four things in order. Detect real speech, with a minimum duration so a cough or echo does not trigger it. Stop playback, which on a telephony stream means sending the clear message because the provider has audio buffered. Cancel the model and speech generation still running. Then rewrite the last assistant message to only what the caller heard, using marks sent after each sentence. If I skip the last step, the model believes it stated a figure the caller never heard, and the next answer builds on it."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "Why not use a speech-to-speech model and drop the pipeline?"</summary>
+    <div class="reveal-body">
+      <p><em>"It is a real option and often has the lower latency floor. For this line I weigh control and record. A first notice of loss is a regulated record, so I want exact transcripts, a guardrail on every reply, and the freedom to use my own model and claims logic. Cascaded gives all three by design. I would reconsider if my latency target cannot be met any other way, and I would keep a parallel transcription as the record, so I still have the text. For a general helpdesk with no regulatory record, I would lean speech-to-speech."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "Your lookup takes 1.5 seconds. The caller hears silence. Fix it."</summary>
+    <div class="reveal-body">
+      <p><em>"First, remove it from the critical path: start the lookup as soon as the caller gives their name or policy number, not when they finish the sentence. If it is still slow, speak a short filler that is true, like 'let me pull up your policy', and let barge-in cancel it. If the tool is slow every time, I fix the tool or cache the result, because fillers on every turn sound scripted. For anything over a few seconds, I say I will confirm by message and move on."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "How do you know when to hand the call to a person?"</summary>
+    <div class="reveal-body">
+      <p><em>"Safety triggers first: injury, fire, a child involved. Those go to a human or emergency guidance before any script. Then measurable triggers: the caller asks for a person, a required field fails twice, recogniser confidence stays low for several turns, or sentiment turns sharply negative. I log each trigger so I can tune thresholds, and I pass the transcript and the fields so the adjuster does not restart the conversation. I also review a sample of calls that did not escalate, because the costly failures are the ones the agent kept."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "What do you tell the business about recording?"</summary>
+    <div class="reveal-body">
+      <p><em>"Recording rules differ by US state and by country, and Harbourline spans both, so I would ask legal to set the wording and the rule per jurisdiction rather than guess. In the product: a short disclosure at the start that the call is recorded and that an automated assistant is on the line. Audio and transcript get separate retention periods, card and bank details are redacted before they reach logs, and access is limited to the claims and quality teams. I would also give the caller a way to ask for a human and to decline recording where the law requires it."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Speech-to-text, the model and text-to-speech each hit their upper limits on the same turn. Without computing the sum, will the turn stay within the 1,400&nbsp;ms ceiling, and what does that say about how to set targets?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. The upper limits sum to 1,500&nbsp;ms before any transport, and with the 290&nbsp;ms of transport the turn reaches about 1,790&nbsp;ms. Even the model alone at its limit breaks the ceiling. So the limits cannot be treated as independent budgets; track the tail per stage and the total. See <a href="#budget">the latency budget</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A caller reads a 12-digit policy number in groups of three, pausing between groups. The agent keeps cutting in after each group. What setting is wrong, what does the fix cost, and what is a better fix than a larger number?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The endpointing silence threshold is shorter than the caller's pauses. Raising it delays every turn by the same amount. A better fix is turn detection that looks at content, so an incomplete number waits and a complete answer does not, or keypad entry for the number. See <a href="#turns">Turn-taking</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a barge-in the agent says "As I mentioned, your deductible is 500", but it was interrupted before saying the figure. Which step in the barge-in handling was skipped, and why did stopping the audio not prevent this?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The history was not corrected to what the caller heard. Stopping playback only halts audio; the model's record still holds the full planned reply. Marks sent after each sentence tell you which sentences played, and the history should be trimmed to those. See <a href="#turns">Turn-taking</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your recogniser scores well on your test set but mishears plate numbers on live calls. Name two likely causes that have nothing to do with the model.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Phone audio arrives as 8&nbsp;kHz mu-law, narrower than the audio the test set used, and callers speak in cars, with noise and accents the set lacks. A third is acting on the first final segment of a long utterance. Test on recorded phone calls. See <a href="#telephony">Getting the call to your code</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A product manager wants the lowest possible latency and proposes a speech-to-speech model for the claims line. What do you ask, and what would make you agree?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask where the exact record of the call comes from, whether every reply can be checked by a guardrail before it is spoken, and whether the claims logic can use the company's own model. Agree if a parallel transcript serves as the record, the guardrail needs can be met, and the cascaded stack cannot reach the latency target. See <a href="#architectures">Cascaded or speech-to-speech</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Voice is designed from a per-stage latency budget; Twilio's published cascaded target is about 1.1 seconds mouth to ear, and one slow stage breaks it.</li>
+    <li>Cascaded pipelines give exact text, per-stage control and auditability; speech-to-speech gives a lower latency floor and better prosody at the cost of control.</li>
+    <li>Endpointing is the largest controllable delay, and a fixed silence threshold always trades interruptions against lag.</li>
+    <li>Barge-in means detect, stop audio, cancel generation and correct the history to what the caller heard.</li>
+    <li>Slow tools are started early, covered by a short true filler, or moved off the live path; digits are confirmed or entered by keypad.</li>
+    <li>Telephone audio is 8&nbsp;kHz mu-law, so recognisers must be tested on real phone recordings.</li>
+    <li>Safety, handoff with context and recording consent are designed first, and the phone agent gathers facts but does not decide coverage.</li>
+  </ul>
+  <p>A voice agent is one case of putting a probabilistic model behind a promise other systems rely on, which is the subject of the next chapter. → <a href="13-llm-behind-a-reliable-contract.html">An LLM Behind a Reliable Contract</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.twilio.com/en-us/blog/developers/best-practices/guide-core-latency-ai-voice-agents" target="_blank" rel="noopener"><strong>A Guide to Core Latency in AI Voice Agents (Cascaded Edition)</strong></a> — Twilio, 2025. The per-stage targets and limits used in this chapter.</li>
+    <li><a href="https://www.twilio.com/docs/voice/media-streams/websocket-messages" target="_blank" rel="noopener"><strong>Twilio Media Streams WebSocket messages</strong></a> — the audio format, <code>mark</code>, <code>clear</code> and <code>dtmf</code> messages. Good for barge-in on telephony.</li>
+    <li><a href="https://developers.deepgram.com/docs/understand-endpointing-interim-results" target="_blank" rel="noopener"><strong>Deepgram: endpointing and interim results</strong></a> — endpointing in milliseconds, <code>is_final</code> versus <code>speech_final</code>.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/voice-agents" target="_blank" rel="noopener"><strong>OpenAI voice agents guide</strong></a> — a vendor's own comparison of speech-to-speech and chained designs.</li>
+    <li><a href="https://experts.illinois.edu/en/publications/universals-and-cultural-variation-in-turn-taking-in-conversation/" target="_blank" rel="noopener"><strong>Universals and cultural variation in turn-taking in conversation</strong></a> — Stivers et al., PNAS 2009. The cross-language evidence for minimised gaps between turns.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
