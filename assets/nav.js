@@ -84,7 +84,7 @@ window.FG = (function () {
     DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/index.html') + '">' + esc(d.name) + '</a>'; });
     h += '</div></div>';
     h += supportItem(base);
-    h += '</div></div><div class="row2"><div class="nav-links domains">';
+    h += '</div></div><div class="row2"><div class="nav-links strip">';
     DOMAINS.forEach(function (d) {
       h += '<div class="nav-item domain' + (d.right ? ' right' : '') + '"><button class="nav-btn" type="button" aria-expanded="false">' + esc(d.label) + ' ' + CHEV + '</button>' +
            '<div class="dropdown' + (d.two ? ' two' : '') + '" role="menu" aria-label="' + esc(d.name) + ' guides">' +
