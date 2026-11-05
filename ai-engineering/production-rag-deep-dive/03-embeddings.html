@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Embeddings — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="What an embedding model actually encodes, why domain vocabulary and identifiers defeat it, dimension and quantisation trade-offs, query and document asymmetry…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/03-embeddings">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Embeddings — Production RAG from the Retrieval Up">
+<meta property="og:description" content="What an embedding model actually encodes, why domain vocabulary and identifiers defeat it, dimension and quantisation trade-offs, query and document asymmetry…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/03-embeddings">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#bi-encoder">What a bi-encoder computes</a>
+    <a href="#asymmetry">Queries are not documents</a>
+    <a href="#dimensions">Dimensions and Matryoshka</a>
+    <a href="#quantisation">Quantisation</a>
+    <a href="#context-pooling">Context length and pooling</a>
+    <a href="#domain">Domain shift and fine-tuning</a>
+    <a href="#choosing">Choosing a model</a>
+    <a href="#arithmetic">The storage arithmetic</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-parsing-and-chunking.html">← Previous: Parsing and Chunking</a>
+    <a href="04-lexical-dense-and-hybrid-retrieval.html">Next: Lexical, Dense and Hybrid Retrieval →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building the index</span>
+  <h1>Embeddings</h1>
+  <p class="subtitle">What an embedding model actually encodes, why domain vocabulary and identifiers defeat it, dimension and quantisation trade-offs, query and document asymmetry, and how to choose and evaluate a model for your corpus.</p>
+</header>
+
+<section id="bi-encoder">
+  <h2>What a bi-encoder computes, and what that rules out</h2>
+  <p>After <a href="02-parsing-and-chunking.html">chunking</a>, every chunk goes through an embedding model once, at index time, and becomes one vector. At query time the question goes through the same model and the nearest vectors are returned. That design is a <em>bi-encoder</em>: query and passage are encoded separately, and the only thing that ever compares them is a dot product or cosine similarity between two fixed-size vectors. It is why the index can be built ahead of time and searched in milliseconds over hundreds of thousands of chunks.</p>
+  <p>It also fixes what the method cannot do. The model has to compress a whole chunk into, say, a thousand numbers before it knows what question will be asked. What survives is mostly topic and gist. What is lost or blurred is detail that does not change the gist, and four kinds of detail matter to Harbourline:</p>
+  <ul>
+    <li><strong>Exact identifiers.</strong> "HO-3 form HW-12" is a rare string the model has likely seen little of. Its subword pieces share overlap with many other form codes, so the vector for a chunk containing HW-12 sits near chunks about HW-21 and HW-1. This is the cause of the 0.52 on the identifiers slice in <a href="01-the-retrieval-contract.html#slices">chapter 01</a>.</li>
+    <li><strong>Negation.</strong> "Water backup is covered" and "Water backup is not covered" share almost every token and the same topic. Models trained on contrastive objectives often place them close together. Whether they separate enough to rank correctly is an empirical question for your model.</li>
+    <li><strong>Numbers.</strong> "$1,000" and "$10,000" differ by one character in the text and little in meaning-space. A query about a $2,500 limit will happily retrieve the chunk with a $25,000 limit if it is otherwise the better topic match.</li>
+    <li><strong>Rare domain terms.</strong> "Anti-concurrent causation clause" and "ensuing loss" have specific meanings in property insurance that a general model may map to loosely related everyday language.</li>
+  </ul>
+  <p>None of this makes embeddings the wrong tool. Paraphrase and intent, the "is my sump pump covered" kind of question, are exactly what they do well. The point is that the failures are structural, so you should expect them at particular slices and handle them with a different mechanism, which <a href="04-lexical-dense-and-hybrid-retrieval.html">the next chapter</a> builds, rather than hoping a bigger model will fix them.</p>
+</section>
+
+<section id="asymmetry">
+  <h2>Queries are not documents</h2>
+  <p>A query is short, often a fragment, and phrased as a need. A passage is long, declarative and full of the vocabulary of the answer. Matching the two directly asks the model to put "what's my deductible if hail hits the roof" near "Wind/hail: 2.5% of Coverage A", and many models are trained to do that with distinct treatment for each side. Cohere's embedding API makes the split explicit: you set <code>input_type</code> to <code>search_document</code> when embedding passages and to <code>search_query</code> when embedding the question, and its documentation says they should differ for semantic search. Other families do the same with text instruction prefixes, which you add to the string before encoding. The exact prefix is part of the model's contract, and it is in the model card.</p>
+  <p>This is a quiet source of bugs. Embedding queries and documents with the same setting on a model trained for asymmetry costs recall without raising any error, and a prefix applied at index time but forgotten at query time looks like a model that is "just not very good". When you change models, check this first. Also check that the stored text and the query go through the same normalisation, since a model that expects unit vectors behaves oddly otherwise.</p>
+</section>
+
+<section id="dimensions">
+  <h2>Dimensions and Matryoshka truncation</h2>
+  <p>Vector length is a direct multiplier on storage, memory and search cost, so it deserves a decision rather than a default. OpenAI's text-embedding-3-small returns 1,536 dimensions and text-embedding-3-large 3,072, with an 8,192-token input limit for both. A 3,072-dimension float vector is 12 KB. At Harbourline's 667,000 chunks that is about 8 GB before any index structure.</p>
+  <p>You do not have to keep every dimension, if the model was trained for it. Matryoshka Representation Learning, by Kusupati and colleagues in 2022, trains the model so that the first d dimensions of the full vector are themselves a usable embedding, with coarse information first and fine detail later. Prefixes of the vector then work at several sizes at little extra cost. OpenAI's embeddings guide exposes this through a <code>dimensions</code> parameter, and states that text-embedding-3-large shortened to 256 dimensions still outperforms the older 1,536-dimension ada-002 on MTEB. If you shorten a vector yourself rather than via the parameter, you must renormalise it to unit length, or the cosine and dot-product rankings diverge.</p>
+  <p>The practical rule: take the shortest length at which your labelled set shows no loss on the slice you care about. Halving dimensions halves storage and roughly halves distance computation. The exception is a model that was not trained with nested dimensions. Cutting its vector is simply discarding information, and quality can drop sharply. Check the model card before truncating.</p>
+</section>
+
+<section id="quantisation">
+  <h2>Quantisation, and what it costs in recall</h2>
+  <p>The second lever is the number of bytes per dimension. A float32 takes four. Scalar quantisation to int8 takes one, a 4x saving. Binary quantisation keeps one bit per dimension, usually the sign, a 32x saving, and replaces floating-point similarity with a Hamming distance, which is far faster on a CPU. Cohere's API returns int8 and binary embeddings directly through its <code>embedding_types</code> parameter, and pgvector stores the <code>halfvec</code> and <code>bit</code> types that fit these formats.</p>
+  <p>Hugging Face measured the retrieval cost on the mxbai-embed-large-v1 model. Binary embeddings kept 92.5% of the float baseline's retrieval score when used alone, and 96.5% when the top candidates were rescored using the original float query against the stored vectors. Int8 kept 97%, rising to about 99% with rescoring. They also report that the effect depends on the model: e5-base-v2 kept only 74.8% under binary quantisation. So the figures transfer as a pattern, and not as numbers you can assume.</p>
+  <p>The pattern is two-stage search. Run the cheap compressed search to get, say, a few hundred candidates, then rescore only those with full precision. pgvector's documentation describes the same approach, using binary quantisation for the index and re-ranking by the original vectors for better recall. The cost is that the full-precision vectors must still live somewhere, usually on disk, so the saving is memory, not total storage. Quantise when the index no longer fits comfortably in memory, or when query latency is the constraint. Do not quantise at 667,000 chunks just because it is possible: at that scale the full index fits in a few gigabytes and the recall loss buys you nothing.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>shrink.py (sketch)</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import numpy as np
+
+def truncate(v, d):
+    """Matryoshka-style shortening: keep the first d dims, then renormalise."""
+    v = v[:, :d]
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+def to_int8(v):
+    """Symmetric scalar quantisation of unit vectors (values within [-1, 1])."""
+    return np.clip(np.round(v * 127), -127, 127).astype(np.int8)
+
+def to_binary(v):
+    """One bit per dimension (the sign), packed eight to a byte."""
+    return np.packbits(v &gt; 0, axis=1)
+
+def hamming(q_bits, doc_bits):
+    return np.unpackbits(q_bits ^ doc_bits, axis=1).sum(axis=1)
+
+def storage_gb(n_chunks, dims, bytes_per_dim, overhead=8):
+    return n_chunks * (dims * bytes_per_dim + overhead) / 1e9</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-label">Quantise the search, not the answer</span>
+    <p>Use compressed vectors to find candidates and the full vectors to order them. The recall you lose to compression is mostly in the order of near neighbours, which rescoring repairs, and rarely in whether the right chunk is among a few hundred.</p>
+  </div>
+</section>
+
+<section id="context-pooling">
+  <h2>Context length and pooling</h2>
+  <p>An embedding model reads at most a fixed number of tokens. OpenAI's third-generation models accept 8,192. Many open-source encoders accept far fewer, often 512, and longer input is cut off or rejected depending on the library. Truncation is silent: a 900-token chunk fed to a 512-token model is indexed as its first 512 tokens, and a query that matches only the second half will never find it.</p>
+  <p>Inside the model, each token gets a vector, and a pooling step reduces them to one. Many models average them (mean pooling), and some use a dedicated summary token. With averaging, every token contributes to the final vector, so a chunk that spends half its length on a boilerplate footer and half on a deductible table is represented by a blend. That is one reason the cleaning in chapter 02 improves recall: removing the footer removes noise from the average. It is also why a long chunk covering two topics is retrieved less reliably than two short chunks, as each topic is diluted. The longer the chunk, the more the vector becomes a summary of everything in it and the less it says about any one fact.</p>
+  <p>This sets a ceiling that is not about the context window of the generator. A model with an 8,192-token input limit does not make an 8,000-token chunk a good idea. Keep chunks at the size where one vector can still describe one thing.</p>
+</section>
+
+<section id="domain">
+  <h2>Domain shift and when fine-tuning pays</h2>
+  <p>An embedding model is trained on general text. Where Harbourline's language departs from that, in endorsement numbers, state-specific regulatory phrasing and the working vocabulary of claims, the model's notion of "nearby" is less reliable. This is domain shift, and it shows up on the slices in the labelled set before it shows up anywhere else.</p>
+  <p>Fine-tuning an embedding model on pairs of real queries and their gold passages teaches it what your users mean by closeness. It pays when three conditions hold: a measurable gap on a slice that matters, enough labelled pairs to train and still hold out an evaluation set, and a corpus stable enough that a model tuned to it will not go stale. It costs more than it appears. The tuned model becomes something you maintain, every change forces a full re-embedding, and a gain measured on the set you trained from is not a gain. Keep a held-out set that training never saw.</p>
+  <p>Before fine-tuning, try the cheaper moves that act on the same gap. Hybrid search handles identifiers, <a href="02-parsing-and-chunking.html#context">context prefixes</a> handle missing vocabulary, and a reranker fixes ordering. Fine-tune when those leave a gap on a slice the business cares about and the labelled set shows it.</p>
+</section>
+
+<section id="choosing">
+  <h2>Choosing and evaluating a model</h2>
+  <p>The Massive Text Embedding Benchmark (MTEB), by Muennighoff and colleagues, gathers 58 datasets across 8 task types and 112 languages. When it was published, the authors benchmarked 33 models and concluded that no particular text embedding method dominates across all tasks. That finding is the useful part. A leaderboard average mixes classification, clustering, retrieval and more, and it is computed on public datasets that may be in a model's training data. OpenAI's documentation lists MTEB scores of 62.3% for text-embedding-3-small and 64.6% for text-embedding-3-large. A gap of 2.3 points on an average over many tasks cannot tell you how the two will rank on policy wordings and form codes.</p>
+  <p>Use the leaderboard to build a shortlist, restricted to its retrieval tasks, and then decide on your own data:</p>
+  <ol>
+    <li>Fix the chunks. Use the output of chapter 02, the same for every model.</li>
+    <li>Embed with each candidate, using its documented query and document settings.</li>
+    <li>Run the labelled set and record recall@k per slice, plus query latency, index size and cost per million tokens.</li>
+    <li>Compare question by question. A model that wins on average but loses the limits slice is not the right choice for Harbourline.</li>
+  </ol>
+  <p>Weigh the result against operating cost. A hosted model charges per token and adds a network call to every query; a self-hosted one adds hardware and an on-call burden but fixes the version. Whichever you pick, record the model name and version in the index metadata, because a silent provider update changes every vector and breaks comparability with the stored ones. The path for changing models safely is in <a href="08-freshness-tenancy-and-access.html">chapter 08</a>. For the wider context of choosing vector stores and embedding strategies in regulated work, see the <a href="../ai-engineer-compliance/06-rag-applied.html#embeddings">compliance guide's section on embeddings</a>.</p>
+</section>
+
+<section id="arithmetic">
+  <h2>The storage arithmetic</h2>
+  <p>Twelve thousand documents average about 20,000 tokens each, so the corpus is about 240 million tokens. Cut into 400-token chunks with 10% overlap, that is about 667,000 chunks, the figure <a href="02-parsing-and-chunking.html#sweep">from the sweep</a>. Per pgvector's documented layout, a vector takes 4 bytes per dimension plus 8, a halfvec 2 per dimension plus 8, and a bit vector one bit per dimension plus 8.</p>
+
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Representation</th><th>Bytes per chunk</th><th>667,000 chunks</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">float32, 3,072 dimensions</td><td>12,296</td><td>8.2 GB</td></tr>
+      <tr><td class="term">float32, 1,024 dimensions</td><td>4,104</td><td>2.7 GB</td></tr>
+      <tr><td class="term">halfvec, 1,024 dimensions</td><td>2,056</td><td>1.4 GB</td></tr>
+      <tr><td class="term">binary, 1,024 dimensions</td><td>136</td><td>0.09 GB</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>These are raw vector sizes. An HNSW index adds a graph on top, controlled by parameters such as <code>m</code> (16 by default in pgvector) and <code>ef_construction</code> (64 by default), and that overhead is not included here. pgvector's index limits also bite: a standard <code>vector</code> can be indexed up to 2,000 dimensions, so a full 3,072-dimension vector needs either truncation or the <code>halfvec</code> type, which indexes up to 4,000. Embedding the whole corpus once costs, at the roughly $0.13 per million tokens that OpenAI's documentation implies for the large model (as of November 2026; check the pricing page), about $35 including overlap. The recurring cost is not this one pass but every re-embedding forced by a chunking or model change, which is the reason to settle those choices on a sampled corpus first.</p>
+  <p>At this scale the numbers say something plain: a 667,000-chunk index fits in memory at full precision. Spend effort on the quality of the vector, not on shrinking it, until the corpus or the number of tenants grows by an order of magnitude.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Users who type "HW-12 water backup" get chunks about HW-21 and HW-1, while users who type "can I claim when my basement floods from the drain" do well. What property of the embedding design explains both, and which would a bigger model fix less?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A bi-encoder compresses a chunk into one vector before it sees the query, keeping gist and losing exact strings. Paraphrase matching is its strength; rare identifiers share subword pieces with similar codes. A larger model helps the second case least, because the loss is structural. See <a href="#bi-encoder">what a bi-encoder computes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a model migration, recall drops a few points everywhere, no errors appear, and the new model's card mentions instruction prefixes. What do you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether queries and documents are encoded with their documented, different settings, and whether the same setting is used at index and query time. A missing prefix or a mismatch lowers recall silently. See <a href="#asymmetry">queries are not documents</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague halves a 1,024-dimension vector by cutting it to 512 dimensions and wants to ship it. Name two things you check before agreeing.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether the model was trained with nested dimensions, since otherwise cutting discards information unevenly. And whether the vectors were renormalised after cutting. Then run the labelled set on the slice that matters. See <a href="#dimensions">dimensions and Matryoshka truncation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Binary quantisation on one model keeps 92.5% of retrieval quality, and on another keeps 75%. What do you conclude about the claim that binary embeddings keep about 92% of quality, and how do you decide whether to adopt them?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The figure belongs to a model and a benchmark, not to the technique. Test on your own model and set, and use rescoring with full-precision vectors, which recovered the first model to 96.5%. Adopt it only if memory or latency is a real constraint. See <a href="#quantisation">quantisation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A 900-token chunk is embedded by a model with a 512-token limit. A query matches only text from the last 300 tokens. What happens, and why does a retrieval metric on the gold page not reveal it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The text beyond token 512 never entered the vector, so the chunk cannot be found by that content. A page-level hit may still occur through another chunk of the same page, which hides the fault. See <a href="#context-pooling">context length and pooling</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Model A beats model B by 2.3 points on MTEB's average and costs six times as much per token. Your labelled set shows B ahead on identifiers and limits and A ahead on definitions. Which do you pick, and what would change your mind?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>B, since it wins where the money and risk are, at lower cost. Reasons to switch include a significantly larger labelled set that reverses the slice results, or a gap that disappears once hybrid search handles identifiers. The leaderboard average is not about your corpus. See <a href="#choosing">choosing and evaluating a model</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A bi-encoder turns each chunk into one vector before it sees any query, so it keeps topic and loses exact strings, negation and numbers.</li>
+    <li>Queries and documents are often encoded differently, and a missing prefix or <code>input_type</code> lowers recall without any error.</li>
+    <li>Matryoshka-trained models allow shorter vectors at modest loss, provided you renormalise; models without that training do not.</li>
+    <li>Quantisation trades recall for memory and speed in a model-dependent way, and rescoring with full-precision vectors recovers most of it.</li>
+    <li>Chunks longer than the model's input limit are silently truncated, and long chunks blur several topics into one vector.</li>
+    <li>MTEB narrows a shortlist, but the choice comes from per-slice recall on your own labelled set, with latency and cost beside it.</li>
+    <li>At about 670,000 chunks a full-precision index is a few gigabytes, so fix quality before storage.</li>
+  </ul>
+  <p>The failures an embedding cannot fix, such as codes, exact phrases and numbers, need a different kind of match. → <a href="04-lexical-dense-and-hybrid-retrieval.html">Lexical, Dense and Hybrid Retrieval</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2210.07316" target="_blank" rel="noopener"><strong>MTEB: Massive Text Embedding Benchmark</strong></a> — Muennighoff, Tazi, Magne and Reimers, 2022. What the benchmark covers and why no single model wins everywhere.</li>
+    <li><a href="https://arxiv.org/abs/2205.13147" target="_blank" rel="noopener"><strong>Matryoshka Representation Learning</strong></a> — Kusupati et al., 2022. How nested embeddings are trained so that prefixes of the vector stay useful.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/embeddings" target="_blank" rel="noopener"><strong>OpenAI embeddings guide</strong></a> — default dimensions, input limit, the <code>dimensions</code> parameter and the normalisation note.</li>
+    <li><a href="https://huggingface.co/blog/embedding-quantization" target="_blank" rel="noopener"><strong>Binary and Scalar Embedding Quantization</strong></a> — Hugging Face. Measured retention of retrieval quality for int8 and binary, with and without rescoring.</li>
+    <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener"><strong>pgvector</strong></a> — README. Storage layout per type, indexing dimension limits and HNSW defaults.</li>
+    <li><a href="https://docs.cohere.com/docs/embeddings" target="_blank" rel="noopener"><strong>Cohere embeddings</strong></a> — how <code>input_type</code> separates query and document encoding, and the quantised output types.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

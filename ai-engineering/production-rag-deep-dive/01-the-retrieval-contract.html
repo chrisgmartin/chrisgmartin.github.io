@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Retrieval Contract — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="What the generator needs from retrieval, stated precisely: enough of the right passages, in a usable shape, with provenance, inside a token budget.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/01-the-retrieval-contract">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Retrieval Contract — Production RAG from the Retrieval Up">
+<meta property="og:description" content="What the generator needs from retrieval, stated precisely: enough of the right passages, in a usable shape, with provenance, inside a token budget.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/01-the-retrieval-contract">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#breach">A wrong answer, a right index</a>
+    <a href="#clauses">Seven clauses</a>
+    <a href="#chain">The chain of contracts</a>
+    <a href="#labelled-set">The labelled set</a>
+    <a href="#slices">Reading it per slice</a>
+    <a href="#not-a-metric">Why "wrong answer" is not a metric</a>
+    <a href="#flips">When the frame bends</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous: Start Here</a>
+    <a href="02-parsing-and-chunking.html">Next: Parsing and Chunking →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building the index</span>
+  <h1>The Retrieval Contract</h1>
+  <p class="subtitle">What the generator needs from retrieval, stated precisely: enough of the right passages, in a usable shape, with provenance, inside a token budget. Every later design choice is judged against this.</p>
+</header>
+
+<section id="breach">
+  <h2>A wrong answer, a right index</h2>
+  <p>A Harbourline customer asks what the wind and hail deductible is on their homeowners policy. The assistant answers $1,000. The policy wording sets it at 2.5% of the dwelling limit. The engineer on call opens the index and finds the right page there, correctly extracted, with the deductible table intact. The model is not hallucinating in the usual sense. It read a number from somewhere and reported it faithfully.</p>
+  <p>That "somewhere" is the whole subject of this guide. The generator can only use what retrieval hands it, so each failure of this kind is a breach of an agreement nobody wrote down. Here the table that got through was last year's version of the wording, ranked above this year's because the two are almost the same text. Retrieval returned a passage that answered the question and was out of date. It looked like success on every metric that checks only for the presence of an answering passage.</p>
+  <p>At roughly 13,000 assistant sessions a day, a wrong limit in 2% of the sessions that ask about limits is a few hundred bad answers a week, each one a possible complaint and refund. The fix is to say what retrieval owes the generator in terms precise enough to test, then to test each term separately. This chapter writes that contract, shows where each layer of the pipeline can break it, and introduces the labelled question set that the rest of the guide uses to measure every change.</p>
+</section>
+
+<section id="clauses">
+  <h2>Seven clauses</h2>
+  <p>Think of the generator as a reader with a strict rule: it will treat everything in its context as the evidence. It cannot go and fetch the missing page, and it cannot tell that a passage is stale unless the passage says so. What it needs falls into seven clauses. Each one fails differently, and each one is checked by a different measurement.</p>
+
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Clause</th><th>Retrieval owes the generator</th><th>Checked by</th><th>Breach looks like</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Coverage</td><td>Every passage needed to answer is in the context</td><td>Recall@k against the labelled set</td><td>"Not in the documents", or a confident answer from the model's own knowledge</td></tr>
+      <tr><td class="term">Precision</td><td>The answering passages are not buried in near-misses</td><td>Precision@k, and how many of the k slots are gold</td><td>The model blends two products, or quotes the wrong one</td></tr>
+      <tr><td class="term">Shape</td><td>Each passage is whole enough to be read alone</td><td>Reading a sample of gold chunks by hand</td><td>A limit with no column header; "see above" with nothing above</td></tr>
+      <tr><td class="term">Provenance</td><td>Document, version, section and page travel with the text</td><td>Fraction of chunks with every field populated</td><td>A citation to "the policy" that no one can open</td></tr>
+      <tr><td class="term">Budget</td><td>The set fits the token budget and the chosen k</td><td>Tokens per context, p50 and p95</td><td>Truncation, or a context so long the evidence sits in the middle</td></tr>
+      <tr><td class="term">Freshness</td><td>Only the version in force for this question</td><td>Test questions with a known superseded wording</td><td>A correct page and last year's number</td></tr>
+      <tr><td class="term">Authorisation</td><td>Only passages this user may see</td><td>Queries run as a user who must not see them</td><td>Another tenant's or role's text in the answer</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><strong>Coverage</strong> is the clause everyone measures, so it gets the least explanation here. A question with two answering passages, for example a limit in the schedule and its exception in an endorsement, needs both. Recall that counts only the first is flattering the system.</p>
+  <p><strong>Precision</strong> matters because the generator does not weigh passages by how they were ranked. Six near-duplicate sections from six policy versions leave it with a vote, and it will often pick the majority. Precision is a constraint on the answer, and a cost issue only second.</p>
+  <p><strong>Shape</strong> is the clause most often missed, because no standard metric covers it. A table row reading "Wind/hail: 2.5%" is a different fact depending on whether "of Coverage A" and "deductible" travel with it. You find shape breaches by reading fifty gold chunks, not by computing anything. The next chapter is largely about keeping this clause.</p>
+  <p><strong>Provenance</strong> is what makes the answer checkable. If the context carries document id, version, section path and page for each chunk, then the assistant can cite, an auditor can follow the citation, and a debugging session can find the source. Without it, <a href="07-context-assembly-and-grounding.html">citation checking</a> has nothing to compare against.</p>
+  <p><strong>Budget</strong> ties retrieval to the generator's window and to cost. The budget is not just a ceiling. The study by Liu and colleagues found that models do best when the relevant text sits at the start or end of a long input and worse in the middle, so a context that technically fits can still waste the evidence. Chapter <a href="07-context-assembly-and-grounding.html">07</a> turns this into ordering rules.</p>
+  <p><strong>Freshness</strong> and <strong>authorisation</strong> are contract clauses that no similarity score can express. Whether a wording applies depends on a date, and whether a passage may be shown depends on who is asking. Both are enforced as filters before ranking, and both are the subject of <a href="08-freshness-tenancy-and-access.html">chapter 08</a>. They are listed here because a system that scores well on the first five clauses can still breach these two, and the consequences, a wrong refund or a disclosure, are the expensive ones.</p>
+
+  <div class="callout insight">
+    <span class="callout-label">Coverage is the cheapest clause to satisfy and the weakest guarantee</span>
+    <p>You can reach near-perfect recall by returning the whole corpus. Every other clause exists to stop you doing that. When someone reports a recall number, ask what it cost in precision, tokens and staleness. A recall figure alone describes only one of seven things the generator needed.</p>
+  </div>
+</section>
+
+<section id="chain">
+  <h2>The chain of contracts</h2>
+  <p>The pipeline is a sequence of stages, and each stage hands the next one something it can no longer repair. A parser that merges two columns cannot be corrected by a better embedding model. A chunker that cuts a table in half cannot be corrected by a reranker. That is why the contract has to be stated per stage: when the final context breaches a clause, you want to know which stage first broke it.</p>
+
+  <div class="flow">  STAGE          OWES THE NEXT STAGE              WHEN BREACHED, DOWNSTREAM SEES
+  ─────────────  ───────────────────────────────  ──────────────────────────────
+  parse          text in reading order, tables    scrambled sentences, a limit
+                 as rows, headers kept            detached from its label
+        ↓
+  chunk          units that survive alone, with   a table split from its header;
+                 title and section path           "the above" with no above
+        ↓
+  embed          nearby vectors for texts that    identifiers and numbers land
+                 mean the same to a reader        far from their own chunk
+        ↓
+  retrieve       gold passages inside top-N       gold absent from candidates;
+                 candidates, filters applied      superseded version present
+        ↓
+  rerank         gold inside top-k, near-misses   gold at rank 19 of 20,
+                 below it                         cut by the budget
+        ↓
+  assemble       k passages in budget, ordered,   truncation; evidence in the
+                 deduplicated, with provenance    middle; no citation fields
+        ↓
+  generate       answer supported by the context  right passage, wrong claim</div>
+
+  <p>The useful property of this view is that a breach is almost always visible one or two stages later than it happened. A wrong deductible shows up at generation, but the cause may sit at the chunker, which split the table. Debugging means walking the chain backwards until the clause that was true at stage <em>n</em> is false at stage <em>n+1</em>. <a href="09-debugging-a-rag-system.html">Chapter 09</a> turns that walk into a procedure, and the <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html#bisect">interview-prep version of it</a> shows the same bisection in the form an interviewer asks for.</p>
+  <p>The contract also tells you what to log. For each request, record the query, the candidates with scores, the reranked list and the assembled context with token counts. Without those, "which clause broke" is a guess. With them, most investigations take minutes.</p>
+</section>
+
+<section id="labelled-set">
+  <h2>The labelled set</h2>
+  <p>A contract is only useful if you can run it. For Harbourline that is a set of about 400 real questions sampled from the assistant's logs, each mapped to the passage or passages that answer it. The set is the instrument for the whole guide: every chunking change, model swap and reranker in the next chapters is judged by what it does to this set.</p>
+  <p>Each record carries the question, a slice label, the gold passages with their document version, and whether the question is answerable at all.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>evalset/q-0142.yaml</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-yaml">id: q-0142
+slice: limits-deductibles
+question: "What is my wind and hail deductible on an HO-3 policy?"
+as_of: 2026-03-01              # the date the answer must be true for
+gold:
+  - doc: HO3-wording
+    version: 2026-01
+    section: "Section I - Deductibles"
+    page: 14
+    role: answer                # the table row
+  - doc: HO3-wording
+    version: 2026-01
+    section: "Section I - Deductibles"
+    page: 14
+    role: context               # the column header for that row
+answerable: true</code></pre>
+  </div>
+
+  <p>Three decisions in that record matter. The <code>as_of</code> date and the version give the freshness clause something to fail against. The <code>role</code> field records that a row without its header is not a complete answer, so the shape clause becomes testable. The <code>answerable</code> flag lets you keep questions the documents cannot answer, which is how you later measure abstention in <a href="07-context-assembly-and-grounding.html">chapter 07</a>.</p>
+  <p>Sampling is the part people rush. Take questions from logs, not from what the team thinks customers ask, and sample inside each slice so the rare, high-stakes types are not drowned by the common ones. Harbourline uses five slices: limits and deductibles, exclusions, procedures, definitions, and identifiers such as policy and form numbers. How to label, judge relevance, check agreement between labellers and keep the set current is the subject of <a href="06-measuring-retrieval.html">chapter 06</a>. For now the shape of the set is what matters.</p>
+</section>
+
+<section id="slices">
+  <h2>Reading it per slice</h2>
+  <p>A single recall number averages over question types that fail for different reasons. Suppose the first run of the 400 questions gives this, at k = 10. The figures are illustrative, and they are the baseline the following chapters improve on.</p>
+
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Slice</th><th>Questions</th><th>Recall@10</th><th>Likely first suspect</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Limits and deductibles</td><td>110</td><td>0.71</td><td>Tables split or flattened in parsing and chunking</td></tr>
+      <tr><td class="term">Exclusions</td><td>80</td><td>0.88</td><td>Negation and wording that embeddings blur</td></tr>
+      <tr><td class="term">Procedures</td><td>100</td><td>0.90</td><td>Mostly fine; check long multi-step documents</td></tr>
+      <tr><td class="term">Definitions</td><td>50</td><td>0.93</td><td>Fine; short, self-contained passages</td></tr>
+      <tr><td class="term">Identifiers</td><td>60</td><td>0.52</td><td>Dense retrieval cannot match exact codes</td></tr>
+      <tr><td class="term">All</td><td>400</td><td>0.79</td><td>Hides both of the above</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The overall figure of 0.79 is the question-weighted mean of the rows. It tells you nothing about where to work. The per-slice view says two things at once: the slice that carries the most money, limits and deductibles, is at 0.71, and the identifiers slice is at 0.52 for an entirely different reason. A fix aimed at one will not move the other. Chunking work in <a href="02-parsing-and-chunking.html">chapter 02</a> goes after the first. The second is a matter for <a href="04-lexical-dense-and-hybrid-retrieval.html">lexical retrieval</a>, because an exact form code is the kind of query an embedding model handles worst.</p>
+
+  <p>Slices also set a limit on what you can conclude. The identifiers slice has 60 questions. At a recall of 0.52 the standard error of that proportion is the square root of 0.52 × 0.48 / 60, about 0.065, so a 95% interval is roughly plus or minus 0.13. If a change moves that slice from 0.52 to 0.60, that is within the noise of a single run. Running both versions on the same 60 questions and comparing which questions flipped is more sensitive than comparing two means, but it does not remove the problem. Either grow the slice, or accept that you can only detect large gains there. Chapter 06 returns to how big the set must be for the differences you care about.</p>
+
+  <div class="callout warn">
+    <span class="callout-label">A flat dashboard can hide a swap</span>
+    <p>If recall on limits falls by 0.05 while identifiers rise by 0.08 after a model change, the weighted overall barely moves. Report every slice every time, and alert on slices, not on the mean.</p>
+  </div>
+</section>
+
+<section id="not-a-metric">
+  <h2>Why "the answer was wrong" is not a retrieval metric</h2>
+  <p>It is tempting to grade the system by comparing final answers to a reference. That conflates at least four outcomes into one number. A wrong answer may follow from retrieval that missed, or from retrieval that was complete while the model ignored it or misread it. A right answer may follow from retrieval that worked, or from the model's own knowledge, which for general insurance terms is often good enough to be right by accident. Accuracy over those four cases cannot say which layer to change, and it drifts when you update the model even if retrieval is untouched.</p>
+  <p>The RAGAS paper by Es and colleagues makes the same separation in its framing: it scores whether the retriever finds relevant, focused context, whether the model stays faithful to that context, and the quality of the answer, as different things. The retrieval metrics in this guide stop at the edge of the context. They ask whether the gold passages are present, whether they are ranked where the budget will keep them, and whether they are whole, all before any model is called. That makes them cheap, deterministic and repeatable, so a sweep over nine chunking settings is nine index builds and nine scoring passes, with no generation spend and no judge variance.</p>
+  <p>The bisection is the bridge back to answers. Take a question the system got wrong, put the gold passage into the context by hand, and rerun. If the answer is now right, retrieval was at fault and the retrieval metrics should show a miss. If it is still wrong, the fault is in generation or in the prompt, and no retrieval change will help. A system that fails this test on the same question with the gold passage present is a different project, covered in <a href="07-context-assembly-and-grounding.html">chapter 07</a>.</p>
+  <p>Treat answer-level evaluation as the final check, not the tuning loop. Run it on a sample before release, to confirm that better retrieval produced better answers, and keep the retrieval metrics as the thing you optimise.</p>
+</section>
+
+<section id="flips">
+  <h2>When the frame bends</h2>
+  <p>The contract assumes one query, one retrieval, one context. That fits the help-centre assistant. It fits less well where the model issues several searches in sequence, as an agent does when it reads a claim file, looks up the wording, then checks a procedure. There, coverage is a property of the whole session: no single call has to return everything, but the sequence has to reach every needed passage, and a bad first query can trap the loop. You then measure the fraction of tasks that reached all gold passages, in addition to per-call recall, and you add a clause for the cost of searching again.</p>
+  <p>Two other cases flip the emphasis. When the corpus is small enough to fit in the window, for example a single policy of fifty pages, passing the whole document may satisfy coverage, shape and provenance more cheaply than any pipeline, at the cost of budget and the position effect. And when a wrong answer is far more expensive than no answer, as with an exclusion read to a customer during a claim, precision and abstention outrank coverage, and you should accept a lower recall that comes with a clear "I could not find this" over a higher recall that sometimes brings in the wrong passage. The <a href="../ai-engineer-compliance/06-rag-applied.html">compliance guide's treatment of RAG</a> covers that risk posture for regulated work.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Overall recall@10 on the 400-question set has sat at 0.79 for a month, yet complaints about quoted deductibles have risen. Name two ways both can be true.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The mean can hide a slice moving against another: limits and deductibles may have fallen while identifiers rose, so the weighted figure stays flat. Or the set may not test the failing behaviour at all, for instance if it has no superseded wordings, so a stale-version breach never counts as a miss. See <a href="#slices">reading it per slice</a> and <a href="#clauses">the clauses</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The gold page is in the context and the model still quotes last year's deductible. Which clause was breached, and what do you look for in the logged context?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Freshness, and probably precision. Look for two versions of the same wording in the assembled context, or a missing version field that would have let a filter or the model choose. Coverage passed, which is why recall alone looked healthy. See <a href="#clauses">seven clauses</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague proposes tuning the retriever by maximising agreement between final answers and reference answers. Which two different failures does that score merge, and why does it mislead after a model upgrade?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retrieval misses and generation faults both produce a wrong answer, and a right answer can come from the model's own knowledge with no useful retrieval. A model upgrade changes the generator's behaviour, so the score moves even when retrieval is unchanged. Score the context directly and bisect to attribute the rest. See <a href="#not-a-metric">why "wrong answer" is not a metric</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a change, recall on the 60-question identifiers slice goes from 0.52 to 0.60. Do you ship on that evidence? What would you do next?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not on that alone. Each figure carries roughly plus or minus 0.13 at 95%, so the gain is within noise. Compare the two runs question by question to see which flipped and whether they share a cause, then add questions to the slice or accept that only larger gains are detectable. See <a href="#slices">reading it per slice</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A team wants to fix missing coverage by raising k from 5 to 20 with 600-token chunks. Argue for and against, and say what you would measure to decide.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>For: recall rises monotonically with k, and a tolerant generator can ignore extras. Against: the context grows from about 3,000 to 12,000 tokens, precision falls, near-duplicate versions enter, and evidence in the middle is used less reliably. Measure recall and precision at both k, the tokens per request, and answer faithfulness on a sample. A reranker that keeps a smaller k is often the better route. See <a href="#clauses">budget and precision</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The claims-intake agent runs four searches per task. Why is per-call recall@k the wrong single number for it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No single call has to return every needed passage. What matters is whether the sequence reaches all of them and how many calls that takes, so measure task-level coverage and search count alongside per-call recall. See <a href="#flips">when the frame bends</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Retrieval owes the generator seven things: coverage, precision, shape, provenance, budget, freshness and authorisation. A system can satisfy the first and still produce a regulatory problem.</li>
+    <li>Each pipeline stage hands the next something it cannot repair, so a breach appears downstream of its cause and debugging walks the chain backwards.</li>
+    <li>Shape has no standard metric. You check it by reading gold chunks, and the table-without-header case is the commonest breach.</li>
+    <li>A labelled set of real questions, each mapped to gold passages with version and date, is the instrument for every later decision in this guide.</li>
+    <li>Report recall per slice. The mean hides opposite movements, and a 60-question slice cannot confirm a gain of a few points.</li>
+    <li>Final-answer accuracy mixes retrieval and generation faults. Tune on context metrics, and use the bisection and an answer-level sample to confirm.</li>
+  </ul>
+  <p>The first breach in the chain is usually the earliest one, in the way documents are read and cut. → <a href="02-parsing-and-chunking.html">Parsing and Chunking</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener"><strong>Lost in the Middle: How Language Models Use Long Contexts</strong></a> — Liu et al., 2023. Evidence that position in the context changes how well relevant text is used; the basis for the budget clause.</li>
+    <li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener"><strong>RAGAS: Automated Evaluation of Retrieval Augmented Generation</strong></a> — Es et al., 2023. Separates retrieval quality, faithfulness and answer quality; good for seeing why one score is not enough.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

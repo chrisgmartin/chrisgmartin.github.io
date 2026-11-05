@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluating RAG — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Separating retrieval from generation, context relevance, faithfulness and answer relevance, citation checks, abstention rate, and the labelled set shared with…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/07-evaluating-rag">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Evaluating RAG — Evals for LLM Systems">
+<meta property="og:description" content="Separating retrieval from generation, context relevance, faithfulness and answer relevance, citation checks, abstention rate, and the labelled set shared with…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/07-evaluating-rag">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#split">Two questions, not one</a>
+    <a href="#retrieval">Retrieval on the labelled set</a>
+    <a href="#gold">Generation: gold versus retrieved context</a>
+    <a href="#metrics">Context, faithfulness, answer relevance</a>
+    <a href="#citations">Citations that resolve</a>
+    <a href="#abstention">Abstention</a>
+    <a href="#owner">One labelled set, one owner</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-evaluating-agents.html">← Previous: Evaluating Agents</a>
+    <a href="08-model-and-prompt-changes.html">Next: Model and Prompt Changes →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Decisions</span>
+  <h1>Evaluating RAG</h1>
+  <p class="subtitle">Separating retrieval from generation, context relevance, faithfulness and answer relevance, citation checks, abstention rate, and the labelled set shared with the retrieval team.</p>
+</header>
+
+<section id="split">
+  <h2>Two questions, not one</h2>
+  <p>Harbourline's help-centre assistant answers about 13,000 sessions a day. When a customer asks "what is my windstorm deductible?" and gets the wrong number, the post-mortem has two candidate causes: the retriever never surfaced the right policy passage, or it did and the model misread it. The fixes are unrelated. One is chunking, embeddings and filters. The other is the prompt, the model or the context layout. A single end-to-end accuracy number cannot tell them apart, so the first job of a RAG eval is to measure the two stages separately and then measure the join.</p>
+  <p>The mechanism is a controlled substitution. You hold the question fixed and vary what the generator is shown: the gold passages a human marked, the passages the retriever actually returned, or nothing. The differences between those runs attribute the error.</p>
+  <div class="flow">  question ──▶ RETRIEVER ──▶ top-k chunks ──▶ GENERATOR ──▶ answer + citations
+                   │                                   ▲
+                   │ measured against gold chunk ids   │ measured three ways:
+                   ▼                                   │
+          recall@k, MRR, nDCG                          ├─ given GOLD chunks   (ceiling)
+          (chapter 06 of the RAG guide)                ├─ given RETRIEVED     (pipeline)
+                                                       └─ given NO context    (prior)
+
+  gap(ceiling − pipeline)  = loss you can blame on retrieval
+  gap(1 − ceiling)         = loss you can blame on the generator and the prompt</div>
+  <p>The third arm, no context, is the one teams skip. It tells you how much the model already "knows" about deductibles in general, which matters because a model that answers correctly without the passage is not evidence that retrieval works, and a model that answers a plausible-but-wrong generic number is the failure you most need to catch.</p>
+</section>
+
+<section id="retrieval">
+  <h2>Retrieval on the labelled set</h2>
+  <p>The retrieval half is covered in depth in <a href="../production-rag-deep-dive/06-measuring-retrieval.html#metrics">Production RAG, chapter 06</a>: recall@k against gold chunk ids, rank-aware metrics, and the sweep over k. Do not re-derive it here. What this guide adds is the stratification. Harbourline's roughly 400 labelled help-centre items are tagged by slice: limits and deductibles, exclusions, procedures, definitions, identifiers. Report retrieval per slice, because the aggregate hides the pattern that matters. Identifier questions ("what does form CL-14 cover?") are lexical and often fail in dense-only retrieval. Exclusion questions fail the other way: the relevant passage is semantically close to three others that say the opposite.</p>
+  <p>Decide the gold unit before you label. If the gold is a document, recall@k is flattering, since a 40-page policy wording "contains" every answer. If the gold is the smallest span that supports the answer, recall is honest but breaks whenever the chunker changes. Record both: the span text and the document, and match at the chunk level by overlap with the span. That keeps the set valid across chunking experiments, which is the main reason the set outlives any one pipeline.</p>
+</section>
+
+<section id="gold">
+  <h2>Generation: gold versus retrieved context</h2>
+  <p>Run the generator twice over the same items: once with the gold passages inserted, once with what the retriever returned. Grade each answer with the graders from <a href="03-graders.html">chapter 03</a> and, where free text needs it, the judge from <a href="04-llm-as-judge.html">chapter 04</a>. On the limits-and-deductibles slice, suppose the numbers come out like this (illustrative figures, not a benchmark):</p>
+  <table>
+    <thead><tr><th>Arm</th><th>Correct</th><th>What it measures</th></tr></thead>
+    <tbody>
+      <tr><td>No context</td><td>31%</td><td>What the model guesses from general knowledge</td></tr>
+      <tr><td>Retrieved context</td><td>74%</td><td>The pipeline as shipped</td></tr>
+      <tr><td>Gold context</td><td>91%</td><td>The generator's ceiling with perfect retrieval</td></tr>
+    </tbody>
+  </table>
+  <p>The 17-point gap between gold and retrieved is retrieval's share of the loss. The 9 points the generator still misses with perfect context are its own: unit confusion (per-claim versus annual deductible), a table read wrongly, or two figures from different policy tiers merged. Spend the next sprint on whichever gap is larger. Here it is retrieval, so a better prompt would be a polite waste of time.</p>
+  <p>Two caveats. First, gold-context accuracy is an upper bound only for the context layout you tested: put the gold chunk at position 1 of 5 and you measure a different thing than position 4 of 5. Reproduce the production layout, including distractor chunks, by inserting the gold passages among the retrieved ones. Second, a gold arm needs gold labels that are themselves right. If the labeller picked the wrong passage, the ceiling is measured against a bad reference and the "generator error" is partly label error. Review every item the gold arm gets wrong before you believe the 9 points.</p>
+</section>
+
+<section id="metrics">
+  <h2>Context relevance, faithfulness, answer relevance</h2>
+  <p>When you have no gold labels for a slice, or want a cheap signal on production traffic, the reference-free trio from the RAGAS paper (Es et al. 2023) gives you three numbers computed by prompting a model. Know exactly what each one sees, because each is blind in a specific way.</p>
+  <ul>
+    <li><strong>Faithfulness.</strong> A model splits the answer into atomic statements, then checks each against the retrieved context. The score is supported statements divided by total statements. It sees the answer and the context, not the question's truth. An answer that quotes the UK policy's £250 excess to a US customer scores 1.0 if the retriever returned the UK passage. Faithfulness measures grounding, not correctness.</li>
+    <li><strong>Answer relevance.</strong> A model generates questions that the answer would address, embeds them, and averages their cosine similarity to the original question. It deliberately ignores factuality. It penalises incomplete or padded answers, and it cannot see a wrong figure inside an on-topic sentence.</li>
+    <li><strong>Context relevance.</strong> A model extracts the sentences from the context that are needed for the question; the score is extracted sentences over total sentences. It rewards tight context and says nothing about whether the one needed sentence is present. It can score high on a context that is short and wrong.</li>
+  </ul>
+  <p>The paper reports agreement with human pairwise preferences on its WikiEval set of 0.95 for faithfulness, 0.78 for answer relevance and 0.70 for context relevance, against 0.72, 0.52 and 0.63 for a plain "score 0 to 10" prompt. Read those numbers for what they are: accuracy in picking the better of two candidates, where one was degraded on purpose, judged with gpt-3.5-turbo. That is a much easier task than absolute scoring of your own subtle failures, and the authors themselves note context relevance is the hardest dimension. Treat the metrics as triage signals and calibrate them on your slice against 50 to 100 human labels before you trust a threshold. The definitions also drift: later versions of the RAGAS library document rank-aware context precision, with reference-based variants, alongside the original formulation. Pin the library version and write down which definition a reported number uses.</p>
+  <div class="callout warn">
+    <span class="callout-label">A faithful answer to the wrong passage scores 1.0</span>
+    <p>Faithfulness cannot catch retrieval errors, because the retrieved context is its ground truth. Pair it with a retrieval metric or the gold-context arm above. A dashboard that shows faithfulness at 0.96 while the deductible slice is at 74% correct is not contradictory; it is the expected shape when retrieval is the weak stage.</p>
+  </div>
+</section>
+
+<section id="citations">
+  <h2>Citations that resolve</h2>
+  <p>Harbourline's assistant cites the policy section behind every figure. A citation is a checkable claim, so check it with code before spending any judge tokens. Four checks, cheapest first, each catching a different failure:</p>
+  <ol>
+    <li><strong>The id resolves.</strong> The cited chunk id exists in the retrieved set for this request. Fabricated or stale ids fail here.</li>
+    <li><strong>The quote is verbatim.</strong> Any span the answer puts in quotation marks appears in the cited chunk after whitespace and case normalisation.</li>
+    <li><strong>The numbers are present.</strong> Every currency amount, percentage and date in the answer appears in the cited chunk. This single check catches most wrong-deductible answers.</li>
+    <li><strong>The source is eligible.</strong> The cited chunk belongs to the customer's jurisdiction and policy version. This needs metadata, not a model.</li>
+  </ol>
+  <p>Passing all four does not prove the answer is right: a chunk can contain the number £250 and still describe a different cover. That is the job of the claim-level faithfulness check. The division of labour is deterministic checks for existence and exact values, a model for entailment. Report each check's failure rate separately, because "citation accuracy 91%" mixes a harmless formatting slip with a fabricated source.</p>
+</section>
+
+<section id="abstention">
+  <h2>Abstention: two error rates, not one</h2>
+  <p>A RAG assistant should decline when the corpus does not contain the answer. Measuring that takes items where the right behaviour is to decline. Without them, an assistant that always answers looks perfect. Put unanswerable questions in the set deliberately: about a quarter of the items, such as products Harbourline does not sell, policy details that exist only in a customer's own documents, or questions that need a decision the assistant must not make. Then compute two rates that trade against each other:</p>
+  <ul>
+    <li><strong>False abstention:</strong> declined an answerable question. The cost is a deflected customer and a support ticket.</li>
+    <li><strong>False answer:</strong> answered an unanswerable question. The cost is a confident wrong statement, which on a coverage question is a regulatory exposure.</li>
+  </ul>
+  <p>Keep a third number apart from both: the wrong-answer rate on answerable questions that the system did attempt. Merging the three into one "accuracy" hides the choice the threshold is making.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>abstention_rates.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import math
+
+def wilson(k, n, z=1.96):
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return c - h, c + h
+
+# one row per labelled item: (answerable_in_corpus, system_abstained, answer_correct)
+rows = (
+    [(True, False, True)] * 118 + [(True, False, False)] * 14 + [(True, True, False)] * 18 +
+    [(False, True, False)] * 41 + [(False, False, False)] * 9
+)
+
+answerable = [r for r in rows if r[0]]
+unanswerable = [r for r in rows if not r[0]]
+false_abstain = sum(r[1] for r in answerable)
+false_answer = sum(not r[1] for r in unanswerable)
+wrong_answer = sum((not r[1]) and (not r[2]) for r in answerable)
+
+for name, k, n in [("false abstention", false_abstain, len(answerable)),
+                   ("false answer", false_answer, len(unanswerable)),
+                   ("wrong answer when answerable", wrong_answer, len(answerable))]:
+    lo, hi = wilson(k, n)
+    print(f"{name:30s} {k}/{n} = {k/n:.1%}  95% CI {lo:.1%} to {hi:.1%}")</code></pre>
+  </div>
+  <p>On these illustrative counts the output is 12.0% false abstention (7.7% to 18.2%), 18.0% false answer (9.8% to 30.8%) and 9.3% wrong answers when answerable (5.6% to 15.1%). The false-answer interval is wide because only 50 items are unanswerable, which is the honest message: you cannot tell 10% from 30% with that set. Interval mechanics and sample sizes are covered in <a href="05-the-ship-decision.html">chapter 05</a>.</p>
+  <p>Where to set the threshold depends on cost. For the deductible slice, a wrong figure is a complaint, so accept some false answers to keep deflection high. For the coverage-decision slice, a wrong answer is a regulatory issue, so push toward abstention and route to a human adjuster even if false abstention doubles. The recommendation flips with the price of the error, and the price is a business input, not something the eval can discover.</p>
+</section>
+
+<section id="owner">
+  <h2>One labelled set, one owner</h2>
+  <p>The retrieval team and the generation team both need the same items. If each keeps its own, their numbers stop being comparable within a quarter and the gold-versus-retrieved gap becomes meaningless. Keep one set in the repository, with one named owner who reviews every change as a pull request. Each item stores the question, its slice, whether it is answerable, the gold answer, the gold spans with document ids, the corpus snapshot date, the jurisdiction, and who labelled it.</p>
+  <p>The corpus snapshot is the field teams forget. Policy wordings change; a gold span that no longer exists turns a correct answer into a counted failure. When the corpus is re-indexed, re-resolve every gold span against the new snapshot and queue the misses for relabelling rather than deleting them. How the set grows, and how production failures enter it, is covered in <a href="02-building-the-eval-set.html">chapter 02</a> and <a href="09-online-signals-and-drift.html#loop">chapter 09</a>. The shape of a defensible ship decision on top of it is in the interview guide's <a href="../ai-engineer-interview-prep/07-eval-set-and-ship-decision.html">eval set and ship decision</a>, if you want it framed as a talk-track.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Faithfulness on the help-centre assistant is 0.96, yet customers on the UK policy tier report wrong excess figures. What is the most likely cause, and which measurement would expose it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retrieval is returning the wrong tier's passage, and the generator is faithfully repeating it. Faithfulness uses the retrieved context as its ground truth, so it cannot see this. Run the gold-context arm and a per-slice retrieval metric against gold chunk ids. See <a href="#metrics">the metrics section</a>.</p></div></details>
+    </li>
+    <li>
+      <p>With perfect retrieval the generator answers 91% of deductible items correctly; with the shipped retriever, 74%. A colleague proposes a prompt rewrite. What do you say, and what would change your mind?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Seventeen of the 26 lost points trace to retrieval, so retrieval work has the larger prize. The prompt rewrite targets the 9-point residual. It would become the better bet if, after reviewing the gold-arm failures, most turned out to be generator errors on a high-cost slice. Check that the gold arm used the production layout with distractors. See <a href="#gold">gold versus retrieved</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your abstention set has 50 unanswerable items and the system answers 9 of them. A reviewer says the false-answer rate is 18% and asks whether it is below 25%. Can you say yes?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not on this evidence. The 95% Wilson interval runs from about 10% to 31%, so 25% is inside it. You need more unanswerable items, or an argument that the cost justifies the wider uncertainty. The tempting answer is to quote 18%; the point estimate hides the interval. See <a href="#abstention">abstention</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A claims-intake answer cites chunk 7, and a script confirms chunk 7 was retrieved and contains every figure in the answer. Is the citation correct?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not necessarily. The checks prove the source exists and holds those figures. The chunk could describe a different cover, or the answer could draw a wrong inference from it. Entailment needs the claim-level check, and the jurisdiction and policy-version check needs metadata. See <a href="#citations">citations</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Product wants the assistant to answer coverage-decision questions instead of handing them to an adjuster, to cut false abstentions. How do you decide, and what would make you accept it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Price the two errors separately. A false abstention costs a ticket; a false answer on coverage is a regulatory exposure. Accept it only if the false-answer rate on that slice, with its interval's upper bound, is below a threshold set by the compliance owner, and a human review step catches the rest. The eval supplies rates; it cannot supply the threshold.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Measure retrieval and generation separately, then measure the join: the gap between gold-context and retrieved-context accuracy is the loss retrieval causes.</li>
+    <li>Faithfulness, answer relevance and context relevance are reference-free triage signals, each blind in a known way, and need calibration against human labels on your own slices.</li>
+    <li>Faithfulness grades grounding in the retrieved context, so it passes confident answers built on the wrong passage.</li>
+    <li>Citations are checkable by code for existence, verbatim quotes, exact figures and eligibility; entailment still needs a claim-level check.</li>
+    <li>False abstention and false answer are different errors with different costs; report them, and the wrong-answer rate on attempted items, separately and with intervals.</li>
+    <li>One shared labelled set with one owner and a corpus snapshot date keeps retrieval and generation numbers comparable.</li>
+  </ul>
+  <p>A model or prompt change can move all of these numbers at once without anyone touching the pipeline. → <a href="08-model-and-prompt-changes.html">Model and Prompt Changes</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener"><strong>Ragas: Automated Evaluation of Retrieval Augmented Generation</strong></a> — Es, James, Espinosa-Anke and Schockaert, 2023. The definitions of faithfulness, answer relevance and context relevance, and the WikiEval agreement table.</li>
+    <li><a href="https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/" target="_blank" rel="noopener"><strong>Ragas documentation: Faithfulness</strong></a> — the current claim-extraction and verification procedure and its formula.</li>
+    <li><a href="https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/" target="_blank" rel="noopener"><strong>Ragas documentation: Context precision</strong></a> — how the library's rank-aware, reference-based and reference-free variants differ from the paper's definition.</li>
+    <li><a href="https://huggingface.co/learn/cookbook/en/rag_evaluation" target="_blank" rel="noopener"><strong>Hugging Face Cookbook: RAG Evaluation</strong></a> — Aymeric Roucher. A worked synthetic eval set with critique filters, a 1 to 5 correctness judge with a per-level rubric, and sweeps over chunk size, embeddings and reranking.</li>
+    <li><a href="../production-rag-deep-dive/06-measuring-retrieval.html"><strong>Production RAG: Measuring retrieval</strong></a> — on this site; the retrieval-side metrics this chapter builds on.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

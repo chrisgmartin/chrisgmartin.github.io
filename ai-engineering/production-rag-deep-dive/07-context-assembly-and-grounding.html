@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Context Assembly and Grounding — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Choosing k, ordering and lost-in-the-middle, deduplication, token budgets, citation formats the model can honour, abstention when the passages do not answer…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/07-context-assembly-and-grounding">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Context Assembly and Grounding — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Choosing k, ordering and lost-in-the-middle, deduplication, token budgets, citation formats the model can honour, abstention when the passages do not answer…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/07-context-assembly-and-grounding">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#budget">Choosing k and the token budget</a>
+    <a href="#ordering">Ordering</a>
+    <a href="#assembly">Dedup, merging, provenance</a>
+    <a href="#citations">Checkable citations</a>
+    <a href="#abstention">Abstaining</a>
+    <a href="#faithfulness">Faithfulness</a>
+    <a href="#caching">Caching the static part</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-measuring-retrieval.html">← Previous: Measuring Retrieval</a>
+    <a href="08-freshness-tenancy-and-access.html">Next: Freshness, Tenancy and Access Control →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Generating and operating</span>
+  <h1>Context Assembly and Grounding</h1>
+  <p class="subtitle">Choosing k, ordering and lost-in-the-middle, deduplication, token budgets, citation formats the model can honour, abstention when the passages do not answer, and measuring faithfulness.</p>
+</header>
+
+<section id="budget">
+  <h2>Choosing k and the token budget</h2>
+  <p>Retrieval hands you a ranked list. Generation needs a context window you have decided how to spend. The decision between them is the one most teams leave at a default, usually "top 5" or "top 10", and it quietly sets both the cost and the ceiling on answer quality.</p>
+  <p>Think of the prompt as a budget with four lines: static instructions, the question and any chat history, the passages, and room for the answer. At Harbourline the instructions run about 900 tokens, history about 600, and the answer about 400. With a 6,000-token input target, which keeps latency and per-session cost predictable at roughly 13k assistant sessions a day, that leaves about 4,000 tokens for passages. The window size of the model is not the constraint. Cost, latency and the next section are.</p>
+  <p>Chunks are not equal in size, so fix the budget in tokens and let k fall out of it. A rule of "8 chunks" gives you 2,400 tokens one day and 6,000 the next, after a parser change alters chunk length (<a href="02-parsing-and-chunking.html">chapter 02</a>). A rule of "fill 4,000 tokens in rank order, stop at the first chunk that does not fit" is stable.</p>
+  <p>The right budget comes from the labelled set (<a href="06-measuring-retrieval.html">chapter 06</a>). For each question you know the rank of the answering passage. Plot recall against cumulative tokens, not against k. The curve usually climbs steeply to a knee and then flattens. Past the knee, extra passages add cost, and they also add distractors: a limits table from the wrong product tier is a plausible-looking wrong answer. For Harbourline the limits and deductibles slice has its knee earlier than the procedures slice, because procedures often need two or three adjacent steps. That argues for a per-intent budget if you route questions by type, and for a single budget at the larger knee if you do not.</p>
+
+<div class="callout insight">
+  <span class="callout-label">Budget in tokens, then measure the knee</span>
+  <p>If recall at 4,000 tokens is within a point of recall at 8,000, the extra 4,000 tokens buy nothing but distractors and spend. If they differ by ten points, the retriever is ranking poorly and the answer is better fixed with a reranker (<a href="05-reranking.html">chapter 05</a>) than with a larger window.</p>
+</div>
+
+  <p>The case where this flips is questions that genuinely need breadth, such as "compare the flood terms across our three home products." Those are multi-document by nature, and a fixed 4,000-token budget starves them. Detect them (a comparison intent, or several product names in the query) and retrieve per entity with a budget each, rather than raising the global budget for everyone.</p>
+</section>
+
+<section id="ordering">
+  <h2>Ordering: where the model actually looks</h2>
+  <p>Position inside the prompt changes what the model uses. Liu et al. (2023) placed the one relevant document at different positions among up to 20 distractors for multi-document question answering. Accuracy was highest when the answer sat at the start or end of the context and fell significantly when it sat in the middle, and the effect held for models built for long contexts. The authors tested models available in 2023, so treat the size of the dip as a property of those models. The shape of the result is the reason to measure your own.</p>
+  <p>The practical rule is to put the strongest evidence at the edges. The default of listing passages best-first already places the top passage at the start, which is the strongest position. The refinement is to put the second best last and push the weakest to the middle:</p>
+
+<div class="flow">rank:      1   2   3   4   5   6          prompt order (edges strongest)
+
+best-first:  [1] [2] [3] [4] [5] [6]     weak tail ends the context
+edges-in:    [1] [3] [5] [6] [4] [2]     rank 1 first, rank 2 last,
+                                         weakest in the middle</div>
+
+  <p>This costs nothing, but test it before adopting it, because it breaks one thing: the reading order of a procedure. If passages are consecutive steps of a claims process, shuffling them to suit attention gives the model steps out of sequence. The fix is to order after merging (next section). Merge adjacent chunks into one passage in document order, then place whole passages at the edges. The unit you place should be a passage that reads straight through.</p>
+  <p>Shorter contexts also reduce the problem. The reliable way to avoid the middle is to have fewer than ten passages in it, which returns to the budget. Measure by running the labelled set twice, best-first against edges-in, and compare answer correctness on the questions where the answering passage was ranked three or lower. If the delta is inside noise on your model, keep best-first and spend the effort elsewhere.</p>
+</section>
+
+<section id="assembly">
+  <h2>Deduplication, merging and provenance</h2>
+  <p>The retrieved list is rarely clean. Overlapping chunks (<a href="02-parsing-and-chunking.html">chapter 02</a>) return the same sentence twice. Several versions of a policy wording return near-identical paragraphs with one number changed. Adjacent chunks from one section arrive at ranks 2, 7 and 9. Assembly turns this list into a context in three steps.</p>
+  <ol>
+    <li><strong>Deduplicate.</strong> Drop a chunk whose text is contained in a higher-ranked chunk, using the chunk offsets you stored at ingestion rather than fuzzy matching. For near-duplicates across versions, do not drop by similarity at all. Resolve them by version, which is the subject of <a href="08-freshness-tenancy-and-access.html#versions">chapter 08</a>.</li>
+    <li><strong>Merge adjacent chunks.</strong> Group retrieved chunks by document and section, sort by offset, and join those that touch or sit within a small gap. One merged passage of 700 tokens reads better than three 250-token fragments, carries its heading once, and avoids the model stitching context together.</li>
+    <li><strong>Attach provenance.</strong> Give every passage a short stable identifier plus the metadata the reader needs: document title, version or effective date, section heading and page.</li>
+  </ol>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>assemble.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from itertools import groupby
+
+def assemble(chunks, budget_tokens, count_tokens):
+    """chunks: ranked list of dicts with doc_id, start, end, text, meta."""
+    chunks = sorted(chunks, key=lambda c: (c["doc_id"], c["start"]))
+    passages = []
+    for _, group in groupby(chunks, key=lambda c: c["doc_id"]):
+        cur = None
+        for c in group:
+            if cur and c["start"] &lt;= cur["end"] + 1:      # overlap or touching
+                cur["text"] += c["text"][max(0, cur["end"] - c["start"] + 1):]
+                cur["end"] = max(cur["end"], c["end"])
+                cur["rank"] = min(cur["rank"], c["rank"])
+            else:
+                cur = {**c}
+                passages.append(cur)
+    passages.sort(key=lambda p: p["rank"])               # best first
+    out, used = [], 0
+    for i, p in enumerate(passages, 1):
+        block = (f'&lt;passage id="P{i}" doc="{p["meta"]["title"]}" '
+                 f'effective="{p["meta"]["effective"]}" page="{p["meta"]["page"]}"&gt;\n'
+                 f'{p["text"]}\n&lt;/passage&gt;')
+        n = count_tokens(block)
+        if used + n &gt; budget_tokens:
+            break
+        out.append(block); used += n
+    return "\n".join(out)</code></pre>
+</div>
+
+  <p>The sketch assumes each chunk carries its character offsets and a rank. Putting the passage text, not the title alone, inside delimiters also matters for security: the model should be able to tell instructions from retrieved text, which <a href="10-injection-through-retrieved-text.html">chapter 10</a> returns to.</p>
+  <p>The effective date in the passage header is not decoration. Harbourline's worst grounding failure looked like a success: the assistant cited the right page of the right document and still quoted last year's deductible. The retriever had returned two versions of the same wording, the 2025 and 2026 editions, with the page numbers lined up. The model cited the page of the one it quoted, the citation verified, and a reviewer checking only "does the cited passage support the claim" would have passed it. Provenance has to carry the version, and assembly has to prefer the version that applied.</p>
+</section>
+
+<section id="citations">
+  <h2>Citations that can be checked by a program</h2>
+  <p>A citation is useful in proportion to how cheaply it can be verified. "According to your policy wording" verifies nothing. A claim followed by <code>[P2]</code> verifies in code: the identifier exists in the context you sent, so the answer cannot point at a document you never provided. Two stronger forms exist.</p>
+  <ul>
+    <li><strong>Quote-and-locate.</strong> Ask the model to emit the exact supporting span with the identifier, then check by string match that the span occurs in that passage. This catches a citation that names a real passage but a claim that passage does not contain, at the cost of output tokens.</li>
+    <li><strong>Native citations.</strong> Anthropic's API can attach citations when you supply documents or search results as content blocks, and the documentation states that the cited text is extracted by the API and that the pointers are guaranteed valid. That removes a class of fabricated references but not the version problem above, and not a model that cites a real passage for a claim it only loosely supports.</li>
+  </ul>
+  <p>Programmatic verification proves the pointer, not the reasoning. Measure the two separately. <em>Citation validity</em> is the share of citations whose identifier exists and whose quoted span matches, and it should be near 100%. <em>Citation support</em> is the share where the cited passage actually entails the sentence, which needs the faithfulness check below. A system can be perfect on the first and mediocre on the second.</p>
+</section>
+
+<section id="abstention">
+  <h2>Abstaining, and what it costs</h2>
+  <p>When the passages do not answer the question, the model has two options: say so, or answer from its weights. The second is the dangerous one at Harbourline, because the weights hold plausible generic insurance knowledge and no knowledge of this policy. Instruct abstention explicitly: answer only from the passages, and when they do not contain the answer, say that the documents provided do not cover it and name what was searched.</p>
+  <p>Abstention has a price, so measure it as a pair. The <em>abstention rate</em> is the share of all questions where the assistant declines. The <em>miss rate</em> is the share of declines where the answering passage was in the context and the model declined anyway, plus the share of answered questions where the answer was not in the context at all. Build the second from the labelled set by splitting questions into those where the retriever surfaced the answer (check against the mapped passages) and those where it did not.</p>
+<div style="overflow-x: auto;">
+<table>
+  <thead><tr><th>Passage in context?</th><th>Model answers</th><th>Model abstains</th></tr></thead>
+  <tbody>
+    <tr><td class="term">Yes</td><td>correct, or a grounding error</td><td>over-abstention: a prompt problem</td></tr>
+    <tr><td class="term">No</td><td>hallucination: the dangerous cell</td><td>correct abstention, but a retrieval miss to fix upstream</td></tr>
+  </tbody>
+</table>
+</div>
+  <p>The bottom-left cell is what the instruction exists to empty, and the top-right cell is what an over-strict instruction fills. Tightening the prompt trades one for the other, so report both on every change. A rising abstention rate with a flat answer-present rate means retrieval got worse, not the prompt. The recommendation flips for low-stakes questions: for "how do I update my address" a hedged best-effort answer may serve customers better than a refusal, so set the strictness per intent, strict for limits, exclusions and anything quoted to a customer during a claim.</p>
+</section>
+
+<section id="faithfulness">
+  <h2>Faithfulness: is each claim supported?</h2>
+  <p>Faithfulness asks whether every claim in the answer is supported by the provided context, independent of whether the answer is true in the world. The RAGAS paper (Es et al., 2023) defines it as claim-level: split the answer into atomic statements, check each against the context, and score the supported fraction. Two kinds of judge do the checking. A natural-language-inference model classifies each claim as entailed, contradicted or neutral against the passage. A model-graded check prompts a capable model with the passage and the claim. NLI models are cheap and deterministic but trained on short premises, so long merged passages and tables strain them. Model graders handle tables and context better but cost a call per claim and drift with the grader version.</p>
+  <p>Run a claim-level check offline on the labelled set for every change, and online on a sample of production traffic (for instance 2% of sessions) plus every answer that quotes a number. For the numbers there is a cheaper deterministic gate: extract every figure, date and percentage from the answer and require each to appear in the cited passage. That check would not have caught the 2025 deductible, because the number was in a real passage. It would catch a deductible the model invented, and it takes microseconds.</p>
+
+<div class="callout warn">
+  <span class="callout-label">A faithful answer can still be wrong</span>
+  <p>Faithfulness measures agreement with the context, so a wrong passage yields a faithful wrong answer. The stale-deductible failure scored perfectly. Pair the faithfulness check with a version check at assembly time and a correctness check against the labelled set.</p>
+</div>
+
+  <p>Calibrate any judge before trusting it. Hand-label 100 claim and passage pairs, run the judge, and look at the disagreement. If the judge and a human agree on only 80%, a faithfulness score moving from 0.92 to 0.94 is noise. A judge also has a bias worth testing: many are lenient toward fluent claims that paraphrase the passage loosely, which is the exact error you most want to catch on exclusions.</p>
+</section>
+
+<section id="caching">
+  <h2>Caching the static part</h2>
+  <p>Order the prompt so the unchanging material comes first: system instructions, abstention rules, citation format, and any few-shot examples. Retrieved passages and the question come last, because they differ on every request. Providers that cache prompt prefixes can then reuse the computation for the static head. On Anthropic's API you mark the end of the cacheable prefix with <code>cache_control</code>; the default lifetime is 5 minutes, refreshed on each use, with a 1-hour option at extra cost, and reads are billed at a fraction of normal input price (check the current pricing page, as of November 2026).</p>
+  <p>The mechanism is prefix matching, so a single changed token early in the prompt invalidates everything after it. Put no timestamps, user names or per-request identifiers in the system block. At 900 instruction tokens the saving is modest, and caching only pays when the prefix is above the provider's minimum cacheable length. It matters more when the static head grows, for instance a 3,000-token definitions glossary, and at Harbourline's volume the prefix will rarely go cold within five minutes. Passages themselves are rarely worth caching, except for popular documents in a conversation where the same passage returns turn after turn.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A parser upgrade makes chunks 40% longer. Your pipeline sends the top 8 chunks. What happens to cost, latency and answer quality, and how would you have designed the rule to avoid it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Prompt tokens rise by roughly 40% on the passage portion, with cost and latency following, and more distractors enter the context. A token budget filled in rank order is stable under chunk-size changes. See <a href="#budget">the budget section</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Recall on the labelled set is 91% at 4,000 context tokens and 92% at 8,000. A colleague proposes doubling the window "to be safe". What do you ask before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask what the extra tokens add besides one point of recall: cost, latency and distractors that sit in the middle where models use evidence least. Ask whether the misses are ranking failures that a reranker fixes more cheaply, and whether any question type, such as comparisons, has a different knee. See <a href="#budget">budget</a> and <a href="#ordering">ordering</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The assistant quotes a deductible with the right document title and page, and the citation check passes, yet a customer complains the figure is last year's. Which two assembly steps failed, and which metric would have stayed green?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Version resolution before assembly failed, so two editions entered the context, and the provenance header either lacked the effective date or the model ignored it. Citation validity and faithfulness stay green, because the quoted number is in a real cited passage. The fix is to filter or prefer by effective date upstream. See <a href="#assembly">assembly</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You tighten the abstention instruction and the abstention rate rises from 6% to 14%, while correct-answer rate on the labelled set stays flat. Is the change an improvement?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Probably not. Split by whether the answering passage was in context. If the extra declines are all in the "passage absent" row, hallucinations became honest refusals, which is a gain. If they are in the "passage present" row, you built over-abstention and the flat correctness hides it behind fewer wrong answers. Judge it per intent. See <a href="#abstention">abstention</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your claim-level faithfulness score is 0.97 and a reviewer still finds wrong answers in the sample. Give two reasons the metric can be high while answers are wrong.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Faithfulness measures support by the context, so a stale or wrong passage produces faithful wrong answers. The judge can also be lenient on loose paraphrases, so calibrate it against human labels. See <a href="#faithfulness">faithfulness</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After adding the current date to the top of the system prompt, your prompt-cache hit rate collapses. Why, and where should the date go?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Caching matches an exact prefix, so a changing token near the top invalidates the whole cached region. Move the date into the per-request section after the cache breakpoint, next to the question. See <a href="#caching">caching</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Set the context budget in tokens and let k follow, choosing it at the knee of the recall-versus-tokens curve from your labelled set.</li>
+    <li>Models use the start and end of a long context better than the middle, so test edges-in ordering on your own model, but merge adjacent chunks first so each placed unit reads straight through.</li>
+    <li>Every passage needs an identifier and provenance including its version or effective date, and citations should be checked by code for validity.</li>
+    <li>Citation validity proves a pointer exists; only a claim-level faithfulness check shows the passage supports the sentence.</li>
+    <li>Measure abstention in the passage-present and passage-absent rows separately, and set strictness per intent.</li>
+    <li>A faithful answer over the wrong passage is still wrong, so version resolution belongs before assembly.</li>
+    <li>Put static instructions first and per-request text last so the prompt prefix stays cacheable.</li>
+  </ul>
+  <p>The context is only as true as the index behind it. → <a href="08-freshness-tenancy-and-access.html">Freshness, Tenancy and Access Control</a>. For the diagnostic walk when an answer is wrong anyway, see <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html#faults">Debugging a wrong RAG answer</a>.</p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener"><strong>Lost in the Middle: How Language Models Use Long Contexts</strong></a> — Liu et al., 2023. The position experiments behind the ordering advice, and the protocol to repeat on your own model.</li>
+    <li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener"><strong>RAGAS: Automated Evaluation of Retrieval Augmented Generation</strong></a> — Es et al., 2023. The claim-level definition of faithfulness and its sibling metrics.</li>
+    <li><a href="https://docs.claude.com/en/docs/build-with-claude/citations" target="_blank" rel="noopener"><strong>Anthropic citations documentation</strong></a> — how document and search-result blocks produce citations with valid pointers, and the constraints on combining them with structured output.</li>
+    <li><a href="https://docs.claude.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener"><strong>Anthropic prompt caching documentation</strong></a> — breakpoints, the 5-minute and 1-hour lifetimes, and how to read cache usage in responses.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

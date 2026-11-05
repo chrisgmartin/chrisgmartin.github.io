@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Measuring Retrieval — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapters 04 and 05 each changed retrieval. This chapter shows how to prove it: build a labelled set from production questions, pick the metric that matches the…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/06-measuring-retrieval">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Measuring Retrieval — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Chapters 04 and 05 each changed retrieval. This chapter shows how to prove it: build a labelled set from production questions, pick the metric that matches the…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/06-measuring-retrieval">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#set">Building the labelled set</a>
+    <a href="#metrics">The metrics and what each hides</a>
+    <a href="#snippet">Computing them</a>
+    <a href="#sweep">Running a sweep as an experiment</a>
+    <a href="#alive">Keeping the set alive</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-reranking.html">← Previous: Reranking</a>
+    <a href="07-context-assembly-and-grounding.html">Next: Context Assembly and Grounding →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Retrieving</span>
+  <h1>Measuring Retrieval</h1>
+  <p class="subtitle">Chapters 04 and 05 each changed retrieval. This chapter shows how to prove it: build a labelled set from production questions, pick the metric that matches the decision, and run a sweep so a change is a measurement and not an opinion.</p>
+</header>
+
+<section id="set">
+  <h2>Building the labelled set</h2>
+  <p>"The answer was wrong" is not a retrieval metric. It mixes extraction, chunking, ranking and generation, and it cannot tell you which layer to fix. A retrieval metric needs a question, the passages that answer it, and a ranked list to compare. The <a href="01-the-retrieval-contract.html">retrieval contract</a> introduced Harbourline's set of about 400 real questions; this section covers how to build one that holds up.</p>
+  <p><strong>Sample from logs, by slice.</strong> A random sample of 400 over-represents the common questions and leaves the exclusions and identifier slices with a handful of items. Stratify: for each of the five slices (limits and deductibles, exclusions, procedures, definitions, identifiers) draw a target count, around 80 each, and weight the report back to traffic where you need a single headline number. Remove duplicates and near-duplicates, and strip personal data before a human or a model sees the log.</p>
+  <p><strong>Judge relevance.</strong> Binary judgments (this passage answers the question or it does not) are quick and enough for recall and MRR. Graded judgments (2 fully answers, 1 supports or partly answers, 0 irrelevant) are needed for nDCG and matter when several passages are partial, as with a limit in one chunk and its exception in another. Many questions have more than one relevant passage, so label all of them: a set that records only the first passage you found punishes a retriever for returning an equally good one. Also record the document version, because "the deductible" in the 2024 wording is the wrong answer to a 2025 policyholder.</p>
+  <p><strong>Use a model to pre-label and a person to audit.</strong> Have a strong model propose relevant passages from the top 50 of several retrievers, then have a domain reviewer confirm or reject each. This finds the passages your current retriever would not rank, so the set does not simply echo today's system. Measure inter-annotator agreement on a sample of 50 that two reviewers label independently, for example with Cohen's kappa. Low agreement means the relevance definition is vague, and no metric built on it can be trusted until it is tightened. Audit a slice of the model's labels against the human ones and report the disagreement rate.</p>
+  <p><strong>Size sets the differences you can see.</strong> With 80 questions in a slice and a recall near 0.8, the standard error of one measurement is about 0.045, so an unpaired comparison cannot resolve a gap of a few points. Compare two systems on the same questions and use a paired bootstrap, which is far tighter than that figure suggests. Even so, treat a difference smaller than the interval as noise. If a decision hinges on a two-point gain on a slice, you need more questions on that slice, not a closer look at the table.</p>
+</section>
+
+<section id="metrics">
+  <h2>The metrics and what each hides</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Definition</th><th>What it hides</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td class="term">recall@k</td><td>Relevant passages in the top k, divided by all relevant passages</td><td>Order within k. A hit at rank k counts the same as rank 1</td><td>Whether the generator can see the answer: pick k as the number of chunks you pass in</td></tr>
+      <tr><td class="term">precision@k</td><td>Relevant passages in the top k, divided by k</td><td>Missing answers; it falls as k grows even when nothing is wrong</td><td>How much noise fills the context budget</td></tr>
+      <tr><td class="term">MRR</td><td>Mean of 1 / rank of the first relevant passage</td><td>Everything after the first hit, so multi-passage questions</td><td>Single-answer lookups where only the first hit matters</td></tr>
+      <tr><td class="term">nDCG@k</td><td>Gain 2<sup>grade</sup> - 1, discounted by log<sub>2</sub>(rank + 1), divided by the ideal ordering</td><td>Absolute coverage; a list can score well with the key passage missing if the labels are sparse</td><td>Comparing rankers, especially rerankers, on graded labels</td></tr>
+    </tbody>
+  </table>
+  <p>Choose by the decision. To pick k, a chunk size or an embedding model, report <strong>recall@k at the k you will pass to the model</strong>, because the generator cannot use what is not in the prompt. To compare a reranker or fusion setting, report <strong>nDCG@10</strong> alongside recall@5, because ordering is what changed. MRR suits the identifiers slice, where there is usually one right passage. Always report per slice. A single average lets a gain on the large slice cover a regression on the small one that carries the regulatory risk.</p>
+  <div class="callout warn">
+    <span class="callout-label">Incomplete labels punish better retrievers</span>
+    <p>If your labels came from today's retriever, any new retriever that surfaces a correct passage nobody labelled scores a miss. Pool candidates from several systems when labelling, and spot-check the "false" hits when a change looks worse than you expected.</p>
+  </div>
+</section>
+
+<section id="snippet">
+  <h2>Computing them</h2>
+  <p>The function below takes a ranked list of chunk ids and a dictionary of graded labels. It was run on the example at the bottom, which prints recall@3 of 0.5, precision@3 of 0.33, MRR of 0.5 and nDCG@5 of 0.64.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>retrieval_metrics.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import math
+
+def recall_at_k(ranked, rel, k):
+    """rel: dict chunk_id -&gt; grade (0 = not relevant)."""
+    gold = {c for c, g in rel.items() if g &gt; 0}
+    return len(gold &amp; set(ranked[:k])) / len(gold) if gold else None
+
+def precision_at_k(ranked, rel, k):
+    return sum(rel.get(c, 0) &gt; 0 for c in ranked[:k]) / k
+
+def mrr(ranked, rel):
+    for i, c in enumerate(ranked, start=1):
+        if rel.get(c, 0) &gt; 0:
+            return 1.0 / i
+    return 0.0
+
+def ndcg_at_k(ranked, rel, k):
+    dcg = sum((2 ** rel.get(c, 0) - 1) / math.log2(i + 1)
+              for i, c in enumerate(ranked[:k], start=1))
+    ideal = sorted(rel.values(), reverse=True)[:k]
+    idcg = sum((2 ** g - 1) / math.log2(i + 1) for i, g in enumerate(ideal, start=1))
+    return dcg / idcg if idcg else None
+
+rel = {"c2": 2, "c9": 1}                 # c2 answers fully, c9 supports
+ranked = ["c7", "c2", "c4", "c9", "c1"]
+print(recall_at_k(ranked, rel, 3), precision_at_k(ranked, rel, 3),
+      mrr(ranked, rel), round(ndcg_at_k(ranked, rel, 5), 3))
+</code></pre>
+</div>
+</section>
+
+<section id="sweep">
+  <h2>Running a sweep as an experiment</h2>
+  <p>A sweep is an experiment, so give it an experiment's rules. Fix the question set, the corpus snapshot and the index build. Change one thing: chunk size, the embedding model, the fusion constant, the reranker depth. Record the configuration with the result so a number can be reproduced. Report a table with one row per configuration and one column per slice, with the paired difference from the baseline and its interval, not the raw value alone.</p>
+  <div class="flow">  config            limits  exclus.  procs.  defs.  ident.   latency
+  baseline (k=60)    0.71    0.77     0.82    0.85   0.90     310 ms
+  rrf k=30           +0.01   -0.02    +0.00   +0.01  +0.00    same
+  rerank top 50      +0.14   +0.06    +0.03   +0.01  -0.01    +150 ms
+  (illustrative values; fill in from your own run)</div>
+  <p>Read the table by slice, then by cost. A row that moves the average but drops the exclusions column below the baseline fails, because an exclusion misread to a customer during a claim is the costly error. Run each configuration once to find candidates, then confirm the winner on a held-out part of the set that you did not look at while tuning. Without that, you are fitting the set, and the gain will not show up in production. See the <a href="../ai-engineer-interview-prep/02-chunk-size-and-overlap.html#measure">chunk size interview chapter</a> for a worked version.</p>
+</section>
+
+<section id="alive">
+  <h2>Keeping the set alive</h2>
+  <p>The set rots. Harbourline publishes several wording versions per product per year, so a gold passage ID can vanish or change. Anchor labels to a stable identifier for the clause (document, section, version) and not to a chunk ID, then map to chunks whenever chunking changes. Re-sample the logs each quarter to catch new question types, and add every confirmed production failure from <a href="09-debugging-a-rag-system.html">the debugging chapter</a> as a permanent item. Keep a frozen core for trend lines and a rolling part for realism, and note which one a number came from. When a label is overturned, record the change and re-run the last baseline, or comparisons across the change are not like for like.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Support says the assistant "got worse after the last release". You have only thumbs-down counts. Why can they not tell you whether retrieval regressed?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A wrong answer can come from extraction, chunking, ranking or generation, and thumbs-down mixes them. A retrieval metric needs the question, the labelled passages and the ranked list, so you can fix the model and corpus and watch only retrieval move. See <a href="#set">Building the labelled set</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You pass 6 chunks to the model. Which of recall@5, recall@6 and MRR do you report to decide between two embedding models, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Recall@6, because the generator can use anything inside the six and nothing outside it. MRR rewards rank 1 over rank 6, which does not matter to a reader who sees all six. See <a href="#metrics">The metrics and what each hides</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A new retriever scores recall@10 of 0.74 against 0.80 for the old one, but when you read the misses many returned passages look correct. What went wrong, and what do you do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The labels are incomplete: they came from the old system, so correct passages that only the new one finds count as misses. Re-label by pooling the top results of both systems and re-run. Do not reject the new retriever on the first number.</p></div></details>
+    </li>
+    <li>
+      <p>A sweep shows a two-point recall gain on the exclusions slice of 80 questions. The change adds a day of work to every re-index. How do you decide?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>First get the paired interval on those 80 questions. If it includes zero, the gain is noise, and the choice is to add questions to that slice and re-run. If it holds, weigh the gain against the cost on the slice with the highest risk. A small, real gain on exclusions can justify a day, while the same gain on definitions may not.</p></div></details>
+    </li>
+    <li>
+      <p>Two reviewers agree on only 60% of relevance labels for the limits slice. What do you do before running any sweep on it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Fix the definition: decide whether a chunk with the limit but not its exception counts as relevant, write that rule down, and relabel. Metrics computed on labels that two people dispute measure the disagreement, not the retriever.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A retrieval metric needs a question, labelled passages and a ranked list, which is why "the answer was wrong" cannot stand in for one.</li>
+    <li>Stratify the labelled set by slice, label every relevant passage, and anchor labels to clauses so chunking changes do not break them.</li>
+    <li>Model pre-labels with a human audit and a measured agreement rate give a set that is cheap to build and still trustworthy.</li>
+    <li>Report recall@k at the k you pass to the model, and nDCG@10 when ordering is what you changed.</li>
+    <li>A sweep changes one thing, uses paired comparison with an interval, reports per slice, and confirms the winner on held-out questions.</li>
+    <li>Labels pooled from several systems stop a better retriever from being scored as a miss.</li>
+  </ul>
+  <p>With retrieval measured, the next question is what the model does with the passages it gets. → <a href="07-context-assembly-and-grounding.html">Context Assembly and Grounding</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener"><strong>BEIR</strong></a> — Thakur et al., 2021. A model for evaluating retrievers across datasets rather than one.</li>
+    <li><a href="https://arxiv.org/abs/1901.04085" target="_blank" rel="noopener"><strong>Passage Re-ranking with BERT</strong></a> — Nogueira and Cho, 2019. An example of reporting MRR@10 on a labelled passage benchmark.</li>
+  </ul>
+  <p>See also <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html">Debugging a wrong RAG answer</a> for the same bisection from the interviewer's side.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Ship Decision — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Paired comparison on the same items, confidence intervals and how many items a given difference needs, per-slice regressions, cost and latency as gates, and…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/05-the-ship-decision">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Ship Decision — Evals for LLM Systems">
+<meta property="og:description" content="Paired comparison on the same items, confidence intervals and how many items a given difference needs, per-slice regressions, cost and latency as gates, and…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/05-the-ship-decision">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#decision">The decision</a>
+    <a href="#paired">Paired comparison</a>
+    <a href="#interval">Bootstrap intervals</a>
+    <a href="#size">How many items</a>
+    <a href="#slices">Slices as blockers</a>
+    <a href="#gates">Non-quality gates</a>
+    <a href="#ci">Wiring it into CI</a>
+    <a href="#no-difference">When nothing differs</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-llm-as-judge.html">← Previous: LLM-as-Judge</a>
+    <a href="06-evaluating-agents.html">Next: Evaluating Agents →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Decisions</span>
+  <h1>The Ship Decision</h1>
+  <p class="subtitle">Paired comparison on the same items, confidence intervals and how many items a given difference needs, per-slice regressions, cost and latency as gates, and wiring it into CI so the decision is made the same way every time.</p>
+</header>
+
+<section id="decision">
+  <h2>The decision this eval serves</h2>
+  <p>A Harbourline engineer rewrites the help-centre assistant's system prompt to explain exclusions better. Someone has to say yes or no to deploying it, and the answer has to be the same whether the engineer, a reviewer or an auditor asks. The earlier chapters gave you the pieces: a labelled set (<a href="02-building-the-eval-set.html">chapter 02</a>), graders (<a href="03-graders.html">chapter 03</a>) and a judge you have checked against people (<a href="04-llm-as-judge.html">chapter 04</a>). This chapter turns two sets of per-item scores into a decision you can defend.</p>
+  <p>The mechanism is statistical, not procedural. Each item gets a score under the old system and under the new one. The question is whether the average difference is real or the product of which items happened to be in the set, and whether the average hides a slice where the change did damage. Three things have to be fixed <em>before</em> you look at results: the items, the comparison method and the thresholds. Any of them chosen afterwards can be bent toward the answer you wanted.</p>
+  <div class="flow">  old system ──► score per item ─┐
+                                 ├─► per-item difference ─► interval
+  new system ──► score per item ─┘                              │
+                                                                ▼
+  slice deltas ──────────────────────────────────────────► gates ─► ship / block
+  p95 latency, cost per item, safety checks ─────────────────┘</div>
+</section>
+
+<section id="paired">
+  <h2>Compare on the same items, item by item</h2>
+  <p>Two systems scored on 400 items give you two accuracies, 80% and 84%. The tempting test treats them as two independent samples of 400 and asks whether 80 and 84 are far apart. They are not independent. Both systems answered the same questions, so the easy items are easy for both and the hard ones hard for both. That shared difficulty is most of the variance in either total, and an unpaired test counts it as noise.</p>
+  <p>A paired comparison removes it. Look at each item and put it in one of four cells: right under both, wrong under both, fixed by the change, broken by the change. Only the last two carry information. If 36 items are fixed and 20 broken, the net gain is 16 items, or 4 points, and the other 344 items say nothing about the difference. The same table gives the win/loss/tie view that reviewers read quickly: 36 wins, 20 losses, 344 ties.</p>
+  <p>The size of the gain from pairing depends on how much the systems agree. With these counts the unpaired 95% interval on the 4-point difference is about ±5.3 points, which includes zero. The paired interval is about ±3.6 points, which does not. The data is the same; only the model of it changed. Pairing helps more the more the two systems agree, and a prompt tweak usually changes few answers, so for the changes you test most often it is large.</p>
+  <div class="callout insight">
+    <span class="callout-label">Two accuracies hide the quantity you need</span>
+    <p>The number that matters is the count of discordant items, where the systems differ. A 4-point gain from 56 changed answers is a different claim from a 4-point gain from 160 changed answers. Always print wins, losses and ties next to the delta.</p>
+  </div>
+</section>
+
+<section id="interval">
+  <h2>A bootstrap interval on the difference</h2>
+  <p>The paired difference per item is +1, 0 or -1. The bootstrap resamples those 400 values with replacement, takes the mean each time, and repeats thousands of times. The middle 95% of the resampled means is the interval. It assumes the items are an independent sample of the traffic you care about, and nothing else about the shape of the data, which is why it suits scores that are bounded and lumpy. Miller's <em>Adding Error Bars to Evals</em> (2024) treats model evaluations as experiments in the same way and gives formulas for comparing two models and for planning an evaluation.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>paired.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import math, random
+
+def paired_report(old, new, n_boot=10_000, seed=7):
+    """old, new: lists of 0/1 per item, same order. Returns delta and 95% bootstrap CI."""
+    assert len(old) == len(new)
+    n = len(old)
+    diffs = [b - a for a, b in zip(old, new)]
+    delta = sum(diffs) / n
+    rng = random.Random(seed)
+    boots = sorted(sum(rng.choices(diffs, k=n)) / n for _ in range(n_boot))
+    lo, hi = boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot)]
+    return delta, (lo, hi), diffs.count(1), diffs.count(-1)
+
+def n_needed(delta, discordant, z_alpha=1.96, z_power=0.84):
+    """Items for a paired test; discordant = share of items where old and new differ."""
+    return math.ceil((z_alpha + z_power) ** 2 * discordant / delta ** 2)</code></pre>
+</div>
+  <p>On the 400-item example this prints a delta of +0.040 with an interval of roughly +0.003 to +0.077, from 36 wins and 20 losses. The lower end sits barely above zero. Read that as "probably better, by an amount we cannot pin down", not "4 points better". If the threshold you set in advance was "lower bound above zero", this change passes by a hair. If it was "at least 2 points", it does not.</p>
+  <p>Two cautions. Items drawn from the same session or the same policy are not independent, so if your set has 5 questions per policy, resample policies, not items, or the interval comes out too narrow. And if the grader is a model judge, the judge's own noise is extra variance; run it with a fixed seed and temperature 0, or average a few runs, and treat a judge change as a change to the instrument that invalidates old comparisons.</p>
+</section>
+
+<section id="size">
+  <h2>How many items a difference needs</h2>
+  <p>A set that is too small cannot tell you anything, and the failure is silent: you see a delta and an interval so wide that neither verdict is justified. Sample size follows from the smallest difference you would act on, and from how often the two systems disagree. For a paired test at 5% significance and 80% power, the approximate count is (1.96 + 0.84)<sup>2</sup> × d / δ<sup>2</sup>, where d is the share of discordant items and δ the difference. That is what <code>n_needed</code> computes.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Difference to detect</th><th>Paired (14% of items differ)</th><th>Unpaired (accuracy near 80%)</th></tr></thead>
+    <tbody>
+      <tr><td>6 points</td><td>about 305 items</td><td>about 610 per system</td></tr>
+      <tr><td>4 points</td><td>about 690 items</td><td>about 1,440 per system</td></tr>
+      <tr><td>2 points</td><td>about 2,740 items</td><td>about 6,030 per system</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Halving the difference quadruples the items. Harbourline's 400-item help-centre set can reliably see a 5 to 6 point gain on the whole set, and cannot see 2 points at all. That is a fact about the set, and it should be written in the eval's README so that nobody reads "no significant change" as "no change". It is also why <a href="02-building-the-eval-set.html">chapter 02</a> treats 50 items as a smoke test: it detects only catastrophic breakage.</p>
+</section>
+
+<section id="slices">
+  <h2>Slices are blockers even when the total improves</h2>
+  <p>The Harbourline prompt change scores +6 points on exclusions: 80 items, 5 net items fixed. It scores -4 points on identifiers (policy and claim numbers, which the assistant must copy exactly): 75 items, 2 items fixed and 5 broken. Suppose the other slices barely move, so the aggregate over 400 items is a small gain with an interval that spans zero. A reader of the aggregate alone sees a wash. A reader of the slices sees a trade, and the trade is not symmetric: a mangled policy number sends a customer to the wrong record, and a better exclusions paragraph is a nicety.</p>
+  <p>Now the statistics get awkward. Seven discordant items on identifiers split 2 to 5, which an exact sign test puts at p = 0.45. You can neither call the regression real nor call it noise. The way out is to decide the rule in advance and to make it asymmetric. For slices where an error is costly, the gate is not "significantly worse" but "shown not to be worse than a margin": the lower bound of the slice's one-sided interval must stay above, say, -3 points. Failing to show safety counts as a block.</p>
+  <p>That rule has a price, and it is worth stating plainly. With about 10% of items differing, showing non-inferiority within 5 points needs roughly 340 items in the slice, and within 3 points roughly 950. A 75-item identifier slice cannot pass either. The consequence is not to relax the gate. It is to grow the slice, by sampling more identifier-heavy production traffic (see <a href="02-building-the-eval-set.html">chapter 02</a>), until the gate can be passed by a good change. A cheap interim measure is a programmatic check on the whole production log that no output alters an identifier string found in the retrieved text.</p>
+  <div class="callout warn">
+    <span class="callout-label">Many slices means many chances to see a fake regression</span>
+    <p>With ten slices and a 5% false-alarm rate each, a harmless change trips one about 40% of the time. Mark which slices are blockers before the run, keep that list short, and treat movement in the others as something to read, not something that stops a release.</p>
+  </div>
+  <p>The rule flips when the slice is small by nature. If a slice is a rare, dangerous case, say 12 claims-denial explanations, no interval will be tight. There you read every item, by hand, on every change. That is a review step, not a statistic, and it is cheaper than it sounds for a dozen items.</p>
+</section>
+
+<section id="gates">
+  <h2>Gates that are not about quality</h2>
+  <p>Accuracy is one gate of several. Latency, cost and safety are also pass or fail, and they are measured on the same run, so there is no reason to evaluate them separately.</p>
+  <ul>
+    <li><strong>Latency p95.</strong> Record time to first token and time to full answer for each item, and gate on the 95th percentile, not the mean. Retrieval and a longer prompt both move the tail first. Gate on a ratio to the current system (for example, no more than 15% worse) so that a slow day on the provider does not read as a regression.</li>
+    <li><strong>Cost per item.</strong> Input and output tokens times the price per token, summed over every call the item made. Prices change, so store the token counts and compute the cost at report time with the price table in force then. A prompt that adds 600 tokens of examples to every call at 13,000 sessions a day is a cost decision, and the report should say so.</li>
+    <li><strong>Safety checks.</strong> Programmatic and binary: no output leaks another customer's data, no refusal-bypass strings, no coverage promise on the forbidden list. These are zero-tolerance gates, with no interval. One failure blocks.</li>
+  </ul>
+  <p>The thresholds belong in a file under version control, set by the person who owns the risk, before the run. A threshold chosen after seeing the numbers measures the numbers, not the system.</p>
+</section>
+
+<section id="ci">
+  <h2>Wiring it into CI</h2>
+  <p>The decision set runs on every change to a prompt, a model version, a retrieval setting or a tool definition. It does not run on every commit: a full run costs money and minutes, so the fast deterministic checks from <a href="01-what-an-eval-is-for.html">chapter 01</a> gate the commit and the decision set gates the merge. The job runs both systems on the set, computes the paired report and the slice table, evaluates the gates, writes the report as a build artefact, and exits non-zero on a block.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>gates.yaml (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-yaml">decision_set: helpcentre-v7        # pinned version; changing it resets the baseline
+baseline: prod                     # the system currently serving traffic
+overall:
+  delta_lower_bound_min: 0.0       # 95% paired interval must not include a loss
+blocking_slices:
+  limits_deductibles: {noninferiority_margin: 0.03}
+  identifiers:        {noninferiority_margin: 0.03}
+  exclusions:         {noninferiority_margin: 0.05}
+latency_p95_ratio_max: 1.15
+cost_per_item_ratio_max: 1.10
+safety_failures_max: 0</code></pre>
+</div>
+  <p>Three details decide whether this survives contact with a team. Keep the baseline run cached against the set version, so the old system is not paid for twice. Save every item's outputs and scores in the report, so a reviewer can open the 20 losses. And log who overrode a block and why; an override is allowed, an invisible one is not. This is also where the traceability a regulator asks for comes from: a dated report per release, the set version and the thresholds in force.</p>
+</section>
+
+<section id="no-difference">
+  <h2>When the result is "no difference"</h2>
+  <p>An interval that spans zero has two meanings that look alike: the change does nothing, or the set was too small to see what it does. Check the interval's width against the smallest difference you care about. If the interval runs from -1 to +2 and you only care about 4 points, you have learned that the change is not worth 4 points, and that is a real answer. If it runs from -4 to +8, you have learned nothing.</p>
+  <p>Then decide on what you do know. A change that is no worse on quality and cheaper or faster ships on those grounds; a change that is no better and adds risk or cost does not. When the cost of waiting is low, collect more items on the slices that matter, or run the change as a canary on live traffic (<a href="08-model-and-prompt-changes.html">chapter 08</a>). Do not re-run until the interval happens to clear zero. Each re-run is another draw, and the chance that one of them clears it by luck grows with every try. Fix the number of runs and the rule beforehand.</p>
+  <p>For how this decision is explained under questioning, see the interview-prep treatment in <a href="../ai-engineer-interview-prep/07-eval-set-and-ship-decision.html">Eval Set &amp; the Ship Decision</a>. Retrieval-specific gates are in <a href="../production-rag-deep-dive/06-measuring-retrieval.html">Measuring Retrieval</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Two prompts score 82% and 85% on the same 300 items, and a colleague runs an unpaired two-proportion test and finds no significant difference. You rerun it paired and find one. What did the paired test use that the first ignored, and what would you check before trusting it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It used the fact that both prompts answered the same items, so shared item difficulty cancels and only the items where the systems differ carry variance. Before trusting it, check how many items differ and whether items are clustered (several per policy), since clustering makes the paired interval too narrow. See <a href="#paired">Paired comparison</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your set has 500 items, and about one in eight answers changes under a typical prompt edit. A product owner asks you to confirm a 2-point improvement. Can you, and what do you tell them?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Detecting 2 points at that disagreement rate needs roughly 2,000 to 2,700 items, so 500 items give an interval several points wide. Say the set can see about 5-point changes, and offer either more items or a live test. See <a href="#size">How many items</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A change lifts the overall score by 2 points and drops the limits-and-deductibles slice by 3 points on 60 items, with an interval including zero. A teammate argues it is within noise and should ship. Where is the argument wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>"Not significantly worse" is the wrong test for a costly slice. An interval that includes zero also includes a large loss, and 60 items cannot rule one out. The gate should demand evidence the slice is no worse than a margin, and a set too small to supply it should be grown. See <a href="#slices">Slices as blockers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Thresholds were written down after a first run showed the new prompt at +1.2 points, and set at "at least +1". The author says the numbers merely recorded the team's expectation. Why does this not count as a pre-set gate, and what would?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A threshold set after seeing the result is fitted to the result and will pass whatever the data show. A real gate is written by the risk owner and committed before the run, tied to a set version. See <a href="#gates">Gates</a> and <a href="#ci">CI wiring</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A change is neither better nor worse, with a paired interval of -1.5 to +1.8 points, and cuts cost per item by 20%. Another is the same on quality but 30% slower at p95. What do you do with each, and what would change your mind about the first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ship the first: the interval excludes any loss larger than about 1.5 points, which is within your margin, and cost improves. Block or rework the second, since quality did not pay for the latency. The first would be reconsidered if a blocking slice lost ground, because the aggregate can hide that. See <a href="#no-difference">When nothing differs</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Compare systems item by item on the same set; the discordant items hold all the information, and a delta without its wins and losses is incomplete.</li>
+    <li>Report a paired bootstrap interval, resampling clusters where items share a source, and read its width against the smallest difference you would act on.</li>
+    <li>Detectable difference scales with 1/√n: halving it costs four times the items, so a 400-item set sees 5 to 6 points, not 2.</li>
+    <li>Slices that carry harm are blockers, tested for non-inferiority against a margin set in advance; a slice too small to pass should be grown, not waved through.</li>
+    <li>Latency p95, cost per item and zero-tolerance safety checks are gates on the same run, with thresholds committed before the run.</li>
+    <li>"No difference" is a result only when the interval is narrow; otherwise it means the set cannot answer, and re-running until it clears zero is not a remedy.</li>
+  </ul>
+  <p>Quality on a single answer is the easy case; a system that calls tools has to be judged on what it did, not only on what it said. → <a href="06-evaluating-agents.html">Evaluating Agents</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2411.00640" target="_blank" rel="noopener"><strong>Adding Error Bars to Evals</strong></a> — Evan Miller, 2024. Statistical treatment of LLM evals as experiments: comparing two models and planning an evaluation.</li>
+    <li><a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener"><strong>τ-bench</strong></a> — Yao et al., 2024. Why repeated trials matter when the same item can pass once and fail the next time.</li>
+    <li><a href="https://arxiv.org/abs/2407.01502" target="_blank" rel="noopener"><strong>AI Agents That Matter</strong></a> — Kapoor et al., 2024. Argues for reporting cost with accuracy and for holdout sets; the basis for the cost gate here.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

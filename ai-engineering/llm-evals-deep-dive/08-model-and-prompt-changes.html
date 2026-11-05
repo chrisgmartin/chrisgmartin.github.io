@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Model and Prompt Changes — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Regression suites for prompt edits and model upgrades, pinning and canaries, shadow traffic, what changes silently between versions, and the rollback you…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/08-model-and-prompt-changes">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Model and Prompt Changes — Evals for LLM Systems">
+<meta property="og:description" content="Regression suites for prompt edits and model upgrades, pinning and canaries, shadow traffic, what changes silently between versions, and the rollback you…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/08-model-and-prompt-changes">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#silent">What changes silently</a>
+    <a href="#pinning">Pinning, and what it buys</a>
+    <a href="#regression">The regression suite per change</a>
+    <a href="#traffic">Shadow and canary traffic</a>
+    <a href="#prompts">Prompt diffs as code</a>
+    <a href="#rollback">Rollback you have rehearsed</a>
+    <a href="#deprecation">Deprecation timelines</a>
+    <a href="#checklist">Migration checklist</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-evaluating-rag.html">← Previous: Evaluating RAG</a>
+    <a href="09-online-signals-and-drift.html">Next: Online Signals and Drift →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Decisions</span>
+  <h1>Model and Prompt Changes</h1>
+  <p class="subtitle">Regression suites for prompt edits and model upgrades, pinning and canaries, shadow traffic, what changes silently between versions, and the rollback you rehearse before you need it.</p>
+</header>
+
+<section id="silent">
+  <h2>What changes silently</h2>
+  <p>A model swap looks like a one-line config change, and the headline benchmark usually improves. What you ship is not the benchmark. It is the behaviour your prompt, parser and downstream rules were tuned against, and a new version changes that behaviour in places nobody announces. Harbourline's help-centre assistant is the example: suppose its model is deprecated and the vendor names a successor. The questions that decide the migration are not "is the successor smarter" but "what did it change that our system depends on".</p>
+  <p>The usual silent changes, in rough order of how often they bite:</p>
+  <ul>
+    <li><strong>Tokenisation.</strong> A new tokenizer changes token counts for the same text, which changes cost, latency and how much fits in a context window. Anthropic's models overview states that 1M tokens is about 555k words on the tokenizer introduced with Claude Opus 4.7, against about 750k words for earlier models (as of November 2026). That is roughly a third more tokens for the same policy wording. A prompt that stuffed five chunks to a token budget now fits fewer, and the bill moves with it.</li>
+    <li><strong>Refusal and hedging behaviour.</strong> A model that now adds "please consult your policy documents" to every deductible answer can fail a correctness grader and raise escalations while being technically right.</li>
+    <li><strong>Formatting.</strong> Markdown, list style, how citations are rendered, whether JSON arrives wrapped in a code fence. Parsers fail here before graders do.</li>
+    <li><strong>Tool-call style.</strong> How eagerly the model calls tools, how it orders calls, how it phrases arguments. For the claims-intake and customer-service agents this is the largest risk; <a href="06-evaluating-agents.html">chapter 06</a> covers the trajectory checks that catch it.</li>
+    <li><strong>Latency and length.</strong> Longer answers and more reasoning per turn change time to first token and total cost per session.</li>
+    <li><strong>Request parameters.</strong> Anthropic's deprecations page lists <code>temperature</code>, <code>top_p</code> and <code>top_k</code> as removed in API version 2026-10-21, with a 400 error when sent. Code that pinned determinism through sampling settings can fail loudly or quietly lose its determinism, depending on the model and API version. Check the page for the exact rules.</li>
+  </ul>
+  <p>Providers also change a model that keeps its name. Chen, Zaharia and Zou (2023) re-ran the same prompts against two dated releases of the same hosted models and found large shifts: GPT-4's accuracy on a prime-versus-composite task fell from 84% in March 2023 to 51% in June, formatting errors in generated code rose, and willingness to answer sensitive questions fell. The lesson is not that any one vendor drifts. It is that "same model name" is a hypothesis you test, not a fact you assume.</p>
+</section>
+
+<section id="pinning">
+  <h2>Pinning, and what it buys</h2>
+  <p>Pin the exact model identifier in configuration, never a moving alias. The reason is causal: when production quality moves, you need to know whether you changed something. Anthropic states that every Claude API model ID is a pinned snapshot, including the dateless IDs used from the 4.6 generation on; for older models an alias is a convenience pointer that resolves to a dated ID. OpenAI's deprecations page shows an alias and its dated snapshot retired together. So pinning gives you stable behaviour for a while, and it does not extend the model's life.</p>
+  <p>Pinning also has limits you should not oversell to a reviewer. It fixes the weights you call. It does not fix the platform in front of them: a cloud partner platform may set its own retirement schedule, the API version may change accepted parameters, and a hosted system prompt or safety layer may change independently. Record in every eval run the model id, API version, prompt hash, tool schema hash, retrieval index snapshot and sampling settings. When two runs disagree, that record is what lets you say why.</p>
+</section>
+
+<section id="regression">
+  <h2>The regression suite per change</h2>
+  <p>Every change to a model, prompt, tool schema or retriever runs the same suite, and the suite is the eval set from <a href="02-building-the-eval-set.html">chapter 02</a> plus the checks from earlier chapters. For the help-centre assistant that means the roughly 400 labelled items scored per slice with the graders of <a href="03-graders.html">chapter 03</a>, the citation checks from <a href="07-evaluating-rag.html#citations">chapter 07</a>, and format, length and latency assertions. For the agents it means the roughly 150 claims trajectories against reference tool sequences.</p>
+  <p>The comparison must be paired. Both versions answer the same items, and the unit of analysis is the item, not the pass rate. A change can improve the aggregate while breaking items that used to pass, and the broken items are what a reviewer and a customer care about. Count the discordant pairs: items the old version passed and the new fails (regressions), and items the new passes that the old failed (fixes). An exact McNemar test asks whether the two directions are equally likely.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>paired_change.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import math
+
+def exact_mcnemar(b, c):
+    """b: old passes, new fails. c: new passes, old fails.
+    Two-sided exact binomial test under H0: both are equally likely (p = 0.5)."""
+    n, k = b + c, min(b, c)
+    p = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * p)
+
+old_pass = 330                     # of 400 items: 82.5%
+b, c = 17, 21                      # regressions, fixes
+print("old", old_pass / 400, "new", (old_pass - b + c) / 400)
+print("discordant pairs", b + c, "p =", round(exact_mcnemar(b, c), 3))</code></pre>
+  </div>
+  <p>This prints 82.5% to 83.5% on 38 discordant pairs with p of about 0.63. Four things follow. The new version is not shown to be better. It is also not shown to be worse. The 17 regressions still deserve reading item by item, because a handful on the exclusions slice matter more than 21 fixes on definitions. And 400 items cannot resolve a one-point difference at all, which is the arithmetic behind the stopping rules in <a href="05-the-ship-decision.html">chapter 05</a>. Set the bar before the run: for instance, no slice may lose more than a stated number of items, and zero regressions are allowed on the items tagged high-cost.</p>
+  <p>Run each item more than once when outputs are stochastic, and report the spread. If sampling controls are not available for the new model, run-to-run variance is something you measure rather than set to zero. A difference smaller than your own repeat noise is not a result.</p>
+</section>
+
+<section id="traffic">
+  <h2>Shadow and canary traffic</h2>
+  <p>The offline suite tells you about the questions you thought of. Real traffic contains the ones you did not, so the second gate is production, in two stages.</p>
+  <div class="flow">  live request ──▶ current model ──▶ answer shown to customer
+        │
+        └─────▶ candidate model ──▶ answer logged, NOT shown     (SHADOW)
+                        │
+                        └─▶ online checks: citations resolve, format valid,
+                            length, latency, judge score vs current answer
+
+  then:  1–5% of sessions get the candidate's answer                 (CANARY)
+         compare escalation, re-ask, thumbs, task completion by arm</div>
+  <p><strong>Shadow</strong> sends a copy of each request to the candidate and discards the answer after scoring it. It costs tokens but exposes no customer. It is where you run the cheap, deterministic online checks plus an LLM judge that compares the two answers pairwise, with the position-bias and verbosity controls from <a href="04-llm-as-judge.html">chapter 04</a>. Shadow cannot measure what the customer does next, because the customer never saw the candidate's answer.</p>
+  <p><strong>Canary</strong> routes a small random share of live sessions to the candidate, so outcome signals exist. Size it from the effect you need to detect. If escalation runs near 10% and a 2-point rise is the smallest harm you would act on, a two-arm comparison at 5% significance and 80% power needs roughly 3,500 sessions per arm. At 13,000 sessions a day, a 5% canary yields about 650 candidate sessions a day, so about five and a half days. Assign by customer, not by message, so one conversation does not mix versions, and exclude sessions where the customer has seen both.</p>
+  <p>The advice flips for the agents. A shadow run of the customer-service agent must stub the write tools: executing an address or payment change twice, once for each model, is real harm. Run shadow with read tools live and write tools recorded but not executed, and compare the proposed write against the production agent's. Canary for write-capable agents should start with confirmation-required actions only, which is what Harbourline already enforces.</p>
+</section>
+
+<section id="prompts">
+  <h2>Prompt diffs reviewed like code</h2>
+  <p>A prompt edit is a behaviour change with no compiler. Treat it as code: keep the prompt in a file in the repository, change it in a pull request, and let continuous integration run the regression suite on the branch. The reviewer needs two diffs, not one. The first is the text change. The second is the output change: the list of items whose graded result or answer text differs between the base and the branch, with before and after side by side. The output diff is where reviewers find that a "clarify tone" edit quietly dropped the jurisdiction caveat.</p>
+  <p>Keep edits small and separable. A pull request that rewrites the system prompt, adds two examples and bumps the model gives you no way to attribute a movement. If you must change model and prompt together, because the new model needs different instructions, run the matrix: old model with old prompt, old model with new prompt, new model with old prompt, new model with new prompt. The four cells tell you which change did what, and they cost four suite runs, not forty.</p>
+</section>
+
+<section id="rollback">
+  <h2>Rollback you have rehearsed</h2>
+  <p>A rollback plan that has never run is a hope. Make the model id, the prompt version and the tool schema version configuration values that a flag flips, not code that needs a deploy. Keep the previous version deployable and keep the previous model reachable for the whole canary period, which matters because a retired model cannot be rolled back to. Define the trigger in advance in measurable terms: a named online metric crossing a named threshold for a named window, for example citation-resolution rate below a floor for 30 minutes.</p>
+  <p>Then rehearse it. Once a quarter, flip the staging flag back and forth under load and record the time to revert and whether in-flight sessions, caches and the logging pipeline behaved. The rehearsal finds the real problems: a cache keyed without the model id that serves the old answers to the new model's sessions, a conversation store whose state format changed, a dashboard that stops tagging the version. Rolling back an agent mid-conversation is the hard case, since half the tool calls were planned by one model. Decide whether sessions finish on the version that started them.</p>
+</section>
+
+<section id="deprecation">
+  <h2>Deprecation timelines</h2>
+  <p>You do not always choose the date. Vendor policies as of November 2026:</p>
+  <table>
+    <thead><tr><th>Vendor</th><th>Stated notice</th><th>How you find out</th></tr></thead>
+    <tbody>
+      <tr><td>Anthropic</td><td>At least 60 days before retirement for publicly released models</td><td>Email to customers with active deployments, and the model deprecations page</td></tr>
+      <tr><td>OpenAI</td><td>At least 6 months for generally available models, 3 months for specialised variants, as little as 2 weeks for preview models, unless safety or compliance requires faster</td><td>Email to active users, the deprecations page, and a <code>shutdown_date</code> field on the models endpoint</td></tr>
+    </tbody>
+  </table>
+  <p>Anthropic's page shows what 60 days looks like in practice: one Claude model was marked deprecated on 30 September 2026 with retirement on 30 November 2026. That is the whole window for building the comparison set, running the suite, canarying and finishing the change. Partner clouds set their own schedules, so a model can live longer on one platform than another. Work backwards from the retirement date: the suite must already exist before the notice arrives, because two months is not enough time to build an eval set and also migrate. Poll the lifecycle data your vendor exposes and alert on a retirement date inside your longest migration time. If the notice is long, spend the slack on a second candidate, not on waiting.</p>
+</section>
+
+<section id="checklist">
+  <h2>Migration checklist</h2>
+  <p>For the help-centre assistant moving to a new model version, in order:</p>
+  <ol>
+    <li>Record the baseline: model id, API version, prompt hash, index snapshot, and the current suite results per slice.</li>
+    <li>Re-count tokens on a sample of real prompts. Update context budgets, chunk counts and the cost model.</li>
+    <li>Run the offline suite twice on each side. Compare paired, per slice, and read every regression on the high-cost slices.</li>
+    <li>Check structured outputs, citation format and tool-call schemas with deterministic assertions.</li>
+    <li>Fix the prompt in a separate pull request, with its own output diff, and re-run the four-cell matrix if both changed.</li>
+    <li>Shadow for a few days; review the pairwise judge results and the disagreements, sampling disagreements for human review.</li>
+    <li>Canary at a small share sized to the effect you care about; watch escalation, re-ask rate and completion by arm.</li>
+    <li>Rehearse the rollback with the flag, then ramp. Keep the old version reachable until the retirement date is far away or you no longer need it.</li>
+    <li>Write the new baseline, and add every canary failure to the eval set (see <a href="09-online-signals-and-drift.html#loop">chapter 09</a>).</li>
+  </ol>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>The candidate model scores 83.5% on the 400-item help-centre set against 82.5% for the current one. A colleague wants to ship. What do you compute before answering, and why does the aggregate not settle it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Count items that regressed and items that were fixed, and test the discordant pairs. Here 17 versus 21 gives p of about 0.63, so no difference is shown, and the aggregate hides which items broke. Read the regressions on the high-cost slices. See <a href="#regression">the regression suite</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a model upgrade, correctness graders pass the same answers as before, yet context-window errors and the monthly bill both rise. What changed, and what should have caught it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Most likely tokenisation: the same text now costs more tokens, so fewer chunks fit and spend rises. A token-count check on real prompts and a cost-per-session assertion in the suite would have caught it. Quality graders do not see it. See <a href="#silent">what changes silently</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You want to shadow-test the customer-service agent's new version on live traffic. What must be true of the write tools, and what do you compare instead of outcomes?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Write tools must be recorded, not executed, or the change happens twice. You compare the candidate's proposed tool calls and arguments with the production agent's, since the customer never sees the candidate's reply and so no outcome exists. See <a href="#traffic">shadow and canary</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A change bumps the model and rewrites the system prompt in one pull request, and escalations rise. How do you attribute the rise?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Run all four combinations of old and new model with old and new prompt on the suite, and on a canary if the offline suite does not reproduce it. The cells show whether the model, the prompt or their interaction moved the metric. See <a href="#prompts">prompt diffs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The vendor gives 60 days' notice that your model retires, and you have no regression suite. Do you spend the first month building the suite or evaluating candidate models? Argue for one.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Build a small suite first, since a candidate cannot be judged without it, and seed it from logged production questions and the highest-cost slices. Start candidate runs as soon as 100 items exist, in parallel with growing it. The deciding factor is the cost of error: with write tools or coverage answers, a thin suite is not a basis to ship, and you should ask the vendor or platform about extended availability. See <a href="#deprecation">deprecation timelines</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A model or prompt change moves tokenisation, refusal behaviour, formatting, tool-call style, latency and parameters that your graders may not see; test for each, not only for answer accuracy.</li>
+    <li>Pin exact model ids and record the full run configuration; pinning stabilises behaviour but does not extend a model's life.</li>
+    <li>Compare versions item by item and test the discordant pairs; a one-point aggregate move on 400 items is noise, and regressions on high-cost slices decide.</li>
+    <li>Shadow traffic checks the candidate without exposing customers; canary traffic measures outcomes and needs thousands of sessions per arm to see a two-point change.</li>
+    <li>Prompts live in the repository, change by pull request and are reviewed as output diffs; change model and prompt separately or run the four-cell matrix.</li>
+    <li>Rollback is a flag, a written trigger and a rehearsal; vendor notice periods range from weeks to months, so the suite must exist before the notice does.</li>
+  </ul>
+  <p>Once a change is live, the question becomes how you notice quality moving when nobody changed anything. → <a href="09-online-signals-and-drift.html">Online Signals and Drift</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/about-claude/model-deprecations" target="_blank" rel="noopener"><strong>Anthropic: Model deprecations</strong></a> — lifecycle states, the 60-day notice commitment, retirement dates, and removed request parameters (as of November 2026).</li>
+    <li><a href="https://platform.claude.com/docs/en/about-claude/models/overview" target="_blank" rel="noopener"><strong>Anthropic: Models overview</strong></a> — model ids as pinned snapshots, and the tokenizer note on words per million tokens.</li>
+    <li><a href="https://developers.openai.com/api/docs/deprecations" target="_blank" rel="noopener"><strong>OpenAI: Deprecations</strong></a> — notice periods by model class, the <code>shutdown_date</code> field, and alias and snapshot retirement dates.</li>
+    <li><a href="https://arxiv.org/abs/2307.09009" target="_blank" rel="noopener"><strong>How is ChatGPT's behavior changing over time?</strong></a> — Chen, Zaharia and Zou, 2023. Measured behaviour shifts between two releases of one hosted model.</li>
+    <li><a href="https://www.anthropic.com/research/demystifying-evals-for-ai-agents" target="_blank" rel="noopener"><strong>Demystifying evals for AI agents</strong></a> — Anthropic, January 2026. Why a maintained suite lets a team assess a new model in hours, and the Qodo example of one-shot evals missing gains on longer tasks.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lexical, Dense and Hybrid Retrieval — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapter 03 gave you vectors. Here they meet BM25: what each retriever computes and the queries it loses, how Reciprocal Rank Fusion and weighted fusion combine…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/04-lexical-dense-and-hybrid-retrieval">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Lexical, Dense and Hybrid Retrieval — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Chapter 03 gave you vectors. Here they meet BM25: what each retriever computes and the queries it loses, how Reciprocal Rank Fusion and weighted fusion combine…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/04-lexical-dense-and-hybrid-retrieval">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#failure">Two queries, two failures</a>
+    <a href="#bm25">What BM25 computes</a>
+    <a href="#dense">What dense retrieval computes</a>
+    <a href="#fusion">Fusing the two lists</a>
+    <a href="#filters">Filters and the ANN index</a>
+    <a href="#ann">Index choices and their cost</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="03-embeddings.html">← Previous: Embeddings</a>
+    <a href="05-reranking.html">Next: Reranking →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Retrieving</span>
+  <h1>Lexical, Dense and Hybrid Retrieval</h1>
+  <p class="subtitle">Chapter 03 gave you vectors. Here they meet BM25: what each retriever computes and the queries it loses, how Reciprocal Rank Fusion and weighted fusion combine the two lists, and what filters and the ANN index do to recall. This is the stage that decides whether the answering passage reaches the reranker at all.</p>
+</header>
+
+<section id="failure">
+  <h2>Two queries, two failures</h2>
+  <p>Harbourline's help-centre assistant gets two questions on the same afternoon. One is "form HO-3 water backup". The other is "is my sump pump covered". The first names a form and a peril. The second names neither. A dense retriever tuned on paraphrase handles the second well and often misses the first, because an identifier such as <code>HO-3</code> is a few word pieces to an embedding model and sits near every other homeowner form. A lexical retriever does the reverse: it finds the exact string in the first query and finds nothing for "sump pump" if the wording says "sewer or drain backup".</p>
+  <p>This chapter is about running both, fusing the lists, and the index that makes the dense half fast. It builds on the <a href="03-embeddings.html">embedding chapter</a>, which covers what the vectors are, and it feeds <a href="05-reranking.html">reranking</a>, which re-scores whatever this stage returns. The target is the coverage clause of the <a href="01-the-retrieval-contract.html">retrieval contract</a>: the answering passage must be in the candidate set at all.</p>
+</section>
+
+<section id="bm25">
+  <h2>What BM25 computes</h2>
+  <p>BM25 scores a document against each query term and adds the scores. For a term <em>t</em> in document <em>d</em>:</p>
+  <div class="flow">score(d, q) = sum over t in q of  idf(t) * tf * (k1 + 1)
+                                          ---------------------------
+                                          tf + k1 * (1 - b + b * |d| / avgdl)
+
+tf    = count of t in d            idf = rarity of t across the corpus
+k1    = tf saturation (1.2 is the common default)
+b     = length normalisation, 0..1 (0.75 is the common default)</div>
+  <p>Three effects follow from the formula, and each predicts behaviour. First, <strong>idf</strong> makes rare terms dominate. "HO-3" appears in a fraction of documents, so it carries most of the score. "Water" appears everywhere and carries little. Second, <strong>saturation</strong> caps the reward for repetition: the tenth occurrence of a term adds far less than the second, so a long wording that says "backup" forty times does not beat a short one that says it three times by a factor of thirteen. Third, <strong>length normalisation</strong> penalises long documents, and <code>b</code> sets how hard. At <code>b = 0</code> a 300-page wording wins on raw term counts. At <code>b = 1</code> short procedure pages win. Chunks are more uniform in length than whole documents, which is one reason BM25 over chunks behaves better than BM25 over files. The formula is the standard form from Robertson and Zaragoza's 2009 survey. The defaults above are the common ones in Lucene-family engines, but check your engine.</p>
+  <p>BM25 wins on any query where the user's words are the document's words: policy numbers, form codes, endorsement names, a quoted phrase from a letter. It loses when the vocabulary differs, and it ignores word order and meaning entirely. It also depends on analysis: if your tokenizer splits <code>HO-3</code> into <code>ho</code> and <code>3</code>, the identifier match degrades into two common tokens. Test the tokenizer on your identifiers before you tune anything else.</p>
+</section>
+
+<section id="dense">
+  <h2>What dense retrieval computes</h2>
+  <p>A bi-encoder maps the query and each chunk to vectors independently, and retrieval is the nearest-neighbour search over those vectors. The chunk vectors are computed once at index time. Only the query is embedded at request time. That asymmetry is why it scales, and it is also its limit: the model compresses a whole chunk into one point before it has seen the query, so detail that does not move the point is lost. Numbers, negation, and exact identifiers are the usual casualties, as the embedding chapter explains.</p>
+  <p>Dense retrieval wins on intent and paraphrase. "Is my sump pump covered" lands near the passage on "sewer or drain backup" because training pushed those phrasings together. It also wins across languages and across the gap between customer wording and legal wording, which is wide in insurance.</p>
+  <p>The two methods fail on different queries, which is the evidence for running both. The BEIR benchmark, which tests retrievers zero-shot across a range of datasets, found BM25 a robust baseline that dense models often did not beat out of domain (Thakur et al., 2021). Your own evidence is the per-slice table from the <a href="01-the-retrieval-contract.html">labelled set</a>: compute recall@20 for BM25 and for dense on each slice. Expect lexical to lead on the identifiers slice and dense to lead on definitions and procedures. If one method wins every slice by a wide margin, hybrid buys little and you should say so and skip it.</p>
+</section>
+
+<section id="fusion">
+  <h2>Fusing the two lists</h2>
+  <p>You now hold two ranked lists with scores on incompatible scales. A BM25 score is unbounded and depends on the query's length and the corpus. A cosine similarity lives between roughly 0.2 and 0.9 and clusters tightly. Adding them directly lets whichever has the larger spread dominate.</p>
+  <p><strong>Reciprocal Rank Fusion</strong> sidesteps the problem by ignoring scores. Each list contributes <code>1 / (k + rank)</code> for each document, ranks start at 1, and a document absent from a list contributes nothing. Documents are sorted by the sum (Cormack, Clarke and Buettcher, 2009). A chunk ranked 1st by BM25 and 5th by dense scores 1/61 + 1/65. A chunk ranked 1st in one list and absent from the other scores 1/61, so agreement between lists beats a single strong vote, but only narrowly.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>rrf.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def rrf(lists, k=60, top=20):
+    """lists: ranked lists of chunk ids, best first."""
+    score = {}
+    for ranked in lists:
+        for rank, cid in enumerate(ranked, start=1):
+            score[cid] = score.get(cid, 0.0) + 1.0 / (k + rank)
+    return sorted(score, key=score.get, reverse=True)[:top]
+
+bm25_hits  = ["c7", "c2", "c9", "c4"]
+dense_hits = ["c2", "c5", "c7", "c1"]
+print(rrf([bm25_hits, dense_hits]))   # c2 and c7 lead: both lists found them</code></pre>
+</div>
+  <p>The constant <em>k</em> sets how fast the reward decays with rank. Small <em>k</em> makes rank 1 dominate. Large <em>k</em> flattens the curve so deep ranks still count. The paper settled on <em>k</em> = 60 from a preliminary investigation, and Elasticsearch ships 60 as its default <code>rank_constant</code> (as of November 2026). Treat 60 as a sound start, then sweep 10, 30, 60 and 100 on the labelled set. Only the candidate depth feeds in, so the window matters as much as <em>k</em>: fusing two top-10 lists gives the fusion at most 20 candidates to work with, and a chunk at dense rank 25 cannot be rescued. Elasticsearch calls this <code>rank_window_size</code>. Fuse from 50 to 100 per list, then cut.</p>
+  <p><strong>Weighted score fusion</strong> normalises each list, for example min-max over the returned scores, then takes <code>w * lexical + (1 - w) * dense</code>. It can beat RRF when you have enough labels to fit <em>w</em>, because it keeps the information that the top dense hit is far ahead of the second. It costs you: min-max over a top-100 list shifts with every query, and a weight tuned on one slice can hurt another. Pick RRF to start. Pick weighted fusion when the sweep shows a gain that survives on every slice, or when you need a query-type switch, such as weighting lexical higher when the query contains a form code. That switch is a legitimate use of the weights, because the identifiers slice is where lexical earns its place.</p>
+  <p>On where to run it: one engine that does both (Elasticsearch, OpenSearch, Weaviate, Qdrant and Postgres with pgvector plus full-text search can all return a lexical and a vector list) keeps one copy of the data, one set of filters and one consistency story. Two engines let you pick the best of each and cost you a sync pipeline and fusion in application code. The flip: if you already operate a mature lexical cluster and the vector side is new, keeping both is cheaper than migrating. If the corpus is 300k chunks, one engine is almost always right.</p>
+</section>
+
+<section id="filters">
+  <h2>Filters and the ANN index</h2>
+  <p>Harbourline's filters are not optional. A question about a UK policy must not return a US wording, and a question about a 2025 policy should prefer the 2025 version. These are metadata filters on <code>jurisdiction</code>, <code>product</code> and <code>effective_date</code>. <a href="08-freshness-tenancy-and-access.html">Chapter 08</a> covers them as access control. Here the point is how they interact with the index.</p>
+  <p><strong>Post-filtering</strong> runs the approximate search first, then drops results that fail the filter. If the filter keeps 10% of chunks and the search returns 40 candidates, about 4 survive. The pgvector documentation gives exactly this example with its default search width of 40 (as of November 2026). <strong>Pre-filtering</strong> restricts the search to matching chunks first. It returns a full list, but the graph traversal must route around excluded nodes, and engines handle this differently: some switch to an exact scan when the filter is selective, some apply the filter during traversal. The result for you is a rule: the more selective the filter, the more the engine's strategy matters, and the more you must test recall <em>with the filter on</em>. A recall number measured on unfiltered queries says nothing about production, where every query is filtered.</p>
+  <p>Two defences. In pgvector, since version 0.8.0, iterative index scans (<code>hnsw.iterative_scan</code>) keep scanning until enough rows pass the filter or a tuple limit (20,000 by default) is hit. In any engine, a highly selective filter such as one tenant out of thousands is better served by a partition or a separate index than by a filter.</p>
+</section>
+
+<section id="ann">
+  <h2>Index choices and their cost</h2>
+  <p>Exact (flat) search compares the query to every vector. At the roughly 667,000 chunks of 1,024 dimensions that <a href="03-embeddings.html#arithmetic">chapter 03</a> arrives at for Harbourline, that is 667,000 dot products per query, about 2.7 GB of float32 vectors to scan. It is simple, exact and often fast enough below a few hundred thousand vectors. Do not add an approximate index until a measured latency says you need one, because the index trades recall for speed and the trade is silent.</p>
+  <p>Past that size you choose between two families. <strong>HNSW</strong> (Malkov and Yashunin, 2016) builds a layered graph. A query enters at the sparse top layer and descends, greedily moving to closer neighbours, and the authors report logarithmic scaling of search cost. Three parameters matter. <code>M</code> is the number of links per node: higher gives better recall and a bigger graph. <code>ef_construction</code> is the candidate list while building: higher gives a better graph and a slower build. <code>ef_search</code> is the candidate list at query time, and it is the dial you turn in production: higher raises recall and latency together. pgvector's defaults are <code>m = 16</code>, <code>ef_construction = 64</code> and <code>ef_search = 40</code> (as of November 2026). <strong>IVF</strong> clusters the vectors, then searches only the nearest <code>nprobe</code> clusters. It builds faster and uses less memory than HNSW, but recall depends on whether the query's neighbours sit across a cluster boundary, and it needs training data representative of the corpus.</p>
+  <table>
+    <thead><tr><th>Index</th><th>Recall</th><th>Query speed</th><th>Memory</th><th>Pick when</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Flat</td><td>Exact</td><td>Linear in corpus</td><td>Vectors only</td><td>Under a few hundred thousand vectors, or as the ground truth for tuning</td></tr>
+      <tr><td class="term">HNSW</td><td>High, tunable by <code>ef_search</code></td><td>Fast</td><td>Vectors plus graph, held in RAM for speed</td><td>Default for interactive search</td></tr>
+      <tr><td class="term">IVF</td><td>Depends on <code>nprobe</code></td><td>Fast</td><td>Lower than HNSW</td><td>Large corpora where RAM is the limit</td></tr>
+    </tbody>
+  </table>
+  <p>Measure index recall against the flat result for the same queries: of the true top-20, how many does the index return? That number is separate from retrieval quality and is the one that <code>ef_search</code> moves. Pick the smallest <code>ef_search</code> that gets index recall above 0.98 under your real filters, then spend the rest of your latency budget on reranking.</p>
+  <p>Postgres with pgvector versus a dedicated store is mostly an operations question at this scale. pgvector indexes up to 2,000 dimensions for <code>vector</code> and 4,000 for <code>halfvec</code> (as of November 2026), keeps vectors beside your relational metadata so filters and joins are native, and gives you one backup story. A dedicated store earns its place when you need very large corpora, built-in hybrid search with managed fusion, or throughput that would contend with your transactional load. For roughly 12k documents, start in the database you already run, and move when a measurement, not a roadmap slide, says to.</p>
+  <div class="callout warn">
+    <span class="callout-label">A speed-up that hides a recall loss</span>
+    <p>Lowering <code>ef_search</code> from 100 to 40 cuts latency and removes the true neighbours that the graph walk did not reach. The chunk that answers "water backup limit" is gone before reranking or the model ever sees it. Always re-run the labelled-set recall after any index parameter change.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A customer asks about "endorsement HO 04 61". Dense retrieval returns three scheduled-property endorsements with other numbers. Why does BM25 get this right, and what would break it even though the string is in the corpus?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The rare token carries a high idf, so a chunk containing it outscores chunks with only common words, while the embedding places all endorsement text close together. It breaks if the analyser splits the code into common fragments such as "ho", "04" and "61", which destroys the rarity. See <a href="#bm25">What BM25 computes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You fuse a BM25 top-10 and a dense top-10 with RRF and recall@10 of the fused list is lower than dense alone. Name two causes you would check first.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Candidate depth is too shallow, so documents ranked 11 to 50 in one list cannot be promoted, and the lexical list is mostly noise on queries without identifiers, where its votes displace good dense hits. Deepen both lists to 50 to 100 and test a query-type weight. See <a href="#fusion">Fusing the two lists</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate proposes min-max normalising both scores and adding them with weight 0.5 "because it uses more information than ranks". What do you ask before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask whether the gain holds on every slice and not just the average, and how stable the normalisation is, since min-max over a top-100 list shifts per query. If the sweep shows no gain, RRF wins on simplicity. If one slice improves and another regresses, the weight should depend on query type.</p></div></details>
+    </li>
+    <li>
+      <p>Recall@20 on the labelled set is 0.91 unfiltered and 0.74 once the jurisdiction filter is applied, with the same index. Where is the loss, and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The approximate search is returning too few candidates that pass the filter: with post-filtering, the filter discards most of a small candidate list. Raise the search width, turn on iterative scanning or pre-filtering, or partition by jurisdiction. See <a href="#filters">Filters and the ANN index</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The corpus is 12k documents and p95 latency is 40 ms with an exact scan. A colleague wants HNSW "for scale". Make the judgement.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep the exact scan: it has no recall loss and the latency is well inside budget. HNSW wins when the scan crosses your latency budget, or the corpus grows by an order of magnitude. Until then the index adds a tuning surface and a silent recall loss. The flip condition is measured latency, not anticipated size.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>BM25 wins when the user's words are the document's words, and dense wins when they are not, so the identifiers slice and the definitions slice should show opposite leaders.</li>
+    <li>Tokenisation decides whether an identifier is a rare term or two common ones. Test it on form and policy numbers first.</li>
+    <li>RRF fuses ranks, not scores, so it needs no calibration. Start at k = 60, fuse from 50 to 100 candidates per list, and sweep k on your set.</li>
+    <li>Weighted fusion earns its place only when the gain holds on every slice, or when the weight switches by query type.</li>
+    <li>Measure recall with the production filters switched on. Post-filtering silently shrinks the candidate list.</li>
+    <li>Below a few hundred thousand vectors, an exact scan is a respectable default. Above it, tune <code>ef_search</code> against the exact result before touching anything else.</li>
+  </ul>
+  <p>Fusion gets the right chunk into the candidate set. Getting it to the top of that set is a different tool. → <a href="05-reranking.html">Reranking</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf" target="_blank" rel="noopener"><strong>Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods</strong></a> — Cormack, Clarke and Buettcher, 2009. Two pages; the source of the formula and k = 60.</li>
+    <li><a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener"><strong>BEIR</strong></a> — Thakur et al., 2021. Evidence that BM25 is a strong out-of-domain baseline.</li>
+    <li><a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener"><strong>Efficient and robust approximate nearest neighbor search using HNSW graphs</strong></a> — Malkov and Yashunin, 2016. The graph structure behind <code>M</code> and <code>ef</code>.</li>
+    <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener"><strong>pgvector README</strong></a> — HNSW and IVFFlat options, defaults, and iterative scans for filtered queries.</li>
+    <li><a href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/reciprocal-rank-fusion" target="_blank" rel="noopener"><strong>Elasticsearch reciprocal rank fusion</strong></a> — the formula as implemented, with <code>rank_constant</code> and <code>rank_window_size</code>.</li>
+  </ul>
+  <p>For the interview framing of the same material, see <a href="../ai-engineer-interview-prep/03-hybrid-search-and-reranking.html">Hybrid search and reranking</a>, and for how this stage sits in a regulated deployment, <a href="../ai-engineer-compliance/06-rag-applied.html#vector-dbs">RAG applied</a>.</p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

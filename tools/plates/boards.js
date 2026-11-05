@@ -115,6 +115,30 @@
     d.note(312,236,'40k chats/day\n6k claims/day',{size:10});
     d.note(14,300,'answer aloud first · then open the probes');
   };
+  B['ai-engineering/production-rag-deep-dive']=function(d){
+    d.title('A chain of contracts');
+    var f=d.flow(84,['parse','chunk','embed','retrieve','rerank','assemble'],{x:10,w:56,h:34,gap:7,size:9.5});
+    d.text(200,62,'each layer owes the next something specific',{size:10.5});
+    d.ring(68,78,66,46);d.note(14,224,'↑ chunking: where meaning\n   is lost first',{size:9.5});
+    var g=d.box(300,172,86,40,'the generator',{wash:1,size:10.5});d.arrow(f[5].cx,f[5].y+f[5].h+2,g.cx,g.y-2,{});
+    var e=d.box(150,166,110,52,'labelled set\n~400 q → passage',{red:1,size:9.5});
+    d.arrow(e.cx,e.y-2,e.cx,f[2].y+f[2].h+30,{dash:1});d.arrow(140,f[2].y+f[2].h+30,10,f[2].y+f[2].h+30,{dash:1});d.arrow(140,f[2].y+f[2].h+30,290,f[2].y+f[2].h+30,{dash:1});
+    d.text(200,f[2].y+f[2].h+22,'one set measures every layer · recall@k per slice',{size:9.5});
+    d.note(14,272,'wrong answer, right document in the index?\nforce the gold passage into the prompt:\nif the answer flips, the breach is upstream',{size:10});
+  };
+  B['ai-engineering/llm-evals-deep-dive']=function(d){
+    d.title('A number you can defend');
+    var set=d.box(14,70,92,44,'eval set\nby slice',{size:10.5}),sys=d.box(150,70,90,44,'the system',{wash:1,size:10.5}),gr=d.box(284,70,100,44,'graders\nrules · judge · human',{size:9.5});
+    d.connect(set,sys);d.connect(sys,gr);
+    var dec=d.box(130,160,140,44,'ship? choose? permit?',{red:1,size:10.5});d.arrow(gr.cx,gr.y+gr.h+2,dec.cx+40,dec.y-2,{});
+    d.text(200,150,'paired · per slice · with an interval',{size:9.5});
+    d.note(14,166,'judge biases:\nposition · verbosity\nself-preference\n→ check against people',{size:9.5});d.arrow(104,182,128,182,{dash:1});
+    d.note(286,166,'cost, latency and\nsafety gates too',{size:9.5});
+    var prod=d.round(130,236,140,34,'production sample',{size:10.5});d.arrow(dec.cx,dec.y+dec.h+2,prod.cx,prod.y-2,{});
+    d.line(prod.x-2,prod.cy,10,prod.cy,{dash:1});d.line(10,prod.cy,10,set.cy,{dash:1});d.arrow(10,set.cy,set.x-1,set.cy,{dash:1});
+    d.note(20,262,'failures become new items',{size:9.5});
+    d.note(200,300,'offline decides · online checks the decision');
+  };
   B['ai-engineering/ai-infrastructure-swe']=function(d){
     d.title('Millions of users, and the p99 tail');
     var req=d.round(14,110,70,34,'requests'),gw=d.box(112,104,90,46,'gateway\n(Rust · tokio)',{wash:1,size:11});d.connect(req,gw);

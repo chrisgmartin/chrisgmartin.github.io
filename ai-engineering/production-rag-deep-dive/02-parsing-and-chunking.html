@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parsing and Chunking — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Where documents lose their meaning before an embedding ever sees them: PDF extraction, tables, headings as context, fixed windows against structure-aware and…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/02-parsing-and-chunking">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Parsing and Chunking — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Where documents lose their meaning before an embedding ever sees them: PDF extraction, tables, headings as context, fixed windows against structure-aware and…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/02-parsing-and-chunking">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#losses">What extraction destroys</a>
+    <a href="#tools">What the tools recover</a>
+    <a href="#table">The deductible table</a>
+    <a href="#strategies">Three ways to cut</a>
+    <a href="#context">Chunks that carry their context</a>
+    <a href="#parent-child">Parent-child retrieval</a>
+    <a href="#overlap">Overlap</a>
+    <a href="#size">What size interacts with</a>
+    <a href="#sweep">The sweep</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-the-retrieval-contract.html">← Previous: The Retrieval Contract</a>
+    <a href="03-embeddings.html">Next: Embeddings →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Building the index</span>
+  <h1>Parsing and Chunking</h1>
+  <p class="subtitle">Where documents lose their meaning before an embedding ever sees them: PDF extraction, tables, headings as context, fixed windows against structure-aware and parent-child chunking, overlap, and how to measure a chunking choice.</p>
+</header>
+
+<section id="losses">
+  <h2>What extraction destroys</h2>
+  <p>The <a href="01-the-retrieval-contract.html#chain">chain of contracts</a> starts with a parser, and the parser is where the first clause is broken without anyone noticing. A PDF does not store paragraphs. It stores glyphs at coordinates, in the order the authoring tool emitted them. Everything a reader takes for granted, such as sentences, columns, tables and the difference between body text and a page footer, has to be inferred from positions. Every inference can be wrong, and the errors are silent: the output is still text, just not the text on the page.</p>
+  <p>Five losses account for most of what Harbourline sees in its 12,000 policy wordings and procedures.</p>
+  <ul>
+    <li><strong>Reading order.</strong> Extraction that follows emission order may read a two-column page straight across, splicing the left sentence into the right one. The embedding of that chunk describes neither column.</li>
+    <li><strong>Tables flattened.</strong> A table becomes a stream of cells in row or column order with the grid gone. "Wind/hail 2.5% Coverage A" survives. Which column header belongs to the 2.5% does not, if the header sits two lines up in a different chunk.</li>
+    <li><strong>Running headers and footers.</strong> "Harbourline Insurance · HO-3 Policy Wording · Page 14 of 112" appears on every page. It lands in every chunk, adds the same tokens to a hundred vectors, and makes unrelated chunks look similar to a query that mentions the product.</li>
+    <li><strong>Headings detached.</strong> A heading is just larger text. If it is not recognised, the chunk "Water backup is excluded unless endorsement HW-12 is attached" no longer says which section, or which product, it belongs to.</li>
+    <li><strong>Scans.</strong> A scanned endorsement has no text layer at all. Without optical character recognition (OCR) the page vanishes from the index, and nothing reports that it did. With OCR, numbers are the characters most often misread: a 5 for a 6, a missing decimal point.</li>
+  </ul>
+  <p>HTML is better behaved, since headings and tables are marked up, but it brings its own noise: navigation, cookie banners and repeated sidebars. The procedure documents in HTML need boilerplate removal rather than layout inference.</p>
+</section>
+
+<section id="tools">
+  <h2>What the tools recover</h2>
+  <p>Parsers fall into two kinds, and choosing between them is mostly a question of what your PDFs are. Libraries that read the text layer and its coordinates are fast and deterministic. pdfplumber, for example, exposes each character, line and rectangle with its position, finds tables by detecting ruled lines or text alignment, and lets you tune the strategy per table. Its own documentation says it works best on machine-generated PDFs, is not designed for scanned documents, and does no OCR. Document-understanding toolkits go further. Docling's description covers page layout, reading order, table structure and OCR for scanned PDFs and images, and exports to Markdown, HTML or a lossless JSON form. (Details as of November 2026; both projects change.)</p>
+  <p>None of that tells you how either tool does on a Harbourline wording. Layout models trade speed for structure, and a table with no ruled lines, spanning two pages, with merged header cells, is hard for all of them. So the first step is a measurement, not a choice. Take about thirty pages that span your hard cases: a two-column page, a deductible schedule, a scanned endorsement, a table that breaks across a page. Parse them with each candidate, and compare against the page by eye. Count the pages where the reading order is right, where every table cell is under the right header, and where the numbers match. Thirty pages is enough to rank two tools, and cheap enough to repeat when a new document type arrives.</p>
+  <p>The same comparison should run again on a schedule, because the failure that matters is a new template. A new product line with a different layout can drop table quality overnight, and the first signal will be recall on the limits slice falling.</p>
+</section>
+
+<section id="table">
+  <h2>The deductible table that split in two</h2>
+  <p>Harbourline's HO-3 wording has a deductible schedule at the foot of page 14 that continues at the top of page 15. The first chunk ended mid-table, and the second began with rows that had no header at all.</p>
+
+  <div class="flow">  AS EXTRACTED AND CUT AT 400 TOKENS
+
+  chunk 41 (page 14)                      chunk 42 (page 15)
+  ┌────────────────────────────────┐      ┌────────────────────────────────┐
+  │ Section I - Deductibles        │      │ Wind/hail      2.5%   Cov. A   │
+  │ Peril | Deductible | Applies   │      │ Water backup   $2,500 Cov. C   │
+  │ All other perils  $1,000  A    │      │ Harbourline Insurance - Page 15│
+  └────────────────────────────────┘      └────────────────────────────────┘
+     query: "wind and hail deductible"  →  chunk 42 matches on "Wind/hail",
+     but has no header: 2.5% of what?      chunk 41 matches on "deductibles"
+                                           and offers $1,000.
+
+  REPAIRED: split on row boundaries, repeat title path and header in each chunk
+
+  ┌────────────────────────────────┐      ┌────────────────────────────────┐
+  │ HO3 2026-01 > Sec. I > Deduct. │      │ HO3 2026-01 > Sec. I > Deduct. │
+  │ Peril | Deductible | Applies   │      │ Peril | Deductible | Applies   │
+  │ All other perils  $1,000  A    │      │ Wind/hail      2.5%   Cov. A   │
+  └────────────────────────────────┘      │ Water backup   $2,500 Cov. C   │
+                                          └────────────────────────────────┘</div>
+
+  <p>The retrieval worked as designed in both cases. The query matched the best available chunk, and the best available chunk gave the wrong number. That is a breach of the shape clause. It is invisible to a recall metric that counts a hit whenever the gold page appears, which is why the gold records in the labelled set mark the header as part of the answer, and why this failure drove the limits slice down to 0.71.</p>
+  <p>The fix is mechanical once the table is recognised as a table. Split on row boundaries rather than token counts, and repeat the section path and the header row in every piece. The sketch below does that. It is a sketch, not a parser: it assumes the table has already been extracted into a header and a list of rows.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>chunk_table.py (sketch)</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">def chunk_table(path, header, rows, max_tokens, count=lambda s: len(s.split())):
+    """Split a table into chunks that each repeat the title path and header row."""
+    prefix = path + "\n" + " | ".join(header) + "\n"
+    chunks, cur = [], []
+    for row in rows:
+        line = " | ".join(row)
+        if cur and count(prefix + "\n".join(cur + [line])) &gt; max_tokens:
+            chunks.append(prefix + "\n".join(cur))
+            cur = []
+        cur.append(line)
+    if cur:
+        chunks.append(prefix + "\n".join(cur))
+    return chunks</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">A table is one unit of meaning, even when it is too big for one chunk</span>
+    <p>If a table must be split, the header travels with every piece. If a row cannot be understood without its neighbours, as with merged cells or a footnote that qualifies every row, keep the footnote with each piece too. A token-window splitter does none of this, because it never sees the table.</p>
+  </div>
+</section>
+
+<section id="strategies">
+  <h2>Three ways to cut</h2>
+  <p>Once text is extracted, a chunker decides the units that get embedded, retrieved and cited. There are three families, and they differ in what they know about the document.</p>
+  <p><strong>Fixed token windows</strong> cut every N tokens, ignoring structure. They are trivial to build, uniform in size, and the cost of embedding them is predictable. They cut sentences in half and tables across rows, and they are the right baseline precisely because every other strategy has to beat them to justify its complexity. For flat prose with no structure, such as long free-text claim notes, they are often good enough.</p>
+  <p><strong>Structure-aware chunking</strong> uses the document's own boundaries: headings, numbered clauses, list items, table rows. Each chunk is a unit the author chose to keep together, so it tends to be self-contained, and it can carry the heading path as context. Sizes vary, so very short sections are merged upward and very long ones split at paragraph boundaries. This depends on the parser having recovered the structure, which is why the previous sections come first. For policy wordings, where a clause is the natural unit of meaning, it is the default.</p>
+  <p><strong>Semantic chunking</strong> places boundaries where the topic shifts, usually by embedding consecutive sentences and cutting where similarity drops below a threshold. It can help where no structure exists. It costs an embedding pass over every sentence before the real embedding pass, its boundaries move when the model or threshold changes, and on documents that already have headings it tends to recover what the headings said. Treat it as a candidate for the unstructured slice of the corpus, not as the main strategy.</p>
+  <p>The recommendation is structure-aware first, fixed windows as the baseline you measure against, and semantic only where you can show it wins on the labelled set. The exception is a corpus of mostly unstructured text, where the baseline and semantic cutting are closer and the choice is an empirical one.</p>
+</section>
+
+<section id="context">
+  <h2>Chunks that carry their context</h2>
+  <p>A chunk is embedded and ranked on its own text, so anything the chunk does not say, the retriever does not know. "The limit is $10,000" might come from any of forty products. The fix is to put the missing context into the chunk before it is embedded.</p>
+  <p>The cheap version is deterministic. Prepend the document title, version and section path, as in the repaired table above: "HO3 2026-01 &gt; Section I &gt; Deductibles". It costs a few tokens per chunk, needs no model call, and helps both the dense embedding and any keyword index that later sees the same text. Keep the stored display text and the embedded text separate, so citations show the clean passage while the index sees the prefix.</p>
+  <p>The expensive version asks a language model to write a short situating sentence for each chunk, given the whole document. Anthropic described this as contextual retrieval and reported, on their evaluation, that the failure rate of the top 20 retrieved chunks fell from 5.7% to 3.7% with contextual embeddings, a 35% reduction, to 2.9% when combined with contextual keyword search, and to 1.9% with reranking added. The generated context was typically 50 to 100 tokens per chunk, and the one-time generation cost they quoted was $1.02 per million document tokens with prompt caching. Those are figures from their 2024 post on their own datasets, so treat the direction as established and the size as something to measure on your corpus. At that rate Harbourline's roughly 240 million tokens would cost in the region of $250 once, plus again for every re-chunk, which is why you try the deterministic prefix first and add model-written context only for the slices that still fail.</p>
+</section>
+
+<section id="parent-child">
+  <h2>Parent-child retrieval</h2>
+  <p>Chunk size pulls two ways. Small chunks embed cleanly, because one vector represents one idea, and they cite precisely. Large chunks read better, because the model sees the surrounding conditions. Parent-child retrieval takes both: embed small child chunks, but when one matches, return the larger parent it came from, such as the whole clause or the whole section.</p>
+
+  <div class="flow">  INDEX TIME                              QUERY TIME
+  section (parent, ~900 tokens)           query → vector search over children
+     ├─ child 1 (~200 tokens) → vector       ↓
+     ├─ child 2 (~200 tokens) → vector    best child: 2
+     ├─ child 3 (~200 tokens) → vector       ↓
+     └─ child 4 (~200 tokens) → vector    look up parent of child 2 → return it
+  parent text stored, not embedded           ↓
+                                          dedupe parents if several children hit</div>
+
+  <p>The mechanism is a lookup, so the cost is a parent store and a parent id on every child. The benefits are real for exclusions and conditions, where the sentence that matches the query ("water backup is excluded") is qualified by the sentence after it ("unless endorsement HW-12 is attached"). Two things limit it. Several children of one parent can match, so deduplicate by parent or you spend the budget on one section. And a large parent may be mostly irrelevant, which costs tokens and raises the precision problem. If your parents are whole documents rather than sections, you have built a slow way to pass whole documents to the model.</p>
+</section>
+
+<section id="overlap">
+  <h2>Overlap</h2>
+  <p>Overlap repeats the end of one chunk at the start of the next, so a sentence cut at a boundary appears whole in at least one of them. For fixed windows that is a real repair: without it, every cut loses whatever straddles it. With 10% overlap the boundary text lives in two chunks.</p>
+  <p>The costs are three. The index grows: 10% overlap embeds about 11% more tokens, and 20% about 25% more, because each new chunk advances by only 90% or 80% of its length. Near-identical chunks compete in the top k and crowd out other evidence, which hits precision. And the repeated text can make a boundary-spanning sentence appear twice in the assembled context unless you deduplicate. For structure-aware chunks that end at clause boundaries, overlap buys little, since nothing was cut mid-thought, and it only duplicates. The practical rule is to use overlap with fixed windows, expect it to be redundant with structure-aware chunks, and settle the question with the sweep rather than by convention.</p>
+</section>
+
+<section id="size">
+  <h2>What chunk size interacts with</h2>
+  <p>Chunk size looks like one setting but it touches four other parts of the system.</p>
+  <ul>
+    <li><strong>The embedding model.</strong> A model embeds at most its maximum input length, and anything longer is truncated or rejected, so a chunk larger than that limit is silently shortened. Many open-source encoders cap at 512 tokens; OpenAI's third-generation embedding models accept 8,192. Separately, models that average token vectors into one vector blur a long chunk that covers two topics into a point between them. Smaller, single-topic chunks give a sharper vector; <a href="03-embeddings.html#context-pooling">chapter 03</a> covers the mechanism.</li>
+    <li><strong>k and the token budget.</strong> Total context is roughly k times chunk size. At 800 tokens and k = 10 you send 8,000 tokens; at 200 tokens you need k = 40 for the same, and then ranking quality matters much more. Smaller chunks raise the recall you need from the retriever and lower the waste per chunk.</li>
+    <li><strong>Citation granularity.</strong> The chunk is the unit you can cite. A 200-token chunk points to a paragraph; a 2,000-token chunk points to a section the reader must search. For the claims-intake agent, which cites to a regulator, the answer is a precise unit, with the parent used for reading.</li>
+    <li><strong>Index size and cost.</strong> Halving chunk size doubles the vector count. At 400 tokens with no overlap, 240 million tokens is about 600,000 chunks; at 200 tokens it is 1.2 million. <a href="03-embeddings.html#arithmetic">The storage arithmetic</a> follows from that count.</li>
+  </ul>
+  <p>The decision that flips most often is size against question type. Definitions and procedures are short and self-contained and do well with small chunks. Exclusions and conditions are qualified by their neighbours and do better with larger units or parent-child. One size for the whole corpus is a compromise, and the per-slice results show where the compromise costs you.</p>
+</section>
+
+<section id="sweep">
+  <h2>The sweep</h2>
+  <p>Chunking is an empirical choice, and the labelled set makes it cheap to settle. Hold the embedding model, k and the question set fixed. Vary chunk size and overlap together, rebuild the index for each, and record recall@k per slice. The <a href="../ai-engineer-interview-prep/02-chunk-size-and-overlap.html">interview-prep chapter</a> shows the same experiment as a talking track; here it is the engineering version.</p>
+
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Setting</th><th>Chunks</th><th>Tokens embedded</th><th>Embedding cost, large model</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">200 tokens, 0% overlap</td><td>1.2 M</td><td>240 M</td><td>$31</td></tr>
+      <tr><td class="term">400, 0%</td><td>600 k</td><td>240 M</td><td>$31</td></tr>
+      <tr><td class="term">400, 10%</td><td>667 k</td><td>267 M</td><td>$35</td></tr>
+      <tr><td class="term">400, 20%</td><td>750 k</td><td>300 M</td><td>$39</td></tr>
+      <tr><td class="term">800, 0%</td><td>300 k</td><td>240 M</td><td>$31</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The full grid of three sizes by three overlaps is nine rebuilds. At the list prices OpenAI's embeddings documentation implies, about $0.13 per million tokens for the large model and $0.02 for the small one (as of November 2026; check the pricing page), nine passes over roughly 240 to 300 million tokens come to about $300 with the large model (the right-hand column sums to about $105 per size) and about $50 with the small. The dollars are small. The real cost is wall-clock time and the engineering care to rebuild every index with the same code, so run the sweep on a sampled subset of documents that contains every gold passage plus a few thousand distractors, and confirm the winner on the full corpus.</p>
+  <p>Add one recall@k column per slice to this table for your own corpus. Read the result per slice. If larger chunks help exclusions and hurt identifiers, that is a signal to route or combine strategies, and to treat identifiers as a lexical problem. And before adopting any gain, apply the arithmetic from <a href="01-the-retrieval-contract.html#slices">chapter 01</a>: a slice of 60 questions cannot confirm a two-point difference. Chunking changes are also re-index events, so changing size means re-embedding everything. <a href="08-freshness-tenancy-and-access.html">Chapter 08</a> covers how to cut over without downtime.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Recall@10 counts a hit whenever the gold page appears in the results, and it reads 0.93 on the limits slice. Users still get the wrong deductible from the schedule that spans two pages. How can both hold, and what in the labelled set would have exposed it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The page-level hit hides a chunk that holds the right row without its header, or the header without the row. Gold records that mark the header as part of the answer, and a check that both are present in one chunk, would count it as a miss. See <a href="#table">the deductible table</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A new product line's wordings use a layout the parser has not seen, and limits recall drops two weeks later. Nothing in the pipeline raised an error. Why not, and what check would have caught it earlier?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Extraction errors still produce text, so nothing fails; the text is just wrong. A scheduled comparison of parser output against hand-checked pages for each template, or a nightly per-slice recall run, would flag it. See <a href="#tools">what the tools recover</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You add 20% overlap to structure-aware chunks that already end at clause boundaries. What do you expect to happen to index size and to recall, and what could get worse?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 25% more tokens embedded, with little recall gain because nothing was cut mid-thought. Precision may fall as near-duplicate chunks fill the top k, and duplicate text can reach the context. See <a href="#overlap">overlap</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Parent-child retrieval embeds 200-token children and returns 900-token parents. With k = 8 children, how many tokens might reach the model, and what makes the real number smaller or larger?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Up to 8 × 900 = 7,200 tokens if every child has a different parent. Several children of one parent collapse to one parent after deduplication, which shrinks it. Parents that are not size-capped can inflate it. See <a href="#parent-child">parent-child retrieval</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your embedding model truncates input at 512 tokens, and the team moves from 400-token to 900-token chunks to improve exclusion recall. What goes wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Everything after token 512 is dropped before embedding, so the second half of each chunk cannot influence retrieval, even though the model later reads all of it. The tempting reading is that bigger chunks add context; here they add text the index never saw. See <a href="#size">what chunk size interacts with</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Choose between a deterministic title-and-section prefix and model-written chunk context for a corpus where the limits slice fails and the definitions slice does not. State what you would try first and when the other option wins.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Try the prefix first: it is free, and limits chunks mostly lack product and section. Model-written context wins when the missing information is not in the path, for instance a chunk that refers to "the policyholder's election" that the document defined elsewhere. Measure on the failing slice. See <a href="#context">chunks that carry their context</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A PDF stores glyphs at coordinates, so reading order, tables and headings are inferred, and wrong inferences produce clean-looking text.</li>
+    <li>Choose a parser by comparing its output with about thirty hard pages by eye, and repeat the check whenever a new template appears.</li>
+    <li>A table is one unit of meaning: split it on row boundaries and repeat the section path and header in every piece.</li>
+    <li>Use structure-aware chunking by default, treat fixed windows as the baseline to beat, and adopt semantic chunking only where the labelled set shows it wins.</li>
+    <li>Prepend title, version and section path before embedding; add model-written context only for the slices that still fail.</li>
+    <li>Overlap repairs mid-sentence cuts in fixed windows and mostly duplicates for structure-aware chunks, at 11% to 25% more embedding cost.</li>
+    <li>Chunk size interacts with the model's input limit, k, citation granularity and index size, so settle it by a per-slice sweep, not by convention.</li>
+  </ul>
+  <p>With the units fixed, the next question is how well a vector represents them. → <a href="03-embeddings.html">Embeddings</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener"><strong>Introducing Contextual Retrieval</strong></a> — Anthropic, 2024. The figures for contextual embeddings, contextual BM25 and reranking quoted above, and the cost of generating context.</li>
+    <li><a href="https://github.com/jsvine/pdfplumber" target="_blank" rel="noopener"><strong>pdfplumber</strong></a> — README. How a coordinate-based extractor finds text and tables, its table strategies, and its stated limits on scanned documents.</li>
+    <li><a href="https://github.com/docling-project/docling" target="_blank" rel="noopener"><strong>Docling</strong></a> — project README. What a layout-aware converter claims to recover: reading order, table structure and OCR.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/embeddings" target="_blank" rel="noopener"><strong>OpenAI embeddings guide</strong></a> — input limit and the models' dimensions, used here for the cost arithmetic.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
