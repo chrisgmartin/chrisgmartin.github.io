@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluating Agents — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Trajectories, tool-call correctness, step and cost budgets, partial credit, safety checks, mocked environments, replaying production traces, and reliability…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/06-evaluating-agents">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Evaluating Agents — Evals for LLM Systems">
+<meta property="og:description" content="Trajectories, tool-call correctness, step and cost budgets, partial credit, safety checks, mocked environments, replaying production traces, and reliability…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/06-evaluating-agents">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#beyond">Beyond the final answer</a>
+    <a href="#trajectory">Trajectories</a>
+    <a href="#safety">Safety assertions</a>
+    <a href="#environment">Environments and replay</a>
+    <a href="#judge">Rules or a judge</a>
+    <a href="#reliability">Reliability: pass^k</a>
+    <a href="#cost">Cost-controlled comparison</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-the-ship-decision.html">← Previous: The Ship Decision</a>
+    <a href="07-evaluating-rag.html">Next: Evaluating RAG →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Decisions</span>
+  <h1>Evaluating Agents</h1>
+  <p class="subtitle">Trajectories, tool-call correctness, step and cost budgets, partial credit, safety checks, mocked environments, replaying production traces, and reliability across repeated trials.</p>
+</header>
+
+<section id="beyond">
+  <h2>The right answer for the wrong reason</h2>
+  <p>Harbourline's claims-intake agent reads a first notice of loss, looks up the policy, checks coverage rules, queries fraud flags, and routes the claim to an adjuster queue. A release candidate scored 94% on routing, up from 91%, and the team was ready to ship. Someone then opened the traces behind the gain. On a class of water-damage claims the new agent had learned that a policy lookup plus the claim text was enough to guess the queue, and it skipped the coverage-rules call. The routing was correct. The coverage check, which exists so that a claim excluded by the policy is flagged before an adjuster spends a day on it, never ran.</p>
+  <p>Grading the final output cannot see this. An agent's output is the end of a chain of decisions, and the chain is where the risk is. An agent can be right by luck, right by a shortcut that fails on the next distribution, or right while doing something it must never do. So an agent eval has two parts. One grades the outcome: did the claim end up in the correct state. The other grades the process: which tools ran, with what arguments, in what order, within what budget. This chapter is about the second, and about running either one often enough to trust it. The single-answer machinery is in <a href="03-graders.html">chapter 03</a>; the interview-prep version of this topic is <a href="../ai-engineer-interview-prep/08-evaluating-agents-beyond-the-answer.html">Evaluating Agents Beyond the Answer</a>.</p>
+</section>
+
+<section id="trajectory">
+  <h2>Trajectories, references and acceptable alternatives</h2>
+  <p>A trajectory is the ordered list of tool calls with arguments, plus the observations returned. Harbourline's ~150 claims items each carry a reference trajectory: <code>policy_lookup(policy_id)</code>, then <code>coverage_rules(policy_id, loss_type)</code>, then <code>fraud_flags(claim_id)</code>, then <code>route(claim_id, queue)</code>. Comparing a run to it can be strict or loose, and the choice depends on whether order is part of the requirement.</p>
+  <div class="flow">reference:  lookup ─► coverage ─► fraud ─► route(queue=Q2)
+
+run A:      lookup ─► coverage ─► fraud ─► route(Q2)         exact match
+run B:      lookup ─► fraud ─► coverage ─► route(Q2)         same set, order differs
+run C:      lookup ─► ─────────► fraud ─► route(Q2)         coverage skipped
+run D:      lookup ─► coverage ─► lookup ─► fraud ─► route    one redundant call</div>
+  <p>Exact match is wrong for B, which is fine if fraud and coverage are independent, and for D, which is wasteful rather than wrong. Set match, which requires every required call and permits others, passes B and D, and correctly fails C. Ordered match is for real dependencies: a route call must come after the checks whose results it uses, and a write must come after its confirmation. Encode which is which in the item, as required calls, allowed extras and ordering constraints, rather than one global rule. A reference trajectory is a hypothesis about a good path, not the only path; when a new model finds a shorter valid one, you want the eval to accept it. List acceptable alternatives per item, and review failures for valid paths the reference did not anticipate.</p>
+  <p>Arguments need their own check. A coverage call with the right name and the wrong loss type is a wrong call. Compare arguments after normalisation (identifier formats, date forms), and check that values came from the claim or a prior observation, not from the model's imagination. Count retries and near-miss tool choices as well. An agent that calls <code>coverage_rules</code> three times with the same arguments, or reaches for <code>policy_search</code> when it needed <code>policy_lookup</code>, produces a trajectory that passes a set match and still tells you the tool descriptions are not doing their job.</p>
+  <p>Partial credit is useful for diagnosis and dangerous for decisions. A score of 0.75 for "three of four required calls" tells an engineer where to look. As a ship metric it lets a skipped coverage check be offset by a clean routing, which is the very trade the case above turned on. Keep two numbers: a strict pass or fail per item for the gate, and per-step results for debugging. Step and cost budgets are also part of the trajectory: fix a ceiling on calls and tokens per item (for example, twice the reference length) and count a run that exceeds it as a failure, because an agent that loops until it finds the answer is not one you can price.</p>
+  <div class="callout insight">
+    <span class="callout-label">Outcome and process disagree exactly where it matters</span>
+    <p>Report the 2×2 of outcome right or wrong against required steps done or skipped. The off-diagonal cell, right outcome with a skipped step, is the one that looks like a gain and is a latent failure. In the release above, that cell held a whole class of water-damage claims.</p>
+  </div>
+</section>
+
+<section id="safety">
+  <h2>Safety assertions are rules, not scores</h2>
+  <p>The customer-service agent has read tools and write tools for address and payment changes. The policy is that a write needs an explicit confirmation from the customer in the preceding turn. This is not a quality to be averaged. It is an invariant, and it is checked over the whole trace by a few lines of code: for every write call, find the closest earlier user turn, and require that it affirms the specific change shown to the customer. One violation on any item fails the run, and the gate allows zero.</p>
+  <p>Write these assertions from the risk list, not from the model's behaviour. Typical ones: no write without confirmation; no tool call on a policy that is not the caller's; no coverage statement that the coverage tool did not return; no payment change when the fraud flag is set. Each is cheap, deterministic and unarguable, which is the reason to prefer it to a judge. Put in adversarial items too: the customer who says "yes" to something else, who gives the confirmation before the amount is shown, or who asks for the change twice. Those are the cases where confirmation logic fails, and a set drawn only from friendly traffic will not contain them (<a href="02-building-the-eval-set.html">chapter 02</a>).</p>
+</section>
+
+<section id="environment">
+  <h2>Mocked environments, fixtures and replayed traces</h2>
+  <p>You cannot evaluate a write-capable agent against live systems. The standard answer is a simulated environment: each tool is replaced by a function over a fixture, and the end state is inspected. τ-bench (Yao et al., 2024) is built this way. A language-model user talks to an agent that has domain tools and policy documents, and success is judged by comparing the database state at the end with an annotated goal state. That design has a useful property: the outcome check is a state diff, not a reading of the transcript, so it cannot be argued with.</p>
+  <p>For Harbourline, a fixture is a small database of policies, claims and fraud flags per item, loaded fresh for every run, plus tool stubs that return what production tools return, including errors and timeouts. Three rules keep the environment honest. Fixtures reset between runs, or one run's writes become the next run's data. Stubs reproduce failure: a coverage service that returns a 503 on 2% of calls teaches you whether the agent retries, fails closed or invents an answer. And stubs are checked against the real tools periodically, since an environment that drifts from production grades the agent on a world that no longer exists.</p>
+  <p>Replaying production traces is the second source of items. Take a logged conversation, freeze the observations that tools returned, and replay the user turns against the new agent. The catch is that once the new agent makes a different call from the logged one, there is no logged observation to return. Two workable answers: stop scoring at the first divergence and report where it happened, or serve the unmatched call from a stub built from the same fixture. Either is better than pretending the logged observations still apply. Replays check regressions on real inputs; the mocked environment checks the new behaviour the logs never contained.</p>
+</section>
+
+<section id="judge">
+  <h2>Rule checks or a judge of the trajectory</h2>
+  <p>Rules check what you can state in advance: required calls, ordering, argument values, invariants, budgets, end state. They are fast, free and exact, and they carry the gate. A judge reading the trajectory is for what rules cannot state: was the clarifying question the customer needed, was the explanation of the decision coherent with the tool results, did the agent recover sensibly after an error. Judge prompts for trajectories inherit every problem in <a href="04-llm-as-judge.html">chapter 04</a>, with a worse one added: long traces make position and verbosity effects larger and make calibration against human labels more important.</p>
+  <p>The practical split at Harbourline: rules decide pass or fail on every item and every change; a judge scores a sample of 10 to 15 percent for dimensions like explanation quality, and its results inform without blocking until its agreement with human reviewers has been measured on traces. A judge must never be the only thing standing between a write call and production, because a judge can be talked around by the same text that fooled the agent.</p>
+  <div class="callout tip">
+    <span class="callout-label">Read the transcripts</span>
+    Anthropic's write-up of its own agent evals puts the habit in three words, and gives the reason. When Opus 4.5 was first run on CORE-Bench it scored 42%; after the team fixed grading bugs (one grader rejected "96.12" because it expected "96.124991…") and loosened an over-constrained scaffold, it scored 95%. A run that fails every trial of an item is usually a broken item, not an incapable agent. Read a sample of failing and passing traces on every run, and keep a column for "grader wrong" next to "agent wrong".
+  </div>
+  <p>Two more habits from the same source. Track capability items and regression items separately, as chapter 01 sets out: when the agent passes nearly every item in the capability set, the set has saturated and says nothing about the next release, so add harder items and move the solved ones into the regression suite, which should sit near 100% and stay there. And hold the two numbers apart in reports. A capability score that climbs because easy items were added, or a regression score that dips because hard items were, is a change in the set dressed as a change in the agent.</p>
+</section>
+
+<section id="reliability">
+  <h2>Reliability over repeated trials: pass^k</h2>
+  <p>An agent samples. The same claim run twice can follow different paths, and a single run per item hides it. τ-bench introduced pass^k for this: the probability that the agent succeeds on all k independent trials of the same task. It is the opposite of pass@k, which asks whether any of k tries works. The paper's abstract reports that function-calling agents such as gpt-4o succeeded on under half of the tasks and were quite inconsistent, with pass^8 under 25% in the retail domain.</p>
+  <p>The arithmetic explains why. If a task succeeds with probability p on each trial, and trials are independent, pass^k is p<sup>k</sup>. An agent at 90% per trial has a pass^8 of about 43%; at 80%, about 17%. A support agent that handles 6,000 claims a day will meet every rare path many times, so the figure that predicts production is the high-k one, not the average of one run. In code, run n trials per item, count successes c, and estimate pass^k as C(c,k) / C(n,k) per item, averaged over items:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>passk.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from math import comb
+
+def pass_hat_k(results, k):
+    """results: {task_id: [0/1 per trial]}. Mean over tasks of C(c,k)/C(n,k):
+    the chance that k trials drawn from the n run all succeed."""
+    scores = []
+    for trials in results.values():
+        n, c = len(trials), sum(trials)
+        if n &lt; k:
+            raise ValueError("need at least k trials per task")
+        scores.append(comb(c, k) / comb(n, k))
+    return sum(scores) / len(scores)</code></pre>
+</div>
+  <p>On four toy items with eight trials each (always passes, passes 7 of 8, passes 4 of 8, never passes) this gives 0.59 at k=1, 0.38 at k=4 and 0.25 at k=8. The drop is the signal. Eight trials per item multiplies the cost of the run by eight, so spend them where they matter: all trials on the write-capable and regulated items, one or two on the rest. Choose k from the real requirement. If the same customer might retry the same request three times, k=3 is the honest figure. The paired comparison from <a href="05-the-ship-decision.html#paired">the ship decision</a> still applies; the per-item score is now a fraction rather than 0 or 1, and the bootstrap works the same way.</p>
+</section>
+
+<section id="cost">
+  <h2>Cost-controlled comparison</h2>
+  <p>An agent can buy accuracy by calling more tools, retrying, sampling several answers or running a larger model, and none of that shows in accuracy alone. Kapoor et al., in <em>AI Agents That Matter</em> (2024), argue that agent benchmarks that look only at accuracy encourage needlessly complex and costly agents, and propose jointly optimising accuracy and cost. Their practical point for a team is to report both, as a point on an accuracy-cost plane, rather than a single score.</p>
+  <p>For Harbourline this means each run reports mean cost per claim (all model calls, all tokens, as of the price table in force that month), the p95 cost, and the number of tool calls. A new agent that gains 2 points of routing accuracy at 3.5 times the cost per claim is a different proposal from one that gains 2 points at the same cost, and at 6,000 claims a day the difference is a budget line. The comparison that matters is between candidates at the same cost: give the simpler agent the same budget, whether more retries or a best-of-n sampling, before you conclude the fancier design is better. If the simple baseline matches it, the complexity has not earned its place. The opposite holds where an error is expensive enough that extra cost is the point, as on a denial that can be appealed: there, buy accuracy with cost, and say so in the report.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A new claims agent beats the old one on routing accuracy by 3 points. What do you need to see in the traces before you believe the gain, and what pattern would make you distrust it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Check that the required steps still ran on the items it won. A gain made by skipping the coverage check is right-outcome, skipped-step: it looks like progress and fails on the next distribution. Cross outcome against process. See <a href="#beyond">the opening case</a> and <a href="#trajectory">Trajectories</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An agent calls the fraud tool before the coverage tool, where the reference has them the other way round, and routes correctly. Your exact-match grader fails it. What do you change, and in which cases would you keep the order requirement?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Move to set match with ordering constraints stated per item, so independent calls may swap. Keep an order requirement where one call uses the result of another, or where a write must follow a confirmation. See <a href="#trajectory">Trajectories</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The customer-service agent passes 97% of items on a quality score that includes a "handled the payment change correctly" criterion. Why is that score the wrong instrument for the rule that payment changes need confirmation, and what replaces it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An average lets three unconfirmed writes in a hundred pass as a good score, yet each is real harm. The rule is an invariant, so it is checked by code over every trace and allowed zero violations. See <a href="#safety">Safety assertions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An agent succeeds on 85% of items in one run. Production sees the same request repeated by anxious customers, about three times. Estimate what reliability to plan for and what you would run to measure it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If trials were independent and uniform, 0.85 cubed is about 61%, and real items vary, so the true figure for k=3 is probably lower for the hard ones. Run several trials per item and compute pass^3, spending the extra trials on the high-stakes items. See <a href="#reliability">Reliability</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A team proposes replacing a rule-based trajectory check with a judge that reads each trace, because the rules "keep missing valid paths". Do you accept, and what would you do instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not as a replacement. Valid paths the rules reject are a gap in the reference, fixed by adding acceptable alternatives and constraints, which keeps the check exact. Use a judge for what rules cannot state, on a sample, after measuring its agreement with people. See <a href="#judge">Rules or a judge</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A candidate agent has 2 points higher accuracy and uses four times the tokens per claim. How would you decide whether it is better, and when would you ship it anyway?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Compare at equal cost: give the cheaper agent the same budget in retries or sampling and see whether the gap persists. Ship anyway where each avoided error is worth more than the extra spend, as on appealable denials. See <a href="#cost">Cost-controlled comparison</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>An agent can reach the right answer by skipping a required step, so grade the trajectory as well as the outcome and report the two together.</li>
+    <li>Define the reference per item as required calls, allowed extras and ordering constraints, and list acceptable alternatives so valid new paths are not failed.</li>
+    <li>Use partial credit to diagnose and strict pass or fail to gate; never let a clean outcome pay for a skipped check.</li>
+    <li>Safety rules such as "no write without confirmation" are code over every trace with zero tolerance, not a score to average.</li>
+    <li>Evaluate against fixtures that reset, simulate failure and are checked against the real tools; replay production traces and handle the point where the new agent diverges.</li>
+    <li>Measure reliability with several trials per item and pass^k, because p<sup>k</sup> falls fast, and compare agents at equal cost.</li>
+    <li>Read failing and passing transcripts every run so grader bugs are not booked as agent failures, and retire saturated capability items into the regression suite.</li>
+  </ul>
+  <p>Agents add tool use to generation; the next chapter looks at the system that retrieves before it generates. → <a href="07-evaluating-rag.html">Evaluating RAG</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener"><strong>τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains</strong></a> — Yao et al., 2024. Source of pass^k and of grading by end-state database comparison with a simulated user.</li>
+    <li><a href="https://arxiv.org/abs/2407.01502" target="_blank" rel="noopener"><strong>AI Agents That Matter</strong></a> — Kapoor et al., 2024. The case for reporting cost with accuracy, holdout sets and standard practice.</li>
+    <li><a href="https://arxiv.org/abs/2411.00640" target="_blank" rel="noopener"><strong>Adding Error Bars to Evals</strong></a> — Evan Miller, 2024. Statistics for comparing models, useful once per-item scores become fractions.</li>
+    <li><a href="https://www.anthropic.com/research/demystifying-evals-for-ai-agents" target="_blank" rel="noopener"><strong>Demystifying evals for AI agents</strong></a> — Anthropic, January 2026. Grader taxonomy, outcome-versus-transcript grading, pass@k against pass^k, saturation, and the case for reading transcripts to separate grader bugs from agent failures.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

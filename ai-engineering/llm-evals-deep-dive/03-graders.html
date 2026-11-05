@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graders — Evals for LLM Systems</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Exact match, programmatic checks, rubric-based model grading and human review: what each can and cannot see, how to write a rubric that two people score the…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/03-graders">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Graders — Evals for LLM Systems">
+<meta property="og:description" content="Exact match, programmatic checks, rubric-based model grading and human review: what each can and cannot see, how to write a rubric that two people score the…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/llm-evals-deep-dive/03-graders">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#overview">Overview</a>
+    <a href="#what-graders-see">What each grader can see</a>
+    <a href="#deterministic">Deterministic graders</a>
+    <a href="#rubrics">Writing a rubric</a>
+    <a href="#partial-credit">Partial credit</a>
+    <a href="#process">Grading the process</a>
+    <a href="#combining">Combining graders</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-building-the-eval-set.html">← Previous: Building the Eval Set</a>
+    <a href="04-llm-as-judge.html">Next: LLM-as-Judge →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Foundations</span>
+  <h1>Graders</h1>
+  <p class="subtitle">Exact match, programmatic checks, rubric-based model grading and human review: what each can and cannot see, how to write a rubric that two people score the same way, and partial credit.</p>
+</header>
+
+<section id="overview">
+  <h2>Overview</h2>
+  <p>Every eval ends in a grader, and the grader sets the ceiling on what the eval can tell you. A grader that cannot see the policy version cannot catch a stale deductible. A grader that sees only the final text cannot catch a claims agent that skipped the coverage check. Before choosing a metric, ask what evidence the grader has in front of it and whether the failure you care about leaves a trace in that evidence.</p>
+  <p>Harbourline's help-centre assistant answers about 13,000 sessions a day, and the eval set from <a href="02-building-the-eval-set.html">chapter 02</a> holds roughly 400 labelled items. A wrong deductible is a complaint. A wrong coverage statement is a regulatory problem. Those two costs justify different graders, and this chapter builds the set of graders that covers both without paying for human review on every item.</p>
+</section>
+
+<section id="what-graders-see">
+  <h2>What each grader can see</h2>
+  <p>Four kinds of grader cover almost every case, and they differ less in quality than in field of view. Each one reads a different slice of the run.</p>
+  <div class="flow">  question ──► system ──► answer + citations + tool calls + trace
+                              │
+   exact / normalised match ◄─┤ answer text vs one gold string
+   programmatic check       ◄─┤ any structured field, any rule you can code
+   rubric model grader      ◄─┤ whatever you paste into its prompt
+   human reviewer           ◄─┘ whatever the UI shows, plus judgement</div>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Grader</th><th>Sees</th><th>Cannot see</th><th>Cost per item</th><th>Failure mode</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Exact or normalised match</td><td>One string against one gold string</td><td>Paraphrase, extra true detail, a correct answer in a different form</td><td>Negligible</td><td>False fails on correct answers; scores drift when the format changes</td></tr>
+      <tr><td class="term">Programmatic check</td><td>Anything you can parse: schema, numbers, citation ids, tool calls</td><td>Meaning that is not encoded in a rule</td><td>Negligible after you write it</td><td>Passes an answer that satisfies every rule and is still wrong</td></tr>
+      <tr><td class="term">Rubric model grader</td><td>The text you put in its prompt</td><td>Anything you left out; facts it does not know</td><td>One model call, often two or three with a reasoning step</td><td>Agrees with fluent text; moves when the prompt moves (<a href="04-llm-as-judge.html">chapter 04</a>)</td></tr>
+      <tr><td class="term">Human reviewer</td><td>What the interface shows, plus domain knowledge</td><td>What the interface hides; their own fatigue</td><td>Minutes of a person's time</td><td>Inconsistent between reviewers and across a long session</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The cost column spans orders of magnitude: microseconds for a regex, a model call for a rubric grader, minutes of an expert's time for a human. That spread is why the design question is never "which grader is best". It is "what is the cheapest grader that can see this failure". Anthropic's own guidance for building evals makes the same trade: prefer automated grading, and accept more items with a somewhat noisier grader over fewer, hand-graded ones (<a href="#further-reading">Further reading</a>).</p>
+</section>
+
+<section id="deterministic">
+  <h2>Deterministic graders: match and programmatic checks</h2>
+  <p>Exact match works when the answer is a closed set: an intent label, a routing queue, a yes/no coverage verdict. It stops working the moment the answer is a sentence. Normalised match loosens it by lowercasing, stripping punctuation and whitespace, and canonicalising numbers and dates, so "$1,000", "1000 dollars" and "£1,000" collapse to comparable forms. Normalisation is where silent bugs live: if your normaliser maps "£1,000" and "$1,000" to the same number, you have just erased the difference between a UK and a US policy. Keep the currency and the jurisdiction in the comparison key.</p>
+  <p>Programmatic checks go further than string comparison. They read structure, not prose. For Harbourline the useful ones are:</p>
+  <ul>
+    <li><strong>Citations resolve.</strong> Every cited clause id exists in the current policy corpus, and the cited clause is one the gold label accepts for this question.</li>
+    <li><strong>Numbers within tolerance.</strong> A limit or deductible must match exactly; a prorated premium may match within a cent.</li>
+    <li><strong>Forbidden content.</strong> No claim that a loss is covered, no promise of payout, no policy number or other customer's data in the answer.</li>
+    <li><strong>Forbidden actions.</strong> No call to a write tool without a confirmation turn before it (see <a href="06-evaluating-agents.html">chapter 06</a>).</li>
+    <li><strong>Schema.</strong> The claims-intake agent's output parses, and every required field is present.</li>
+    <li><strong>Instruction following.</strong> The fixed instructions in the system prompt that a program can verify: the answer is in the language of the question, under the length ceiling, carries the required disclaimer on coverage questions, and uses no markdown where the channel cannot render it.</li>
+  </ul>
+  <p>These checks are cheap, fast and unambiguous, so run them on every item and every change. Their blind spot is the one named in the table: an answer can satisfy every rule and still be wrong, because the rules encode only what you thought to check. The mechanism to hold in mind is that a programmatic grader scores <em>evidence of correctness</em>, not correctness. Where the evidence is tight (an amount that must equal a gold number), the proxy is nearly the thing itself. Where it is loose (an answer that "mentions the exclusion"), it is not.</p>
+  <p>A guardrail is a grader that runs in production, and it needs the same measurement as any other. Harbourline's output filter blocks coverage promises and other customers' data before a response is shown. Treat it as a classifier with its own labelled set of violating and clean outputs: how many violations it catches, how many clean answers it blocks, and whether the correction it applies (a rewrite, a refusal, a hand-off) leaves the customer with something usable. A filter that is never measured is a filter you are trusting. The eval set should carry both the violation it must catch and the near-miss it must let through.</p>
+  <p>Here is the deductible gate. It extracts the money amounts from the answer, requires exactly one, and checks it against the gold amount, the policy version and the citation.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>grade.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import re
+from dataclasses import dataclass
+
+MONEY = re.compile(r"[$£]\s?(\d[\d,]*(?:\.\d+)?)")
+
+@dataclass
+class Item:
+    gold_amount: float          # deductible in the gold policy version
+    gold_version: str           # e.g. "HO-3 2025-07"
+    gold_citation: str          # id of the policy clause that states it
+
+def gate(answer: str, cited_ids: list[str], item: Item, corpus_ids: set[str]) -&gt; dict:
+    amounts = {float(m.replace(",", "")) for m in MONEY.findall(answer)}
+    return {
+        "number": item.gold_amount in amounts and len(amounts) == 1,
+        "version": item.gold_version in answer,
+        "citation_resolves": bool(cited_ids) and all(c in corpus_ids for c in cited_ids),
+        "citation_correct": item.gold_citation in cited_ids,
+    }
+
+item = Item(1000.0, "HO-3 2025-07", "HO3-2025-07:s4.2")
+corpus = {"HO3-2025-07:s4.2", "HO3-2024-01:s4.2"}
+print(gate("Your wind/hail deductible is $1,000 (HO-3 2025-07).", ["HO3-2025-07:s4.2"], item, corpus))
+print(gate("Your deductible is $500 or $1,000.", ["HO3-2024-01:s4.2"], item, corpus))</code></pre>
+  </div>
+  <p>The second call shows the point of requiring a single amount. "$500 or $1,000" contains the right number, and a naive "gold number appears in the answer" check would pass it. A customer reading that sentence has no answer.</p>
+  <div class="callout warn">
+    <span class="callout-label">"Contains the gold string" passes hedged answers</span>
+    <p>Substring match rewards an answer that lists every plausible figure. Require exactly one amount, or grade the extracted claim rather than the raw text. The same hole opens for any identifier: an answer listing three form numbers "contains" the right one.</p>
+  </div>
+</section>
+
+<section id="rubrics">
+  <h2>Writing a rubric two people score the same way</h2>
+  <p>When the property you care about needs reading comprehension (is the answer faithful to the clause, does it say what the customer should do next), you need a rubric. A model grader and a human reviewer use the same one, which is the first reason to write it carefully: if two people cannot apply it consistently, a model will not apply it consistently either, and you will not be able to tell which of them is wrong.</p>
+  <p>Four habits separate a usable rubric from a vague one.</p>
+  <ol>
+    <li><strong>Binary criteria, not scales.</strong> "Does the answer state the deductible that the cited clause states? yes or no" is something two reviewers can agree on. "Rate accuracy from 1 to 5" is not: the 3-versus-4 boundary is each reviewer's private taste. A five-point scale also hides disagreement, because averages of noisy scores look smooth.</li>
+    <li><strong>One property per criterion.</strong> "Accurate and helpful and concise" lets a reviewer fail the answer for any of three reasons and lets you read the failure as any of three. Split it, and each criterion points at a fix.</li>
+    <li><strong>Anchor examples.</strong> For each criterion, give a passing and a failing example, with the borderline ones that came up in calibration. Reviewers rarely disagree about the clear cases. They disagree on the edge, and the edge is only learned from examples.</li>
+    <li><strong>State what to ignore.</strong> Tone, length and formatting should not move a correctness verdict. Say so in the rubric.</li>
+  </ol>
+  <p>Test the rubric before you rely on it. Have two reviewers score the same 40 to 50 items independently, then compute agreement with a chance correction such as Cohen's kappa (the statistic is defined, with a worked example, in <a href="04-llm-as-judge.html#calibration">chapter 04</a>). Raw percentage agreement flatters rubrics on skewed data. When 90% of answers pass, two reviewers who guess "pass" nine times in ten agree on 82% of items by chance alone, so a raw 90% agreement is a kappa of about 0.44, which is moderate at best. Low kappa after the first round almost always means the rubric, not the reviewers. Read the disagreements, find the criterion they cluster on, and add the example that would have settled it.</p>
+  <p>Ask the grader for its reasoning before the verdict, and keep the reasoning in the stored report. A grader that writes "the answer states $500; the cited clause states $1,000" gives you an item you can audit in ten seconds. A bare "fail" gives you nothing to audit.</p>
+</section>
+
+<section id="partial-credit">
+  <h2>Partial credit and how it gets abused</h2>
+  <p>Partial credit is tempting because an answer that gets four of five things right feels better than one that gets one of five. The problem is that a weighted sum treats failures as exchangeable, and in an insurance product they are not. An answer with the right deductible, the right procedure, a polite tone and a wrong exclusion scores 0.8 on a four-criterion sum. The customer who relies on it loses a claim.</p>
+  <p>Three rules keep partial credit honest.</p>
+  <ul>
+    <li><strong>Gate before you sum.</strong> Criteria that carry regulatory or financial harm are pass/fail gates. An answer that fails a gate scores zero regardless of the rest. Partial credit applies only to quality criteria that do not carry that cost, such as completeness of next steps.</li>
+    <li><strong>Report the criteria, not just the total.</strong> A drop from 0.86 to 0.83 in a sum could be the exclusions slice collapsing and tone improving. The per-criterion table is the result; the sum is a headline.</li>
+    <li><strong>Fix the weights before you see the results.</strong> Weights chosen after a run tend to favour the variant you already liked. Record them with the rubric version.</li>
+  </ul>
+  <p>The case where partial credit earns its place is long-form output with many independent facts, such as a claims summary with a dozen fields. There, per-field accuracy is the right metric and a single pass/fail on the whole summary hides how close the output is. The exception still holds: a field that drives a decision, such as the coverage determination, remains a gate.</p>
+</section>
+
+<section id="process">
+  <h2>Grading the process, not only the output</h2>
+  <p>An output grader sees the answer. A process grader sees how the system got there: which passages were retrieved, which tools were called, with what arguments and in what order. The two disagree more often than teams expect. A help-centre answer can be right because the model remembered a policy from training data, and break when the policy changes. A claims agent can reach the right routing by a path that skips a required check. Output-only grading rates both as passes.</p>
+  <p>Process grading costs more to set up, because you must define what a good process is and capture it in a trace. Use it where the process carries the risk. For the help-centre assistant, a cheap process check is "the cited clause was in the retrieved set" (the answer was grounded, not recalled). For the claims agent and the customer-service agent, the process is the product, and <a href="06-evaluating-agents.html">chapter 06</a> treats it in full, along with the interview-prep view in <a href="../ai-engineer-interview-prep/08-evaluating-agents-beyond-the-answer.html">evaluating agents beyond the answer</a>. For retrieval specifically, the mechanics are in <a href="../production-rag-deep-dive/06-measuring-retrieval.html">measuring retrieval</a>.</p>
+</section>
+
+<section id="combining">
+  <h2>Combining graders: gate, then judge, then audit</h2>
+  <p>Layer the graders from cheapest and most certain to dearest and most subjective. Each layer sees only what survived the one before, and each is justified by what the previous layer cannot see.</p>
+  <div class="flow">  every item, every change
+      │
+      ▼
+  [programmatic gate]  number, version, citation, forbidden content, schema
+      │ fail ──► scored fail, no model call spent
+      ▼ pass
+  [rubric model grader] faithful to cited clause? next step stated? tone?
+      │
+      ▼
+  [human audit]  all gate fails + disagreements + a random 10% of passes
+      │
+      ▼
+  per-criterion report, per slice</div>
+  <p>The gate does three jobs. It saves money, since a clearly failed item needs no model call. It removes the cases where a model grader is weakest, which is exact numbers and identifiers (<a href="04-llm-as-judge.html#wrong-tool">chapter 04</a> explains why). And it makes the model grader's job smaller and more consistent, because every item it sees already has the right number and a resolving citation.</p>
+  <p>The human audit is what makes the cheaper graders trustworthy. Send the humans three kinds of item: everything the gate failed, to confirm the gate is not rejecting correct answers; every item where the model grader and a programmatic check disagree; and a random sample of the passes, to estimate how many wrong answers slip through. A 10% sample of 400 items is 40 reviews per run, which is an afternoon rather than a project. If the audit finds the gate rejecting good answers, fix the normaliser. If it finds bad answers passing, add the rule that would have caught them, and add the item to the set.</p>
+  <div class="callout insight">
+    <span class="callout-label">Choose the grader by the cost of a wrong grade</span>
+    <p>For a deductible, a wrong grade means shipping a wrong figure to customers, so use a deterministic gate and a human audit. For tone on a thank-you message, a wrong grade costs almost nothing, so a rubric model grader alone is enough. Spending the same effort on both is waste in one place and risk in the other.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate proposes scoring the deductible slice by checking that the gold amount appears somewhere in the answer. Name two answers that would pass this check and still harm a customer.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An answer that lists several amounts ("$500 or $1,000") passes, and so does an answer that states the right amount for the wrong policy version or jurisdiction. The check scores presence, not a claim. Extract the stated amount, require exactly one, and compare version and jurisdiction as well. See <a href="#deterministic">deterministic graders</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two reviewers score 100 answers with a pass/fail rubric. They agree on 90, and each marks 90 answers as passes. Their manager calls the rubric solid. What is the chance-corrected agreement, and what do you do next?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Chance agreement is 0.9 × 0.9 + 0.1 × 0.1 = 0.82, so kappa is (0.90 − 0.82) / (1 − 0.82), about 0.44. The raw 90% looks strong only because most answers pass. Read the 10 disagreements, find the criterion they cluster on, and add anchor examples before you trust the rubric. See <a href="#rubrics">rubrics</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer-service answer scores 0.85 on a weighted rubric: correct procedure, friendly tone, clear next steps, and a wrong statement that a flood loss is covered. Why is the score misleading, and how do you restructure it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A weighted sum lets three good qualities offset one failure that carries regulatory cost. Turn the coverage statement into a gate: failing it zeroes the item. Keep partial credit for quality criteria that carry no such cost, and report per-criterion results. See <a href="#partial-credit">partial credit</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your gate rejects 6% of answers that a human audit says are correct. Where do you look first, and why does fixing it matter more than fixing the model grader?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Look at the normaliser: formats such as "1,000.00", "one thousand" or a currency symbol the parser misses. A false fail in the first layer removes the item from every later layer and depresses the headline score on every run, so the error is systematic and invisible downstream. See <a href="#combining">combining graders</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Where would you not add a model grader at all in the help-centre pipeline, and what do you use instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>On exact figures, identifiers and anything with a resolvable source, such as a deductible, a form number or a clause citation. A programmatic check is exact, free and repeatable, while a model grader can pass a plausible wrong number. Use the model grader for properties that need reading, such as faithfulness to the clause. See <a href="#combining">combining graders</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A grader scores only what it can see, so choose it by whether the failure you fear leaves a trace in its inputs.</li>
+    <li>Programmatic checks are the default for numbers, identifiers, citations, schemas and forbidden actions, because they are exact and free, but they score evidence of correctness rather than correctness.</li>
+    <li>"Contains the gold string" passes hedged answers; require one extracted claim and compare version and jurisdiction too.</li>
+    <li>A rubric works when two people apply it the same way: binary criteria, one property each, anchor examples, and a chance-corrected agreement check before use.</li>
+    <li>Gate the criteria that carry regulatory or financial harm and sum only the rest; fix weights before the run, and report per criterion.</li>
+    <li>Layer graders from cheap and certain to dear and subjective, and spend human time on gate fails, disagreements and a random sample of passes.</li>
+  </ul>
+  <p>The model grader in the middle of that stack has its own biases and needs its own calibration. → <a href="04-llm-as-judge.html">LLM-as-Judge</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/test-and-evaluate/develop-tests" target="_blank" rel="noopener"><strong>Define success criteria and build evaluations</strong></a> — Anthropic docs, accessed 2026. Eval design principles, including preferring automated grading at volume and using a different model to grade than the one that generated the output.</li>
+    <li><a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener"><strong>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</strong></a> — Zheng et al., 2023. The evidence base for what a model grader can and cannot do; chapter 04 uses it in detail.</li>
+    <li><a href="https://arxiv.org/abs/2303.16634" target="_blank" rel="noopener"><strong>G-Eval</strong></a> — Liu et al., 2023. Chain-of-thought evaluation steps plus form-filling scoring, and its noted bias toward model-written text.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

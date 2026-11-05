@@ -26,7 +26,8 @@
         { name: 'Build an Inference Gateway in Rust', folder: 'build-inference-gateway-rust' },
         { name: 'PagedAttention from First Principles', folder: 'paged-attention-deep-dive' },
         { name: 'AI Engineer Interview Prep', folder: 'ai-engineer-interview-prep' },
-        { name: 'Production RAG from the Retrieval Up', folder: 'production-rag-deep-dive' }
+        { name: 'Production RAG from the Retrieval Up', folder: 'production-rag-deep-dive' },
+        { name: 'Evals for LLM Systems', folder: 'llm-evals-deep-dive' }
       ]
     },
     {
