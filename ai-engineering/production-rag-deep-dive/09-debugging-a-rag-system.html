@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Debugging a RAG System — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The trace you need per request, the bisection that separates retrieval faults from generation faults, the six failure classes and the test that identifies…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/09-debugging-a-rag-system">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Debugging a RAG System — Production RAG from the Retrieval Up">
+<meta property="og:description" content="The trace you need per request, the bisection that separates retrieval faults from generation faults, the six failure classes and the test that identifies…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/09-debugging-a-rag-system">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#trace">The trace: what one request must leave behind</a>
+    <a href="#bisect">The bisection: retrieval or generation</a>
+    <a href="#classes">The six failure classes and the one test for each</a>
+    <a href="#dashboard">The regression dashboard</a>
+    <a href="#runbook">Runbook: a user reported a wrong answer</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-freshness-tenancy-and-access.html">← Previous: Freshness, Tenancy and Access Control</a>
+    <a href="10-injection-through-retrieved-text.html">Next: Injection Through Retrieved Text →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Generating and operating</span>
+  <h1>Debugging a RAG System</h1>
+  <p class="subtitle">The trace you need per request, the bisection that separates retrieval faults from generation faults, the six failure classes and the test that identifies each, and the dashboard that catches regressions before users do.</p>
+</header>
+
+<section id="trace">
+<h2>The trace: what one request must leave behind</h2>
+<p>A support lead at Harbourline forwards a screenshot: the assistant told a customer her water-damage deductible was $500, and the wording says $1,000. Without a record of that request you can only rerun it today, against today's index, today's prompt and a sampling temperature that may not repeat the mistake. Debugging a RAG system is forensic work on a request that already happened, so the first decision is what every request writes down. The rule is that the log must let you replay each stage in isolation, not just read the answer.</p>
+<div class="flow">  ONE REQUEST, ONE TRACE RECORD (keyed by request_id, kept 30+ days)
+
+  user query ─► rewritten query ─► filters applied (tenant, product, version, date)
+                                          │
+        candidates: [chunk_id, doc_version, bm25_rank, dense_rank, fused_score] x 100
+                                          │
+        reranked:   [chunk_id, rerank_score] x 20      (the list the cutoff acts on)
+                                          │
+        assembled context: [chunk_id, tokens] in prompt order, total tokens, truncated?
+                                          │
+        prompt_version, model id, temperature  ─►  answer  ─►  citations parsed
+                                          │
+        latency per stage (rewrite, retrieve, rerank, generate), tokens in/out</div>
+<p>Three fields are routinely missing and each one hides a failure class. Candidates with scores, because without them you cannot tell "the gold chunk was never retrieved" from "it was retrieved and the reranker buried it". The assembled context in prompt order with token counts, because truncation and position (see <a href="07-context-assembly-and-grounding.html">chapter 07</a>) change what the model can use. And the document version, because Harbourline keeps several versions of each product wording per year and a perfectly retrieved chunk from the 2024 wording is a wrong answer for a 2026 policy. Store chunk ids and hashes rather than full text if volume or privacy is a concern, and keep the text in the immutable index snapshot so the ids resolve later. The retrieval contract that decides what a chunk id means is in <a href="01-the-retrieval-contract.html">chapter 01</a>.</p>
+<div class="callout warn">
+<span class="callout-label">A trace that cannot replay is a log line</span>
+<p>If the stored request cannot be fed back through retrieval with the same index snapshot, same filters and same prompt version, you will end up arguing about what probably happened. Version the index and the prompt, and store both identifiers in the trace.</p>
+</div>
+</section>
+
+<section id="bisect">
+<h2>The bisection: retrieval or generation</h2>
+<p>Every wrong answer has one of two broad causes: the model did not receive the evidence, or it received it and failed to use it. One experiment separates them. Take the trace, replace the retrieved context with the gold passage (the one your labelled set maps to this question), keep the prompt and model identical, and ask again. If the answer is now right, the fault is upstream of generation. If it is still wrong, retrieval is not the problem and no amount of chunk tuning will fix it.</p>
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>bisect.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">def bisect(trace, gold_chunks, ask, judge):
+    """Replay a failed request with oracle context. `ask` and `judge` are yours."""
+    oracle = ask(trace.query, context=gold_chunks, prompt=trace.prompt_version)
+    if judge(oracle, trace.expected_answer):
+        # generation is fine when given the evidence: look upstream
+        gold_ids = {c.id for c in gold_chunks}
+        retrieved = {c.id for c in trace.candidates}
+        in_final = {c.id for c in trace.context}
+        if not gold_ids &amp; retrieved:
+            return "not retrieved"      # extraction, chunking, embedding, or filter
+        if not gold_ids &amp; in_final:
+            return "ranked below cutoff"
+        return "retrieved but not used: check position and truncation"
+    return "generation"                 # model ignored or overrode correct context</code></pre>
+</div>
+<p>The second cut happens inside the retrieval branch. Walk the evidence outward from the answer: is the gold passage in the assembled context, in the reranked list, in the 100 candidates, in the index at all, in the parsed text at all? The first stage where it is absent is the stage that failed. This is the same bisection as the one in the <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html#bisect">interview-prep chapter</a>, here with the measurements attached.</p>
+</section>
+
+<section id="classes">
+<h2>The six failure classes and the one test for each</h2>
+<p>Each class below leaves a different signature in the trace, and each has a test that takes minutes and returns a yes or no. Run them in this order, cheapest first, because an excluded filter or an unparsed table wastes less time than a retuned embedding model.</p>
+<div style="overflow-x: auto;">
+<table>
+<thead><tr><th>Class</th><th>What the trace shows</th><th>The one test</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td class="term">Filter excluded it</td><td>Gold chunk absent from every candidate list, at any rank</td><td>Rerun retrieval with filters off. Gold appears: a filter did it.</td><td>Fix the metadata (wrong product code, missing version) or the filter logic; add a filter-miss alarm.</td></tr>
+<tr><td class="term">Extraction lost it</td><td>Answer is in the PDF but no chunk contains it</td><td>Search the parsed text for the exact gold string, such as "$1,000". Not found: the parser dropped it.</td><td>Change the parser for that layout; tables and scanned pages are the usual cause (<a href="02-parsing-and-chunking.html">chapter 02</a>).</td></tr>
+<tr><td class="term">Chunking split it</td><td>Two chunks each hold half the answer, such as a deductible with its heading in the previous chunk</td><td>Is the whole gold span inside one chunk? Count chunks that contain the span.</td><td>Structure-aware boundaries, keep headings and table headers with rows, or add parent-chunk expansion.</td></tr>
+<tr><td class="term">Embedding or query mismatch</td><td>Chunk exists but is absent from top 100 dense, present in BM25 (or the reverse)</td><td>Compare gold rank under dense-only and BM25-only. Embed the raw and rewritten query and compare the gold's score.</td><td>Hybrid retrieval for identifiers, a better embedding model, or drop a query rewrite that moved the query away from the document's vocabulary (<a href="04-lexical-dense-and-hybrid-retrieval.html">chapter 04</a>).</td></tr>
+<tr><td class="term">Ranked below k</td><td>Gold in candidates at rank 40, absent from the 5 chunks the prompt kept</td><td>Compare recall@100 with recall@5 on this question. A large gap means the ranking is the loss.</td><td>Add or retrain the reranker, raise k if the token budget allows, dedupe near-identical versions that crowd the list (<a href="05-reranking.html">chapter 05</a>).</td></tr>
+<tr><td class="term">Generation ignored it</td><td>Gold chunk is in the prompt; the answer contradicts or omits it</td><td>Oracle-context replay is still wrong, or moving the gold chunk to the first position makes it right.</td><td>Reorder context, shrink it, tighten the grounding instruction, require quotes, or change the model (<a href="07-context-assembly-and-grounding.html">chapter 07</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two of these are easy to misread. Embedding mismatch and ranking below k both show the gold chunk "not in the final context", so people retune the reranker for a problem that sits in the first-stage retrieval. The distinguishing number is where the gold chunk sits in the 100 candidates: absent means first stage, present but low means ranking. The other is the generation class, where "the model hallucinated" is often really a position effect. Liu et al. found that accuracy on multi-document question answering falls when the relevant passage sits in the middle of a long context rather than at the start or end, so the one-line test of moving the gold chunk is worth running before blaming the model.</p>
+<p>For Harbourline's $500 versus $1,000 case the traces usually land in one of three places. The wording for 2024 and 2026 both match the query and the older one outranks the newer (a filter or dedupe fault). The deductible sits in a table whose header row was parsed into a different chunk (extraction or chunking). Or the right table was retrieved and the model quoted a neighbouring row (generation). The bisection takes the three apart in one pass.</p>
+<div class="callout insight">
+<span class="callout-label">Most wrong answers have two causes, and fixing one reveals the other</span>
+<p>Fix a chunking fault and the gold chunk now ranks fifth, below your cutoff of four. Plan to rerun the bisection after each fix until the oracle and the real pipeline agree.</p>
+</div>
+</section>
+
+<section id="dashboard">
+<h2>The regression dashboard</h2>
+<p>Individual bug reports tell you what is broken for people who complained. The dashboard tells you what changed for everyone else, and it runs on the same ~400 labelled questions used throughout this guide. Four panels, run nightly and on every change to the index, prompt or model.</p>
+<ul>
+<li><strong>Recall@k per slice.</strong> The five question types (limits and deductibles, exclusions, procedures, definitions, identifiers) each get their own line, measured as in <a href="06-measuring-retrieval.html">chapter 06</a>. The aggregate hides a regression that touches one slice, and identifiers are exactly where a change to the embedding model or tokenizer hurts first.</li>
+<li><strong>Faithfulness sample.</strong> A judge model scores whether each claim in the answer is supported by the retrieved context, as in the RAGAS metrics, on a rotating sample of live traffic. Treat the judge as a noisy instrument and spot-check a handful of its verdicts by hand every week.</li>
+<li><strong>Abstention rate.</strong> The share of answers that decline. A rise means retrieval is thinning out or the grounding prompt got stricter. A fall can mean the model has started answering things it should refuse, which at Harbourline is the dangerous direction.</li>
+<li><strong>Latency per stage.</strong> p50 and p95 for rewrite, retrieve, rerank and generate separately. A p95 jump in retrieve with flat recall usually means an index or filter-plan change.</li>
+</ul>
+<p>Mind the sample size. With roughly 80 questions in a slice and recall near 0.90, the 95% confidence interval on a single measurement is about plus or minus 6.5 points (1.96 times the square root of 0.9 x 0.1 / 80). A drop from 0.90 to 0.86 in one night is inside the noise. Compare runs on the same questions as paired differences, alert on drops that persist for several runs or exceed what the paired difference supports, and keep a fixed holdout that you never tune against so improvements are not just overfitting to the dashboard.</p>
+</section>
+
+<section id="runbook">
+<h2>Runbook: a user reported a wrong answer</h2>
+<p>Write this down once so the on-call engineer does not improvise. It assumes the trace exists.</p>
+<ol>
+<li>Pull the trace by request id. Confirm the index snapshot and prompt version are still available. If not, say so in the ticket, because the rest is guesswork.</li>
+<li>Establish the correct answer from the source document, with page and version, before you touch the system. Write the gold passage into the ticket.</li>
+<li>Run the oracle-context replay. Wrong with the gold passage: go to step 6.</li>
+<li>Right with the gold passage: find the first stage where the gold chunk is missing (context, reranked list, candidates, index, parsed text). Run the matching test from the table.</li>
+<li>Apply the fix to the cause, not the symptom. Do not add a prompt line saying "the water-damage deductible is $1,000".</li>
+<li>For a generation fault, test position, context size and grounding wording, one change at a time, on this question.</li>
+<li>Add the question and its gold passage to the labelled set under the right slice. Rerun the dashboard and confirm the slice did not regress elsewhere.</li>
+<li>If the wrong answer reached a customer who may have acted on it, tell the owner of complaints and refunds the same day. That decision is not an engineering one.</li>
+</ol>
+<p>Step 7 is the one that compounds. Each reported failure that enters the labelled set becomes a permanent regression test, so the same bug cannot return unnoticed. A related failure type, where retrieval and answer are right but the attack came through a document, is the subject of <a href="10-injection-through-retrieved-text.html">the next chapter</a>; the compliance guide covers the audit trail side in <a href="../ai-engineer-compliance/06-rag-applied.html#ops">RAG applied</a>.</p>
+</section>
+
+<section id="check">
+<h2>✓ Check yourself</h2>
+<p>Answer from memory before opening each one.</p>
+<ol>
+<li>
+<p>A user reports a wrong exclusion. You replay the request with the gold passage placed in the prompt and the answer is still wrong. A colleague wants to try a larger chunk size. What do you tell them, and what do you test instead?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Chunk size cannot matter: the model was handed the right evidence and still failed, so the fault is in generation. Test the position of the gold chunk, the amount of other context, and the grounding instruction one at a time. See <a href="#bisect">the bisection</a>.</p></div></details>
+</li>
+<li>
+<p>Gold chunk is rank 37 among 100 candidates and absent from the 5 chunks in the prompt. Another question has the gold chunk absent from all 100. Do they need the same fix?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. The first is a ranking loss, addressed by reranking or a larger k. The second is a first-stage failure (embedding or query mismatch, filter, chunking or extraction), and a better reranker cannot find what was never a candidate. See <a href="#classes">the failure classes</a>.</p></div></details>
+</li>
+<li>
+<p>The aggregate recall@5 on your labelled set is flat at 0.88 after an embedding model upgrade, but support complains about policy-number lookups. What do you check, and why did the dashboard stay green?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Check the identifiers slice. Dense models often lose exact-match behaviour on codes, and gains on other slices can offset it in the average. A per-slice view exposes this. See <a href="#dashboard">the dashboard</a>.</p></div></details>
+</li>
+<li>
+<p>A slice of 80 questions drops from 0.90 to 0.86 recall overnight. Should the on-call page the team?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not on that alone. The interval on one measurement is about plus or minus 6.5 points, so the drop is within noise. Look at the paired difference on the same questions, and page if it persists or specific questions that used to pass now fail. See <a href="#dashboard">the dashboard</a>.</p></div></details>
+</li>
+<li>
+<p>An engineer fixes a reported wrong deductible by adding the correct figure to the system prompt. It works. Why is that the wrong fix at Harbourline, and what should have happened?</p>
+<details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It patches one product's one limit, goes stale when the wording changes, and leaves the real cause (parsing, ranking, versioning) in place for every other limit. The question and gold passage should have gone into the labelled set after a root-cause fix. See <a href="#runbook">the runbook</a>.</p></div></details>
+</li>
+</ol>
+</section>
+
+<section id="takeaway">
+<h2>Takeaway</h2>
+<ul>
+<li>A request that leaves no replayable trace (candidates with scores, ordered context with token counts, index and prompt versions) cannot be debugged, only guessed at.</li>
+<li>Replacing the retrieved context with the gold passage splits wrong answers into retrieval faults and generation faults in one experiment.</li>
+<li>Within retrieval, the first stage at which the gold chunk goes missing names the failure class: filter, extraction, chunking, first-stage mismatch or ranking.</li>
+<li>Test the cheap, mechanical causes first, and rerun the bisection after each fix because a second fault is often hiding behind the first.</li>
+<li>Recall per slice on a fixed labelled set catches regressions that an average hides, but small slices carry wide error bars, so use paired comparisons.</li>
+<li>Every reported failure should end as a new labelled question, not as a prompt patch.</li>
+</ul>
+<p>Retrieval is also an input channel an attacker can write to. → <a href="10-injection-through-retrieved-text.html">Injection Through Retrieved Text</a></p>
+</section>
+
+<section id="further-reading">
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener"><strong>Lost in the Middle: How Language Models Use Long Contexts</strong></a> — Liu et al., 2023. The evidence for position effects in multi-document question answering.</li>
+<li><a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener"><strong>Ragas: Automated Evaluation of Retrieval Augmented Generation</strong></a> — Es et al., 2023. Reference-free metrics for context relevance, faithfulness and answer quality, the basis for the faithfulness panel.</li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Start Here — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Most RAG systems are tuned by swapping parts until the demo looks better. This guide takes the pipeline apart layer by layer so you can predict what a change…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/00-START-HERE">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Start Here — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Most RAG systems are tuned by swapping parts until the demo looks better. This guide takes the pipeline apart layer by layer so you can predict what a change…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/00-START-HERE">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">Why a deep dive on RAG</a>
+    <a href="#chain">The pipeline as a chain of contracts</a>
+    <a href="#set">The one labelled set</a>
+    <a href="#harbourline">The running example</a>
+    <a href="#folder">The chapters, in order</a>
+    <a href="#how">How to read it</a>
+    <a href="#takeaway">Takeaway</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-the-retrieval-contract.html">Next: The Retrieval Contract →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section A · Orient</span>
+  <h1>Start Here</h1>
+  <p class="subtitle">Most RAG systems are tuned by swapping parts until the demo looks better. This guide takes the pipeline apart layer by layer so you can predict what a change will do before you make it, and measure it afterwards on one labelled set. Start here for the frame, the set, and the running example.</p>
+</header>
+
+<section id="why">
+  <h2>Why a deep dive on RAG</h2>
+  <p>Retrieval-augmented generation is the most common shape of production LLM system and the least understood by the teams running it. The pattern is simple enough to build in an afternoon, which is the problem: the afternoon version works on the ten questions you tried, and the failures arrive later, one user complaint at a time, with no obvious place to look. Teams respond by changing the embedding model, or the chunk size, or the prompt, and judge the change by whether the complaint stops. That is not engineering; it is superstition with a deploy pipeline.</p>
+  <p>Every layer of the pipeline has a mechanism: something it computes, over some input, with a cost, and a specific way it loses information. Once you know the mechanism you can say in advance that a larger chunk will help recall on procedures and hurt it on definitions, that a reranker will fix rank-eleven failures and do nothing for parsing failures, that a filter will exclude the right passage as readily as the wrong one. This guide explains each layer at that level, then gives you the measurement that shows whether your system has the problem.</p>
+  <p>It is written for people who already run a RAG system. If you need the interview-shaped version of this material, the <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html">AI Engineer Interview Prep</a> guide covers the same ground in that format and links back here for depth.</p>
+</section>
+
+<section id="chain">
+  <h2>The pipeline as a chain of contracts</h2>
+  <p>The frame the whole guide uses: each layer owes the next something specific, and every failure is a breach of one of those obligations. Debugging is finding the breach; tuning is strengthening the layer that keeps breaching.</p>
+  <div class="flow">  source documents
+      │  PARSE      owes: the text, in reading order, tables intact, with structure
+      ▼
+  text + structure
+      │  CHUNK      owes: units that carry their own meaning, small enough to retrieve,
+      ▼              whole enough to read, labelled with where they came from
+  chunks + metadata
+      │  EMBED      owes: vectors that put a question near the passage that answers it
+      ▼
+  index (vectors, terms, metadata)
+      │  RETRIEVE   owes: the answering passage somewhere in the candidate list
+      ▼
+  candidates
+      │  RERANK     owes: the answering passage inside the top k
+      ▼
+  top k
+      │  ASSEMBLE   owes: a context the model can use: ordered, deduplicated,
+      ▼              within budget, with provenance the model can cite
+  prompt
+      │  GENERATE   owes: an answer supported by the context, or an honest "not here"
+      ▼
+  answer + citations</div>
+  <p>Two things follow from drawing it this way. First, the index being "complete" proves almost nothing about the answer: six obligations still have to hold after ingestion. Second, a wrong answer with the right document in the index is not one bug but a family of six, and they leave different evidence. <a href="09-debugging-a-rag-system.html">Chapter 09</a> turns this into a procedure.</p>
+  <div class="callout insight">
+    <span class="callout-label">Retrieval and generation fail differently, and you can tell them apart in one call</span>
+    <p>Take a failing question, find the passage that should have answered it, and run the generator again with that passage forced into the context. If the answer flips to correct, the breach is upstream of the prompt. If it stays wrong, the breach is in assembly or generation. Every chapter in this guide assumes you have done this before you start tuning anything.</p>
+  </div>
+</section>
+
+<section id="set">
+  <h2>The one labelled set</h2>
+  <p>Nothing in this guide is judged by whether an answer "looks better". Every layer is measured against the same artefact: a labelled set of real questions, each mapped to the passage or passages that answer it, sliced by the kind of question it is. For Harbourline that set is about 400 questions sampled from the help-centre logs, in five slices:</p>
+  <table>
+    <thead><tr><th>Slice</th><th>Example question</th><th>What usually breaks it</th></tr></thead>
+    <tbody>
+      <tr><td>Limits and deductibles</td><td>"What is my deductible for water damage?"</td><td>Tables flattened at parse time; the wrong policy year outranking the right one</td></tr>
+      <tr><td>Exclusions</td><td>"Is damage from a sump-pump failure covered?"</td><td>Negation; paraphrase between customer language and policy language</td></tr>
+      <tr><td>Procedures</td><td>"How do I add a driver to my policy?"</td><td>Steps split across chunks; internal and customer-facing procedures confused</td></tr>
+      <tr><td>Definitions</td><td>"What counts as a named storm?"</td><td>Definition sections chunked away from the terms they define</td></tr>
+      <tr><td>Identifiers</td><td>"What does form HL-204 cover?"</td><td>Dense retrieval treating a form code as noise</td></tr>
+    </tbody>
+  </table>
+  <p>With this set you can compute recall@k (is the answering passage in the top k?), MRR and nDCG for retrieval, and faithfulness for generation, per slice, before and after any change. A change that lifts the aggregate while dropping the identifiers slice is a regression you would otherwise ship. <a href="06-measuring-retrieval.html">Chapter 06</a> explains how to build the set and what each metric hides; chapters 02 through 05 each end by measuring their layer against it.</p>
+</section>
+
+<section id="harbourline">
+  <h2>The running example: Harbourline Insurance</h2>
+  <p>Harbourline is a fictional mid-size property-and-casualty insurer, about two million policies across the US and UK, shared with the other AI Engineering guides on this site. The system under study is its help-centre assistant: retrieval over roughly 12,000 documents, policy wordings of 20 to 300 pages in PDF and HTML with tables of limits and deductibles, several versions per product per year, plus internal procedures that agents use. Around 40,000 chat sessions a day, a third of which reach the assistant.</p>
+  <p>The cost of error is deliberately uneven. A wrong deductible quoted to a customer is a complaint and a refund. A wrong exclusion read to a customer during a claim is a regulatory issue. The same corpus feeds the claims-intake agent, so a retrieval fault can surface as a wrong coverage decision rather than a wrong chat answer. Those stakes are what justify the measurement discipline; a hobby project could skip most of it.</p>
+</section>
+
+<section id="folder">
+  <h2>The chapters, in order</h2>
+  <p>The order follows the pipeline. Each chapter opens on the decision or the failure, explains the mechanism, gives the numbers with their sources, shows the measurement, and ends with scenario questions to answer before you open the answers.</p>
+  <h3>Section B · Building the index</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="01-the-retrieval-contract.html">01 The Retrieval Contract</a></td><td>What the generator needs from retrieval, stated so you can test for it</td></tr>
+      <tr><td><a href="02-parsing-and-chunking.html">02 Parsing and Chunking</a></td><td>Where documents lose their meaning before an embedding sees them, and how to chunk and measure</td></tr>
+      <tr><td><a href="03-embeddings.html">03 Embeddings</a></td><td>What a bi-encoder can and cannot represent, and how to choose a model for your corpus</td></tr>
+    </tbody>
+  </table>
+  <h3>Section C · Retrieving</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="04-lexical-dense-and-hybrid-retrieval.html">04 Lexical, Dense and Hybrid Retrieval</a></td><td>Why BM25 and dense retrieval miss different queries, and how to fuse them</td></tr>
+      <tr><td><a href="05-reranking.html">05 Reranking</a></td><td>What a cross-encoder computes that a bi-encoder cannot, and when it earns its latency</td></tr>
+      <tr><td><a href="06-measuring-retrieval.html">06 Measuring Retrieval</a></td><td>Building the labelled set, and recall@k, MRR and nDCG with what each hides</td></tr>
+    </tbody>
+  </table>
+  <h3>Section D · Generating and operating</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="07-context-assembly-and-grounding.html">07 Context Assembly and Grounding</a></td><td>k, ordering, budgets, citations the model can honour, and abstention</td></tr>
+      <tr><td><a href="08-freshness-tenancy-and-access.html">08 Freshness, Tenancy and Access Control</a></td><td>Keeping the index true to the source and enforcing permissions at retrieval time</td></tr>
+      <tr><td><a href="09-debugging-a-rag-system.html">09 Debugging a RAG System</a></td><td>The trace, the bisection, the six failure classes and the regression dashboard</td></tr>
+      <tr><td><a href="10-injection-through-retrieved-text.html">10 Injection Through Retrieved Text</a></td><td>Retrieved documents as untrusted input: the attacks, the defences that hold, and how to test them</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="how">
+  <h2>How to read it</h2>
+  <p>If you run a RAG system, read with it open. After chapter 06, build the labelled set for your own corpus; a hundred questions is enough to start. Every later chapter then gives you something to measure rather than something to believe. If you are reading for understanding only, the order still holds, because each layer's failures are explained in terms of what the previous layer promised.</p>
+  <p>The chapters assume you know what an embedding and a vector index are and have called a model API. They do not assume you have read any paper; the ones that matter are cited where they are used and listed under Further reading with a note on what each is good for.</p>
+  <div class="callout tip">
+    <span class="callout-label">Answer before you open</span>
+    <p>Each chapter ends with scenario questions whose answers are folded away. They are written so that a reader who followed the mechanism can work them out and a reader who skimmed cannot. Use them as the test of whether to move on.</p>
+  </div>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A RAG pipeline is a chain of contracts: each layer owes the next something specific, and every failure is a breach you can locate.</li>
+    <li>"The document is in the index" leaves six obligations still to be met before the model can use it.</li>
+    <li>Forcing the gold passage into the context separates retrieval faults from generation faults in one model call; do it before tuning anything.</li>
+    <li>Every change is measured against one labelled set, per slice, because aggregates hide the regressions that matter.</li>
+    <li>Mechanism first: knowing what a layer computes lets you predict what a change will do instead of trying it and watching the complaints.</li>
+  </ul>
+  <p>The chain begins with what the generator is owed. → <a href="01-the-retrieval-contract.html">The Retrieval Contract</a></p>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

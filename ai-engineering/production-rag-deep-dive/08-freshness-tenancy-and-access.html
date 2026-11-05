@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Freshness, Tenancy and Access Control — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Keeping the index true to the source: change detection, re-embedding, deletes and versions, multi-tenant isolation, document-level permissions enforced at…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/08-freshness-tenancy-and-access">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Freshness, Tenancy and Access Control — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Keeping the index true to the source: change detection, re-embedding, deletes and versions, multi-tenant isolation, document-level permissions enforced at…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/08-freshness-tenancy-and-access">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#derived">The index is derived data</a>
+    <a href="#change">Change detection</a>
+    <a href="#deletes">Deletes and tombstones</a>
+    <a href="#versions">Versions and effective dates</a>
+    <a href="#reembed">Changing the embedding model</a>
+    <a href="#tenancy">Multi-tenancy</a>
+    <a href="#access">Access control</a>
+    <a href="#signals">Operational signals</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-context-assembly-and-grounding.html">← Previous: Context Assembly and Grounding</a>
+    <a href="09-debugging-a-rag-system.html">Next: Debugging a RAG System →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Generating and operating</span>
+  <h1>Freshness, Tenancy and Access Control</h1>
+  <p class="subtitle">Keeping the index true to the source: change detection, re-embedding, deletes and versions, multi-tenant isolation, document-level permissions enforced at retrieval time rather than in the prompt.</p>
+</header>
+
+<section id="derived">
+  <h2>The index is derived data</h2>
+  <p>Every chunk, vector and posting list in the index is computed from a source document by a pipeline: parser, chunker, embedding model, metadata rules. The index is therefore a cache of that pipeline's output, and like any cache it is wrong the moment the source or the pipeline changes. The freshness question is how long it stays wrong, and for what.</p>
+  <p>Harbourline's corpus makes the stakes concrete. About 12k documents at roughly 100 chunks each is on the order of a million chunks (an estimate; count yours). A new edition of a home policy wording replaces a 200-page document. A claims procedure changes on a Tuesday. A document is withdrawn after a regulatory review. Each is a different kind of change, and the pipeline needs a different response to each: re-embed, delete, supersede. Two further events change the whole index at once: a new embedding model and a new chunking scheme. The rest of the chapter takes these in turn, then the question of who is allowed to see what.</p>
+  <p>Treat the source system as the truth and give each chunk a lineage: <code>doc_id</code>, <code>doc_version</code>, <code>content_hash</code>, the pipeline version that produced it (parser, chunker and embedding model identifiers) and the time it was indexed. Everything below depends on those fields existing at ingestion. Adding them later means re-ingesting everything.</p>
+</section>
+
+<section id="change">
+  <h2>Change detection and incremental re-embedding</h2>
+  <p>Re-embedding the whole corpus on every sync is simple and wasteful, and embedding is usually the largest ingestion cost. Change detection decides which documents need work. Three signals, in order of cost:</p>
+  <ol>
+    <li><strong>Source metadata:</strong> a modified time, ETag or version number from the document store. Cheap, but wrong when an upstream system touches files without changing them, or changes them without bumping the time.</li>
+    <li><strong>Document content hash:</strong> hash the raw bytes (or the parsed text) and compare to the stored hash. This catches the metadata lies and ignores no-op touches.</li>
+    <li><strong>Chunk content hash:</strong> after parsing and chunking, hash each chunk. Only chunks whose hash is new need embedding; chunks with an unchanged hash keep their vectors.</li>
+  </ol>
+  <p>The third level matters for long documents with local edits. Updating one clause in a 200-page wording should re-embed a handful of chunks, not 600. It only works if the chunker is stable, meaning an edit at page 40 does not shift every boundary after it. Fixed-size windows by token count fail this test, since one inserted sentence moves every later boundary and every hash changes. Structure-aware chunking that splits on headings and clauses (<a href="02-parsing-and-chunking.html">chapter 02</a>) keeps boundaries local. Include the heading path in the hashed text, or a chunk whose section was renamed will look unchanged.</p>
+
+<div class="flow">source doc ──► parse ──► chunk ──► hash each chunk
+                                          │
+              compare with stored hashes  │
+                 ┌────────────────────────┼─────────────────────┐
+                 ▼                        ▼                     ▼
+          hash unchanged            hash is new            hash gone
+          keep vector               embed + upsert         tombstone
+                                          │                     │
+                                          └──────► index ◄──────┘</div>
+
+<div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>sync_doc.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import hashlib
+
+def chunk_hash(chunk, pipeline_version):
+    text = chunk["heading_path"] + "\n" + chunk["text"]
+    return hashlib.sha256((pipeline_version + text).encode()).hexdigest()
+
+def sync(doc, new_chunks, store, embed, pipeline_version):
+    old = {c["hash"]: c for c in store.chunks_for(doc["id"], doc["version"])}
+    new = {chunk_hash(c, pipeline_version): c for c in new_chunks}
+
+    to_embed = [h for h in new if h not in old]
+    vectors = embed([new[h]["text"] for h in to_embed])
+    store.upsert([{**new[h], "hash": h, "doc_id": doc["id"],
+                   "doc_version": doc["version"], "vector": v}
+                  for h, v in zip(to_embed, vectors)])
+
+    store.tombstone([old[h]["id"] for h in old if h not in new])
+    return len(to_embed), len(old) - len(new) + len(to_embed)  # embedded, removed</code></pre>
+</div>
+
+  <p>Put the pipeline version inside the hash, as above. When you change the chunker or the cleaning rules, every hash changes and the sync re-processes the corpus without a special mode. When you change only the embedding model, though, you do not want a quiet mixing of vector spaces, which the re-embedding section handles.</p>
+  <p>How fresh is fresh enough? A nightly batch is fine for policy wordings that change a few times a year. It is not fine for a procedure change that agents must follow today. Harbourline can run an event-driven path for the internal procedures (document store webhook, queue, sync) and a nightly reconciliation job for everything, since webhooks get lost. The reconciliation, which lists source and index and diffs them, is the part that guarantees convergence.</p>
+</section>
+
+<section id="deletes">
+  <h2>Deletes, tombstones and orphans</h2>
+  <p>An upsert pipeline is naturally good at adding and bad at removing. Documents withdrawn at the source leave their chunks in the index, still retrievable, still quoted. These are orphaned chunks, and they are one of the most common long-run RAG defects because nothing errors when they appear.</p>
+  <p>Two mechanisms are needed. First, delete by key: every chunk carries its <code>doc_id</code>, and a withdrawn document deletes all chunks with that id, in the vector index and in any lexical index, cache or side table that holds copies. Second, delete by absence: the reconciliation job lists the ids present in the index and absent from the source and removes them. The second catches the events that were lost.</p>
+  <p>Many approximate-nearest-neighbour engines do not remove a deleted vector from the graph at once. They mark it and reclaim the space later, through compaction or vacuum. Check that your engine filters marked deletes at query time and that the lag between delete and effective removal is measured. For a withdrawn document the requirement may be minutes, and for a regulatory withdrawal it may be "before the next question". Also check the derived stores nobody remembers: a semantic response cache, a reranker feature store, a log of "popular passages". A deleted policy that survives in a response cache is still being served.</p>
+</section>
+
+<section id="versions">
+  <h2>Versions and effective dates</h2>
+  <p>Deleting is the wrong response to a new edition. A claim filed in March 2026 for a loss in November 2025 is governed by the wording in force in November 2025. Harbourline holds several versions of each product per year, and "which wording applied on the claim date" is a question with exactly one right answer. If the index contains only the latest edition, the assistant is confidently wrong for every claim that straddles a change. If it contains all editions with no discipline, it returns whichever scored best, which is how last year's deductible reached a customer (<a href="07-context-assembly-and-grounding.html#assembly">chapter 07</a>).</p>
+  <p>The model for this is bitemporal in spirit. Each document version carries <code>effective_from</code> and <code>effective_to</code> (when the wording applied), and the index records when it learned of it. Retrieval takes an <code>as_of</code> date as a filter, not a hint: <code>effective_from &lt;= as_of AND (effective_to IS NULL OR as_of &lt; effective_to)</code>. The date comes from the caller. The claims-intake agent has a loss date. The customer chat has "today" unless the question names a date or the session has a policy number whose term implies one. Never let the model guess the date.</p>
+  <p>Retrieval then returns one version per document for a given date. Where the question does not pin a date and the user is a customer asking about their current policy, filter on the policy they hold, which is an identifier lookup and not a similarity search.</p>
+
+<div class="callout warn">
+  <span class="callout-label">Similarity cannot tell you which edition applies</span>
+  <p>Two editions of a wording differ in a few numbers, so their embeddings are almost identical and either can win the ranking. Resolve the version with a metadata filter before ranking, never by hoping the better passage wins.</p>
+</div>
+
+  <p>The cost is index size and filter selectivity. Keeping every edition multiplies chunks by the number of live versions, which for a handful of editions is acceptable and for a document revised weekly is not. For fast-changing procedures that carry no legal weight in the past, keep only the current version. State the retention rule per document class, rather than one rule for the corpus.</p>
+</section>
+
+<section id="reembed">
+  <h2>Changing the embedding model</h2>
+  <p>Vectors from different models, or even different versions of one model, live in different spaces. A query vector from model B compared with document vectors from model A returns numbers with no meaning, and nothing raises an error. So an embedding change is a migration of the entire index, not a setting (<a href="03-embeddings.html">chapter 03</a> covers why to change). The standard path is a parallel index and a cutover.</p>
+
+<div class="flow">phase 1  build        old index (model A) ◄── all queries
+                       new index (model B) ◄── backfill from source
+
+phase 2  dual-write   old index ◄── queries      writes go to BOTH
+                       new index ◄── shadow queries (compare, do not serve)
+
+phase 3  cutover      old index (kept for rollback)
+                       new index ◄── all queries   (flag flip)
+
+phase 4  retire       drop old index after the rollback window</div>
+
+  <p>Backfill from the source documents, not by copying text out of the old index, so that the new index also picks up parser and chunker changes deliberately. During dual-write, every incremental change goes to both indexes, so the new one does not fall behind while the backfill runs. Shadow queries run the labelled set (and a sample of live questions) against both and compare retrieval metrics per slice (<a href="06-measuring-retrieval.html">chapter 06</a>). A model that wins on average can lose on identifiers or on limits tables, which are the slices Harbourline cannot afford to lose. Cut over behind a flag, per tenant if you have tenants, and keep the old index until the rollback window passes.</p>
+  <p>The cost is mostly embedding compute for the whole corpus plus a second index in storage for the overlap period. Estimate it before you start: chunks times average tokens times the model's per-token price from its current price list. Where documents number in the millions this is a budget line, and at Harbourline's size it is small next to the engineering time. The path flips to an in-place re-embed only when the index is small enough to tolerate a maintenance window.</p>
+</section>
+
+<section id="tenancy">
+  <h2>Multi-tenancy: separate or shared</h2>
+  <p>If the assistant serves more than one tenant, whether business customers, brands or the US and UK arms of Harbourline, you need a boundary in the index. There are two shapes.</p>
+<div style="overflow-x: auto;">
+<table>
+  <thead><tr><th></th><th>Namespace or index per tenant</th><th class="pick">Shared index with a tenant filter</th></tr></thead>
+  <tbody>
+    <tr><td class="term">Isolation</td><td>structural: a query cannot reach another tenant's data</td><td class="pick">only as strong as every query's filter</td></tr>
+    <tr><td class="term">Many small tenants</td><td>many indexes or partitions to manage; per-tenant overhead</td><td class="pick">one index, cheap to run</td></tr>
+    <tr><td class="term">Per-tenant lifecycle</td><td>delete, export or re-embed one tenant in isolation</td><td class="pick">requires filtered deletes and filtered migrations</td></tr>
+    <tr><td class="term">Filtered ANN quality</td><td>no filter needed, so no recall loss</td><td class="pick">depends on how the engine filters</td></tr>
+  </tbody>
+</table>
+</div>
+  <p>The last row is a mechanism worth knowing. With approximate indexes, a filter applied after the graph scan can return fewer results than asked for: pgvector's documentation notes that if a condition matches 10% of rows, an HNSW scan with the default <code>hnsw.ef_search</code> of 40 returns about four matching rows on average, and since version 0.8.0 iterative index scans keep scanning until enough rows match. Other engines filter during traversal or use partitions per tenant. A highly selective tenant filter on a shared index is exactly the case that exposes the difference, so test the filter at your smallest tenant's share of the corpus and check that recall at k holds.</p>
+  <p>For a few large tenants, with strict contractual isolation or per-tenant keys, use separate namespaces or indexes. For thousands of small tenants, a shared index with filters, or the engine's partition key feature if it has one, is the only economical shape. Harbourline's US and UK corpora differ in regulation and wording, share a few procedures, and number two, so separate namespaces with a small shared one are the clean fit.</p>
+</section>
+
+<section id="access">
+  <h2>Access control belongs in the retrieval filter</h2>
+  <p>Within one tenant, documents still have audiences. Adjuster guidance is not for customers. A claims procedure marked internal must never reach the public chat. The rule is simple and often broken: the access decision is made by the retrieval layer, as a filter on the query, before any text reaches the model. It is never made by telling the model to withhold what it was given.</p>
+  <p>The reason is mechanical. A model that has seen a passage can be made to repeat it. Instructions like "do not reveal internal procedures" are a request, not a control, and a paraphrase, a translation request or an injected instruction in another retrieved passage (<a href="10-injection-through-retrieved-text.html">chapter 10</a>) defeats them. The control that works is absence: text the caller may not read is never in the context.</p>
+  <p>The implementation has four parts.</p>
+  <ul>
+    <li><strong>Stamp every chunk</strong> at ingestion with its access attributes (audience, tenant, group ids or an ACL reference), inherited from the source document.</li>
+    <li><strong>Derive the caller's attributes from the authenticated session</strong> on the server, never from the request body or the model's output.</li>
+    <li><strong>Apply the filter inside the search call</strong> (and in the lexical leg and any reranking candidate fetch), so filtered-out chunks cannot occupy top-k slots.</li>
+    <li><strong>Handle permission changes.</strong> If ACLs are copied into chunk metadata, revoking access means updating metadata, which is another change the sync job must detect. Where permissions change often, store a group id on the chunk and resolve group membership at query time.</li>
+  </ul>
+
+<div class="callout danger">
+  <span class="callout-label">Filtering after retrieval leaks through the gaps</span>
+  <p>Retrieving top-k and then dropping unauthorised chunks returns fewer results and can leak through side channels such as counts or rerank scores. Filter inside the query, and apply it to every retrieval path including caches.</p>
+</div>
+
+  <p>Test it as a security property rather than a quality metric. Build a set of probe questions for each audience pair whose answer exists only in documents the caller must not see, run them as the lower-privilege identity, and assert that no chunk from a forbidden document appears in the retrieved set, the assembled prompt or the cited sources. Run this in CI against a fixture index, and on a schedule against production. Add the adversarial cases: a caller whose group was just revoked, a query phrased to ask for the internal document by name, and a request that differs only in tenant header. The compliance guide treats the wider picture of data handling in <a href="../ai-engineer-compliance/06-rag-applied.html#ops">RAG applied</a>.</p>
+</section>
+
+<section id="signals">
+  <h2>Operational signals</h2>
+  <p>Freshness fails silently, so give it instruments. Four are enough to start.</p>
+  <ul>
+    <li><strong>Index lag:</strong> time from a source change to the new chunks being retrievable, as a distribution (median and 99th percentile), per document class. Alert on the percentile against the target you set for that class.</li>
+    <li><strong>Orphaned chunks:</strong> count of chunks whose <code>doc_id</code> or version no longer exists at the source, from the reconciliation diff. The target is zero, and any nonzero count is a ticket.</li>
+    <li><strong>Pipeline version spread:</strong> chunks per parser, chunker and embedding version. More than one embedding version in a live index means mixed vector spaces.</li>
+    <li><strong>Stale-version serves:</strong> answers whose cited chunk has a newer effective version than the one applied, found by joining the citation log to the version table. This is the metric that would have caught the wrong deductible.</li>
+  </ul>
+  <p>When an answer is wrong and the passage looks right, check these before touching the model; the order for doing so is in <a href="09-debugging-a-rag-system.html">chapter 09</a>, and the interview-style version is in <a href="../ai-engineer-interview-prep/01-debugging-a-wrong-rag-answer.html#faults">Debugging a wrong RAG answer</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A 200-page wording gets one clause amended. Your fixed 512-token windows re-embed 600 chunks instead of two. What is wrong, and what would you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Inserted or removed text shifts every later window boundary, so every chunk hash changes. Chunking on headings and clauses keeps boundaries local so only the edited chunks differ. See <a href="#change">change detection</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Legal withdraws a wording on Monday. By Wednesday it is still being quoted. List three places it could still live even though you deleted it from the vector index.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The lexical index, a semantic response cache, and any side stores (rerank features, popular-passage logs); also marked-but-uncompacted deletes in the vector engine. Delete by key across all stores, and let reconciliation catch the misses. See <a href="#deletes">deletes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A claim with a loss date in November 2025 is filed in March 2026. The index holds both editions and the assistant quotes the 2026 deductible. Why does ranking not solve this, and what does?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Editions differ in a few numbers, so their embeddings and lexical scores are nearly equal and either can rank first. Filter on effective dates using the loss date supplied by the caller, before ranking. See <a href="#versions">versions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You swap the embedding model by re-embedding documents in place, a batch per night, while queries use the new model from day one. What do users see in the first week?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Queries compare new-space vectors with a mix of old and new document vectors. Not-yet-migrated documents score near-randomly and drop out of results, with no error raised, so recall falls unevenly. Build a parallel index, shadow-test per slice, then cut over. See <a href="#reembed">changing the embedding model</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A shared index with a tenant filter works in tests, but your smallest tenant, 0.5% of the corpus, gets thin or empty results in production. What mechanism explains it, and what are two ways out?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If the filter applies after the approximate scan, most of the scanned candidates belong to other tenants and few survive. Use iterative or in-traversal filtering, or give small and large tenants separate partitions or namespaces. See <a href="#tenancy">tenancy</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate proposes keeping internal documents in the shared index and adding "never disclose internal material to customers" to the system prompt. Argue for or against, and say what you would build instead.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Against. A prompt is a request, and anything in the context can be extracted by paraphrase or injection. Stamp chunks with audience attributes, derive the caller's attributes server-side, filter inside the query, and test with probe questions run as the lower-privilege identity. See <a href="#access">access control</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The index is derived data: store lineage on every chunk (document, version, content hash, pipeline version) at ingestion, because adding it later means re-ingesting.</li>
+    <li>Hash at the chunk level so edits re-embed only what changed, which needs a chunker whose boundaries stay local.</li>
+    <li>Deletes need both delete-by-key and reconciliation by absence, across every store that holds a copy.</li>
+    <li>Which wording applied is a metadata filter on effective dates supplied by the caller; similarity cannot decide it.</li>
+    <li>A new embedding model means a parallel index, dual-write, per-slice shadow comparison and a flagged cutover.</li>
+    <li>Access control is a filter inside the retrieval query, derived from the authenticated session; a prompt instruction is not a control.</li>
+    <li>Track index lag, orphaned chunks, pipeline-version spread and stale-version serves, since freshness fails without errors.</li>
+  </ul>
+  <p>With the index kept true and the boundary enforced, the next question is what to do when an answer is still wrong. → <a href="09-debugging-a-rag-system.html">Debugging a RAG System</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener"><strong>pgvector README</strong></a> — how filtering interacts with approximate indexes, and the iterative scan settings added in 0.8.0.</li>
+    <li><a href="https://docs.pinecone.io/guides/index-data/indexing-overview" target="_blank" rel="noopener"><strong>Pinecone indexing overview</strong></a> — namespaces and metadata filtering as the vendor describes them; follow its multitenancy page for the per-tenant pattern.</li>
+    <li><a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener"><strong>Efficient and robust approximate nearest neighbor search using HNSW graphs</strong></a> — Malkov and Yashunin, 2016. The graph structure that explains why deletes and filters behave as they do.</li>
+    <li><a href="https://arxiv.org/abs/2302.12173" target="_blank" rel="noopener"><strong>Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection</strong></a> — Greshake et al., 2023. Why access control must not rely on the model withholding retrieved text.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

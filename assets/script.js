@@ -25,7 +25,8 @@
         { name: 'Senior SWE — AI Infrastructure (Rust)', folder: 'ai-infrastructure-swe' },
         { name: 'Build an Inference Gateway in Rust', folder: 'build-inference-gateway-rust' },
         { name: 'PagedAttention from First Principles', folder: 'paged-attention-deep-dive' },
-        { name: 'AI Engineer Interview Prep', folder: 'ai-engineer-interview-prep' }
+        { name: 'AI Engineer Interview Prep', folder: 'ai-engineer-interview-prep' },
+        { name: 'Production RAG from the Retrieval Up', folder: 'production-rag-deep-dive' }
       ]
     },
     {
