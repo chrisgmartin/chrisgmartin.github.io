@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reranking — Production RAG from the Retrieval Up</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapter 04 widened the net so the answering passage is in the candidates. A reranker reads query and passage together to put it near the top.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/05-reranking">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Reranking — Production RAG from the Retrieval Up">
+<meta property="og:description" content="Chapter 04 widened the net so the answering passage is in the candidates. A reranker reads query and passage together to put it near the top.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/production-rag-deep-dive/05-reranking">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#decision">When a reranker pays</a>
+    <a href="#pair">What a reranker sees</a>
+    <a href="#families">Cross-encoders, late interaction, LLM rerankers</a>
+    <a href="#placement">Where it sits and what it costs</a>
+    <a href="#measure">Measuring the gain</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-lexical-dense-and-hybrid-retrieval.html">← Previous: Lexical, Dense and Hybrid Retrieval</a>
+    <a href="06-measuring-retrieval.html">Next: Measuring Retrieval →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Retrieving</span>
+  <h1>Reranking</h1>
+  <p class="subtitle">Chapter 04 widened the net so the answering passage is in the candidates. A reranker reads query and passage together to put it near the top. This chapter covers what that joint reading buys, the three families, what each costs, and how to tell on your own set whether the stage earns its latency.</p>
+</header>
+
+<section id="decision">
+  <h2>When a reranker pays</h2>
+  <p>After <a href="04-lexical-dense-and-hybrid-retrieval.html">hybrid retrieval</a> the answering passage is usually in the top 50 but not in the top 5. Harbourline's assistant passes only a handful of chunks to the model, so a deductible table at rank 14 is a miss even though coverage is satisfied. A reranker closes that gap: it takes the candidate list and reorders it with a more expensive judgement than the first stage could afford. The decision is whether the reorder is worth its latency, and the labelled set from <a href="01-the-retrieval-contract.html">chapter 01</a> answers it. Compare recall@50 with recall@5 on each slice. If they are close, the first stage already ranks well and a reranker only adds delay. If recall@50 is far above recall@5, the answers are present and badly ordered, and reranking is the right tool.</p>
+</section>
+
+<section id="pair">
+  <h2>What a reranker sees</h2>
+  <p>A bi-encoder embeds the query and the chunk separately, so the chunk vector cannot depend on the question. A reranker reads the two together. Every query token can attend to every chunk token, so it can notice that the query asks for the water backup limit and the chunk's table row labelled "Sewer or drain backup" holds a number in the next column. No single vector can encode that for every question that might be asked of the chunk.</p>
+  <div class="flow">  FIRST STAGE (bi-encoder)               RERANKER (cross-encoder)
+
+  query  ---> [encoder] ---> q vec        [query ; chunk]  ---> [encoder] ---> score
+  chunk  ---> [encoder] ---> c vec               joint attention over the pair
+  score = q . c                            one forward pass PER candidate
+  chunk vectors precomputed                nothing precomputable</div>
+  <p>The price follows from the diagram. A cross-encoder cost scales with the number of candidates, because each pair needs its own forward pass and nothing is cached. It cannot search the corpus, only reorder a short list. Nogueira and Cho's early BERT reranker improved MRR@10 on the MS MARCO leaderboard by 27% relative over the previous best, which is the evidence that the joint view is worth paying for.</p>
+</section>
+
+<section id="families">
+  <h2>Cross-encoders, late interaction, LLM rerankers</h2>
+  <p><strong>Cross-encoders</strong> are the default. A model trained on query and passage pairs outputs one relevance score. Hosted examples include Cohere's Rerank, whose documentation lists v4 and v5 models with a 32k context and older v3.5 models with 4k, where the query and the document share that limit and longer documents are split and scored in pieces (as of November 2026). Open-weight cross-encoders run on your own GPU. Both take a list of passages and return them with scores.</p>
+  <p><strong>Late interaction</strong> sits between the two stages. ColBERT (Khattab and Zaharia, 2020) encodes the query and the document independently, like a bi-encoder, but keeps one vector per token. The score is MaxSim: for each query token, take its best match among the document's token vectors, then sum. Document token vectors can be precomputed and indexed, so you keep much of the cross-encoder's fine-grained matching while still searching quickly. The paper's abstract reports roughly two orders of magnitude lower latency and four orders of magnitude fewer FLOPs per query than BERT-based rerankers, with competitive effectiveness. The cost is storage: one vector per token, not one per chunk, so an index is many times larger than a dense one. Use it when the corpus is stable enough to pay for that index and first-stage ranking is the problem, and skip it if you cannot afford the memory.</p>
+  <p><strong>LLM rerankers</strong> prompt a general model. A pointwise prompt scores each candidate on its own. A listwise prompt shows the model all candidates and asks for an ordering, which lets it compare them but is limited by context length and by sensitivity to the order shown. They need no training data and can follow instructions that a trained reranker cannot, such as "prefer the wording in force on the loss date". They are also the slowest and costliest option, with every candidate's tokens billed per query. They are the right choice for a low-volume, high-stakes path like claims intake, and the wrong default for 13k chat sessions a day (about a third of 40k).</p>
+  <table>
+    <thead><tr><th>Approach</th><th>Reads query and chunk together</th><th>Precompute</th><th>Cost driver</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Cross-encoder</td><td>Yes</td><td>No</td><td>Candidates per query</td></tr>
+      <tr><td class="term">Late interaction</td><td>Token level, after separate encoding</td><td>Yes</td><td>Index size</td></tr>
+      <tr><td class="term">LLM reranker</td><td>Yes, plus instructions</td><td>No</td><td>Tokens per query</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="placement">
+  <h2>Where it sits and what it costs</h2>
+  <div class="flow">  hybrid retrieval ---> top 50-100 ---> reranker ---> top 5-8 ---> prompt
+                       (cheap, wide)    (costly)      (narrow)
+
+  candidate count n   -> reranker latency grows with n
+  cutoff m            -> tokens in the prompt grow with m</div>
+  <p>Two numbers define the stage. The <strong>candidate count</strong> is how many chunks you rerank. Too few and the answer is not among them, so check recall at that depth on the set. Too many and latency and cost climb for no gain. The <strong>cutoff</strong> is how many survive into the prompt, which <a href="07-context-assembly-and-grounding.html">chapter 07</a> treats as a token budget. Cost per query is the candidate count times the cost per pair, plus any splitting of long chunks. Cohere's documentation counts one search unit as a query ranking up to 100 documents, and chunks beyond 500 tokens, including the query, count as extra documents (as of November 2026). Check current prices on the vendor's page, since I could not confirm a figure. Latency also varies with hardware and model size. Measure p50 and p95 for your candidate count in your region, and do not extrapolate from a vendor's marketing page.</p>
+  <p>For Harbourline the arithmetic is simple to state. Say rerank latency at 50 candidates adds 150 ms to a request. For a third of 40k sessions that is a cost in the p95 users feel and a bill. The gain must be visible on a slice that matters, such as limits and deductibles, to justify it.</p>
+  <div class="callout tip">
+    <span class="callout-label">Rerank the chunk the model will read</span>
+    <p>If you retrieve small chunks and expand to their parent section for the prompt, score the version the model will actually see, or at least the version that carries the heading path. A reranker that sees the table row without its header cannot tell a limit from a deductible.</p>
+  </div>
+</section>
+
+<section id="measure">
+  <h2>Measuring the gain</h2>
+  <p>Run the reranker over the same labelled set and compare before and after on nDCG@10 and recall@5, per slice. The definitions are in <a href="06-measuring-retrieval.html">the next chapter</a>. The table below shows the shape of the result you need to produce. The values are illustrative, not measured on a real Harbourline system.</p>
+  <table>
+    <thead><tr><th>Slice</th><th>recall@5 before</th><th>recall@5 after</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Limits and deductibles</td><td>0.62</td><td>0.81</td><td>Worth the latency</td></tr>
+      <tr><td class="term">Exclusions</td><td>0.70</td><td>0.78</td><td>Likely worth it</td></tr>
+      <tr><td class="term">Identifiers</td><td>0.93</td><td>0.92</td><td>No gain: BM25 already ranks them</td></tr>
+    </tbody>
+  </table>
+  <p>The pattern to expect is a large gain on slices where passages look alike and the question picks one (tables of limits), and none on slices the first stage already wins. If the gain is uniformly small, drop the reranker. If it is large on some slices only, you can apply it conditionally, for instance skipping it when the query contains a form number and BM25 has a clear top hit. Also check what the reranker can hurt: a model trained on general web pairs may demote a terse legal clause below a chatty help page, so read the cases where the gold passage moved down. For the interview framing, see <a href="../ai-engineer-interview-prep/03-hybrid-search-and-reranking.html#rerank">Hybrid search and reranking</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Why can a cross-encoder rank "sewer backup limit" correctly against two near-identical table chunks when the embedding model could not, and why can you not simply use it as the first stage?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It attends across the query and chunk jointly, so the question shapes how the chunk is read. That requires one forward pass per query-chunk pair and nothing precomputable, so cost grows with the corpus. See <a href="#pair">What a reranker sees</a>.</p></div></details>
+    </li>
+    <li>
+      <p>On your set, recall@50 is 0.95 and recall@5 is 0.90 for the first stage. A colleague wants to add a reranker. What do you say?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The ceiling for any reranker is 0.95 and the current gap is 0.05, so the most it can add is a few points of recall at a fixed latency and cost. Check per slice first, since a weak slice can hide behind a strong average. See <a href="#decision">When a reranker pays</a>.</p></div></details>
+    </li>
+    <li>
+      <p>ColBERT scores far faster than a cross-encoder. What did it give up to get there, and what new cost did it create?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It encodes the query and document separately, so there is no full cross-attention between them, only token-level MaxSim. It stores one vector per token, so the index is much larger than a one-vector-per-chunk index. See <a href="#families">Cross-encoders, late interaction, LLM rerankers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The claims-intake agent must prefer the policy wording in force on the loss date, which no trained reranker knows about. Which option fits, and what stops you using it for the chat assistant?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An LLM reranker can follow that instruction. Its per-query token cost and latency make it hard to justify at chat volume. A better chat answer is to filter by effective date, as chapter 08 describes, and keep the model for the low-volume path.</p></div></details>
+    </li>
+    <li>
+      <p>Reranking raises nDCG@10 overall but the identifiers slice drops from 0.93 to 0.85. What happened and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The reranker likely prefers semantically fluent passages over exact-string matches that BM25 had ranked first. Skip reranking when lexical has a clear top hit, or blend the first-stage score into the final score. See <a href="#measure">Measuring the gain</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A reranker helps only when the answer is in the candidates but not near the top, which you read off recall@50 against recall@5 per slice.</li>
+    <li>Cross-encoders read the query and chunk together, which is why they rank better and why they cannot be the first stage.</li>
+    <li>Late interaction keeps token-level matching with precomputed document vectors, and pays in index size.</li>
+    <li>LLM rerankers follow instructions no trained model can, and cost the most per query, so reserve them for low-volume, high-stakes paths.</li>
+    <li>Cost scales with candidate count. Choose the smallest depth whose recall you have measured.</li>
+    <li>Report the gain per slice. A reranker can lift the average while hurting the identifiers slice.</li>
+  </ul>
+  <p>Every claim here rests on a labelled set and a metric, so next is how to build one that can detect the differences you care about. → <a href="06-measuring-retrieval.html">Measuring Retrieval</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1901.04085" target="_blank" rel="noopener"><strong>Passage Re-ranking with BERT</strong></a> — Nogueira and Cho, 2019. The first widely used BERT cross-encoder reranker and its MS MARCO result.</li>
+    <li><a href="https://arxiv.org/abs/2004.12832" target="_blank" rel="noopener"><strong>ColBERT</strong></a> — Khattab and Zaharia, 2020. Late interaction and the efficiency claim against BERT rerankers.</li>
+    <li><a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener"><strong>BEIR</strong></a> — Thakur et al., 2021. Zero-shot comparison where re-ranking and late interaction lead on average at high computational cost.</li>
+    <li><a href="https://docs.cohere.com/docs/rerank" target="_blank" rel="noopener"><strong>Cohere Rerank documentation</strong></a> — model list, context limits, and how long documents are split.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
