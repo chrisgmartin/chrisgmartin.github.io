@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Claims Agent Under a Token Budget — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Design an insurance-claims agent that uses RAG and keeps token cost under control: context budgeting, caching, routing, and the metrics that prove it.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/05-claims-agent-under-a-token-budget">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="A Claims Agent Under a Token Budget — AI Engineer Interview Prep">
+<meta property="og:description" content="Design an insurance-claims agent that uses RAG and keeps token cost under control: context budgeting, caching, routing, and the metrics that prove it.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/05-claims-agent-under-a-token-budget">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#design">The design</a>
+    <a href="#where-tokens-go">Where tokens go</a>
+    <a href="#cost-model">The cost model</a>
+    <a href="#levers">The levers</a>
+    <a href="#measure">Measuring cost</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-agent-or-workflow.html">← Previous: Agent or Workflow</a>
+    <a href="06-customer-service-agent.html">Next: A Customer-Service Agent →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Agents</span>
+  <h1>A Claims Agent Under a Token Budget</h1>
+  <p class="subtitle">Design an insurance-claims agent that uses RAG and keeps token cost under control: context budgeting, caching, routing, and the metrics that prove it.</p>
+</header>
+
+<section id="question">
+  <h2>The question and what it scores</h2>
+  <p>The interviewer says: "Design an agent that processes insurance claims using RAG, and keep the token cost under control." The second clause is the real question. Anyone can sketch an agent with five tools. Few can say what it costs per claim before building it.</p>
+  <p>They are scoring four things:</p>
+  <ul>
+    <li><strong>Design first.</strong> You can say what goes into each model call and why, before you reach for optimisations.</li>
+    <li><strong>Cost from first principles.</strong> You compute tokens in and out per step, multiply by steps and price, and know why the input side dominates.</li>
+    <li><strong>The levers in order of payoff</strong>, with the quality risk of each one stated.</li>
+    <li><strong>Measurement.</strong> Cost per claim is a metric you track, next to an accuracy metric, so a saving never hides a regression.</li>
+  </ul>
+</section>
+
+<section id="design">
+  <h2>The design before the optimisation</h2>
+  <p><a href="04-agent-or-workflow.html#harbourline">Chapter 04</a> put claims intake in a workflow with a bounded agent inside it. This chapter designs the part that runs after the facts are collected: the claims agent that reads the evidence, finds the right procedure, checks coverage and routes the claim. About 6,000 new claims arrive a day.</p>
+  <p><strong>Inputs.</strong> The first notice of loss text (about 800 tokens), up to three photos, and the policy record. <strong>Tools.</strong> Five of them:</p>
+  <ul>
+    <li><code>get_policy</code> returns the policy record. Raw, it is a large JSON document of about 3,000 tokens.</li>
+    <li><code>search_procedures</code> is the RAG tool. It searches Harbourline's claims procedures and returns the top passages (<a href="01-debugging-a-wrong-rag-answer.html">chapter 01</a> covers when this retrieval goes wrong).</li>
+    <li><code>check_coverage</code> calls the rules engine with the peril, the date and the facts. It is deterministic code, and the answer is a typed verdict.</li>
+    <li><code>fraud_flags</code> returns the score and the reasons from the existing fraud model.</li>
+    <li><code>route_claim</code> places the claim in an adjuster queue.</li>
+  </ul>
+  <p>One point of design matters for cost and for risk. The agent prepares a coverage recommendation and routes. A denial, or a payout above a threshold the business sets, goes to a human adjuster. A wrong coverage decision is a regulatory issue, so the agent's job is a complete, correct packet, not the final word.</p>
+
+  <div class="flow">[FNOL text + 3 photos + policy id]        ~5,300 tokens in
+        ↓
+ [Agent loop: system prompt + 5 tool schemas ≈ 6,000 tokens, identical every claim]
+        ↓ 1  get_policy        → policy record
+        ↓ 2  search_procedures → top passages for this peril
+        ↓ 3  check_coverage    → typed verdict
+        ↓ 4  fraud_flags       → score + reasons
+        ↓ 5  route_claim       → queue + written summary for the adjuster</div>
+
+  <p>The tool schemas also cost tokens. Anthropic adds a fixed tool-use system prompt of about 286 tokens for current models when tools are present, and your own tool names, descriptions and schemas are counted on top, as of November 2026.</p>
+</section>
+
+<section id="where-tokens-go">
+  <h2>Why the input side dominates</h2>
+  <p>The API is stateless. Every call re-sends the tool definitions, the system prompt and the full history so far. So a piece of text that enters at step <em>k</em> of <em>n</em> is billed on every call from <em>k</em> to <em>n</em>, which is <em>n − k + 1</em> times. Output tokens are billed once, at a higher rate per token (five times the input rate on Sonnet 5.5, as of November 2026), but there are far fewer of them.</p>
+  <p>Take a naive version with seven model calls. The 6,000-token prefix is sent seven times, which is 42,000 tokens. The 5,300-token first message, with its photos, is also sent seven times, which is 37,100. The raw policy record (3,000 tokens) is sent six times, and two search results of 4,800 tokens each are sent five and two times. Add those up and about nine of every ten input tokens are repeats of three things: the prefix, the first message and the large tool results. The model writes only about 1,850 tokens in the whole run, but reads about 142,000.</p>
+  <p>Photos deserve a note, because they are the largest single item in the first message. Claude reads an image in 28 by 28 pixel patches, so a picture costs roughly its width divided by 28, times its height divided by 28, tokens, capped by a per-model limit. A 1,000 by 1,000 pixel photo costs about 1,300 tokens. A large phone photo is downscaled to the model's cap, which is up to 4,784 tokens on the high-resolution tier (Claude 4.7 and later) and about 1,560 on the standard tier (Anthropic vision documentation, November 2026). Photos resized to about 1,090 pixels square cost about 1,500 tokens each; the three-photo first message in this model assumes that size.</p>
+  <div class="callout insight">
+    <span class="callout-label">Cost scales with context times calls, not with what the model writes</span>
+    <p>That is why the first levers act on what sits in the history. Shaving output words saves little. Removing a 3,000-token tool result from a seven-call loop saves 18,000 input tokens.</p>
+  </div>
+</section>
+
+<section id="cost-model">
+  <h2>A per-claim cost model you can run</h2>
+  <p>The script below prices a claim as the sum over calls of input tokens times the input rate, plus output tokens times the output rate. With caching on, the prefix and history are billed at the cache-read rate and only the new tail is billed at the cache-write rate. The token counts per step are assumptions for Harbourline, not measurements; you would replace them with counts from your own traces. The prices are Anthropic's list prices as of November 2026.</p>
+
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>claim_cost.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">"""Per-claim token cost model. Prices in USD per million tokens, as of November 2026."""
+PRICE = {                          # input, 5-minute cache write, cache read, output
+    "sonnet-5.5": (2.00, 2.50, 0.10, 10.00),
+    "haiku-5.5":  (0.10, 0.125, 0.01, 0.50),   # prompts up to 100k tokens
+}
+
+def claim_cost(model, prefix, steps, cached):
+    """steps = [(new_input_tokens, output_tokens), ...]. Every call re-sends all history."""
+    p_in, p_write, p_read, p_out = PRICE[model]
+    history = usd = 0
+    for new_in, out in steps:
+        if cached:   # prefix and history come from cache; only the new tail is written
+            usd += (prefix + history) * p_read + new_in * p_write
+        else:
+            usd += (prefix + history + new_in) * p_in
+        usd += out * p_out
+        history += new_in + out
+    return usd / 1e6
+
+PREFIX = 6_000   # system prompt, tool schemas, coverage rules
+# (new input tokens, output tokens) for each model call
+NAIVE = [(5300, 300), (3000, 150), (4800, 200), (1200, 150), (800, 150), (4800, 200), (200, 700)]
+LEAN  = [(5300, 300), (500, 150), (1800, 200), (400, 150), (200, 100), (150, 600)]
+SLIM  = [(1200, 300), (500, 150), (1800, 200), (400, 150), (200, 100), (150, 600)]
+PHOTO_PASS = [(5300, 400)]         # one small-model call reads the photos once
+
+def row(label, usd, claims_per_day=6000):
+    print(f"{label:38s} ${usd:.4f}/claim  ${usd*claims_per_day:&gt;6,.0f}/day  ${usd*claims_per_day*30:&gt;7,.0f}/month")
+
+row("1 naive loop, no cache", claim_cost("sonnet-5.5", PREFIX, NAIVE, False))
+row("2 + prompt caching", claim_cost("sonnet-5.5", PREFIX, NAIVE, True))
+row("3 + trimmed tool results, one search", claim_cost("sonnet-5.5", PREFIX, LEAN, True))
+big = claim_cost("sonnet-5.5", PREFIX, SLIM, True)
+small = claim_cost("haiku-5.5", PREFIX, SLIM, True)
+photo = claim_cost("haiku-5.5", 1_500, PHOTO_PASS, False)
+row("4 + photos read once, summary kept", photo + big)
+SHARE = 0.6    # assumption: share of claims the small model can finish. Measure it.
+row("5 + 60% of loops on the small model", photo + SHARE * small + (1 - SHARE) * big)</code></pre>
+  </div>
+
+  <p>Running it prints the table below. The first row is the baseline and each later row adds one lever to the row above it.</p>
+
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Variant (Sonnet 5.5 unless noted)</th><th>Per claim</th><th>6,000 claims a day</th><th>Per 30 days</th></tr></thead>
+    <tbody>
+      <tr><td class="term">1 Naive loop, no cache</td><td>$0.303</td><td>$1,820</td><td>$54,600</td></tr>
+      <tr><td class="term">2 + prompt caching</td><td>$0.081</td><td>$486</td><td>$14,600</td></tr>
+      <tr><td class="term">3 + trimmed tool results, one search</td><td>$0.043</td><td>$260</td><td>$7,800</td></tr>
+      <tr><td class="term">4 + photos read once, summary kept</td><td>$0.032</td><td>$191</td><td>$5,700</td></tr>
+      <tr><td class="term">5 + 60% of loops on Haiku 5.5</td><td>$0.014</td><td>$86</td><td>$2,600</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The whole stack cuts the cost by a factor of about twenty. Caching alone gives the first 73%, because it acts on the biggest repeated block with no change to behaviour. Notice also that output tokens, which were 6% of the naive cost, are about 35% of the cost in row 3. Once the input side is cheap, output becomes visible, and that is when a <code>max_tokens</code> cap and terse structured outputs start to matter.</p>
+  <p>At 6,000 claims a day the naive design costs about $54,600 a month. At 60 claims a day it would cost $546, and none of this work would be worth the time. State that scale argument in the interview. It shows you optimise for the bill that exists.</p>
+</section>
+
+<section id="levers">
+  <h2>The levers, in order of payoff</h2>
+  <p><strong>1. Cache the prefix and the history.</strong> Anthropic's prompt caching stores the prompt prefix, ordered tools, then system, then messages. A later call that begins with an identical prefix reads it from cache. As of November 2026, a read costs 0.05 times the base input price on Sonnet 5.5 ($0.10 against $2 per million tokens), a five-minute write costs 1.25 times, and a one-hour write costs 2 times. Three conditions decide whether it works. The prefix must be at least 512 tokens on Sonnet 5.5, which 6,000 is. The prefix must match exactly, so a timestamp or claim id in the system prompt, placed before the breakpoint, defeats it. And any change to the tool definitions invalidates everything after them, so editing a tool description in production resets the cache for every claim. The default lifetime is five minutes and each read refreshes it. At 6,000 claims a day, claims arrive on average about every 15 seconds, so the prefix stays warm in the day. For a quiet overnight spell, either accept a re-write or pay the one-hour write price. Check the <code>cache_read_input_tokens</code> field in the usage data; if it is zero, the prompt was not cached.</p>
+  <p><strong>2. Make tools return less.</strong> The raw policy record has hundreds of fields and coverage needs a dozen. Code, not the model, should project the fields the next step needs, so the tool returns 500 tokens and not 3,000. Anthropic's context-engineering guidance calls clearing stale tool results one of the lightest and safest forms of compaction. The risk is dropping a field a later step needs, so keep an id the agent can use to fetch the full record on demand.</p>
+  <p><strong>3. Retrieve once, at the step that needs it.</strong> The naive loop searched the procedures twice, with eight passages each time, because it re-searched on every turn. Search after the facts and peril are known, ask for the top three passages, and keep them. Smaller <em>k</em> only works if ranking is good, so this lever depends on the reranking work in <a href="03-hybrid-search-and-reranking.html">chapter 03</a>. Measure recall at three, not at ten, before you cut.</p>
+  <p><strong>4. Read the photos once.</strong> A small model reads the three photos in one call and writes a 400-token structured damage summary. The main loop carries the summary, not the pixels, so the images are not billed on six more calls. Add a <code>view_photo</code> tool that fetches one image on demand for the rare step that needs the detail. The cost is lost detail in the summary, so test it on the claims where damage severity decides the route.</p>
+  <p><strong>5. Route by difficulty.</strong> Haiku 5.5 costs $0.10 per million input tokens and $0.50 per million output tokens (for prompts up to 100,000 tokens, as of November 2026), against $2 and $10 for Sonnet 5.5. That is a factor of twenty. Run the loop on the small model for claims that look simple, and escalate to the larger one when <code>check_coverage</code> returns "ambiguous", the fraud score is high or the small model reports low confidence. The 60% share in the table is an assumption. You find the real share by running both models on the eval set and counting how often the small model reaches the same verdict. The saving here is about $100 a day, and one wrongly auto-routed claim that becomes a complaint can cost more than that. So the router needs an escalate-when-in-doubt rule and its own eval slice, not a hunch.</p>
+  <p><strong>6. Cap everything.</strong> Set <code>max_tokens</code> on every call, a limit of model calls per claim, and a total token budget per claim, for example 120,000 input tokens. When any limit hits, the claim goes to a human with the partial packet. <a href="14-the-agent-that-loops-forever.html">Chapter 14</a> shows the guard. The cap also bounds the worst case, which matters because the average hides the p99 claim that loops.</p>
+  <p><strong>7. Cache embeddings.</strong> Embed each procedure passage once, at index time. Cache query embeddings only if a retry reruns the same search. Embedding calls cost far less than generation here, so this is housekeeping, not a lever. Say so, and move on.</p>
+  <p>Two things that look like levers are not. The Batch API gives a 50% discount on input and output, but it returns results asynchronously, and a loop that needs six sequential calls per claim does not fit. Use it for the nightly classification and summary jobs in <a href="09-batching-system-for-llm-queries.html">chapter 09</a>. And a very long context is not a substitute for retrieval: a 300-page policy file at about 500 tokens a page is roughly 150,000 tokens, and even at the cache-read price that is $0.015 for every call, which is $0.105 over seven calls, more than the whole lean pipeline costs.</p>
+  <div class="callout warn">
+    <span class="callout-label">Every saving needs a matching accuracy check</span>
+    <p>Trimmed tool results, a smaller <em>k</em>, a photo summary and a cheaper model each trade tokens for information. Apply them one at a time and re-run the eval set after each, so you know which lever cost you accuracy. Report cost and accuracy together or not at all.</p>
+  </div>
+</section>
+
+<section id="measure">
+  <h2>Cost per claim as a first-class metric</h2>
+  <p>A bill that arrives monthly cannot tell you which step grew. Log one record per model call: claim id, step name, model, input tokens, cache-read tokens, cache-write tokens, output tokens and the computed cost. Sum by claim id to get cost per claim, and sum by step name to see where it goes. Then track:</p>
+  <ul>
+    <li><strong>Cost per claim at p50, p95 and p99.</strong> The mean hides the looping claim. A p99 ten times the p50 is a sign of an uncapped path.</li>
+    <li><strong>Cost by step.</strong> A new tool that returns twice the tokens shows up as one step's share jumping, the day it ships.</li>
+    <li><strong>Cache hit rate</strong>, as cache-read tokens over all input tokens. A drop after a deploy usually means someone edited the prefix.</li>
+    <li><strong>Calls per claim.</strong> A rising average is the cheapest early warning of a loop.</li>
+    <li><strong>Accuracy on the eval set, beside every cost number.</strong> The release gate is "cost fell and routing accuracy did not", as in <a href="07-eval-set-and-ship-decision.html">chapter 07</a>. For the broader view of latency and cost together, see <a href="10-latency-and-cost-at-scale.html">chapter 10</a>.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+  <p>Answer each aloud before opening it.</p>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong>: hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Your cost per claim doubled last week and claim volume did not change. Where do you look?"</summary>
+    <div class="reveal-body">
+      <p><em>"I'd split the cost per claim by step and by model, because that tells me which of three things happened. If cache-read tokens fell, someone changed the prefix or a tool definition and the cache keeps missing. If one step's input grew, a tool started returning more, such as a new field in the policy record. If calls per claim rose, there is a loop or a new retry path. Each has a different owner and a different fix, and the per-step log finds it in minutes. Then I'd add the alert I didn't have, on cost per claim p95."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "We turned on prompt caching and saved much less than the price table suggests. Why?"</summary>
+    <div class="reveal-body">
+      <p><em>"Usually one of four things. The prompt is under the minimum cacheable length, so nothing is cached and there is no error, only zeros in the cache fields. The prefix is not identical, because something per-request, such as a timestamp or customer name, sits before the breakpoint. The cache expires between calls, because traffic is too sparse for the five-minute lifetime. Or most of the input is not repeated, so there is little to read from cache, and I'd see that as a high share of fresh tokens. I'd check the usage fields on a real call before changing anything."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "Models have huge context windows. Why do you need RAG here at all?"</summary>
+    <div class="reveal-body">
+      <p><em>"Because every call pays to read the context, and each step needs a few passages, not the whole file. With a 300-page policy at roughly 150,000 tokens, even a cached read costs about a cent and a half per call, and seven calls cost more than my whole lean pipeline. Retrieval also gives me citations the adjuster can check. Long context wins when one document is queried many times in quick succession and the file is small relative to the questions, because caching makes those reads cheap. For claims, with new files every time, RAG wins."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "How do you decide what share of claims the small model handles, without guessing?"</summary>
+    <div class="reveal-body">
+      <p><em>"I run both models on the same labelled claims and look at where the small model's verdict matches the large model's and the adjuster's. I find which features predict a match, such as peril type, claim value and the ambiguity flag from the rules engine, and route on those. Then I run it in shadow on live traffic for a week, comparing decisions without acting on them, and watch the disagreement rate by slice. I also keep an always-escalate rule for high-value claims, because the saving per claim is small and the downside is not."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "Finance wants the bill cut in half by tomorrow. What do you change first?"</summary>
+    <div class="reveal-body">
+      <p><em>"The changes with no quality risk first. I'd confirm caching is on and the hit rate is high, then trim the tool outputs to the fields the next step uses, and cap output tokens. In my model caching and trimming together cut the cost by about 85%, and they do not change what the model sees about the claim. I would not touch retrieval depth or the model routing tomorrow, because those change decisions and need an eval run. I'd tell finance which cuts are safe now and which need a week."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>An agent makes eight model calls. A 4,000-token tool result arrives on call 2 and nothing removes it. About how many input tokens does that one result cost across the run, and what single change cuts it most?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is sent on calls 2 to 8, so seven times: 28,000 input tokens. Having code project only the needed fields (or clearing the result after it is used) cuts it most, because the cost scales with how long the text stays in the history. See <a href="#where-tokens-go">why the input side dominates</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You enable prompt caching with a 6,000-token system prompt, but the usage data shows zero cache-read tokens on every call. The prompt starts with "Today is {date}, you are helping claim {id}". What is wrong, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The per-request date and claim id sit at the start of the prefix, so no two calls share an identical prefix and every call is a miss. Move the static instructions first, put the breakpoint after them, and put the date and id in the user message after the breakpoint. See <a href="#levers">lever 1</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate proposes moving every claim to the small model, since it is twenty times cheaper and "most claims are easy". Using the numbers in this chapter, what is the most the change can save per day, and what would you require before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Against the row-4 design the ceiling is about $190 a day, and the realistic saving is less, since the large model is still needed for hard claims. Require an eval run that shows the small model's coverage verdicts match on every slice, an escalate-on-doubt rule, and a shadow period. One extra complaint can cost more than the day's saving. See <a href="#levers">lever 5</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After caching and trimming, a dashboard shows output tokens are now about a third of the per-claim cost. The team wants to cut input further. Argue for or against.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Output is billed at five times the input rate, so at that mix the cheapest remaining saving may be on the output side: a lower <code>max_tokens</code>, a structured verdict instead of prose, and a shorter adjuster summary. Check that the summary's length is not carrying information adjusters use. Input cuts now risk accuracy for smaller returns. See <a href="#cost-model">the cost model</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why can the Batch API not be your main cost lever for the claims agent, even though it halves the price?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each step of the loop depends on the previous step's result, so the calls are sequential, and a batch returns asynchronously, so the delay would multiply across the steps. It fits independent, deferrable work such as nightly summaries. See <a href="#levers">the closing note on levers</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Agent cost is context times calls: every call re-sends the prefix and the history, so text that stays in the history is billed again on each later call.</li>
+    <li>In the Harbourline model about nine of every ten input tokens are repeats of the system prompt, the first message and large tool results.</li>
+    <li>Prompt caching comes first, since it acts on the biggest repeated block without changing behaviour, and it only works with an identical prefix, the minimum length and traffic frequent enough to keep the entry warm.</li>
+    <li>Trim tool results in code, retrieve once at the step that needs it, and read photos once, each of which removes tokens from every later call.</li>
+    <li>Route to a smaller model only with an eval slice, an escalate-when-in-doubt rule and a shadow period, because the saving is small next to the cost of one wrong coverage decision.</li>
+    <li>Log cost per call, aggregate per claim and per step, track p95 and p99, and never report a cost change without the accuracy change beside it.</li>
+  </ul>
+  <p>Next, the other agent in the programme, the one customers talk to directly. → <a href="06-customer-service-agent.html">A Customer-Service Agent</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener"><strong>Prompt caching</strong></a>: Anthropic documentation. Prefix order, breakpoints, minimum lengths, lifetimes, what invalidates the cache and the usage fields.</li>
+    <li><a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank" rel="noopener"><strong>Pricing</strong></a>: Anthropic documentation. Per-model input, cache and output prices and the Batch API discount; check it again before quoting any number.</li>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/vision" target="_blank" rel="noopener"><strong>Vision</strong></a>: Anthropic documentation. The patch-based image token formula, per-model caps and the size table.</li>
+    <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener"><strong>Effective context engineering for AI agents</strong></a>: Anthropic engineering, September 2025. Tool-result clearing, compaction and just-in-time retrieval.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

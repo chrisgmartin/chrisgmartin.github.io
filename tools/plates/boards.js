@@ -104,6 +104,17 @@
     d.note(20,190,'RAG over\nregs',{size:10.5});d.arrow(48,212,150,232,{dash:1});
     d.note(20,300,'ch 04–09: you build it · JWT + HTTP transport · RegTech');
   };
+  B['ai-engineering/ai-engineer-interview-prep']=function(d){
+    d.title('Sixteen questions, one company');
+    var q=d.round(14,70,96,40,'the question',{size:11});
+    var steps=d.flow(140,['scope','mechanism','trade-off','measure'],{x:14,w:66,h:36,gap:8,size:10.5});
+    d.arrow(q.cx,q.y+q.h+2,q.cx,138,{});
+    var brk=d.box(308,134,78,48,'what\nbreaks\nfirst',{red:1,size:10.5});d.connect(steps[3],brk);d.ring(300,126,96,66);
+    var h=d.box(150,228,150,40,'Harbourline Insurance',{wash:1,size:11});
+    d.note(14,236,'RAG · agents\nevals · voice\nbatch · uploads',{size:10});d.arrow(118,246,148,246,{dash:1});
+    d.note(312,236,'40k chats/day\n6k claims/day',{size:10});
+    d.note(14,300,'answer aloud first · then open the probes');
+  };
   B['ai-engineering/ai-infrastructure-swe']=function(d){
     d.title('Millions of users, and the p99 tail');
     var req=d.round(14,110,70,34,'requests'),gw=d.box(112,104,90,46,'gateway\n(Rust · tokio)',{wash:1,size:11});d.connect(req,gw);

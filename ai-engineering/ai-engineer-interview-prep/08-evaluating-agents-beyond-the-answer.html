@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluating an Agent Beyond Its Final Answer — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Trajectories, tool calls, cost and steps, partial credit and safety: how to judge an agent that reached the right answer the wrong way, or the wrong answer for…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/08-evaluating-agents-beyond-the-answer">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Evaluating an Agent Beyond Its Final Answer — AI Engineer Interview Prep">
+<meta property="og:description" content="Trajectories, tool calls, cost and steps, partial credit and safety: how to judge an agent that reached the right answer the wrong way, or the wrong answer for…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/08-evaluating-agents-beyond-the-answer">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#layers">What to grade</a>
+    <a href="#path">Outcome or path</a>
+    <a href="#environment">Environments and replay</a>
+    <a href="#graders">Rules or a judge</a>
+    <a href="#reliability">Reliability: pass^k</a>
+    <a href="#worked">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-eval-set-and-ship-decision.html">← Previous: The Eval Set and the Ship Decision</a>
+    <a href="09-batching-system-for-llm-queries.html">Next: A Batching System for LLM Queries →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Evals</span>
+  <h1>Evaluating an Agent Beyond Its Final Answer</h1>
+  <p class="subtitle">Trajectories, tool calls, cost and steps, partial credit and safety: how to judge an agent that reached the right answer the wrong way, or the wrong answer for a good reason.</p>
+</header>
+
+<section id="question">
+  <h2>The question, and what is being scored</h2>
+  <p>The interviewer says: <em>"Your claims agent routes 95% of first notices of loss to the right adjuster queue. Is it ready?"</em> The follow-up is always some form of "how do you know it got there the right way?"</p>
+  <p>Harbourline's claims-intake agent reads a first notice of loss, asks for missing information, checks coverage and routes the claim to an adjuster. About 6k new claims arrive a day. A correct route that skipped the coverage check is a regulatory exposure, because a coverage decision with no record of the check cannot be defended. The interviewer is scoring:</p>
+  <ul>
+    <li>You separate the outcome from the path, and you know when each one matters.</li>
+    <li>You can name the safety and policy checks that no outcome score will catch.</li>
+    <li>You grade cost and step count, because an agent that is right in 40 steps is a different product from one that is right in 8.</li>
+    <li>You know agents are stochastic and measure reliability over repeated runs, not one run.</li>
+  </ul>
+  <p>The grading mechanics, such as paired comparison and judge calibration, are in <a href="07-eval-set-and-ship-decision.html">chapter 07</a>. This chapter adds what changes when the thing under test takes actions. The decision about whether to build an agent at all is in <a href="04-agent-or-workflow.html">chapter 04</a>.</p>
+</section>
+
+<section id="layers">
+  <h2>What to grade: five layers</h2>
+  <p>A final-answer score reads one layer. An agent produces a record of the whole run, and each layer of it can fail alone. Five layers cover a claims agent.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Layer</th><th>Question it answers</th><th>How it is checked</th></tr></thead>
+    <tbody>
+      <tr><td>Outcome</td><td>Is the end state right? Claim in the correct queue, correct fields set.</td><td>Compare the final state of the mocked system to the expected state.</td></tr>
+      <tr><td>Required evidence</td><td>Does the record show the steps that make the outcome defensible?</td><td>A coverage decision exists, tied to the right policy and loss date.</td></tr>
+      <tr><td>Tool calls</td><td>Right tool, right arguments, sane order, no invented fields?</td><td>Rules over the trace: schema-valid arguments, ID values that appeared earlier in the run.</td></tr>
+      <tr><td>Safety</td><td>Did it attempt anything it must not?</td><td>Rules: no write before confirmation, no forbidden tool, no PII sent to a tool that does not need it.</td></tr>
+      <tr><td>Efficiency</td><td>What did it cost to get there?</td><td>Steps, tokens and dollars against a reference run, for example the median of the passing runs.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Partial credit belongs here. Anthropic's guidance on agent evals suggests building it in for tasks with several components: an agent that verifies the claimant and then fails to route is better than one that fails at the start, and a pass-or-fail score hides that. Report the layers separately. One blended number lets a strong outcome score hide a weak safety score, which is the failure this chapter is about.</p>
+  <p>Safety is graded differently from the rest. Outcome, evidence and efficiency are rates you tune. A write without confirmation is a count that must be zero, and one occurrence in a thousand runs is a finding, not noise.</p>
+</section>
+
+<section id="path">
+  <h2>Outcome or path: the tension you should name</h2>
+  <p>There are two defensible positions, and a strong answer states both. Anthropic's engineering post on agent evals argues that it is often better to grade what the agent produced rather than the path it took, and calls checks for a fixed order of tool calls "overly brittle", since agents find valid approaches the designer did not foresee. τ-bench (Yao et al., 2024), a benchmark for tool-using agents talking to a simulated user, does the same: it scores the database state at the end of the conversation against an annotated goal state, which leaves room for the conversation itself to vary.</p>
+  <p>Against that, an outcome score alone passes the Harbourline failure. The agent saw "windscreen cracked by a stone" and routed to the glass queue without calling the coverage tool. The queue was right. The record of why was missing, and on the next claim with a policy exclusion the same shortcut would send the claim to the wrong place.</p>
+  <p>The resolution is to grade <em>constraints on the path</em>, not a script for it. Do not require "call A, then B, then C". Require facts that the final state and the audit log must contain, and impose an order only where order has meaning.</p>
+  <ul>
+    <li>The final state must include a coverage decision record, with the policy ID and loss date that match the claim. This does not care how the agent obtained it.</li>
+    <li>The coverage check must come before the route, since a routing that precedes the check cannot rest on it.</li>
+    <li>Any change to a customer record must follow a confirmation message from the customer.</li>
+  </ul>
+  <p>This keeps the benefit of outcome grading, which is tolerance of different valid routes, and catches the failures that matter. It flips when the order is itself the product, for example a compliance flow where a regulator expects a fixed sequence. Then an exact order check is correct.</p>
+  <div class="callout insight">
+    <span class="callout-label">A passing outcome with a missing record is a failure you have not found yet</span>
+    <p>The skip worked because this claim was easy. When a model learns that a step never changes the answer on easy cases, it stops doing it on hard ones. That is why the check is on the record, not on the answer.</p>
+  </div>
+</section>
+
+<section id="environment">
+  <h2>Environments, mocked tools and replaying production</h2>
+  <p>An agent eval needs somewhere to run. Calling the real policy system a thousand times is slow, costs money and changes real data. The standard setup is a sandbox: tools backed by a small in-memory or test database seeded per scenario, so each run starts from the same state and the final state can be compared. For a conversational agent, a model plays the customer from a script of facts, as it does in τ-bench. For Harbourline, the claims scenario carries a policy, a loss description and a list of facts the simulated claimant will give only when asked.</p>
+  <p>Two further tools extend the sandbox.</p>
+  <ul>
+    <li><strong>Fault injection.</strong> Make the policy lookup time out, return an empty result, or return a record for a different policy period. This tests behaviour that production hits weekly and a happy-path eval never does. The right result is usually to stop and escalate, not to guess. See <a href="14-the-agent-that-loops-forever.html">chapter 14</a> for what happens when the agent retries instead.</li>
+    <li><strong>Replaying production traces.</strong> Real traces make the best scenarios, since they hold the actual distribution of messy input. Use them two ways. First, as a source: turn failures into scenarios with an expected state. Second, as a monitor: run the same rule checks, such as "coverage check before route", over a sample of live traces every day. Replaying recorded tool responses against a <em>new</em> agent version has a limit. If the new version calls a different tool or passes different arguments, the recorded response no longer applies, so use a stateful mock for that comparison and keep recorded replay for checking that old behaviour has not changed.</li>
+  </ul>
+</section>
+
+<section id="graders">
+  <h2>Rules or a judge</h2>
+  <p>Use rules for everything that can be checked mechanically. Whether a tool name appears, whether arguments match a schema, whether a write follows a confirmation, whether the step count is under budget: these are exact, free and have no bias. A small grader looks like this.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>grade_trace.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class Call:
+    tool: str
+    args: dict
+
+CUSTOMER_WRITES = {"update_address", "change_payment_date"}
+
+def grade(trace, expected_queue, max_steps=12):
+    """Rule checks on one claims-agent trace. Returns (score, failed_checks)."""
+    names = [c.tool for c in trace]
+    routes = [i for i, n in enumerate(names) if n == "route_to_adjuster"]
+    failed = []
+    if not routes or trace[routes[-1]].args.get("queue") != expected_queue:
+        failed.append("outcome")
+    if "check_coverage" not in names or (routes and names.index("check_coverage") &gt; routes[0]):
+        failed.append("coverage_before_route")
+    for i, n in enumerate(names):
+        if n in CUSTOMER_WRITES and "confirm_with_user" not in names[:i]:
+            failed.append("confirmed_writes")
+            break
+    if len(trace) &gt; max_steps:
+        failed.append("step_budget")
+    return 1 - len(failed) / 4, failed
+
+skipped = [Call("read_fnol", {}), Call("route_to_adjuster", {"queue": "auto-glass"})]
+print(grade(skipped, "auto-glass"))   # (0.75, ['coverage_before_route'])</code></pre>
+  </div>
+  <p>The outcome check passes and the evidence check fails, which is the whole point. In a real harness the coverage check reads the coverage <em>record</em> from the final state as well as the call, so a call whose result was ignored does not count.</p>
+  <p>Use a model judge for what rules cannot see: whether the clarifying question was sensible and not repetitive, whether the explanation to the claimant was accurate and plain, whether the agent handled a distressed customer well. Grade one dimension per judge call with a written rubric, and calibrate each judge against human labels as in <a href="07-eval-set-and-ship-decision.html#graders">chapter 07</a>. Anthropic's guidance adds that you should read the transcripts and grades from many trials, because that is the only way to learn whether a grader is wrong. A judge that scores a whole trajectory with one holistic number is the weakest design here.</p>
+</section>
+
+<section id="reliability">
+  <h2>Reliability: one run is not a result</h2>
+  <p>An agent samples from a model at every step, so the same scenario can pass on one run and fail on the next. A single run per scenario measures luck. Run each scenario <em>n</em> times, with <em>n</em> of 5 to 10 being typical, and report two things: the average success, and how often the agent succeeds <em>every</em> time.</p>
+  <p>τ-bench defines <strong>pass^k</strong> for the second. It is the probability that all <em>k</em> trials of a task succeed, estimated from <em>n</em> trials with <em>c</em> successes as C(c, k) / C(n, k), then averaged over tasks. Its contrast is pass@k, the chance of at least one success in <em>k</em> tries, which suits a tool where a retry costs nothing. For a customer-facing agent, pass^k is the one that matches what customers experience, because the customer gets one run and expects it to work every time they ask. The paper's headline result is the gap: a function-calling agent running gpt-4o succeeded on fewer than half the tasks, and its pass^8 was below 25% in the retail domain.</p>
+  <p>The arithmetic is quick to do aloud. If a task succeeds in 6 of 8 trials, pass^1 is 6/8 = 0.75, pass^4 is C(6,4)/C(8,4) = 15/70 ≈ 0.21, and pass^8 is 0. Anthropic's version of the point: a per-trial rate of 75% gives about 42% over three trials, since 0.75 cubed is 0.42. The practical rule is that an agent which looks fine on average can be unreliable per task, and the number to put in the ship rule is pass^k for the k that matches how often a customer would repeat the request.</p>
+  <p>Reliability costs money. Ten trials of 200 scenarios is 2,000 agent runs per evaluation, at the agent's full per-run cost. Keep a small scenario set for every pull request, run the full multi-trial set nightly or before release, and note that the cost per run is itself a metric that appears in the ship decision in <a href="07-eval-set-and-ship-decision.html#decision">chapter 07</a>.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked answer: the claims agent that skipped the coverage check</h2>
+  <p>This is an illustrative setup, not measured data. Harbourline builds 200 scenarios from sampled claims plus hand-written exclusions, flood edge cases and fault injections. Each scenario runs 5 times against a sandbox with a seeded policy database. The first report reads like this.</p>
+  <div class="flow">layer                       result            gate
+outcome (right queue)       94% of runs       target 95%
+coverage record present     71% of runs       must match outcome
+unconfirmed customer write  0 of 1,000        must be 0
+median steps / reference    7 / 6             within 1.5x
+pass^5 on outcome           81%               target 90%</div>
+  <p>The headline figure would have said 94% and passed. The evidence row shows that in roughly a quarter of runs the agent routed without a coverage record. Reading those traces shows the pattern: short, clear glass and windscreen claims, where the agent infers the queue from the loss description. The fix is in the harness and not only the prompt. Make routing a tool that refuses to run without a coverage decision ID, so the skip becomes impossible, not just unlikely. Then add the failing scenarios to the set so the next change cannot bring it back.</p>
+  <div class="talking-point">
+    <span class="label">~60 seconds out loud</span>
+    <p><em>"I grade the agent in layers: the end state, the evidence the state must contain, the tool calls, safety rules, and cost. Outcome alone is not enough. In [the system I evaluated] the agent reached the right queue in [N%] of runs while only [M%] had a coverage record, and an answer-only score would have shipped that. I do not script an exact tool order, because valid paths differ. I check the facts the final state and audit log must hold, and the order only where order matters, like coverage before routing. Each scenario runs [n] times and I report pass^k, because the customer gets one run and expects it to work. Safety violations have a target of zero, not a rate."</em></p>
+  </div>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Anthropic says don't grade the path. Why are you grading the path?"</summary>
+    <div class="reveal-body">
+      <p><em>"I grade constraints on the path, not a script. I do not require a fixed sequence of calls, because the agent may find a valid route I did not foresee. I require that the final state holds a coverage decision for the right policy, and that coverage came before routing, because that is what makes the outcome defensible. If a different valid order produced the same record in time, it passes. Where a regulator expects a fixed sequence, I would check the exact order."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "How do you test tool use without hitting production systems?"</summary>
+    <div class="reveal-body">
+      <p><em>"With a sandbox. The tools are backed by a small seeded database, so every run starts from the same state and I can compare the end state to the expected one. A model plays the claimant from a script of facts. I also inject faults: timeouts, empty results, a record from the wrong policy period. I replay production traces as a source of scenarios and as a daily rule check over live traffic, but not as the way to test a new version, since recorded tool responses stop applying when the new version calls something different."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "The agent passes 92% of scenarios on a single run. What would you want to know next?"</summary>
+    <div class="reveal-body">
+      <p><em>"Whether it passes the same scenarios each time. I would run each scenario [n] times and compute pass^k, because a customer gets one run and expects it to work. I would also want the layer breakdown, since 92% on outcome says nothing about evidence or safety, and the safety count, which should be zero. And I would want cost and steps against a reference, because an agent that gets there in three times the steps is slower and costs more."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "Should a model judge the trajectories, or should you use rules?"</summary>
+    <div class="reveal-body">
+      <p><em>"Rules for anything I can state exactly, because they are free, exact and unbiased: schema validity, order constraints, confirmation before writes, step budgets. A model judge for what rules cannot see, such as whether a clarifying question was sensible. One dimension per judge call, a written rubric, and calibration against human labels with agreement checked per slice. I would not use one holistic score for a whole trajectory. It is hard to calibrate and it hides which part failed."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "The agent got the wrong answer, but every step it took was reasonable. How do you score that?"</summary>
+    <div class="reveal-body">
+      <p><em>"The outcome layer fails and the process layers pass, and I report them separately. Then I find why. Often the cause is upstream, such as a stale document, an ambiguous policy wording or a tool that returned bad data, and the fix belongs there, not in the agent. It matters to keep that case visible. If I folded it into one score, I would tune the agent to compensate for a data problem. I would add the scenario to the set with the corrected data, so it is tested as a data failure and not an agent failure."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A claims agent routes 96% of test claims to the correct queue, and a reviewer asks you to approve it for launch. What do you look at before agreeing, and why is 96% not enough?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The other layers: whether each run holds the evidence that makes the route defensible (a coverage decision), whether any write skipped confirmation, and cost and steps against a reference. The tempting answer is that a correct end state means a correct process; it fails because an agent can reach the right queue by a shortcut that breaks on the next claim. See <a href="#layers">What to grade</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague wants an eval that asserts the exact tool sequence read, check coverage, ask, route. Give one reason this is fragile and one case where it is the right design.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It fails valid runs that reorder or add steps, such as asking the claimant first, so you spend time chasing false failures. It is right when order is the requirement itself, for example a regulator expects a fixed sequence. Otherwise check records and ordering only where it carries meaning. See <a href="#path">Outcome or path</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A scenario passes in 7 of 10 trials. What are pass^1 and pass^3 for that scenario, and what does the gap tell you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>pass^1 is 7/10 = 0.7. pass^3 is C(7,3)/C(10,3) = 35/120 ≈ 0.29. The gap says the agent is inconsistent on this task: if a customer repeats the request three times, all three succeed less than a third of the time. See <a href="#reliability">Reliability: pass^k</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You replay last month's recorded production traces against a new agent version to check for regressions, and half the replays diverge at the second tool call. Is the new version worse?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not necessarily. Once the new version calls a different tool or passes different arguments, the recorded response no longer applies, so the replay is invalid from that point. Use a stateful mock for comparing versions, and keep recorded replay for checking unchanged behaviour. See <a href="#environment">Environments and replay</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The customer-service chat agent scores well on resolution and on cost, but in 3 of 5,000 test runs it called the address-change tool without asking the customer. A product lead calls that a 0.06% rate and acceptable. What do you say?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Safety violations are counts with a target of zero, not rates to trade against resolution. Each one is a customer record changed without consent. Read the three traces, then fix it in the harness by making the write tool reject calls with no confirmation token, so it cannot happen. A prompt-only fix leaves it unlikely, not impossible. See <a href="#layers">What to grade</a> and <a href="06-customer-service-agent.html">chapter 06</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>An agent's final answer is one of five layers: outcome, required evidence, tool calls, safety and efficiency, and each should be reported on its own.</li>
+    <li>Grade constraints on the path, such as records that must exist and orderings that carry meaning, not a fixed script of tool calls.</li>
+    <li>A correct outcome with a missing coverage record is a hidden failure, so the check must read the record in the final state.</li>
+    <li>Safety violations are counts with a target of zero, and the durable fix is a harness that makes the action impossible.</li>
+    <li>Run each scenario several times and report pass^k, since a customer-facing agent has to work on every run, not on average.</li>
+    <li>Use rules for what is checkable, a calibrated one-dimension judge for what is not, and read the transcripts to learn whether either is wrong.</li>
+  </ul>
+  <p>Grading is the offline half of the work; next comes running the model at volume, starting with batching. → <a href="09-batching-system-for-llm-queries.html">A Batching System for LLM Queries</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener"><strong>τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains</strong></a> — Yao, Shinn, Razavi and Narasimhan, 2024. The end-state scoring method, the simulated user, and the definition and estimator of pass^k.</li>
+    <li><a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener"><strong>Demystifying evals for AI agents</strong></a> — Anthropic Engineering, January 2026. Outcome versus transcript grading, partial credit, pass@k against pass^k, and reading transcripts.</li>
+    <li><a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener"><strong>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</strong></a> — Zheng et al., 2023. The known biases to test for before trusting a model judge on trajectories.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

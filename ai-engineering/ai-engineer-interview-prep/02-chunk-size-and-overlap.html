@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chunk Size and Overlap — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="How to choose chunking for a corpus you have never seen: what the embedding model, the questions and the generator each constrain, and how to measure the…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/02-chunk-size-and-overlap">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Chunk Size and Overlap — AI Engineer Interview Prep">
+<meta property="og:description" content="How to choose chunking for a corpus you have never seen: what the embedding model, the questions and the generator each constrain, and how to measure the…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/02-chunk-size-and-overlap">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#constraints">Four constraints</a>
+    <a href="#strategies">Chunking strategies</a>
+    <a href="#overlap">Overlap</a>
+    <a href="#context">Context in the chunk</a>
+    <a href="#measure">Measure, do not guess</a>
+    <a href="#worked">Worked answer</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="01-debugging-a-wrong-rag-answer.html">← Previous: The Wrong Answer When the Right Document Exists</a>
+    <a href="03-hybrid-search-and-reranking.html">Next: Hybrid Search and Reranking →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · RAG and retrieval</span>
+  <h1>Chunk Size and Overlap</h1>
+  <p class="subtitle">How to choose chunking for a corpus you have never seen: what the embedding model, the questions and the generator each constrain, and how to measure the choice instead of guessing.</p>
+</header>
+
+<section id="question">
+  <h2>The question, and what is being scored</h2>
+  <p>The interviewer says: <em>"How would you choose chunk size and overlap for this corpus?"</em> The corpus is Harbourline's help-centre material: policy wordings of 20 to 300 pages, claims procedures, and short FAQ pages.</p>
+  <p>A weak answer gives a number: "512 tokens with 10% overlap". A strong answer treats size as a decision with constraints and a measurement. Three things are being scored:</p>
+  <ul>
+    <li><strong>Do you know what constrains the choice?</strong> The embedding model, the shape of the questions, the generator's budget and the citation need each push in a different direction.</li>
+    <li><strong>Do you know there are alternatives to fixed windows?</strong> Structure-aware splitting and small-to-big retrieval change the question.</li>
+    <li><strong>Do you test it?</strong> The honest answer is "I do not know the best size for your data until I sweep it".</li>
+  </ul>
+  <p>Chunking is also where the most common retrieval fault from <a href="01-debugging-a-wrong-rag-answer.html#faults">chapter 01</a> is born: a fact separated from the context that gives it meaning.</p>
+</section>
+
+<section id="constraints">
+  <h2>Four constraints on chunk size</h2>
+  <p>A chunk is the unit of retrieval, of embedding, of the prompt and of the citation. Those four roles want different sizes.</p>
+  <p><strong>1. The embedding model.</strong> An embedding model turns a chunk into one vector, usually by pooling the token representations (mean pooling or a special token). Every token in the chunk contributes. A 1,500-token chunk that holds six unrelated clauses produces a vector that sits between them and matches none of them well. A 40-token chunk can be precise, but has little for the model to work with. Each model also has a maximum input length, from 512 tokens on older BERT-style models to roughly 8,000 on newer ones; text beyond the limit is truncated silently by many clients. Check the model card for the exact limit and whether it truncates.</p>
+  <p><strong>2. The shape of the questions.</strong> Harbourline's questions come in two kinds. "What is my water damage deductible?" is answered by one table row. "What do I do after a car accident?" needs a procedure that spans several paragraphs. Chunks sized for the first kind fragment the second, and chunks sized for the second dilute the first. Look at real questions before choosing.</p>
+  <p><strong>3. The generator's budget.</strong> If the prompt carries five chunks, the chunk size sets the context cost: five 800-token chunks is 4,000 tokens per question. At 40,000 chats a day that is 160 million input tokens a day from retrieval alone, before the system prompt and history. Larger chunks also lengthen the prompt in which the position effect from chapter 01 operates.</p>
+  <p><strong>4. The citation need.</strong> If the assistant must cite "Home Plus wording, section 4.2", a chunk that spans three sections cannot cite precisely. Citation granularity argues for chunks that map to a section or smaller.</p>
+  <div class="callout insight">
+    <span class="callout-label">Retrieval wants small chunks; generation wants whole ones</span>
+    <p>Small units match questions precisely, and large units give the model enough surrounding text to answer correctly. A single size is always a compromise between those two jobs. Most of the good techniques below exist to decouple them.</p>
+  </div>
+</section>
+
+<section id="strategies">
+  <h2>Chunking strategies</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Strategy</th><th>How it splits</th><th>Strength</th><th>Failure</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Fixed window</strong></td><td>N tokens, cut anywhere</td><td>Trivial, uniform cost</td><td>Cuts mid-sentence and mid-table; context lands in a neighbour</td></tr>
+      <tr><td><strong>Recursive</strong></td><td>Try paragraph breaks, then sentences, then words until under N</td><td>Respects natural breaks; the common default</td><td>Knows nothing of headings or tables</td></tr>
+      <tr><td><strong>Structure-aware</strong></td><td>Split on headings and sections; keep a table or list whole</td><td>Chunks are units a person would cite</td><td>Section sizes vary; huge sections need a second pass</td></tr>
+      <tr><td><strong>Semantic</strong></td><td>Embed sentences, cut where similarity between neighbours drops</td><td>Follows topic shifts without headings</td><td>Extra embedding cost; gains over recursive are inconsistent, so test them</td></tr>
+      <tr><td><strong>Parent-child</strong></td><td>Index small chunks; return the parent section to the model</td><td>Precise match, full context</td><td>Larger prompts; a parent can hold several matches</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>For Harbourline's policy wordings I would use <strong>structure-aware splitting with parent-child retrieval</strong>. Policy documents already have a hierarchy: part, section, clause. Split on it, keep each table intact whatever its size, and cut any section over a cap (say 800 tokens) at paragraph breaks. Embed child chunks of one clause or one table row group, and when a child matches, send its parent section to the generator. The deductible question hits the table row; the model reads the whole table with its column headers.</p>
+  <p>The parent-child pattern pays for itself because the two jobs separate. The index is optimised for matching, and the prompt is optimised for understanding. Its cost is the larger prompt: if a parent is 1,200 tokens and you send five, that is 6,000 tokens, so dedupe parents when two children come from the same one.</p>
+  <p><strong>When this flips:</strong> for short FAQ pages of under 300 tokens, do not split at all; the page is the chunk. For free-form content with no headings, such as transcribed call notes, recursive splitting at 300 to 500 tokens is a reasonable start. For a corpus that is small enough to fit the context window outright, skip retrieval on that corpus. Anthropic's 2024 contextual-retrieval post suggests this for knowledge bases under about 200,000 tokens.</p>
+</section>
+
+<section id="overlap">
+  <h2>Overlap: what it buys and when it only duplicates</h2>
+  <p>Overlap repeats the last part of one chunk at the start of the next. It exists for one reason: a fixed-window cut can fall in the middle of an idea, and without overlap neither side holds the whole of it. With 100 tokens of overlap, a sentence cut at the boundary appears whole in at least one chunk.</p>
+  <p>That is a patch for blind cutting. If you split on sentence or section boundaries, nothing is cut mid-idea, and overlap adds only cost: more vectors, more storage, and two near-identical chunks competing for the same top-k slots, which pushes out distinct passages. The effect is worst with top-k of 5, where one duplicated pair uses 40% of the slots.</p>
+  <ul>
+    <li><strong>Fixed window or recursive splitting:</strong> some overlap helps; 10 to 20% of the chunk is a common starting range, to be tuned.</li>
+    <li><strong>Structure-aware splitting:</strong> start at zero overlap. Add it only if the sweep shows gains.</li>
+    <li><strong>Sliding windows over long unstructured text</strong> (a 40-page transcript) are where overlap earns its place.</li>
+  </ul>
+  <p>Overlap also affects deduplication downstream. If you keep it, merge adjacent retrieved chunks before building the prompt so the repeated text appears once.</p>
+</section>
+
+<section id="context">
+  <h2>Put the context in the chunk</h2>
+  <p>A clause on its own often cannot be understood: "The deductible is $1,000" does not say which policy, peril or year. Two fixes, from cheap to expensive.</p>
+  <p><strong>Prepend metadata.</strong> Add the document title, version and section path to the text that gets embedded: <code>Home Plus wording 2026 &gt; Section 4 Water damage &gt; Deductibles</code>. It costs a few tokens per chunk and no model calls. Store the same fields as filterable metadata too, which is the cure for the wrong-year bug from chapter 01.</p>
+  <p><strong>Generate context per chunk.</strong> Anthropic's contextual retrieval has a model write a short description of where the chunk sits in its document and prepends it before embedding and before building the BM25 index. Anthropic reported failed top-20 retrievals falling from 5.7% to 3.7% with contextual embeddings, to 2.9% when combined with contextual BM25, and to 1.9% with reranking added (as measured by them, on their datasets; yours will differ). They put the one-off cost at about $1.02 per million document tokens, using Claude 3 Haiku with prompt caching, in 2024; re-check current model prices before quoting a budget. A 50-million-token Harbourline corpus would cost around $51 by that figure, which is small next to engineer time but not zero when re-indexing happens monthly.</p>
+  <div class="callout tip">
+    <span class="callout-label">Start with the free fix</span>
+    <p>Metadata prepending gets most of the way for structured documents like policy wordings, because the structure already exists. Pay for generated context when the documents are flat, such as emails or call notes, where no header says what a chunk is about.</p>
+  </div>
+</section>
+
+<section id="measure">
+  <h2>Measure, do not guess</h2>
+  <p>Any chunking choice can be tested in an afternoon if you have a labelled set. Build 50 to 200 question-to-passage pairs from real questions: a sample of help-centre search logs, with a person marking the passage that answers each. Include several question kinds: single-fact, multi-paragraph, table lookups, and questions with no answer in the corpus. Keep the set fixed so results compare.</p>
+  <p>Then sweep. For each configuration, re-chunk, re-embed, and compute <strong>recall@k</strong>: the share of questions where the gold passage's text appears inside a retrieved chunk. A passage-level label survives re-chunking because you match on text, not chunk ID.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>sweep.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from itertools import product
+
+def covers(chunk_text, gold_text):
+    return gold_text in chunk_text            # gold answer span, not a chunk ID
+
+def recall_at_k(questions, search, k):
+    hits = 0
+    for q in questions:                       # q.text, q.gold_span
+        top = search(q.text, k)
+        hits += any(covers(c.text, q.gold_span) for c in top)
+    return hits / len(questions)
+
+for size, overlap in product([200, 400, 800], [0, 50, 100]):
+    index = build_index(corpus, chunk_tokens=size, overlap=overlap)   # your code
+    print(size, overlap, round(recall_at_k(questions, index.search, k=5), 3))</code></pre>
+  </div>
+  <p>Report more than recall. Add the average prompt tokens per question (the cost side) and an answer-quality score from the same labelled set using a grader, because a configuration can raise recall while hurting answers if the extra text distracts the model. <a href="01-debugging-a-wrong-rag-answer.html#bisect">Chapter 01's bisect</a> shows how to separate the two. Also count the re-index cost: a chunking change means re-embedding the whole corpus, so a sweep of nine configurations costs nine embeddings of the corpus. Run it on a sample of documents first.</p>
+  <p>Do not assert one best size. Published guidance converges on "a few hundred to about a thousand tokens", and the right value depends on the embedding model, the documents and the questions. The sweep result for your data outranks any rule of thumb.</p>
+  <p>For the same topic in a shorter, compliance-flavoured form, see <a href="../ai-engineer-compliance/06-rag-applied.html#fm2">RAG Applied, failure mode 2</a>.</p>
+</section>
+
+<section id="worked">
+  <h2>A worked answer</h2>
+  <ol>
+    <li><strong>Ask about the questions and the corpus.</strong> "Are answers usually a single fact, or a procedure? Are documents structured?" For Harbourline: both, and the policies have clear headings.</li>
+    <li><strong>State the constraints.</strong> Embedding limit and pooling, question granularity, prompt budget, citation precision.</li>
+    <li><strong>Propose a design, not a number.</strong> Structure-aware splits on part, section and clause, tables kept whole, zero overlap to start, child chunks of about 200 to 400 tokens indexed, parent sections returned to the generator, title and section path prepended.</li>
+    <li><strong>Say how you would check it.</strong> A labelled set of 100 questions from help-centre logs, a sweep over size and overlap, and recall@5, prompt tokens and answer quality reported together.</li>
+    <li><strong>Name where it flips.</strong> Short FAQ pages stay whole. Unstructured transcripts get recursive splitting with overlap. A corpus under about 200,000 tokens may not need retrieval.</li>
+  </ol>
+  <p>The sentence that scores: "I would not pick a size before I had run the sweep, but I would not start from a blind fixed window either."</p>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "Why not use the biggest chunks your embedding model allows?"</summary>
+    <div class="reveal-body">
+      <p><em>"Because the vector is one summary of everything in the chunk. A 6,000-token chunk covering six clauses embeds as a blend, and a specific question matches the blend less well than it would match the one clause. It also costs more in the prompt and gives the model more text to lose the answer in. The model's maximum length is a ceiling, not a target. The exception is when questions really are broad, such as 'summarise this policy', where larger units are right."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "Your tables keep coming back as garbage. What do you do?"</summary>
+    <div class="reveal-body">
+      <p><em>"I treat tables as their own element during parsing instead of letting text splitting touch them. Extract each table as structured data, render it as Markdown or one row per line with the column headers repeated, and keep it in one chunk, even when it exceeds the normal cap. For very large tables I split by row groups and repeat the header in each. Then I add a caption from the nearest heading to the chunk, so the deductibles table says what it is."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "You change the chunk size and recall goes up but answers get worse. Explain."</summary>
+    <div class="reveal-body">
+      <p><em>"Recall@k only says the gold text is present among k chunks. If I raised the size, each chunk is bigger, so the gold text is more likely inside one, but the prompt now has more tokens and more distractors. The generator can lose the fact in the middle, or two nearby clauses can confuse it. I would check prompt tokens, where the gold passage sits and a faithfulness score. The fix might be smaller children with parent expansion, or a reranker that keeps only the best chunks."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "Re-chunking needs a re-embed of everything. How do you make that safe?"</summary>
+    <div class="reveal-body">
+      <p><em>"I build the new index beside the old one, versioned, and never edit in place. I run the labelled set against both, compare, and switch traffic with an alias, so rollback is one pointer change. I also cache embeddings by a hash of chunk text and model, so chunks that did not change are not re-embedded. Cost is proportional to corpus tokens, so I estimate it first. For Harbourline, with a corpus in the tens of millions of tokens, one embedding pass is not the expensive part. The labelling and analysis time is."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "Is semantic chunking worth it?"</summary>
+    <div class="reveal-body">
+      <p><em>"It is a hypothesis to test, not a default. It adds embedding calls at ingestion and produces variable-size chunks, and in comparisons I have seen the gain over a good recursive or structure-aware split is small and inconsistent. When documents have headings, I use the headings, because they are free and meaningful. I would try semantic splitting for long, flat text like call transcripts, and keep it only if recall@k and answer quality improve on the labelled set."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague tests a 3,000-token chunk size and finds exact-clause questions retrieve worse than at 400 tokens. What mechanism explains this?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The embedding is one pooled vector over all tokens, so a chunk holding many clauses sits between them and matches a specific question less well than a single clause would. See <a href="#constraints">the four constraints</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You split on section headings, so no chunk is cut mid-idea. A teammate adds 100 tokens of overlap anyway. What is the likely result at top-5?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Adjacent chunks share text, so near-duplicates occupy several of the five slots and crowd out distinct passages, while the index grows. Overlap patches arbitrary cuts, which this split does not make. See <a href="#overlap">Overlap</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Five retrieved children come from two parent sections of 1,200 tokens each. What do you send the generator, and why does that matter for cost?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Send each parent once, 2,400 tokens, not five parents at 6,000. Deduplicating parents keeps the prompt small while the model still reads full sections. See <a href="#strategies">Chunking strategies</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You have 40 labelled questions, and a sweep shows 400 tokens beating 800 by two points of recall@5. Do you re-index production? What would you want first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not yet. With 40 questions two points is one question, which is within noise. Grow the set toward 100 to 200, add prompt tokens and answer quality to the comparison, and then decide. See <a href="#measure">Measure, do not guess</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Harbourline adds 8,000 short, flat claims-call notes to the corpus. Why might you now spend money on generated chunk context when you did not for policy wordings?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Policy wordings carry their context in headings, which can be prepended for free. Flat notes have no headings, so a model-written description of what each note concerns is the only way to restore the context. See <a href="#context">Put the context in the chunk</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Chunk size is set by four constraints at once: how the embedding model pools, how big the questions' answers are, the generator's token budget and the citation granularity needed.</li>
+    <li>Retrieval wants small units and generation wants whole ones, so parent-child retrieval usually beats picking one size.</li>
+    <li>Split on the structure the document already has, keep tables whole, and treat fixed windows as the fallback for text with no structure.</li>
+    <li>Overlap only patches arbitrary cuts; with structure-aware splits it mostly duplicates chunks and crowds the top-k.</li>
+    <li>Prepend title, version and section path to every chunk, and spend on model-generated context only where the document has no structure to supply it.</li>
+    <li>No size is best in general: sweep size and overlap on 100 or more labelled questions, and judge by recall@k, prompt tokens and answer quality together.</li>
+  </ul>
+  <p>Even well-cut chunks leave a gap: dense search misses exact codes, and the right chunk may rank sixth. That is the job of the next chapter. → <a href="03-hybrid-search-and-reranking.html">Hybrid Search and Reranking</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener"><strong>Introducing Contextual Retrieval</strong></a> — Anthropic, 2024. The per-chunk context technique, with failure-rate and cost figures.</li>
+    <li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener"><strong>Lost in the Middle</strong></a> — Liu et al., 2023. Why larger prompts of chunks can lower answer quality.</li>
+    <li><a href="https://docs.ragas.io/" target="_blank" rel="noopener"><strong>Ragas metrics list</strong></a> — retrieval and generation metrics to pair with recall@k in a sweep.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

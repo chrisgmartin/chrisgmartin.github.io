@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Latency and Cost at Scale — AI Engineer Interview Prep</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The levers in order of payoff: prompt and prefix caching, model routing, output limits, speculative decoding, streaming and parallel tool calls, with the…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/10-latency-and-cost-at-scale">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Latency and Cost at Scale — AI Engineer Interview Prep">
+<meta property="og:description" content="The levers in order of payoff: prompt and prefix caching, model routing, output limits, speculative decoding, streaming and parallel tool calls, with the…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/ai-engineer-interview-prep/10-latency-and-cost-at-scale">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=19" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=19" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=19">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=19">
+<script defer src="../../assets/script.js?v=19"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#question">The question</a>
+    <a href="#measure">Measure first</a>
+    <a href="#levers">The levers, ranked</a>
+    <a href="#caching">Prefix caching</a>
+    <a href="#routing">Routing and output</a>
+    <a href="#speed">Streaming, tools, speculation</a>
+    <a href="#semantic-cache">Semantic caching</a>
+    <a href="#budget">The budget table</a>
+    <a href="#not-first">What not to do first</a>
+    <a href="#probes">Interview probes</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="09-batching-system-for-llm-queries.html">← Previous: A Batching System for LLM Queries</a>
+    <a href="11-multimodal-file-uploader.html">Next: A Large-File Uploader for a Multimodal Chat →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section E · LLM system design</span>
+  <h1>Latency and Cost at Scale</h1>
+  <p class="subtitle">The levers in order of payoff: prompt and prefix caching, model routing, output limits, speculative decoding, streaming and parallel tool calls, with the numbers to quote.</p>
+</header>
+
+<section id="question">
+  <h2>The question, and what is being scored</h2>
+  <div class="talking-point">
+    <span class="label">As asked</span>
+    <p><em>"Your LLM feature is too slow and too expensive at scale. What do you do?"</em></p>
+  </div>
+  <p>The weak answer is a list: caching, a smaller model, shorter prompts. The strong answer is a procedure. You measure first, you rank the levers by payoff on this workload, you quantify each, and you say which ones you refuse to touch yet. Interviewers score four things:</p>
+  <ul>
+    <li><strong>Measurement before action.</strong> You name the metrics and the percentiles, and you know that time to first token and total time are different problems.</li>
+    <li><strong>Mechanism per lever.</strong> You can say why prefix caching cuts both cost and time to first token, why output tokens dominate total time, and why speculative decoding helps at low load.</li>
+    <li><strong>Ordering by payoff.</strong> The cheap, safe, large wins go first. You know what is last and why.</li>
+    <li><strong>Correctness risk.</strong> You see that some savings, semantic caching above all, buy speed by risking a wrong answer, and you price that risk by surface.</li>
+  </ul>
+  <p>The running example is Harbourline's web chat: about 40,000 sessions a day, a customer-service agent with tools for policy lookup, payment status and address changes. The agent design itself is in <a href="06-customer-service-agent.html">the customer-service chapter</a>. This chapter asks what it costs to run and how fast it feels.</p>
+</section>
+
+<section id="measure">
+  <h2>Measure first: what, at which percentile</h2>
+  <p>A model call has two phases with different physics. In prefill, the engine processes the whole prompt in parallel, and the cost grows with prompt length. In decode, it generates one token at a time, and the cost grows with output length. That gives the identity you should be able to write on a whiteboard:</p>
+  <div class="flow">  time to first token  =  network + queue + prefill(prompt tokens) + first decode
+  total time           =  time to first token + output tokens × time per token
+  session time         =  Σ over turns of (model calls + tool calls + your own code)</div>
+  <p>Prompt length moves the first term. Output length moves the second, and for chat answers it is usually the larger one. Output tokens also cost more: on Sonnet 5.5 an output token is five times the price of an input token ($10 against $2 per million, as of November 2026). So shorter outputs improve both numbers, and a shorter prompt mainly improves time to first token and the input bill.</p>
+  <p>Record these per surface, per model and per tool, not as one global average:</p>
+  <ul>
+    <li><strong>p50, p95 and p99 of time to first token and of total time.</strong> The average hides the users who complain. Sessions have several turns, so the tail compounds: with six turns and a p95 that is slow one time in twenty, about 26% of sessions (1 − 0.95<sup>6</sup>) contain at least one slow turn.</li>
+    <li><strong>Inter-token time</strong>, for streamed answers. It tells you whether the stream looks smooth.</li>
+    <li><strong>Cost per session</strong>, computed from the usage fields each response returns: uncached input, cache-written input, cache-read input and output tokens, each at its own price.</li>
+    <li><strong>Cache hit ratio</strong>: cache-read tokens divided by all input tokens. A drop after a release is a bug report.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>session_cost.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">PRICES = {  # USD per million tokens, as of November 2026
+    "claude-sonnet-5-5": {"in": 2.00, "cache_write_5m": 2.50, "cache_read": 0.10, "out": 10.00},
+    "claude-haiku-5-5":  {"in": 0.10, "cache_write_5m": 0.125, "cache_read": 0.01, "out": 0.50},
+}
+
+def call_cost(model: str, usage: dict) -&gt; float:
+    """Cost of one call from the `usage` object on a Messages API response."""
+    p = PRICES[model]
+    return (
+        usage.get("input_tokens", 0) * p["in"]
+        + usage.get("cache_creation_input_tokens", 0) * p["cache_write_5m"]
+        + usage.get("cache_read_input_tokens", 0) * p["cache_read"]
+        + usage.get("output_tokens", 0) * p["out"]
+    ) / 1_000_000
+
+# One chat turn: 4,000-token stable prefix, 1,500 variable tokens, 250 output tokens.
+cold = {"input_tokens": 5500, "output_tokens": 250}
+warm = {"input_tokens": 1500, "cache_read_input_tokens": 4000, "output_tokens": 250}
+print(f"cold {call_cost('claude-sonnet-5-5', cold):.5f}  warm {call_cost('claude-sonnet-5-5', warm):.5f}")
+# cold 0.01350  warm 0.00590</code></pre>
+  </div>
+  <p>Anthropic's own advice on latency is worth repeating in an interview: first get a prompt that performs well without constraints, then optimise. Trimming too early hides what top quality looks like, and you cannot judge a cheaper variant without that reference.</p>
+</section>
+
+<section id="levers">
+  <h2>The levers, in order of payoff</h2>
+  <p>The order below is for Harbourline's chat workload. The ranking is workload-specific: a job with short prompts and long outputs would reorder it. The percentages come from the budget table later in this chapter, built on stated assumptions.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>#</th><th>Lever</th><th>Moves</th><th>Harbourline effect</th><th>Main risk</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="term">Prefix caching</td><td>Cost, time to first token</td><td>Cost down 56%</td><td>Silent misses after a prompt change</td></tr>
+      <tr><td>2</td><td class="term">Model routing</td><td>Cost, total time</td><td>Cost down a further 55%</td><td>Router errors on hard cases</td></tr>
+      <tr><td>3</td><td class="term">Output discipline</td><td>Cost, total time</td><td>Cost down a further 11%</td><td>Answers that lose needed detail</td></tr>
+      <tr><td>4</td><td class="term">Streaming</td><td>Perceived time to first token</td><td>No cost change</td><td>Validators that need the whole answer</td></tr>
+      <tr><td>5</td><td class="term">Parallel tool calls</td><td>Total time</td><td>Saves one model round trip per turn</td><td>Side effects run out of order</td></tr>
+      <tr><td>6</td><td class="term">Shorter prompts and tool results</td><td>Cost, time to first token</td><td>Small once caching is on</td><td>Dropped context</td></tr>
+      <tr><td>7</td><td class="term">Speculative decoding</td><td>Per-token time, self-hosted</td><td>None on a hosted API</td><td>Little gain at high load</td></tr>
+      <tr><td>8</td><td class="term">Semantic caching</td><td>Cost, all latency</td><td>Not in the budget</td><td>Wrong answers served confidently</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Batching belongs on the list for the non-interactive half of the company, and it is the one lever with a price tag attached: half price for work that can wait. That is the subject of <a href="09-batching-system-for-llm-queries.html#provider-batch">the previous chapter</a> and is not repeated here.</p>
+</section>
+
+<section id="caching">
+  <h2>Prefix caching: the biggest lever and the easiest to break</h2>
+  <p>The model's key and value tensors for a prompt prefix depend only on that prefix. If the provider has already computed them for an identical prefix, it can skip that prefill work. Anthropic's prompt caching exposes this: you mark a breakpoint, the first call writes a cache entry, later calls with the exact same prefix read it. A read of Sonnet 5.5 costs 0.05 times the base input price, and a five-minute write costs 1.25 times (as of November 2026). Every use refreshes the five-minute lifetime for free. One-hour entries cost twice the base price to write.</p>
+  <p>The break-even is fast. A write costs 0.25 base extra and each read saves 0.95 base, so a single reuse pays for the write. For Harbourline's chat, the stable prefix is the system prompt, policy-handling rules and tool definitions: about 4,000 tokens, identical on every turn of every session. At roughly 0.5 sessions a second the entry never goes cold.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>cached_call.py (sketch)</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import anthropic
+client = anthropic.Anthropic()
+
+resp = client.messages.create(
+    model="claude-sonnet-5-5",
+    max_tokens=400,
+    system=[{
+        "type": "text",
+        "text": SYSTEM_PROMPT_AND_RULES,            # stable: identical on every request
+        "cache_control": {"type": "ephemeral"},     # breakpoint: cache everything up to here
+    }],
+    messages=conversation,                          # variable: history and new user turn
+)
+u = resp.usage
+hit_ratio = u.cache_read_input_tokens / max(
+    1, u.cache_read_input_tokens + u.cache_creation_input_tokens + u.input_tokens)</code></pre>
+  </div>
+  <p>Caching is a prefix match over the order tools, then system, then messages. A change at one level invalidates that level and everything after it. That makes the failures predictable, and they are all the same bug: something that varies sits in front of something that does not.</p>
+  <ul>
+    <li>A timestamp, a request ID or the customer's name at the top of the system prompt. Move it into the user turn.</li>
+    <li>Tool definitions reordered, or serialised with unstable key order, on each deploy. Anthropic's docs call out non-deterministic key ordering in tool inputs as a cache-breaker.</li>
+    <li>A prefix shorter than the minimum cacheable length (512 tokens for Sonnet 5.5 and Haiku 5.5, 4,096 for Haiku 4.5). The call succeeds and caches nothing, so only the usage fields tell you.</li>
+  </ul>
+  <div class="callout warn">
+    <span class="callout-label">Caching can cost more than it saves on a quiet surface</span>
+    <p>If a surface sees a few dozen requests a day, the five-minute entry expires between calls. You pay the 1.25 times write every time and never get a read. Harbourline's internal underwriter tool is that case. Check the hit ratio per surface; turn caching off, or use the one-hour entry, where reads do not outnumber writes.</p>
+  </div>
+</section>
+
+<section id="routing">
+  <h2>Routing, output discipline and shorter prompts</h2>
+  <p><strong>Model routing.</strong> Most turns in a customer-service chat are easy: "has my payment gone through", "confirm the new address". A small model handles them well, and Haiku 5.5 costs a twentieth of Sonnet 5.5 per input token ($0.10 against $2). The router can be rules (intent from the UI button the customer pressed), a small classifier, or the small model itself deciding to escalate. The mechanism that matters is the asymmetry of errors: sending a hard case to the small model costs quality, sending an easy one to the large model costs money. Harbourline's cost of a wrong answer differs by surface, so the router is conservative where it hurts. Anything touching a coverage decision goes to the larger model whatever the router thinks. Check routing quality with the same eval set you use for ship decisions, per route. See <a href="07-eval-set-and-ship-decision.html">the eval-set chapter</a>.</p>
+  <p><strong>Output discipline.</strong> Decode time is linear in output length, so the cheapest speed-up for total time is a shorter answer. Ask for it in the prompt in sentences or paragraphs; Anthropic notes that word-count limits work less well than sentence limits because models count tokens, not words. Use <code>max_tokens</code> as a guard rail, not a style control: hitting it truncates mid-sentence. On models that expose an effort setting, lower effort also shortens hidden reasoning, which counts as output.</p>
+  <p><strong>Shorter prompts.</strong> Once the prefix is cached, the stable part of the prompt costs 5% of its size, so trimming it is nearly worthless. What remains worth trimming is the variable part: tool results. A policy-lookup tool that returns a 3,000-token JSON document when the model needs the deductible and the effective date is the usual offender. Have the tool return what the agent needs. The token-budget discipline is covered in <a href="05-claims-agent-under-a-token-budget.html">the claims-agent chapter</a>.</p>
+  <div class="callout tip">
+    <span class="callout-label">Trim tool results, not the system prompt</span>
+    <p>After caching, a 4,000-token system prompt costs about what a 200-token one did before. A 3,000-token tool result is billed at full price on every later turn of the session, because it stays in the history. Shortening it pays twice.</p>
+  </div>
+</section>
+
+<section id="speed">
+  <h2>Streaming, parallel tool calls and speculative decoding</h2>
+  <p><strong>Streaming</strong> does not make the answer arrive sooner. It makes the first words arrive sooner, which is what a person perceives, so time to first token becomes the number that matters. It has a cost: anything that must inspect the whole answer before showing it, such as a grounding check or a policy-wording validator, cannot sit behind a stream. Harbourline streams help-centre answers and does not stream anything that states a coverage position. Those are buffered, checked, then shown, and the extra seconds are accepted.</p>
+  <p><strong>Parallel tool calls.</strong> A model can request several tools in one turn. For a customer who asks "did my payment go through and what's my renewal date", policy lookup and payment status are independent. Run them concurrently and you save a full model round trip compared with calling them one after another. The API leaves execution order to you, which is the catch: reads can run in parallel, but an address change that must follow a verification step cannot. Make side-effecting tools sequential and independent reads concurrent.</p>
+  <p><strong>Speculative decoding</strong> applies only when you run the model yourself. A small draft model proposes several tokens, the large model checks all of them in one forward pass, and a rejection-sampling step keeps the longest correct prefix. Leviathan, Kalman and Matias (2022) show the output distribution is unchanged, with a 2 to 3 times speed-up on T5-XXL. The vLLM documentation positions it for medium-to-low request rates where decode is memory-bound, supports draft models, EAGLE, multi-token prediction, n-gram and suffix methods, and says real gains depend on model, traffic and hardware. My reading of the mechanism: at high concurrency continuous batching already keeps the GPU busy with useful work, so extra verification compute competes with it and the gain shrinks. Test it against your own traffic. The <a href="../paged-attention-deep-dive/index.html#spec-decode">PagedAttention deep dive</a> has the scheduler view. For a hosted API it is not a lever you hold.</p>
+  <p><strong>Regional endpoints</strong> shorten the network leg and may be required for data residency, but providers can price in-region processing differently and the saving is tens of milliseconds, not seconds. Choose them for compliance first. Confirm the current terms with your provider before putting a number in a design.</p>
+</section>
+
+<section id="semantic-cache">
+  <h2>Semantic caching: fast, cheap and wrong in the worst place</h2>
+  <p>A semantic cache embeds the incoming question, finds a prior question within a similarity threshold, and returns the stored answer without calling the model. The latency is a vector lookup and the cost is close to zero. The mechanism of the risk is that embeddings measure topical closeness, not equivalence of meaning for this customer. "What is my deductible for water damage?" from two policyholders embeds almost identically and has two different correct answers. "Can I cancel my policy?" and "Can I cancel my claim?" are one word apart.</p>
+  <p>Where Harbourline would use it: public, non-personalised help-centre questions ("how do I upload photos of the damage") with an entry lifetime tied to the document version, and a threshold chosen from a labelled set of paired questions, not by feel. Where it never would: anything personalised or touching coverage, where a wrong deductible is a complaint and a wrong coverage position is a regulatory issue. For personalised surfaces, an exact-match cache keyed on the full normalised request including policy ID and policy version is safe, and rarely hits.</p>
+  <div class="callout danger">
+    <span class="callout-label">A semantic cache hit skips the guardrails you built</span>
+    <p>The stored answer was checked when it was generated, against that customer's data. Served to someone else it carries none of those checks. If you ship a semantic cache, put the customer, jurisdiction and policy version in the cache key, and measure false-hit rate as a first-class metric.</p>
+  </div>
+</section>
+
+<section id="budget">
+  <h2>The worked answer: a budget table for 40,000 sessions a day</h2>
+  <p>State the assumptions out loud, since the interviewer will test them. Each session has six model turns. Each turn sends 4,000 stable-prefix tokens plus 1,500 variable tokens (history and tool results) and returns 250 output tokens. That is 33,000 input tokens and 1,500 output tokens per session, or 1.32 billion input and 60 million output tokens a day. Prices are Sonnet 5.5 and Haiku 5.5 list prices as of November 2026.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Step (cumulative)</th><th>Assumption</th><th>Per day</th><th>Per session</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Baseline</td><td>Everything on Sonnet 5.5, no caching</td><td>$3,240</td><td>$0.081</td></tr>
+      <tr><td class="term">+ Prefix caching</td><td>All 4,000 prefix tokens read from cache</td><td>$1,416</td><td>$0.035</td></tr>
+      <tr><td class="term">+ Routing</td><td>60% of turns on Haiku 5.5; router call on Haiku about $30</td><td>$641</td><td>$0.016</td></tr>
+      <tr><td class="term">+ Output discipline</td><td>Average answer 250 to 180 tokens</td><td>$569</td><td>$0.014</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The shape is the answer: two levers remove nearly four fifths of the bill, and the last one is worth a few percent. Each assumption is where the interviewer will push. The caching row is an upper bound: every point of hit rate lost costs about $23 a day (9.6 million tokens at the difference between write and read price). The routing row depends on the 60% share, which is an eval result, not a guess. A missed routing decision costs quality; a missed cache costs money.</p>
+  <p>For latency, write the budget the same way and mark it as a target you propose, not a benchmark: p95 time to first token under 1.5 seconds and p95 total under 8 seconds on the web chat; tighter for voice, which <a href="12-real-time-voice-application.html">has its own chapter</a>. Then attribute: retrieval and tool calls typically take a fixed slice, prefill takes a slice that caching shrinks, and decode takes the remainder in proportion to output tokens. Measure the split before choosing the lever.</p>
+</section>
+
+<section id="not-first">
+  <h2>What not to do first</h2>
+  <ul>
+    <li><strong>Fine-tune or distil a smaller model.</strong> It works, but costs weeks and a retraining loop, while routing to an existing small model costs a day.</li>
+    <li><strong>Self-host to save money.</strong> At this volume you buy GPUs, on-call and an inference stack to save a bill that caching and routing already cut by four fifths. It flips at sustained high volume or under a residency rule.</li>
+    <li><strong>Add a semantic cache.</strong> It is the lever with a correctness cost, and it is worth the least once prefix caching is on.</li>
+    <li><strong>Cut <code>max_tokens</code> to shorten answers.</strong> It truncates; it does not summarise.</li>
+    <li><strong>Optimise without a per-surface measurement.</strong> You will fix the average and miss the surface that complains.</li>
+  </ul>
+</section>
+
+<section id="probes">
+  <h2>Interview probes</h2>
+  <p>Answer aloud before opening each one.</p>
+
+  <div class="drill-bar">
+    <label>
+      <input type="checkbox" id="drillToggle">
+      <span class="toggle"></span>
+      <span><strong>Drill mode</strong> — hide all answers</span>
+    </label>
+  </div>
+
+  <details class="reveal">
+    <summary>Q1: "p95 time to first token on web chat is 4 seconds. Where do you start?"</summary>
+    <div class="reveal-body">
+      <p><em>"I split the 4 seconds into its parts from traces: queue and network, retrieval and tool calls that run before generation, prefill, and first decode. The fix depends on the biggest slice. If prefill dominates, I check the cache hit ratio first, because a broken prefix is the commonest cause and costs nothing to fix. If tool calls dominate, I run independent ones in parallel and trim their output. If queueing dominates, it is a capacity or back-pressure problem and no prompt change will help. I do not touch the model until I know which slice it is."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q2: "Product wants a semantic cache to cut cost. Your answer?"</summary>
+    <div class="reveal-body">
+      <p><em>"Yes for public help-centre questions, no for anything personalised or about coverage. The risk is that similar questions do not have the same correct answer: two policyholders asking about their deductible embed the same and need different answers, and a hit skips every check we built. So I would scope it to non-personalised content, key it on document version, set the threshold from a labelled set of question pairs, and track false-hit rate. I would also point out that prefix caching already removes most of the cost, so the semantic cache is saving a small remainder at a correctness price."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q3: "Cache hit ratio dropped from 95% to 10% after a release. What happened?"</summary>
+    <div class="reveal-body">
+      <p><em>"Something that varies moved in front of the stable prefix, or the prefix itself changed. I would diff the rendered prompts from before and after: a timestamp or user ID placed in the system prompt, reordered tool definitions, a changed tool schema, or unstable key ordering in serialised inputs. Any change at one level invalidates everything after it. The fix is to keep the stable parts first and byte-identical, and the guard is an alert on hit ratio per surface, since the API succeeds either way and only the usage fields reveal it."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q4: "How do you decide which turns go to the small model, and what if the router is wrong?"</summary>
+    <div class="reveal-body">
+      <p><em>"I label a sample of real turns by difficulty, run both models over them, and route a class to the small model only when its score on the eval is within an agreed margin of the large one. Cheap signals first: the user's chosen intent, whether a tool with side effects is involved, whether the topic is coverage. When the router is wrong, the damage depends on the direction. Easy-to-large wastes money. Hard-to-small risks quality, so for [high-risk surface] I make the router conservative and let the small model escalate when unsure. I monitor per-route quality, not just the overall number."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q5: "When is speculative decoding not worth it?"</summary>
+    <div class="reveal-body">
+      <p><em>"On a hosted API it is not mine to turn on. Self-hosted, it helps most at low to medium load, where decode is memory-bound and the GPU has slack to verify drafted tokens. At high concurrency the engine is already full, so the verification work competes with useful work and the gain shrinks. It also adds a draft model to run and tune. I would measure on a replay of real traffic at real concurrency before adopting it, and I would want the exact-distribution guarantee, which the standard method has and some relaxed variants do not."</em></p>
+    </div>
+  </details>
+
+  <details class="reveal">
+    <summary>Q6: "You have a week to halve the cost. What is the plan?"</summary>
+    <div class="reveal-body">
+      <p><em>"Day one: instrument cost per session and cache hit ratio per surface, so I know the baseline. Then, in order: fix the prefix so it caches, which is usually a day and the largest single saving; route the easy turns to the small model behind the eval set; shorten outputs and trim tool results. I move non-interactive work to the batch API for the half price. I would not start with fine-tuning, self-hosting or a semantic cache: they take longer, carry risk, and are not needed to reach half."</em></p>
+    </div>
+  </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A change halves the average prompt length of a chat feature, but users report that long answers still feel slow. Why did the change not fix that?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Prompt length drives prefill, and so time to first token. Long answers are dominated by decode, which scales with output tokens. A shorter prompt cannot speed that up. See <a href="#measure">measure first</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You enable prefix caching and the usage fields show zero cache reads and zero cache writes. Name two causes unrelated to a code bug in your caching call.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The prefix is shorter than the model's minimum cacheable length, so the request is processed uncached with no error. Or the cache is invalidated by content before the breakpoint changing on each call, which writes a new entry each time. Zero writes points to the first cause. See <a href="#caching">prefix caching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer asks, "Is flood damage covered on my policy?" A semantic cache returns a stored answer to a nearly identical question from a different customer. Describe the failure and the smallest design change that prevents it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Similar wording does not imply the same coverage, and the stored answer was grounded on the other customer's policy. The cache skipped retrieval and validation. Keying the cache on policy ID, jurisdiction and policy version prevents cross-customer hits, but for coverage questions I would not use a semantic cache at all. See <a href="#semantic-cache">semantic caching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Traffic doubles and you consider a more aggressive batch size on a self-hosted server, plus speculative decoding. Which of the two is more likely to help at the new load, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Batching, as higher concurrency fills the batch and raises throughput per GPU. Speculative decoding targets memory-bound, lower-load decode, where spare compute can verify drafts; at high load that spare compute is gone. The inter-token latency cost of the larger batch still needs a check. See <a href="#speed">speculative decoding</a> and <a href="09-batching-system-for-llm-queries.html#continuous">continuous batching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The budget shows caching and routing removing most of the cost. Finance asks why you did not start by fine-tuning a small model. Give the deciding factors, and the condition under which you would reconsider.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Fine-tuning needs labelled data, training runs, evaluation and a maintenance loop, while the cheaper levers need days and no new model. I reconsider when the remaining bill is still large after those levers, the task is narrow and stable, and an eval shows a tuned small model matches the larger one. See <a href="#not-first">what not to do first</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Time to first token depends on the prompt and prefill; total time depends mostly on output tokens, so you must measure both, per surface, at p95.</li>
+    <li>Prefix caching is the largest and cheapest lever, and it is only as good as your discipline about keeping the stable prefix first and identical.</li>
+    <li>Routing easy turns to a small model removes most of the remaining cost, provided an eval set, not intuition, decides which turns qualify.</li>
+    <li>Streaming improves perceived speed, not total time, and cannot sit in front of validators that need the whole answer.</li>
+    <li>Semantic caching trades correctness for speed and does not belong on personalised or coverage surfaces.</li>
+    <li>At 40,000 sessions a day, caching plus routing plus output discipline cut a list-price bill of $3,240 a day to about $569 before any model is trained or hosted.</li>
+  </ul>
+  <p>Cost and latency change once the input is no longer a short text turn: a 2 GB video does not fit any of the prompts above. → <a href="11-multimodal-file-uploader.html">A Large-File Uploader for a Multimodal Chat</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener"><strong>Anthropic: Prompt caching</strong></a> — pricing multipliers, minimum lengths, breakpoints and what invalidates a cache. Good for the cache-bug diagnosis.</li>
+    <li><a href="https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-latency" target="_blank" rel="noopener"><strong>Anthropic: Reducing latency</strong></a> — model choice, prompt and output length, streaming, and the advice to optimise after quality.</li>
+    <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use" target="_blank" rel="noopener"><strong>Anthropic: Parallel tool use</strong></a> — execution semantics and when to run tools concurrently.</li>
+    <li><a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank" rel="noopener"><strong>Anthropic: Pricing</strong></a> — list and cache prices behind the budget table. Check the date before quoting.</li>
+    <li><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener"><strong>Fast Inference from Transformers via Speculative Decoding</strong></a> — Leviathan, Kalman and Matias, 2022. The method and its exactness argument.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/speculative_decoding/" target="_blank" rel="noopener"><strong>vLLM: Speculative decoding</strong></a> — supported methods, configuration keys, and the load regime it targets.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
