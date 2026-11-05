@@ -76,7 +76,15 @@ window.FG = (function () {
 
   function globalNav(el, opts) {
     opts = opts || {}; var base = opts.base || '';
-    var h = '<a class="wordmark" href="' + esc(base + 'index.html') + '">Field <em>Guides</em></a><div class="nav-links">';
+    // Masthead: an identity row (wordmark, About, mobile menu, Support) over a hairline strip of the domains.
+    var total = DOMAINS.reduce(function (n, d) { return n + guideCount(d); }, 0);
+    var h = '<div class="row1"><a class="wordmark" href="' + esc(base + 'index.html') + '">Field <em>Guides</em></a><div class="nav-links">';
+    h += '<div class="nav-item about"><a class="nav-btn" href="' + esc(base + 'about.html') + '">About</a></div>';
+    h += '<div class="nav-item mobile right"><button class="nav-btn" type="button" aria-expanded="false">Menu ' + CHEV + '</button><div class="dropdown" role="menu" aria-label="Domains">';
+    DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/index.html') + '">' + esc(d.name) + '</a>'; });
+    h += '</div></div>';
+    h += supportItem(base);
+    h += '</div></div><div class="row2"><div class="nav-links domains">';
     DOMAINS.forEach(function (d) {
       h += '<div class="nav-item domain' + (d.right ? ' right' : '') + '"><button class="nav-btn" type="button" aria-expanded="false">' + esc(d.label) + ' ' + CHEV + '</button>' +
            '<div class="dropdown' + (d.two ? ' two' : '') + '" role="menu" aria-label="' + esc(d.name) + ' guides">' +
@@ -87,12 +95,7 @@ window.FG = (function () {
       });
       h += '</div></div>';
     });
-    h += '<div class="nav-item about"><a class="nav-btn" href="' + esc(base + 'about.html') + '">About</a></div>';
-    h += '<div class="nav-item mobile right"><button class="nav-btn" type="button" aria-expanded="false">Menu ' + CHEV + '</button><div class="dropdown" role="menu" aria-label="Domains">';
-    DOMAINS.forEach(function (d) { h += '<a class="dd-g" role="menuitem" href="' + esc(base + d.folder + '/index.html') + '">' + esc(d.name) + '</a>'; });
-    h += '</div></div>';
-    h += supportItem(base);
-    h += '</div>';
+    h += '</div><span class="tally"><b>' + total + '</b> guides · ' + DOMAINS.length + ' domains</span></div>';
     el.className = 'nav'; el.setAttribute('aria-label', 'Site'); el.innerHTML = h;
     behavior(el); wireCopy(el);
   }

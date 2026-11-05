@@ -59,11 +59,11 @@ Asset paths are relative and depth-aware: `assets/…` (root), `../assets/…` (
 
 Every page links `style.css?v=N` / `script.js?v=N`, and `script.js` loads `nav.css?v=N` / `nav.js?v=N`. Cloudflare
 serves static assets with `max-age=14400`, so **whenever `style.css`, `script.js`, `nav.css` or `nav.js` changes,
-bump N everywhere** (currently `v=19`; the same applies to `fonts.css`, `home.js` and `404.js`):
+bump N everywhere** (currently `v=20`; the same applies to `fonts.css`, `home.js` and `404.js`):
 
 ```
-git ls-files -z '*.html' | xargs -0 perl -pi -e 's/(style\.css|script\.js|nav\.css|nav\.js|fonts\.css|home\.js|404\.js|favicon\.svg|favicon\.ico|apple-touch-icon\.png)\?v=19/$1?v=20/g'
-perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=19/$1?v=20/g' assets/script.js      # not an .html file — do this separately
+git ls-files -z '*.html' | xargs -0 perl -pi -e 's/(style\.css|script\.js|nav\.css|nav\.js|fonts\.css|home\.js|404\.js|favicon\.svg|favicon\.ico|apple-touch-icon\.png)\?v=20/$1?v=21/g'
+perl -pi -e 's/(nav\.css|nav\.js|fonts\.css)\?v=20/$1?v=21/g' assets/script.js      # not an .html file — do this separately
 # new, not-yet-committed pages are not in `git ls-files`: bump them by hand
 ```
 
