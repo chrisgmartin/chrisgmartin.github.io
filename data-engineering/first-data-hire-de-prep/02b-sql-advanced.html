@@ -62,6 +62,9 @@
     <a href="#pruning">Pruning, skew, spill</a>
     <a href="#approx">Approximate aggregates</a>
     <a href="#debug">A debugging method</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -247,7 +250,8 @@ FROM usage_events GROUP BY customer_id;</code></pre></div>
     <li><strong>LOCF (last observation carried forward):</strong> fill gaps by carrying the last known value — a spine + <code>LAST_VALUE(... IGNORE NULLS)</code> over the ordered window.</li>
   </ul>
 <div class="code-wrap"><div class="code-header"><span class="filename"><span class="dot"></span>spine_locf.sql</span><button class="copy-btn">Copy</button></div>
-<pre><code class="language-sql">WITH spine AS (
+<pre><code class="language-sql">-- IGNORE NULLS: Snowflake, BigQuery, DuckDB. PostgreSQL rejects it (see the note below).
+WITH spine AS (
   SELECT generate_series(DATE '2026-01-01', CURRENT_DATE, INTERVAL '1 day')::date AS day
 )
 SELECT s.day,
@@ -255,6 +259,7 @@ SELECT s.day,
        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS price_locf
 FROM spine s
 LEFT JOIN daily_price p ON p.day = s.day;</code></pre></div>
+  <p>PostgreSQL has no <code>IGNORE NULLS</code>. There, number the runs with <code>COUNT(p.price) OVER (ORDER BY s.day)</code> and take <code>MAX(p.price) OVER (PARTITION BY that_count)</code>; each run holds one non-null price, so the maximum is that price.</p>
 </section>
 
 <section id="recursive">
@@ -333,6 +338,64 @@ SELECT * FROM chain;</code></pre></div>
     <span class="callout-label">Next</span>
     <p>Now apply all of this on harder problems — the foundational set in <a href="03-sql-problems.html">03</a>, then the advanced set in <a href="03b-sql-problems-advanced.html">03b</a> →</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>You need a trailing 7-calendar-day revenue sum, but some days have no rows. Compare ROWS BETWEEN 6 PRECEDING with RANGE BETWEEN INTERVAL '6 days' PRECEDING. Which is correct, and what does the other one do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>RANGE with the interval is correct, because it measures distance in the ORDER BY value. ROWS counts seven physical rows, so across a gap it reaches back more than seven days. A date spine joined first would also fix it. See <a href="#frames">window frames</a>.</p></div></details>
+    </li>
+    <li>
+      <p>LAST_VALUE(amount) OVER (PARTITION BY customer_id ORDER BY event_ts) returns each row's own amount instead of the customer's final one. Why, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The default frame ends at the current row, so the last row in the frame is the current row. Add ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, or use MAX or ROW_NUMBER if you only need an extreme or the whole row. See <a href="#firstlast">FIRST_VALUE and LAST_VALUE</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After joining usage to price_history, total cost is 8% higher than the billing system. What is the likeliest cause, and what test would have caught it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Validity windows for the same machine overlap, so some usage rows match two prices and are counted twice. Add a test that windows are disjoint per machine, or keep the latest match with ROW_NUMBER. See <a href="#asof">as-of joins</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A price table has rows only for Jan 1 and Jan 5. You join it to a Jan 1 to Jan 7 date spine and carry the last price forward. What should Jan 3 and Jan 6 show, and what happens if you run LAST_VALUE(price IGNORE NULLS) on PostgreSQL?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Jan 3 shows the Jan 1 price and Jan 6 shows the Jan 5 price. PostgreSQL rejects IGNORE NULLS with a syntax error, so there you count non-null prices cumulatively and take MAX(price) per count; Snowflake, BigQuery and DuckDB accept it. See <a href="#dates">dates, intervals and spines</a>.</p></div></details>
+    </li>
+    <li>
+      <p>EXPLAIN ANALYZE shows the planner expected 100 rows from a scan and got 4 million, and it chose a nested loop for the join. What do you suspect, and what do you do first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Stale statistics, so the planner picked an algorithm for a small input. Run ANALYZE on the table and re-check the plan; a hash join is the usual choice for a large equi-join. If the estimate stays wrong, look for a join-key type mismatch. See <a href="#explain">reading EXPLAIN</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You must report trailing 30-day active customers across two billion events a day. Choose between an exact range self-join and HyperLogLog sketches, and say what decides it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Use daily HLL sketches for a trend or dashboard: they cost a fraction of the scan, merge across days, and carry about 1 to 2% error. Use the exact count only where the figure is audited or billed. Say the error bound out loud. See <a href="#approx">approximate aggregates</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The frame is part of the answer: ROWS counts physical rows, RANGE measures distance in the ORDER BY value and lumps ties, and the default is RANGE.</li>
+    <li>LAST_VALUE needs an explicit full frame or it returns the current row.</li>
+    <li>An as-of join multiplies cost if validity windows overlap, so test that they are disjoint.</li>
+    <li>A date spine with a LEFT JOIN makes empty days appear; carrying a value forward needs IGNORE NULLS where supported and a count-then-max fallback on PostgreSQL.</li>
+    <li>Read plans for sequential scans, estimates far from actual rows and spills; on a warehouse read bytes scanned and partitions pruned.</li>
+    <li>Approximate distinct counts trade a known small error for sketches you can merge across days; keep exact counts for audited numbers.</li>
+    <li>To debug a wrong query, compare COUNT(*) with COUNT(DISTINCT key) after each CTE; the first step where they diverge is the fan-out.</li>
+  </ul>
+  <p>Techniques are only useful once you can apply them under a timer, so drill them on problems. → <a href="03-sql-problems.html">SQL Problems</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/current/sql-expressions.html" target="_blank" rel="noopener"><strong>Value Expressions</strong></a> — PostgreSQL docs, 2026. Section 4.2.8 defines window function calls and frame clauses, including RANGE, ROWS and GROUPS.</li>
+    <li><a href="https://www.postgresql.org/docs/current/functions-window.html" target="_blank" rel="noopener"><strong>Window Functions</strong></a> — PostgreSQL docs, 2026. Why LAST_VALUE depends on the frame, and which functions ignore it.</li>
+    <li><a href="https://www.postgresql.org/docs/current/queries-with.html" target="_blank" rel="noopener"><strong>WITH Queries (Common Table Expressions)</strong></a> — PostgreSQL docs, 2026. Recursive CTE structure and how to guard against cycles.</li>
+    <li><a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener"><strong>Using EXPLAIN</strong></a> — PostgreSQL docs, 2026. Reading plans, row estimates and actual timings.</li>
+    <li><a href="https://docs.snowflake.com/en/sql-reference/constructs/asof-join" target="_blank" rel="noopener"><strong>ASOF JOIN</strong></a> — Snowflake docs, 2026. Native point-in-time join syntax and its match condition.</li>
+    <li><a href="https://duckdb.org/docs/stable/sql/query_syntax/from.html" target="_blank" rel="noopener"><strong>FROM and JOIN clauses</strong></a> — DuckDB docs, 2026. The as-of join section, useful for trying the pattern locally.</li>
+    <li><a href="https://cloud.google.com/bigquery/docs/reference/standard-sql/approximate_aggregate_functions" target="_blank" rel="noopener"><strong>Approximate aggregate functions</strong></a> — Google Cloud docs, 2026. HLL sketches and approximate quantiles, with the documented error behaviour.</li>
+  </ul>
 </section>
 
 </main>
