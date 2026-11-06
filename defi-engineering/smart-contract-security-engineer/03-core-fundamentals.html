@@ -44,6 +44,9 @@
     <a href="#compiler">Compiler version and Solc bugs</a>
     <a href="#assembly">Reviewing inline assembly</a>
     <a href="#quick-ref">Quick reference</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -159,7 +162,7 @@ assembly {
 <section id="solidity-gotchas">
   <h2>Solidity gotchas that show up in interviews</h2>
   <ul>
-    <li><strong>Visibility defaults.</strong> Functions default to <code>public</code> if you forget. State variables default to <code>internal</code>. A missing <code>internal</code> on what should be a helper turns it into <code>public</code>; a missing modifier turns it into a free function call for the world.</li>
+    <li><strong>Visibility.</strong> Before Solidity 0.5 a function with no visibility was <code>public</code>; since 0.5 the compiler requires you to write one. State variables still default to <code>internal</code>. The live risk is choosing <code>public</code> or <code>external</code> on what should be an <code>internal</code> helper, or omitting a modifier, which turns the function into a free call for the world.</li>
     <li><strong>Shadowing.</strong> A local variable with the same name as a state variable silently shadows. Modern compilers warn; older code doesn't.</li>
     <li><strong>Integer wraparound.</strong> Solidity 0.8+ checks by default. <code>unchecked {}</code> blocks disable checks. Pre-0.8 code is unchecked everywhere — SafeMath was required.</li>
     <li><strong>ABI decoding strictness.</strong> <code>abi.decode</code> reverts on malformed data but doesn't tell you why. Custom encoding (assembly) can silently misbehave.</li>
@@ -176,14 +179,14 @@ assembly {
   <h2>Compiler version pinning and Solc bugs</h2>
   <p>Solc itself has had real bugs. A few must-knows:</p>
   <ul>
-    <li><strong>Storage write to <code>bytes</code></strong> (0.8.13) — optimizer bug, fixed in 0.8.15.</li>
-    <li><strong>ABI re-encoding bug</strong> (0.5.x) — fixed in 0.5.14.</li>
+    <li><strong>Storage write removal before conditional termination</strong> (0.8.13 to 0.8.16) — the Yul optimizer could drop a storage write that a later conditionally terminating call depended on. Fixed in 0.8.17.</li>
+    <li><strong>ABI re-encoding head overflow with static array cleanup</strong> (0.5.8 to 0.8.15) — ABI-encoding a statically sized calldata array padded the data wrongly. Fixed in 0.8.16.</li>
     <li><strong>Yul optimizer bugs</strong> — historically the optimizer has shipped with bugs that affect bytecode determinism. <code>via_ir</code> increases this surface.</li>
   </ul>
   <p>Practice:</p>
   <ul>
     <li>Pin a specific patch (<code>pragma solidity 0.8.24;</code>, not <code>^0.8.0</code>).</li>
-    <li>Track the <a href="#">Solidity bugs.json</a> for the version you're on.</li>
+    <li>Check the <a href="https://docs.soliditylang.org/en/latest/bugs.html" target="_blank" rel="noopener">Solidity known bugs list</a> for the version you're on.</li>
     <li>Be cautious with <code>--via-ir</code>; the optimizer pass set is different and historically buggier.</li>
     <li>Audit reports should record the exact compiler version and settings used for the audited bytecode.</li>
   </ul>
@@ -226,12 +229,68 @@ assembly {
       <ul>
         <li><code>SSTORE</code> zero→nonzero: 22100; nonzero→nonzero: 5000; clear→refund: 4800.</li>
         <li><code>SLOAD</code> cold: 2100; warm: 100.</li>
-        <li><code>CALL</code> cold address: 2600; warm: 100. Stipend rules removed post-Berlin for value transfer.</li>
+        <li><code>CALL</code> cold address: 2600; warm: 100. A call that sends value adds 9000 gas and hands the callee a 2300 gas stipend.</li>
         <li><code>CREATE2</code>: 32000 + memory expansion + initcode word cost.</li>
         <li><code>KECCAK256</code>: 30 + 6 per word.</li>
       </ul>
     </div>
   </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Contract A uses delegatecall to run a function in contract B. That function does <code>require(msg.sender == owner)</code> and then writes storage slot 0. Whose <code>msg.sender</code> does it see, and whose slot 0 changes?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It sees the original caller, because delegatecall preserves <code>msg.sender</code> and <code>msg.value</code>. The code runs against A's storage, so <code>owner</code> is read from A's slots and the write lands in A's slot 0. Any mismatch between the two layouts corrupts A silently. See <a href="#call-types">call types</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Version 2 of an upgradeable contract adds a new state variable at the top of the list. What happens to the live proxy's state, and what catches it before deploy?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every variable after the insertion shifts one slot, so reads return the wrong data and writes corrupt unrelated state. A committed layout snapshot from <code>forge inspect storage-layout</code> that fails CI on any diff catches it. Upgrades must only append. See <a href="#storage">storage layout</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your contract calls an address chosen by a user with <code>(bool ok, bytes memory data) = target.call(payload)</code>. The target returns two megabytes. What goes wrong, and how do you bound it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Solidity copies all the returndata into memory, and memory expansion cost grows quadratically, so the call can run your contract out of gas. Cap the size in assembly and copy at most a fixed number of bytes. See <a href="#memory">memory, calldata, returndata</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A gas-tuned router reads the selector with <code>calldataload(0)</code> and a caller sends only two bytes of calldata. What does the assembly see, and what is the risk?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It sees the two bytes padded with zeros, because <code>calldataload</code> past <code>calldatasize()</code> returns zero rather than reverting. A truncated call can then decode as a valid selector with all-zero arguments. Check <code>calldatasize()</code> before decoding. See <a href="#assembly">reviewing inline assembly</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The team wants <code>pragma solidity ^0.8.20</code> and <code>--via-ir</code> for gas. What do you ask for before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Pin one patch version for the audited build and record the exact compiler settings in the report. Read the known-bugs list for that version. The IR pipeline has a different optimizer pass set and a worse bug history, so ask for tests against both pipelines, or give the assembly extra scrutiny. See <a href="#compiler">compiler version and Solc bugs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why is a transient-storage reentrancy lock cheaper than a storage lock, and when does it reset?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Transient storage is not written to the state trie, so it avoids the storage write costs and clears itself at the end of the transaction. It needs a chain that has activated the Cancun upgrade. See <a href="#evm-model">the EVM mental model</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Most severe EVM bugs come from misreading context: delegatecall runs the callee's code against the caller's storage, <code>address(this)</code> and <code>msg.sender</code>.</li>
+    <li>Upgrades are safe only when storage layout is append-only. EIP-1967 slots keep proxy state away from slot 0, and layout diffs belong in CI.</li>
+    <li>Unbounded returndata burns gas and out-of-range calldata reads as zero. Both fail silently.</li>
+    <li>Checked arithmetic is the default since 0.8, so review every <code>unchecked</code> block and treat pre-0.8 code as unchecked throughout.</li>
+    <li>Pin the compiler patch, record its settings in the audit and read the known-bugs list for that version.</li>
+    <li>Implementation contracts behind proxies need their initializers locked, or anyone can claim them.</li>
+  </ul>
+  <p>With the machine model in place, the first deep dive is how to prove properties about it. → <a href="04-deep-dive-primary.html">Deep Dive: Formal Verification</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.soliditylang.org/en/latest/security-considerations.html" target="_blank" rel="noopener"><strong>Security Considerations</strong></a> — Solidity documentation, accessed 2026. The language team's own list of pitfalls, including reentrancy, <code>tx.origin</code> and gas limits.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/bugs.html" target="_blank" rel="noopener"><strong>List of Known Bugs</strong></a> — Solidity documentation, accessed 2026. Every compiler bug by version, with the conditions that trigger it.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/assembly.html" target="_blank" rel="noopener"><strong>Inline Assembly</strong></a> — Solidity documentation, accessed 2026. Memory safety rules and what the compiler assumes about your assembly.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-1967" target="_blank" rel="noopener"><strong>EIP-1967: Proxy Storage Slots</strong></a> — Ethereum Improvement Proposals, accessed 2026. The standard slots for implementation, admin and beacon, and why they avoid collisions.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-1153" target="_blank" rel="noopener"><strong>EIP-1153: Transient Storage Opcodes</strong></a> — Ethereum Improvement Proposals, accessed 2026. Semantics and gas costs of <code>TLOAD</code> and <code>TSTORE</code>.</li>
+    <li><a href="https://www.evm.codes/" target="_blank" rel="noopener"><strong>EVM Codes</strong></a> — evm.codes, accessed 2026. Opcode reference with gas costs and the playground for checking them.</li>
+  </ul>
 </section>
 
 <footer>
