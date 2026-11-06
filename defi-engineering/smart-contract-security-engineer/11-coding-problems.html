@@ -47,6 +47,9 @@
     <a href="#p8">P8 · War-room runbook</a>
     <a href="#p9">P9 · CVL parametric access control</a>
     <a href="#p10">P10 · Donation attack mitigation</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -83,15 +86,16 @@
     }
 
     function withdraw(uint256 amount) external {
-        require(balances[msg.sender] &gt;= amount, "INSUFFICIENT");
+        uint256 bal = balances[msg.sender];
+        require(bal &gt;= amount, "INSUFFICIENT");
         (bool ok,) = msg.sender.call{value: amount}("");
         require(ok, "TRANSFER_FAIL");
-        balances[msg.sender] -= amount;
+        balances[msg.sender] = bal - amount;
     }
 }</code></pre></div>
   <details class="reveal">
     <summary>Reveal solution</summary>
-    <p>Classic reentrancy. The external call happens before the balance update, so a malicious recipient can re-enter <code>withdraw</code> and drain. Fix: apply CEI — update state before the external call — and/or add <code>nonReentrant</code>.</p>
+    <p>Classic reentrancy. The external call happens before the balance update, so a malicious recipient can re-enter <code>withdraw</code> and drain. Fix: apply CEI — update state before the external call — and/or add <code>nonReentrant</code>. The stale <code>bal</code> matters: with <code>balances[msg.sender] -= amount</code> after the call, checked arithmetic in 0.8 makes the unwinding frames underflow and revert the whole drain, so that form is only exploitable before 0.8 or inside <code>unchecked</code>.</p>
     <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw(uint256 amount) external nonReentrant {
     require(balances[msg.sender] &gt;= amount, "INSUFFICIENT");
     balances[msg.sender] -= amount;                     // effect first
@@ -195,12 +199,13 @@ modifier lock() {
     <p>Option 2 — transient storage (EIP-1153):</p>
     <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">bytes32 constant LOCK_SLOT = keccak256("vault.reentrancy.lock");
 modifier lock() {
+    bytes32 slot = LOCK_SLOT; // assembly cannot read a constant built with keccak256
     assembly {
-        if tload(LOCK_SLOT) { mstore(0, 0x52454e545259) revert(0, 32) }
-        tstore(LOCK_SLOT, 1)
+        if tload(slot) { mstore(0, 0x52454e545259) revert(0, 32) }
+        tstore(slot, 1)
     }
     _;
-    assembly { tstore(LOCK_SLOT, 0) }
+    assembly { tstore(slot, 0) }
 }</code></pre></div>
     <p>Option 2 saves the SSTORE/SLOAD cost (~5000 gas per protected call). Option 1 works on chains pre-Cancun.</p>
   </details>
@@ -335,6 +340,62 @@ rule onlyOwnerChangesParams(method f, env e, calldataarg args) {
     </ol>
     <p>In an interview, naming OpenZeppelin ERC4626's default and explaining why it's the default signals depth.</p>
   </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Take P1 and change the last line of <code>withdraw</code> to <code>balances[msg.sender] -= amount</code>. Compile with 0.8 and run the P6 attack. What do you see, and what does it mean?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The test fails with <code>TRANSFER_FAIL</code>. Each nested frame subtracts after its call returns, the second subtraction underflows, and the revert unwinds the whole drain. Checked arithmetic blocked this form, but the ordering flaw is still there, so a stale local copy or an <code>unchecked</code> block brings the exploit back. See <a href="#p6">P6</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In P7, name the three missing checks and explain why <code>uint256(price)</code> on a negative answer is dangerous.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>There is no staleness check on <code>updatedAt</code>, no check that the price is positive, and no round-completeness check. A negative <code>int256</code> cast to <code>uint256</code> becomes an enormous number, which values collateral at close to infinity. See <a href="#p7">P7</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The vault in P10 enforces a minimum first deposit of 100 units. Why does that not fully stop the inflation attack?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It raises the attacker's cost, because the ratio can only be inflated from a larger base, but an attacker willing to deposit the minimum can still donate and capture a smaller victim's deposit. It is a mitigation, not a fix. Virtual shares remove the profit from the attack. See <a href="#p10">P10</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Option 2 in P5 uses <code>tload</code> and <code>tstore</code>. What happens if you deploy it to a chain that has not activated Cancun?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Those opcodes do not exist there, so executing them halts as an invalid opcode and every protected call fails. Use the storage lock on such chains. Check the target chain's opcode support before choosing. See <a href="#p5">P5</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your monitor shows 3 percent of TVL leaving in 30 minutes. In P8, what do you decide before you know the root cause, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Validate the alert, then pause if it looks like an exploit. Pausing costs friction that you can reverse, while waiting costs funds you cannot get back. Find the cause with the protocol paused. See <a href="#p8">P8</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In P2, why might the no-bad-debt invariant fail right after interest accrual, and what do you add?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Accrual changes borrow assets by a rate the Prover has not bounded, so it can find a state where borrows exceed supply. Bound the rate, or summarize the rate function, and pull in the invariants that tie the totals together with <code>requireInvariant</code>. See <a href="#p2">P2</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A bug hunt starts at the external call and its order against state updates. Classic reentrancy is a write that comes after a call.</li>
+    <li>Checked arithmetic can change whether an exploit works, so run a proof of concept before you claim it.</li>
+    <li>An oracle read needs a positive price, a fresh timestamp and a completed round before any cast to <code>uint256</code>.</li>
+    <li>A good invariant names a state the protocol must never reach and is checked against an independent record.</li>
+    <li>The four donation mitigations differ in side effects, and the library's virtual-share offset is the default to reach for.</li>
+    <li>In an incident, validate and contain before root cause. A pause is reversible and lost funds are not.</li>
+  </ul>
+  <p>The coding material is done. The next chapter covers the off-chain half: monitoring and data. → <a href="12-data-pipelines.html">Data &amp; Pipelines</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.soliditylang.org/en/latest/security-considerations.html" target="_blank" rel="noopener"><strong>Security Considerations</strong></a> — Solidity documentation, accessed 2026. Reentrancy and the checks-effects-interactions pattern from the language team.</li>
+    <li><a href="https://docs.chain.link/data-feeds/using-data-feeds" target="_blank" rel="noopener"><strong>Using Data Feeds</strong></a> — Chainlink documentation, accessed 2026. The checks behind the corrected version of P7.</li>
+    <li><a href="https://docs.openzeppelin.com/contracts/5.x/erc4626" target="_blank" rel="noopener"><strong>ERC-4626</strong></a> — OpenZeppelin Contracts documentation, accessed 2026. Virtual shares and the decimal offset used in P10.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-1153" target="_blank" rel="noopener"><strong>EIP-1153: Transient Storage Opcodes</strong></a> — Ethereum Improvement Proposals, accessed 2026. The opcodes behind the lock in P5.</li>
+    <li><a href="https://book.getfoundry.sh/forge/cheatcodes" target="_blank" rel="noopener"><strong>Cheatcodes</strong></a> — Foundry Book, accessed 2026. The <code>vm</code> functions used in the proof-of-concept tests.</li>
+    <li><a href="https://github.com/crytic/slither/wiki/Detector-Documentation" target="_blank" rel="noopener"><strong>Detector Documentation</strong></a> — Trail of Bits, accessed 2026. The built-in detectors to read before writing a custom one for P4.</li>
+  </ul>
 </section>
 
 <footer>
