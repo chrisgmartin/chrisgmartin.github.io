@@ -43,6 +43,9 @@
     <a href="#interpret">Interpret the metrics</a>
     <a href="#coalesce-test">Prove the coalescer's win</a>
     <a href="#checkpoint">Checkpoint</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -202,7 +205,7 @@ INFERGW_WORKER_THREADS=1 cargo run -p infergw --release
   <details class="collapse-card">
     <summary>The "coordinated omission" trap</summary>
     <div class="collapse-card-body">
-      <p>Many load testers (older <code>wrk</code>, naive curl-loops) suffer from coordinated omission: when the server is slow, the load tester pauses, so the slow requests aren't counted at their full lateness — they're counted from when the tester started timing them. <code>oha</code> handles this correctly by tracking expected-start-time, not actual-start-time, when computing latency. <code>wrk2</code> and <code>vegeta</code> also do this right. If you see p99 numbers that look "too good" under load, check whether your tool corrects for this.</p>
+      <p>Many load testers (older <code>wrk</code>, naive curl-loops) suffer from coordinated omission: when the server is slow, the load tester pauses, so the slow requests aren't counted at their full lateness — they're counted from when the tester started timing them. <code>oha</code> only corrects for it when you set a fixed rate with <code>-q</code> and add <code>--latency-correction</code>; the closed-loop <code>-c</code> runs in this chapter are not corrected. <code>wrk2</code> and <code>vegeta</code> schedule at a fixed rate and measure from the scheduled start. If you see p99 numbers that look "too good" under load, check whether your tool corrects for this.</p>
     </div>
   </details>
 </section>
@@ -276,6 +279,57 @@ seq 1 1000 | xargs -P 200 -I{} curl -sN -o /dev/null \
   <p>You're done with the build. One short chapter on where to take this next.</p>
 
   <p style="margin-top: 24px;"><a href="08-where-to-next.html"><strong>→ Chapter 08: Where to next</strong></a></p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Run the baseline: <code>oha -z 30s -c 100</code> against the gateway with the mock behind it. What fastest latency and requests per second should you expect, and what does a result far from that mean?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The mock throttles 19 chunks at 40 ms, so the floor is about 760 ms and a typical request takes about 800 ms. With 100 workers that gives roughly 100 / 0.8, about 125 requests a second, close to the 123.7 shown. A much lower rate with a much higher average means something serialises requests, such as a lock or a pool limit. See <a href="#baseline">baseline run</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Run 30 seconds of identical requests with <code>-c 200</code>, then 1,000 distinct prompts. How many upstream calls should the mock see each time, and what should the follower counter do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Identical: about 38 calls, one per 0.8 second window, against roughly 7,500 client requests, so the follower counter climbs fast. Distinct: about 1,000 calls and the counter stays near zero. If the identical run reaches the mock thousands of times, the bodies differ. If the distinct run raises the counter, the shell substitution failed and every body is the same. See <a href="#coalesce-test">prove the coalescer's win</a>.</p></div></details>
+    </li>
+    <li>
+      <p>One worker thread handles 100 concurrent streams fine. Why, and what change to the gateway would make you add threads?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each request is a task that is suspended at an await while waiting on I/O, so one thread can drive many of them. Threads exist to spend CPU. Add them when the gateway does real work per chunk, such as parsing SSE, counting tokens or hashing large bodies, and a profile or per-thread CPU shows workers saturating. See <a href="#tune">tune tokio worker threads</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A closed-loop run with 100 connections hits a 5-second upstream stall. Why does <code>oha</code> report a mild p99, and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each worker waits for its stalled response and sends nothing meanwhile, so the requests that would have arrived during the stall are never made or timed. That is coordinated omission. Use a fixed rate with <code>-q</code> and <code>--latency-correction</code>, so latency is measured from the scheduled start time. See <a href="#tail">read the tail honestly</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Raising <code>-c</code> from 10 to 1,000, throughput levels off and p99 climbs. <code>infergw_inflight</code> stops growing at one fixed number. What does that tell you, and where do you look?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A plateau in throughput with rising latency means you passed capacity, and an in-flight count that stops at a fixed value means some limit in the path caps concurrency. Check the upstream connection pool and the upstream's own concurrency limit, worker CPU, and the file descriptor limit on the load generator. Report the concurrency at the knee, not the peak. See <a href="#interpret">interpret the metrics</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Against a fixed-cost mock, a load test measures how little the gateway adds. The floor is about 760 ms and the gap between fastest and p99 is gateway jitter.</li>
+    <li>At fixed concurrency, throughput is concurrency divided by latency, so 100 workers at 0.8 seconds give about 125 requests a second. A far lower number means something serialises.</li>
+    <li>Tokio worker threads exist to use CPU, not to hold connections, so size them by the gateway's own work.</li>
+    <li>Report p99 and p99.9 rather than the mean, and take the knee where latency rises while throughput is flat as the capacity.</li>
+    <li>Closed-loop tools hide stalls. Test at a fixed rate with latency correction to see the true tail.</li>
+    <li>The coalescer's win is checkable: about 38 upstream calls for 30 seconds of identical load against one per distinct prompt, confirmed by the follower counter.</li>
+  </ul>
+  <p>You have built and measured the gateway. → <a href="08-where-to-next.html">Where to next</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://github.com/hatoo/oha" target="_blank" rel="noopener"><strong>oha</strong></a> — GitHub, hatoo, accessed 2026. The load generator used here, including the rate and latency-correction flags.</li>
+    <li><a href="https://www.youtube.com/watch?v=lJ8ydIuPFeU" target="_blank" rel="noopener"><strong>"How NOT to Measure Latency"</strong></a> — Gil Tene, Strange Loop talk, accessed 2026. The clearest account of coordinated omission and why averages mislead.</li>
+    <li><a href="https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html" target="_blank" rel="noopener"><strong>tokio::runtime::Builder</strong></a> — docs.rs, accessed 2026. Worker thread and runtime options behind the tuning knob.</li>
+    <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener"><strong>Histograms and summaries</strong></a> — Prometheus docs, accessed 2026. What a histogram quantile can and cannot tell you.</li>
+    <li><a href="https://prometheus.io/docs/prometheus/latest/querying/functions/" target="_blank" rel="noopener"><strong>Query functions</strong></a> — Prometheus docs, accessed 2026. The reference for <code>histogram_quantile</code> and <code>rate</code> used in the panels.</li>
+  </ul>
 </section>
 
 </main>

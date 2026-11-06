@@ -44,6 +44,9 @@
     <a href="#parsing">Reading the bytes</a>
     <a href="#failure">Failure modes</a>
     <a href="#checkpoint">Checkpoint</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -369,10 +372,10 @@ INFO tower_http::trace::on_response: finished processing request latency=816 ms 
 <pre><code class="language-bash">curl -sN -H 'content-type: application/json' \
   -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hi"}],"stream":true}' \
   http://127.0.0.1:8080/v1/chat/completions \
-  | awk '{ print systime() " | " $0; fflush(); }'</code></pre>
+  | perl -MTime::HiRes=time -ne 'BEGIN{$|=1} printf "%.3f | %s", time, $_'</code></pre>
 </div>
 
-  <p>Each printed line shows the unix timestamp when that chunk arrived at your terminal. Subtract consecutive timestamps and you'll see ~40ms gaps — proof that no layer in between is buffering.</p>
+  <p>Each printed line shows the unix timestamp, to the millisecond, when that line arrived at your terminal. Subtract consecutive timestamps and you'll see ~40ms gaps — proof that no layer in between is buffering.</p>
 </section>
 
 <section id="failure">
@@ -419,6 +422,58 @@ INFO tower_http::trace::on_response: finished processing request latency=816 ms 
   <p>This is already a useful gateway. The next four chapters are about making it reliable.</p>
 
   <p style="margin-top: 24px;"><a href="03-batching-and-coalescing.html"><strong>→ Chapter 03: Batching &amp; coalescing</strong></a></p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Stop the mock, then send a streaming request to the gateway with <code>curl -i</code>. What status and body should you get, and what would a request that simply hangs tell you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A <code>502</code> with a JSON body whose <code>error</code> starts with <code>upstream unreachable</code>, because a refused connection maps to Bad Gateway. A hang means the upstream accepted the connection but never sent headers. Only the connect timeout is set, so <code>send()</code> would wait without limit. See <a href="#failure">failure modes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The shared client sets a connect timeout but no request timeout. A colleague adds <code>.timeout(30s)</code> to be safe. What happens to a response that streams for 40 seconds?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The timeout covers the whole response including the body, so the stream is cut at 30 seconds and the client sees a truncated answer. Use a connect timeout, plus a limit on the wait for the first byte if you need one, and keep full-request timeouts for non-streaming calls. See <a href="#shared-client">the shared client</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The gateway hands <code>resp.bytes_stream()</code> to <code>Body::from_stream</code>. A client on a slow link reads 1 KB a second. What does that do to the upstream read, and why does it matter?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nothing is buffered between the two sockets, so when the client stops reading, the body is not polled, the upstream read pauses, and TCP flow control pushes back. Memory per request stays bounded. A buffering proxy would absorb the whole response and hold it for the slow client. See <a href="#proxy">the proxy handler</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Through the gateway directly, tokens arrive 40 ms apart. Behind a company nginx they arrive in one burst after about 800 ms. What do you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Proxy buffering in the layer in front of the gateway. The <code>x-accel-buffering: no</code> header asks nginx not to buffer, but other proxies and CDNs have their own settings. Compare <code>curl -N</code> direct with <code>curl -N</code> through the proxy to find the hop that holds bytes. See <a href="#proxy">the proxy handler</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The handler passes bytes through without parsing SSE frames. When would you give that up and parse, and what is the trap?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Parse when you need to count tokens, spot the <code>[DONE]</code> sentinel, or read errors that arrive mid-stream. The trap is splitting on network chunks: a TCP read can end in the middle of a frame, so you must buffer until the blank line that ends a record. Passthrough is faster and cannot misparse, so take the cost only for a feature that needs it. See <a href="#parsing">reading the bytes</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A streaming proxy gives the upstream byte stream to the response body, so backpressure and cleanup follow from the streams themselves.</li>
+    <li>Build one reqwest client at startup and clone it. A client per request throws away keep-alive and burns ports.</li>
+    <li>A client-wide timeout caps the whole body, so streaming calls get a connect timeout instead, and a hung upstream needs its own first-byte limit.</li>
+    <li>A refused connection becomes a 502 with a JSON error, but only before the first byte is sent. After that the status is already committed.</li>
+    <li>When the client disconnects, dropping the body drops the upstream stream, so no tokens are generated for nobody.</li>
+    <li>No-buffering headers protect the stream from intermediaries that would turn it into one burst.</li>
+  </ul>
+  <p>Every client still costs one upstream call. → <a href="03-batching-and-coalescing.html">Batching &amp; coalescing</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html" target="_blank" rel="noopener"><strong>reqwest::ClientBuilder</strong></a> — docs.rs, accessed 2026. Every timeout and pool option, with what each one covers.</li>
+    <li><a href="https://docs.rs/reqwest/latest/reqwest/struct.Response.html" target="_blank" rel="noopener"><strong>reqwest::Response</strong></a> — docs.rs, accessed 2026. <code>bytes_stream</code> and the other ways to consume a body.</li>
+    <li><a href="https://docs.rs/axum/latest/axum/body/struct.Body.html" target="_blank" rel="noopener"><strong>axum::body::Body</strong></a> — docs.rs, accessed 2026. How <code>from_stream</code> turns a stream into a response body.</li>
+    <li><a href="https://html.spec.whatwg.org/multipage/server-sent-events.html" target="_blank" rel="noopener"><strong>Server-sent events</strong></a> — WHATWG HTML Standard, accessed 2026. The framing rules behind the <code>data:</code> lines and the blank-line separator.</li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events" target="_blank" rel="noopener"><strong>Using server-sent events</strong></a> — MDN Web Docs, accessed 2026. The client side of the protocol, with event field examples.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html" target="_blank" rel="noopener"><strong>OpenAI-compatible server</strong></a> — vLLM docs, accessed 2026. The upstream API the gateway forwards to, including streaming.</li>
+  </ul>
 </section>
 
 </main>
