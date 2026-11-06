@@ -45,6 +45,9 @@
     <a href="#pivot">Pivots</a>
     <a href="#hierarchy">Hierarchical queries</a>
     <a href="#composition">CTE composition</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -132,7 +135,7 @@ ORDER BY day;</code></pre>
   </div>
   <div class="callout warn">
     <span class="callout-label">Frame trap</span>
-    <p>Use <code>ROWS BETWEEN</code> for time-based moving averages, not <code>RANGE</code>. <code>RANGE</code> with date gaps does the wrong thing. Classic interviewer gotcha.</p>
+    <p><code>ROWS</code> counts rows, not days. If a day has no sessions it has no row in <code>daily</code>, and a 6-row frame then reaches back more than 7 days. Either fill the missing days from a date spine first, or use a <code>RANGE</code> frame with an interval, such as <code>RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW</code> (PostgreSQL 11 and later). Classic interviewer gotcha.</p>
   </div>
 
   <h3>First / last value</h3>
@@ -160,33 +163,34 @@ FROM plan_changes;</code></pre>
   <div class="code-wrap">
   <div class="code-header"><span class="filename"><span class="dot"></span>weekly retention triangle</span><button class="copy-btn">Copy</button></div>
 <pre><code class="language-sql">WITH cohorts AS (
-  SELECT customer_id, DATE_TRUNC('week', signed_up_at) AS cohort_week
+  SELECT customer_id, DATE_TRUNC('week', signed_up_at)::DATE AS cohort_week
   FROM customers
+),
+cohort_size AS (
+  SELECT cohort_week, COUNT(*) AS size
+  FROM cohorts
+  GROUP BY 1
 ),
 activity AS (
   SELECT DISTINCT
     customer_id,
-    DATE_TRUNC('week', event_at) AS activity_week
+    DATE_TRUNC('week', started_at)::DATE AS activity_week
   FROM gpu_sessions
 )
 SELECT
   c.cohort_week,
-  DATE_PART('week', a.activity_week - c.cohort_week)::INT AS weeks_since_signup,
-  COUNT(DISTINCT c.customer_id) AS retained,
-  COUNT(DISTINCT c.customer_id) * 1.0 /
-    NULLIF(
-      MAX(CASE WHEN DATE_PART('week', a.activity_week - c.cohort_week) = 0
-               THEN COUNT(DISTINCT c.customer_id) END)
-      OVER (PARTITION BY c.cohort_week), 0
-    ) AS retention_rate
+  (a.activity_week - c.cohort_week) / 7 AS weeks_since_signup,
+  COUNT(DISTINCT c.customer_id)         AS retained,
+  COUNT(DISTINCT c.customer_id) * 1.0 / s.size AS retention_rate
 FROM cohorts c
-LEFT JOIN activity a
-  ON c.customer_id = a.customer_id
+JOIN cohort_size s ON s.cohort_week = c.cohort_week
+JOIN activity a
+  ON a.customer_id = c.customer_id
  AND a.activity_week &gt;= c.cohort_week
-GROUP BY 1, 2
+GROUP BY c.cohort_week, s.size, 2
 ORDER BY 1, 2;</code></pre>
   </div>
-  <p>For an interview, the simpler version (compute cohort size separately, join in the denominator) often reads cleaner. The above shows the window-function flex if asked.</p>
+  <p>Cohort size comes from its own CTE, so the denominator never depends on which weeks have activity. Subtracting two <code>DATE</code> values gives a whole number of days in PostgreSQL, so dividing by 7 gives weeks since signup. Other dialects use <code>DATEDIFF</code>.</p>
 </section>
 
 <section id="funnel">
@@ -337,6 +341,62 @@ ORDER BY depth;</code></pre>
     <span class="callout-label">The composition signal</span>
     <p>If your query is over ~30 lines and lives in a single deeply-nested subquery, refactor to CTEs even mid-interview. Say "let me restructure this for clarity" — interviewers love that move.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A customer's sessions have revenue tiers 100, 90, 90 and 80. Give the ranks from ROW_NUMBER, RANK and DENSE_RANK, and say which you would use for "top 3 distinct revenue tiers per region".</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>ROW_NUMBER gives 1, 2, 3, 4 with the tie broken arbitrarily. RANK gives 1, 2, 2, 4 and DENSE_RANK gives 1, 2, 2, 3. For distinct tiers use DENSE_RANK, because tied rows share a rank and no tier is skipped. See <a href="#windows">window functions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A query uses LAST_VALUE(plan) OVER (PARTITION BY customer_id ORDER BY changed_at) and every row returns its own plan. Why, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>With an ORDER BY the default frame ends at the current row, so the last value in the frame is the current row. State the frame as ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, or take the row with ROW_NUMBER() over a descending order. See <a href="#windows">window functions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A daily table has rows for every day except the 3rd, 4th and 5th of the month. For the row on the 8th, what does ROWS BETWEEN 6 PRECEDING AND CURRENT ROW cover, and what would you use instead for a true 7-day average?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It covers the 1st, 2nd, 6th, 7th and 8th, so it reaches back eight days and averages over only five rows. Use a date spine so every day has a row, or a RANGE frame with an interval of 6 days where the dialect supports one. See <a href="#windows">window functions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You switch the first-launch step of the funnel from an inner join to a LEFT JOIN to count drop-offs. Where must the 7-day bound live, and what happens if it sits in WHERE?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It stays in the ON clause. A WHERE predicate on the right table removes the NULL rows the LEFT JOIN just preserved, so the query silently becomes an inner join again and the drop-off count is zero. See <a href="#funnel">funnels with time constraints</a>.</p></div></details>
+    </li>
+    <li>
+      <p>One customer has events at 10:00, 10:20, 11:00 and 11:10, with a 30-minute idle gap. What are the is_new_session flags and the final session ids?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The flags are 1, 0, 1, 0, because the first event starts a session, the 20-minute gap does not, and the 40-minute gap does. The running sum gives session ids 1, 1, 2, 2, so two sessions of two events each. See <a href="#session">sessionization</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer is active on March 1, 2, 3, 5 and 6. What run keys does the gaps-and-islands query produce, and what streaks come out?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The row numbers are 1 to 5, so the keys are Feb 28 for March 1 to 3 and March 1 for March 5 and 6. That gives a three-day and a two-day streak. The key is constant within a run because the date and the row number both rise by one. Duplicates must be removed first or the key drifts. See <a href="#gaps">gaps and islands</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Most screen prompts are a composition of two or three patterns, so name the pattern before you type.</li>
+    <li>ROW_NUMBER, RANK and DENSE_RANK differ only in how they treat ties, and the business question decides which one is right.</li>
+    <li>Window frames matter: LAST_VALUE needs an explicit frame, and ROWS counts rows rather than days, so gaps in the data change what a moving average means.</li>
+    <li>Put time bounds on a funnel step in the join condition, not in WHERE, so the step survives a change to an outer join.</li>
+    <li>Sessionization and streaks both reduce to flagging boundaries or keying runs, then using a running sum or a date-minus-rank key.</li>
+    <li>One CTE per logical step, named like prose, makes the query read as an outline of your thinking.</li>
+  </ul>
+  <p>Writing the query is half the screen; the next chapter covers reading a broken one. → <a href="04-sql-debugging.html">SQL Debugging</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/current/tutorial-window.html" target="_blank" rel="noopener"><strong>Window Functions (tutorial)</strong></a> — PostgreSQL documentation, 2026. A short worked introduction to PARTITION BY, ORDER BY and frames.</li>
+    <li><a href="https://www.postgresql.org/docs/current/sql-expressions.html" target="_blank" rel="noopener"><strong>Value Expressions, Window Function Calls</strong></a> — PostgreSQL documentation, 2026. The exact definition of frame clauses, including ROWS, RANGE, GROUPS and the default frame.</li>
+    <li><a href="https://www.postgresql.org/docs/current/functions-window.html" target="_blank" rel="noopener"><strong>Window Functions</strong></a> — PostgreSQL documentation, 2026. Reference for ROW_NUMBER, RANK, LAG, LEAD, FIRST_VALUE and LAST_VALUE.</li>
+    <li><a href="https://www.postgresql.org/docs/current/queries-with.html" target="_blank" rel="noopener"><strong>WITH Queries (Common Table Expressions)</strong></a> — PostgreSQL documentation, 2026. CTE behaviour and the recursive form used for hierarchies.</li>
+    <li><a href="https://cloud.google.com/bigquery/docs/reference/standard-sql/window-function-calls" target="_blank" rel="noopener"><strong>Window function calls</strong></a> — Google Cloud, BigQuery documentation, 2026. How frames and ordering work in a warehouse dialect.</li>
+    <li><a href="https://docs.snowflake.com/en/sql-reference/functions-analytic" target="_blank" rel="noopener"><strong>Window functions</strong></a> — Snowflake documentation, 2026. Another warehouse reference for frames and analytic functions.</li>
+  </ul>
 </section>
 
 </main>
