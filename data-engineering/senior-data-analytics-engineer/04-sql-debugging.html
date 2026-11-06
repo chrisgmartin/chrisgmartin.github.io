@@ -45,6 +45,9 @@
     <a href="#dates">6 · Date math &amp; time zones</a>
     <a href="#slow">7 · Slow queries</a>
     <a href="#groupby">8 · GROUP BY surprises</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -207,7 +210,7 @@ FROM plan_changes;</code></pre>
   <p>The default frame when ORDER BY is specified is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. Aggregate windows over time work fine; <code>LAST_VALUE</code> and unbounded windows do not.</p>
 
   <h3>ROWS vs RANGE</h3>
-  <p>Rolling N-day averages over data with gaps: use <code>ROWS BETWEEN N PRECEDING AND CURRENT ROW</code>. <code>RANGE</code> treats logical ranges (multiple rows with the same timestamp grouped), which silently misbehaves on gaps.</p>
+  <p><code>ROWS</code> frames count physical rows. <code>RANGE</code> frames count by the value of the <code>ORDER BY</code> column and treat rows with equal values as peers. For a rolling N-day average over data with missing days, <code>ROWS BETWEEN N-1 PRECEDING AND CURRENT ROW</code> silently spans more than N days. Fill the gaps with a date spine first, or use a <code>RANGE</code> frame with an interval where the dialect supports one.</p>
 </section>
 
 <section id="dates">
@@ -252,13 +255,69 @@ WHERE started_at &gt;= '2026-03-01'
   <h2>8 · GROUP BY surprises</h2>
 
   <h3>Missing aggregation</h3>
-  <p>Selecting columns not in GROUP BY and not aggregated. Postgres rejects, MySQL silently picks an arbitrary value, BigQuery errors. Bug, not feature.</p>
+  <p>Selecting columns not in GROUP BY and not aggregated. Postgres rejects it, BigQuery errors, and MySQL accepts it only when <code>ONLY_FULL_GROUP_BY</code> is off, in which case it picks an arbitrary value. Bug, not feature.</p>
 
   <h3>NULLs in GROUP BY</h3>
   <p>NULL is its own group. <code>SELECT tier, COUNT(*) FROM session_summary GROUP BY tier;</code> will include a "NULL" group. Surprised people forget about it.</p>
 
   <h3>GROUP BY 1, 2 ordinal references</h3>
   <p>Convenient, but if you reorder SELECT, the GROUP BY silently changes. Prefer explicit column names in anything that ships.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>What does 5 NOT IN (1, 2, NULL) evaluate to, and why does NOT EXISTS behave differently on the same data?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It evaluates to UNKNOWN, not true, because the comparison with NULL is unknown and a single unknown makes the whole NOT IN list unknown. WHERE keeps only true rows, so everything is filtered out. NOT EXISTS tests whether a matching row exists and ignores NULL keys in the inner table. See <a href="#null">NULL traps</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You want every customer, with their h100 sessions where they have any. The query uses LEFT JOIN gpu_sessions and then WHERE g.tier = 'h100'. Which customers disappear and where does the predicate belong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Customers with no sessions, and customers with only other tiers, disappear, because their right-side columns are NULL and fail the WHERE test. Move the predicate on the right table into the ON clause. See <a href="#leftjoin">the LEFT JOIN turned INNER trap</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Revenue per customer doubles after you add a join to a discounts table. What one check finds the cause, and what result confirms it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Compare the row count of the joined result with the left table. If the joined result has more rows than orders, the discounts table has several rows per order and each order repeats. Aggregate discounts to one row per order before the join. See <a href="#duplicates">row duplication</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The dashboard reports average revenue per customer of 12.40 and finance computes 31. Without seeing the query, what is the likeliest cause?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The dashboard averages over sessions, which are many per customer, rather than over customers. Sum to one row per customer first, then average. Always ask "average per what" before writing the query. See <a href="#granularity">wrong granularity</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A date-partitioned table of 3 TB is queried with WHERE DATE(started_at) = '2026-03-15' and scans everything. Why, and what do you write instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Wrapping the partition column in a function can stop the engine from matching the predicate to partitions. Filter the column directly with a half-open range, started_at at or after 2026-03-15 and before 2026-03-16. Then read the plan to confirm pruning. See <a href="#slow">slow queries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A report uses started_at BETWEEN '2026-03-01' AND '2026-03-31' on a timestamp column. What is lost, and how does a UTC timestamp of 2026-03-02 03:00 bucket for a Los Angeles customer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Everything after midnight at the start of March 31 is lost, because the upper bound is a timestamp at 00:00. Use a half-open range ending at April 1. The UTC timestamp falls on March 1 at 7 pm in Los Angeles, so a UTC day bucket puts it on the wrong day. See <a href="#dates">date math and time zones</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Debug in a fixed order: restate the intent, check row counts, then walk joins, filters, aggregates and windows.</li>
+    <li>NOT IN returns nothing when the subquery contains a NULL, so use NOT EXISTS for lookups against nullable keys.</li>
+    <li>A filter on the right table of a LEFT JOIN belongs in ON; in WHERE it turns the join back into an inner join.</li>
+    <li>Silent wrong answers come from fan-out joins and wrong granularity, and a row-count comparison against the left table finds the first.</li>
+    <li>Use half-open ranges on timestamps and decide the time zone for bucketing before you aggregate.</li>
+    <li>Slow queries usually start with the plan, partition pruning, stale statistics or skew, in that order.</li>
+  </ul>
+  <p>The next chapter turns these patterns into ten problems to work under a timer. → <a href="05-sql-problems.html">SQL Problems</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/current/functions-subquery.html" target="_blank" rel="noopener"><strong>Subquery Expressions</strong></a> — PostgreSQL documentation, 2026. Defines IN, NOT IN and EXISTS, including how NULL results are treated.</li>
+    <li><a href="https://www.postgresql.org/docs/current/queries-table-expressions.html" target="_blank" rel="noopener"><strong>Table Expressions</strong></a> — PostgreSQL documentation, 2026. Outer join semantics and the difference between join conditions and WHERE.</li>
+    <li><a href="https://www.postgresql.org/docs/current/sql-expressions.html" target="_blank" rel="noopener"><strong>Value Expressions, Window Function Calls</strong></a> — PostgreSQL documentation, 2026. The default frame when ORDER BY is present.</li>
+    <li><a href="https://www.postgresql.org/docs/current/functions-datetime.html" target="_blank" rel="noopener"><strong>Date/Time Functions and Operators</strong></a> — PostgreSQL documentation, 2026. DATE_TRUNC, AT TIME ZONE and interval arithmetic.</li>
+    <li><a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener"><strong>Using EXPLAIN</strong></a> — PostgreSQL documentation, 2026. How to read a plan for scans, joins and sorts.</li>
+    <li><a href="https://cloud.google.com/bigquery/docs/querying-partitioned-tables" target="_blank" rel="noopener"><strong>Query partitioned tables</strong></a> — Google Cloud, BigQuery documentation, 2026. Which filters prune partitions and which do not.</li>
+  </ul>
 </section>
 
 </main>
