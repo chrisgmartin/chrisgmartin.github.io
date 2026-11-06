@@ -44,6 +44,9 @@
     <a href="#erc20-quirks">ERC-20 quirks that bite DEX code</a>
     <a href="#nft-positions">ERC-721 / ERC-1155 position NFTs</a>
     <a href="#one-byte">One wrong byte costs millions</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -115,19 +118,19 @@ struct Slot0 {
   <h2>Transient storage (EIP-1153) — Cancun</h2>
   <p>Post-Cancun, <code>TSTORE</code> and <code>TLOAD</code> give you storage that exists only for the lifetime of the transaction. Two killer use cases for DEX code:</p>
   <ol>
-    <li><strong>Reentrancy locks.</strong> Previously: write 1 / write 2 to a storage slot, costing ~20k + ~5k gas. With transient storage: ~100 + ~100. Massive savings on every swap.</li>
+    <li><strong>Reentrancy locks.</strong> Previously: write 2 then 1 to a storage slot that starts nonzero, costing about 5k gas to take the lock on a cold slot (22k if the slot starts at zero). With transient storage: ~100 + ~100. Massive savings on every swap.</li>
     <li><strong>Intermediate state in a multi-hook lifecycle.</strong> v4's hooks need to pass data between <code>beforeSwap</code> and <code>afterSwap</code> without persisting it. Transient storage is purpose-built for this.</li>
   </ol>
   <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Pre-Cancun reentrancy guard — expensive
 uint256 private _locked = 1;
 modifier nonReentrant() {
     require(_locked == 1, "reentrant");
-    _locked = 2;        // ~20k gas (cold) or ~5k (warm SSTORE)
+    _locked = 2;        // ~5k gas (cold slot, nonzero to nonzero)
     _;
-    _locked = 1;        // ~5k or refund
+    _locked = 1;        // ~100 gas, plus a refund
 }
 
-// Cancun-era transient lock — ~200 gas total
+// Cancun-era transient lock — ~300 gas total
 modifier tnonReentrant() {
     assembly {
         if tload(0) { revert(0,0) }
@@ -147,8 +150,8 @@ modifier tnonReentrant() {
   <p>Solidity's default function dispatch is a linear search through selectors. Solady popularized a sorted-selector dispatch trick — pre-sort by 4-byte selector and binary-search-style branch — that shaves measurable gas on hot routers.</p>
   <p>You aren't usually expected to write this in an interview, but you should know:</p>
   <ul>
-    <li>Solidity emits a series of <code>EQ + JUMPI</code> per selector. Cost grows linearly with selector count.</li>
-    <li>Frequently-called selectors should be ordered first (Solidity 0.8.x supports this via the <code>via-ir</code> pipeline and function ordering heuristics — and you can hint it).</li>
+    <li>Solidity compares the 4-byte selector with each function in ascending selector order, using <code>EQ + JUMPI</code>, about 22 gas per miss. With few functions that is a linear chain. The compiler turns it into a binary search when the optimizer <code>runs</code> setting and the function count make that pay off.</li>
+    <li>The order follows the selector value, not the order you declare functions in. A hot function is cheapest when its selector sorts low, which is why some teams rename functions to get low selectors.</li>
     <li>Solady / advanced repos drop into Yul and write their own dispatcher. The gain is real on routers.</li>
   </ul>
 </section>
@@ -242,6 +245,62 @@ function _depositMeasured(IERC20 token, address from, uint256 amount) internal r
     <span class="callout-label">The senior posture</span>
     <p>Treat every line of core code as if it will be deployed forever and run with $1B+ at stake. Because it will be.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A swap's hot path reads the price from one slot, the tick from a second and a lock flag from a third. What do you change, and roughly what does it save?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Pack the fields that are read together into one struct under 256 bits, as the v3 pool does with its first slot of 248 bits. One cold read costs 2,100 gas where three cost 6,300, so the swap saves about 4,200 gas before it does any work. See <a href="#storage-slot">single-storage-slot designs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A router calls two functions that both carry the transient-storage lock modifier, in one transaction through multicall. The modifier sets the flag on entry and clears it on exit. What breaks if you delete the clear, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The second call reverts. A transient value lasts until the end of the transaction, not the end of the call frame, so a flag that is never cleared stays set for every later guarded call in that transaction. The clear is part of the lock, not cleanup. See <a href="#transient">transient storage</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A token takes a 5% fee on transfer. A deposit helper calls <code>transferFrom</code> for 100 and credits the depositor for 100. Who pays for the missing 5, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The other liquidity providers pay, because the pool holds 95 but has issued claims on 100. Measure the balance before and after the transfer and credit the difference. Offering fee-on-transfer support as a separate opt-in path keeps the common path cheap. See <a href="#erc20-quirks">ERC-20 quirks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The code <code>require(token.transfer(to, amount))</code> reverts for USDT even though the transfer succeeds. Why, and what does the safe wrapper accept instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The compiler decodes a bool from the return data, and USDT returns nothing, so the decode fails and the call reverts. The wrapper makes a low-level call and accepts success when the return data is empty or decodes to true. See <a href="#erc20-quirks">ERC-20 quirks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague proposes writing the whole swap path in Yul to save gas. What do you say, and where would you accept assembly?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Decline for whole pools. Accept small blocks where the compiler cannot help: packed loads and stores, bit operations on the tick bitmap, 512-bit multiply-divide, and scratch-space hashing. Each block removes compiler checking, so it needs a memory-safe annotation, comments, and the same fuzz coverage as the rest. See <a href="#yul">Yul for hot paths</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A lending market accepts v3 position NFTs as collateral. What does transferring the NFT change inside the pool, and what new risk does a callback during that flow create?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nothing changes inside the pool, because the pool's position belongs to the position manager and only the NFT moves. The risk is read-only reentrancy: if the lender reads a price during a callback, the pool may be mid-update and return an inconsistent value. See <a href="#nft-positions">position NFTs</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>DEX peripheries pay mostly for calldata, so default to calldata parameters and batch routine steps through one multicall.</li>
+    <li>Fields read together on the hot path belong in one packed slot, because each extra cold slot costs another 2,100 gas.</li>
+    <li>Transient storage lasts until the end of the transaction, not the call, so a transient lock must be cleared explicitly.</li>
+    <li>Dispatch order follows selector value, so a hot function can be cheaper with a low selector, though this matters only on very hot routers.</li>
+    <li>Assembly belongs in small, tested blocks: packed loads, bitmap math, 512-bit multiply-divide and scratch hashing.</li>
+    <li>Real tokens break the ERC-20 spec in routine ways, so measure balance changes instead of trusting amounts and call tokens through a safe wrapper.</li>
+    <li>Core code ships once and holds the pool's value, so every line meets the bar for code that cannot be patched.</li>
+  </ul>
+  <p>The next chapter takes the first deep dive, the AMM math that these fundamentals serve. → <a href="04-deep-dive-primary.html">AMM Math, From x·y=k to Hooks</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-1153" target="_blank" rel="noopener"><strong>EIP-1153: Transient storage opcodes</strong></a> — Ethereum EIPs, in the Cancun upgrade, 2024. The opcodes, gas costs and the rule that values end with the transaction.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/internals/layout_in_storage.html" target="_blank" rel="noopener"><strong>Layout of State Variables in Storage and Transient Storage</strong></a> — Solidity docs, accessed 2026. The packing rules behind every slot diagram in this chapter.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/assembly.html" target="_blank" rel="noopener"><strong>Inline Assembly</strong></a> — Solidity docs, accessed 2026. What the compiler no longer checks inside an assembly block, and the memory-safe contract.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-20" target="_blank" rel="noopener"><strong>ERC-20: Token Standard</strong></a> — Ethereum EIPs, 2015. The interface that real tokens bend, and the reference for what a caller may assume.</li>
+    <li><a href="https://docs.openzeppelin.com/contracts/5.x/api/token/erc20" target="_blank" rel="noopener"><strong>ERC20 API, including SafeERC20</strong></a> — OpenZeppelin docs, accessed 2026. The production wrapper for tokens that return nothing or return false.</li>
+  </ul>
 </section>
 
 <footer>

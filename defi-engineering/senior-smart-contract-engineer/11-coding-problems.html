@@ -46,6 +46,9 @@
     <a href="#p8">P8 · Fees-owed for a position</a>
     <a href="#p9">P9 · TWAP from observations</a>
     <a href="#p10">P10 · CREATE2 vanity solver</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -120,7 +123,7 @@ amountOut = FullMath.mulDiv(amountInWithFee, reserveOut, reserveIn * 1000 + amou
   <p><strong>Approach A — Babylonian, simple:</strong></p>
   <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function sqrt(uint256 x) internal pure returns (uint256 z) {
     if (x == 0) return 0;
-    z = (x + 1) / 2;
+    z = x / 2 + x % 2;   // ceil(x / 2) without the overflow that (x + 1) has at 2^256 - 1
     uint256 y = x;
     while (z &lt; y) {
         y = z;
@@ -170,7 +173,7 @@ function getPriceFromPool(IPool pool) external view returns (uint256 price) {
   <p><strong>Fix:</strong></p>
   <ol>
     <li>Verify the pool's reentrancy lock is not held (some pools expose this — call a function the pool guards with its lock).</li>
-    <li>Or use a TWAP — <code>pool.observe([10])</code> over a window — which gives a price that's resilient to single-block manipulation.</li>
+    <li>Or use a TWAP — <code>pool.observe([window, 0])</code> over a window — which gives a price that's resilient to single-block manipulation.</li>
     <li>Or use a snapshot-based oracle that updates only outside of swap context.</li>
   </ol>
 </section>
@@ -260,21 +263,23 @@ contract FlashBorrower {
     uint256 feeGrowthOutsideUpper0X128,
     int24   tickCurrent
 ) internal pure returns (uint256 owed0, uint256 owed1) {
-    // 1. Compute feeGrowthInside since position's lastSnapshot
-    uint256 inside0;
-    if (tickCurrent &gt;= pos.tickUpper) {
-        inside0 = feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
-    } else if (tickCurrent &lt; pos.tickLower) {
-        inside0 = feeGrowthOutsideUpper0X128 - feeGrowthOutsideLower0X128;
-    } else {
-        inside0 = feeGrowthGlobal0X128 - feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
+    unchecked {   // wraparound is intentional: feeGrowth values overflow by design
+        // 1. Compute feeGrowthInside since position's lastSnapshot
+        uint256 inside0;
+        if (tickCurrent &gt;= pos.tickUpper) {
+            inside0 = feeGrowthOutsideUpper0X128 - feeGrowthOutsideLower0X128;
+        } else if (tickCurrent &lt; pos.tickLower) {
+            inside0 = feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
+        } else {
+            inside0 = feeGrowthGlobal0X128 - feeGrowthOutsideLower0X128 - feeGrowthOutsideUpper0X128;
+        }
+
+        // 2. Delta against position's stored snapshot
+        uint256 delta = inside0 - pos.feeGrowthInside0LastX128;
+
+        // 3. Multiply by liquidity, downshift Q128
+        owed0 = FullMath.mulDiv(delta, pos.liquidity, 1 &lt;&lt; 128);
     }
-
-    // 2. Delta against position's stored snapshot
-    uint256 delta = inside0 - pos.feeGrowthInside0LastX128;   // unchecked wraparound is intentional
-
-    // 3. Multiply by liquidity, downshift Q128
-    owed0 = FullMath.mulDiv(delta, pos.liquidity, 1 &lt;&lt; 128);
 }</code></pre></div>
   <p><strong>Gotchas:</strong></p>
   <ul>
@@ -331,6 +336,63 @@ function predict(address deployer, bytes32 salt, bytes32 initCodeHash) pure retu
 }</code></pre></div>
   <p>The off-chain solver is the interesting part — try random salts and check the prefix. Reasoning on the math: each random salt gives a ~16⁻⁸ ≈ 2.3 × 10⁻¹⁰ chance of an 8-nibble-zero prefix. ~4B trials expected. A modern GPU does this in seconds.</p>
   <p><strong>Why this matters:</strong> v4 hook permissions are encoded in the low bits of the hook's contract address. You <em>must</em> CREATE2-mine your hook to a valid permission-encoding address. This isn't optional.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Run your integer square root on the largest <code>uint256</code>. What should you see, and what does a revert tell you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The result is 2^128 − 1, which is 340282366920938463463374607431768211455. A revert means an intermediate step overflowed, for example the common starting guess <code>(x + 1) / 2</code>, which overflows at 2^256 − 1. Use <code>x / 2 + x % 2</code> instead. See <a href="#p3">P3, integer square root</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A position's fee growth inside its range is global minus below minus above. When the current tick is above the range, which expression gives it, and why can the subtraction still wrap?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Above the range it is the upper tick's outside value minus the lower tick's outside value, because the global terms cancel. Fee growth counters are meaningful modulo 2^256, so the difference is correct even when a counter has wrapped, provided the subtraction runs in <code>unchecked</code> arithmetic. See <a href="#p8">P8, fees owed</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A v2 flash-swap borrower takes 1,000,000 units of token0. How much must it repay, and why is it not exactly 0.3%?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Repay 1,003,010: the fee is 1,000,000 × 3 / 997 rounded down, which is 3,009, plus 1. The pair's check counts only 99.7% of the repaid amount, so the repayment must satisfy repaid × 997 / 1000 ≥ borrowed, which makes the fee about 0.3009% of the loan. See <a href="#p7">P7, flash swap</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An integrator prices collateral from a v3 pool's <code>slot0</code>, and a callback fires mid-swap. Give two fixes that do not rely on <code>slot0</code> alone.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Read a TWAP by calling <code>observe</code> with a window and zero, or check the pool's unlocked flag, which <code>slot0</code> also exposes, and revert while it is false. A snapshot oracle that updates only outside swap context also works. The common point is that a single spot read cannot be trusted mid-callback. See <a href="#p5">P5, read-only reentrancy</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You mined a CREATE2 salt for a hook, then changed one constructor argument and redeployed with the same salt. What happens and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The address changes, because the init code hash is part of the address and constructor arguments are appended to the init code. The permission bits you mined are gone, so the manager will reject the hook or call the wrong functions. Re-mine with the final arguments. See <a href="#p10">P10, CREATE2 vanity solver</a>.</p></div></details>
+    </li>
+    <li>
+      <p>How do you check a swap-fee hook that skims 5 bps works, and which facts about its address and return value must be right?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Test that the user's output falls by exactly the fee and that the recipient gains it. The hook must sit at an address whose low bits flag the before-swap hook and its return-delta variant, and it must return a delta that the manager nets against the swap. A wrong flag means the manager never calls it. See <a href="#p6">P6, a v4 fee hook</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Write the constant-product output as 997 over 1000 integer math with floor division, and use <code>mulDiv</code> when the product can pass 256 bits.</li>
+    <li>StableSwap <code>getY</code> is Newton's method on a polynomial in y, run only after D is known, with a stop at a change of one.</li>
+    <li>An integer square root needs the postcondition r² ≤ x &lt; (r + 1)² and tests at 0, 1 and 2^256 − 1.</li>
+    <li>Fees inside a position's range depend on where the current tick sits; the cases mirror each other, and the subtractions must wrap.</li>
+    <li>A price read from <code>slot0</code> is unsafe mid-callback, so use the lock flag, a TWAP or a snapshot.</li>
+    <li>A hook must be deployed to an address whose low bits encode its permissions, so it needs a mined CREATE2 salt for its exact init code.</li>
+    <li>A flash-swap borrower must authenticate the pair and the initiator and repay the loan plus about 0.3009%.</li>
+  </ul>
+  <p>The next chapter covers what happens after the contracts ship: events, indexers and monitoring. → <a href="12-data-pipelines.html">Data &amp; Pipelines</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/Tick.sol" target="_blank" rel="noopener"><strong>Tick.sol</strong></a> — Uniswap Labs, 2021. <code>getFeeGrowthInside</code>, the reference for problem 8.</li>
+    <li><a href="https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/TickMath.sol" target="_blank" rel="noopener"><strong>TickMath.sol</strong></a> — Uniswap Labs, 2021. The tick-to-price conversion in problem 4.</li>
+    <li><a href="https://github.com/Uniswap/v2-core/blob/master/contracts/UniswapV2Pair.sol" target="_blank" rel="noopener"><strong>UniswapV2Pair.sol</strong></a> — Uniswap Labs, 2020. The swap and flash-swap path that problems 1 and 7 reduce.</li>
+    <li><a href="https://docs.uniswap.org/contracts/v2/guides/smart-contract-integration/using-flash-swaps" target="_blank" rel="noopener"><strong>Using Flash Swaps</strong></a> — Uniswap Labs docs, accessed 2026. The repayment rule and callback shape for problem 7.</li>
+    <li><a href="https://docs.uniswap.org/concepts/protocol/oracle" target="_blank" rel="noopener"><strong>Price Oracles</strong></a> — Uniswap Labs docs, accessed 2026. The <code>observe</code> call and the tick accumulator behind problem 9.</li>
+    <li><a href="https://docs.uniswap.org/contracts/v4/guides/hooks/hook-deployment" target="_blank" rel="noopener"><strong>Hook Deployment</strong></a> — Uniswap Labs docs, accessed 2026. Address flags and salt mining for problems 6 and 10.</li>
+  </ul>
 </section>
 
 <footer>
