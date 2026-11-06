@@ -47,6 +47,9 @@
     <a href="#p9-bounded-channel">P9 · Bounded channel from scratch</a>
     <a href="#p10-shutdown">P10 · Graceful shutdown</a>
     <a href="#drill">How to drill</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -428,8 +431,8 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
     let server = tokio::spawn(async move {
         // axum's `with_graceful_shutdown` takes a future that resolves on shutdown
         let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
-        axum::Server::bind(&amp;"0.0.0.0:8080".parse().unwrap())
-            .serve(app.into_make_service())
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        axum::serve(listener, app)
             .with_graceful_shutdown(server_shutdown.cancelled_owned())
             .await
             .ok();
@@ -466,6 +469,63 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
     <span class="callout-label">The senior tell</span>
     <p>Talking through the tradeoffs before coding wins more points than perfect syntax. "I'm choosing approach 1 because contention is low; if you tell me the bucket is hot I'd switch to sharded atomics" is what they want to hear.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A token bucket is computed lazily on each call, with no background timer. What does it compute on access, and what do you change when one bucket becomes hot?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It adds elapsed time times the rate to the tokens, caps at capacity and then tries to subtract the request. A single mutex per bucket becomes the bottleneck under contention, so move to a packed atomic with a compare-and-swap loop, or shard by key. Lazy refill means no timer thread per bucket. See <a href="#p1-rate-limiter">P1 rate limiter</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Fifty identical requests arrive while the first one is still computing, and the caller that started the compute is cancelled. What are your choices for the other 49?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Cancel all of them, or let a waiting caller take over the work. The usual production choice is to run the compute as a detached task so it completes for everyone. Also decide that a failure goes to all waiters but is not cached, and bound the in-flight map. See <a href="#p4-dedup">P4 request dedup</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A shared AtomicU64 counter slows down as core counts grow, though each increment is one instruction. Why, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every increment bounces the cache line between cores. Use per-thread or per-CPU shards that are summed on read. Relaxed ordering suffices for a monotonic counter, but use acquire and release if the counter publishes other data. See <a href="#p6-counter">P6 lock-free counter</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your retry combinator wraps a POST that creates an order. What does it need beyond backoff and jitter?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An idempotency key passed in by the caller, so a repeated attempt does not create a second order, and a check that the error is retryable at all. A fleet-wide retry budget can also cap the extra load. See <a href="#p7-retry">P7 retry combinator</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An agent run spawns three sub-tasks and one fails. What does the parent do, and why does it wait for the others after cancelling?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It cancels the shared token, which cascades to the child tokens, and then drains the join set before returning the error. Waiting lets each sub-task run its cleanup, so nothing is left running behind the caller. See <a href="#p8-cancel-cascade">P8 cancellation cascade</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A pod receives SIGTERM while the load balancer still sends it traffic. Your graceful shutdown stops accepting connections immediately and clients see resets. What do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep serving briefly after the signal, using a preStop sleep, so the load balancer notices the pod is leaving before the server stops accepting. Then stop accepting, drain in-flight requests within the deadline and exit. See <a href="#p10-shutdown">P10 graceful shutdown</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A token bucket refills lazily on access, with one mutex per bucket until it is hot, then atomics or sharding; a distributed limit needs an atomic Redis script and local caching.</li>
+    <li>Request coalescing keeps an in-flight map so concurrent callers share one compute, and the compute should finish even if the first caller leaves.</li>
+    <li>Sharded counters remove cache-line bouncing, and Relaxed ordering is enough for a counter that publishes nothing else.</li>
+    <li>A retry combinator retries only retryable errors with capped, jittered backoff, and needs an idempotency key when the operation has side effects.</li>
+    <li>Cancel with a token tree: cancel the parent on any failure and drain the join set so cleanup completes.</li>
+    <li>Graceful shutdown is stop accepting, drain within a deadline and exit, and in Kubernetes a preStop delay gives the load balancer time to notice.</li>
+    <li>Talk through the approach and trade-offs before coding, and drill the structure rather than the syntax.</li>
+  </ul>
+  <p>With the coding rounds covered, the next chapter turns to the data that flows through the platform. → <a href="12-data-pipelines.html">Data &amp; pipelines</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://tokio.rs/tokio/topics/shutdown" target="_blank" rel="noopener"><strong>Graceful Shutdown</strong></a> — Tokio documentation. Detecting shutdown, telling tasks to stop and waiting for them.</li>
+    <li><a href="https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html" target="_blank" rel="noopener"><strong>CancellationToken</strong></a> — docs.rs. Child tokens and cascading cancel used in P8 and P10.</li>
+    <li><a href="https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html" target="_blank" rel="noopener"><strong>JoinSet</strong></a> — docs.rs. Spawning a group of tasks and draining them.</li>
+    <li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener"><strong>Exponential Backoff and Jitter</strong></a> — AWS Architecture Blog, 2015. The comparison of full, equal and decorrelated jitter behind P7.</li>
+    <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener"><strong>Pod Lifecycle</strong></a> — Kubernetes documentation. How termination, preStop hooks and grace periods interact.</li>
+    <li><a href="https://doc.rust-lang.org/nomicon/atomics.html" target="_blank" rel="noopener"><strong>Atomics</strong></a> — The Rustonomicon. Memory orderings, and when Relaxed is enough.</li>
+  </ul>
 </section>
 
 <footer>

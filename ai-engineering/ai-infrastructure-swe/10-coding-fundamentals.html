@@ -45,6 +45,9 @@
     <a href="#dsa">DSA suite</a>
     <a href="#concurrency-primitives">Concurrency primitives</a>
     <a href="#big-o">Big-O cheat sheet</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -110,7 +113,7 @@ fn redact_email(s: &amp;str) -&gt; Cow&lt;'_, str&gt; {
   <ol>
     <li><strong>Cancellation = drop.</strong> When you drop a future, its in-flight work stops at the next <code>.await</code> point. Resources owned by the future are released by destructors.</li>
     <li><strong>Cancellation is cooperative.</strong> If a task is CPU-spinning without awaits, you can't cancel it. The fix is yielding, or moving the work to <code>spawn_blocking</code>.</li>
-    <li><strong>Cancel-safety</strong> is a property of a future: can it be cancelled mid-execution without leaving state corrupted? <code>tokio::select!</code> docs flag which futures are cancel-safe; <code>mpsc::Receiver::recv</code> is, but <code>broadcast::Receiver::recv</code> is not (you may lose a message).</li>
+    <li><strong>Cancel-safety</strong> is a property of a future: can it be cancelled mid-execution without leaving state corrupted? <code>tokio::select!</code> docs flag which futures are cancel-safe; <code>mpsc::Receiver::recv</code> is, but <code>AsyncReadExt::read_exact</code> is not (a partial read can be lost).</li>
   </ol>
   <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -246,7 +249,7 @@ impl ToolError {
   <p>Beyond channels and mutexes, know:</p>
   <ul>
     <li><strong>Semaphore</strong> — bound concurrent operations. <code>tokio::sync::Semaphore</code>.</li>
-    <li><strong>Notify</strong> — single-producer, single-consumer "something happened" signal.</li>
+    <li><strong>Notify</strong> — wake one waiting task (or all of them) when something happens; it carries no data.</li>
     <li><strong>Barrier</strong> — wait until N tasks reach a point.</li>
     <li><strong>JoinSet</strong> — spawn N tasks, await any/all.</li>
     <li><strong>Atomics</strong> — <code>AtomicU64</code>, <code>AtomicBool</code>, etc. Use <code>Ordering::Relaxed</code> for counters, <code>Acquire</code>/<code>Release</code> for cross-thread synchronization.</li>
@@ -273,6 +276,62 @@ impl ToolError {
     <span class="callout-label">Senior signal</span>
     <p>"I default to <code>Vec&lt;T&gt;</code> + linear scan for N&lt;100 — cache locality wins until then." Knowing where the constants matter is a senior tell.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A hot-path function redacts an email address only when one is present, and most inputs need no change. What return type avoids an allocation in the common case, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Cow&lt;str&gt;. It returns the borrowed input untouched when nothing needs replacing and allocates an owned String only when it does. A plain String return would allocate on every call. See <a href="#string-types">String vs &amp;str vs Cow</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Code that uses Rc inside tokio::spawn fails to compile. Explain the error and the fix.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Tokio tasks can move between worker threads, so everything they hold must be Send, and Rc is not, since its count is not atomic. Use Arc, and add a Mutex or RwLock if you need to mutate. See <a href="#ownership-types">Box, Rc, Arc</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A select! loop has two branches: a shutdown token and a call that reads a four-byte length prefix with read_exact. What can go wrong, and how would you restructure it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If shutdown wins while read_exact has read part of the prefix, those bytes are dropped with the future, so the stream is misaligned if you continue. read_exact is not cancel-safe. Read into a buffer you own and keep across iterations, or use a framing codec, so cancelling loses nothing. See <a href="#async-cancel">Async cancellation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Sixteen workers share one Mutex around an mpsc receiver. What limits this design, and what are your alternatives?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every worker serialises on the lock to take a job, so throughput is capped by that lock under heavy load. Use a multi-consumer channel crate, give each worker its own queue with a dispatcher, or use a work-stealing scheduler; keep the shared mutex when contention is low and simplicity matters. See <a href="#channel-patterns">Channel patterns</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Choose between generics and trait objects for a tool registry whose tools are looked up by name at run time, and for a worker that handles one request type on a hot path.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A tool registry holds many types chosen at run time, so use Box&lt;dyn Tool&gt; and accept an indirect call. The single-type hot-path worker should be generic so the compiler monomorphizes and inlines it. Pick by whether the set of types is open and runtime-known. See <a href="#trait-objects">Trait objects vs generics</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A lookup table of 40 entries is read on every request. Would you use a HashMap, and what does your answer depend on?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A Vec with a linear scan is a sound default below roughly a hundred entries, because contiguous memory gives cache locality that hashing cannot beat at that size. Past that, or if lookups are on a hot, large table, use a HashMap, and consider a faster hasher than SipHash. Measure before you decide. See <a href="#big-o">Big-O cheat sheet</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Take &amp;str at API boundaries unless you store it, and use Cow to borrow in the common case and own only when you must change the text.</li>
+    <li>Shared state across Tokio tasks needs Arc and a Mutex or RwLock, because tasks migrate between threads and so their contents must be Send.</li>
+    <li>Cancellation means dropping a future at an await point; it is cooperative, and a future is cancel-safe only if dropping it mid-way loses nothing.</li>
+    <li>Use oneshot for request-reply, broadcast for fan-out and a bounded mpsc for work, and know that a shared receiver mutex limits a worker pool.</li>
+    <li>Model failures with a thiserror enum, one variant per distinct decision, with an is_retryable method.</li>
+    <li>Use generics on hot paths with few types and trait objects for open, heterogeneous registries; and keep a small DSA toolkit and the collection costs ready.</li>
+  </ul>
+  <p>The worked problems apply these primitives under a timer. → <a href="11-coding-problems.html">Coding problems worked</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html" target="_blank" rel="noopener"><strong>Understanding Ownership</strong></a> — The Rust Programming Language, Rust project. String slices and borrowing at function boundaries.</li>
+    <li><a href="https://doc.rust-lang.org/std/borrow/enum.Cow.html" target="_blank" rel="noopener"><strong>Cow</strong></a> — Rust standard library. Clone-on-write semantics and when to return it.</li>
+    <li><a href="https://doc.rust-lang.org/nomicon/send-and-sync.html" target="_blank" rel="noopener"><strong>Send and Sync</strong></a> — The Rustonomicon. Why Rc is not Send and what the marker traits promise.</li>
+    <li><a href="https://docs.rs/tokio/latest/tokio/macro.select.html" target="_blank" rel="noopener"><strong>select!</strong></a> — docs.rs. Cancellation safety rules for each branch type.</li>
+    <li><a href="https://tokio.rs/tokio/tutorial/select" target="_blank" rel="noopener"><strong>Select</strong></a> — Tokio tutorial. How select! polls branches and drops the losers.</li>
+    <li><a href="https://doc.rust-lang.org/std/collections/index.html" target="_blank" rel="noopener"><strong>std::collections</strong></a> — Rust standard library. When to use which collection, with the cost of each operation.</li>
+  </ul>
 </section>
 
 <footer>

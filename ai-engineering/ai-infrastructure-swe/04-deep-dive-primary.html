@@ -48,6 +48,9 @@
     <a href="#zero-copy">Zero-copy with bytes</a>
     <a href="#profiling">Profiling Rust services</a>
     <a href="#perf-checklist">Perf checklist</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -221,10 +224,8 @@ let app = Router::new()
     .layer(tower_http::trace::TraceLayer::new_for_http())
     .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(30)));
 
-axum::Server::bind(&amp;"0.0.0.0:8080".parse().unwrap())
-    .serve(app.into_make_service())
-    .await
-    .unwrap();
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+axum::serve(listener, app).await.unwrap();
 </code></pre></div>
 </section>
 
@@ -321,6 +322,63 @@ tokio-console http://127.0.0.1:6669
     <span class="callout-label">Interview phrase</span>
     <p>"My discipline is profile-then-fix. The first answer is never 'rewrite,' it's 'show me the flamegraph.'"</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A gateway handler tokenises a 200 KB prompt in a tight CPU loop with no await. Latency for unrelated requests rises. Why does that happen, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A task that never yields keeps its worker thread, and other tasks queued on that thread wait behind it. Move the synchronous work to the blocking pool with spawn_blocking so the async workers stay free, and avoid using it as a hammer for work that is already async. See <a href="#work-stealing">Work-stealing in practice</a> and <a href="#blocking">Blocking vs cooperative tasks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Traffic spikes and the gateway's memory climbs until the pod is killed, though CPU never saturates. Where do you look first, and what does the structure of a fix look like?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Look for an unbounded channel or an unlimited number of spawned tasks between the front door and the model server. Bound the queue and cap in-flight work with a semaphore or concurrency limit, so that a full system makes callers wait or receive a 503 early instead of growing memory. See <a href="#backpressure">Backpressure</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In a tower stack, what is the difference between a concurrency limit and load shedding, and which do you want in front of a model server?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A concurrency limit makes extra callers wait for capacity, while load shedding rejects them at once when the service is at capacity. Waiting hides overload as latency, so for a latency-bound service in front of a model server you generally want shedding, with a small bounded queue if bursts are short. See <a href="#backpressure">Backpressure</a> and <a href="#tower">tower middleware</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An LLM response of several hundred KB passes through deserialise, transform and reserialise steps. How do you cut the copying, and what property of the type makes it safe?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Hold the data as a Bytes value and clone it by reference count instead of copying. Bytes is immutable and cheap to clone, and many handles can point into one buffer, so stages share it without a copy. Build with BytesMut and freeze once. See <a href="#zero-copy">Zero-copy with the bytes crate</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Swapping the global allocator to jemalloc is proposed as a fix for high p99. How do you respond?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Treat it as a hypothesis. The gain is real for allocation-heavy, multi-threaded services but depends on the workload, so measure throughput and tail latency before and after under representative load, and compare against what a flamegraph says about allocation cost. See <a href="#alloc">Allocators</a> and <a href="#perf-checklist">the perf checklist</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone proposes rewriting a slow Rust service's hot path with unsafe code. Walk through your order of investigation, and say what evidence would justify the rewrite.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Profile first with a flamegraph under load, then look for blocking calls, per-request allocations, JSON on internal RPCs, saturated channels and hot locks, and only then codegen. A rewrite is justified when the profile shows the cost concentrated in code a safe change cannot fix. See <a href="#perf-checklist">The senior-Rust perf checklist</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Tokio runs many cheap tasks on a few worker threads, and the one rule that matters is never to block a worker thread.</li>
+    <li>CPU-heavy or synchronous work belongs on the blocking pool via spawn_blocking, because a task that never yields starves the tasks queued behind it.</li>
+    <li>Backpressure comes from bounded channels, semaphores and tower limits. Overload should surface early as a wait or a 503, not as memory growth.</li>
+    <li>tower layers compose timeout, limits, retry, tracing and auth around one service, and tonic and axum are built on the same model.</li>
+    <li>Hot-path cost comes from allocations and copies, so reuse buffers, avoid format! and clones, and share data with the bytes crate.</li>
+    <li>Allocators, PGO and LTO are measured wins, not claims. Profile with a flamegraph and tokio-console before changing anything.</li>
+  </ul>
+  <p>The second pillar is the layer these services call: model servers, batching, streaming and orchestration. → <a href="05-deep-dive-secondary.html">Deep dive: secondary topic</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://tokio.rs/tokio/tutorial" target="_blank" rel="noopener"><strong>Tokio tutorial</strong></a> — Tokio project. The runtime model and task semantics behind this chapter.</li>
+    <li><a href="https://ryhl.io/blog/async-what-is-blocking/" target="_blank" rel="noopener"><strong>Async: What is blocking?</strong></a> — Alice Ryhl, 2020. A precise account of why blocking in async code hurts and how to fix it.</li>
+    <li><a href="https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html" target="_blank" rel="noopener"><strong>tokio::task::spawn_blocking</strong></a> — docs.rs. Exact behaviour and limits of the blocking pool.</li>
+    <li><a href="https://docs.rs/tower/latest/tower/" target="_blank" rel="noopener"><strong>tower</strong></a> — docs.rs. Service, Layer and the limit, load-shed, retry and timeout middleware.</li>
+    <li><a href="https://docs.rs/bytes/latest/bytes/" target="_blank" rel="noopener"><strong>bytes</strong></a> — docs.rs. Bytes and BytesMut, and how cloning shares a buffer.</li>
+    <li><a href="https://nnethercote.github.io/perf-book/" target="_blank" rel="noopener"><strong>The Rust Performance Book</strong></a> — Nicholas Nethercote. Profiling, allocation and build settings for Rust programs.</li>
+    <li><a href="https://github.com/tokio-rs/console" target="_blank" rel="noopener"><strong>tokio-console</strong></a> — Tokio project. The task inspector used to find tasks stuck on await.</li>
+  </ul>
 </section>
 
 <footer>
