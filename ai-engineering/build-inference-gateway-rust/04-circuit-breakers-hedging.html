@@ -44,6 +44,9 @@
     <a href="#test">Make the mock misbehave</a>
     <a href="#tradeoffs">Tradeoffs</a>
     <a href="#checkpoint">Checkpoint</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -346,12 +349,17 @@ async fn race(mut s: ByteStream, tx: std::sync::Arc&lt;tokio::sync::Mutex&lt;Opt
 
   <div class="callout insight">
     <span class="callout-label">Why hedging is so effective</span>
-    <p>In a fleet of upstreams, individual workers occasionally pause for GC, model paging, KV-cache eviction, or just an unlucky load spike. Per-worker tail latency is bursty. Firing a hedge after p95 means: if the primary was about to be slow, the hedge has a high chance of hitting a fresh worker. Studies inside Google ("Tail at Scale") show 30-50% p99 reductions for ~5% extra load.</p>
+    <p>In a fleet of upstreams, individual workers occasionally pause for GC, model paging, KV-cache eviction, or just an unlucky load spike. Per-worker tail latency is bursty. Firing a hedge after p95 means: if the primary was about to be slow, the hedge has a high chance of hitting a fresh worker. In Google's "Tail at Scale" paper, hedging a 1,000-value read after a 10 ms delay cut the 99.9th-percentile latency from 1,800 ms to 74 ms for just 2% more requests.</p>
   </div>
 
   <div class="callout warn">
     <span class="callout-label">When hedging is bad</span>
     <p>Hedging is bad when the upstream is already overloaded — you're adding load while it's struggling. The circuit breaker prevents the worst version (if upstream is dying, breaker opens and no hedge fires), but you should still gate hedging behind a "only when upstream is healthy" check. We do that below.</p>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-label">The sketch waits even when the primary fails fast</span>
+    <p>In <code>hedged</code> above, a primary that errors at once still leaves the backup waiting for <code>hedge_after</code>, so a failing upstream gets two calls per request and each error arrives 800 ms late. Treat the fix as an exercise: have <code>race</code> return whether it produced a first chunk, and <code>select!</code> in the hedge task between the sleep and the primary's <code>JoinHandle</code>, so a fast failure fires the backup at once and the breaker above decides whether to fire it at all.</p>
   </div>
 </section>
 
@@ -612,6 +620,61 @@ WARN infergw::proxy: breaker short-circuited request s=Open</code></pre>
   <p>Reliability layer done. Time to see what's actually happening.</p>
 
   <p style="margin-top: 24px;"><a href="05-observability.html"><strong>→ Chapter 05: Prometheus metrics and OpenTelemetry traces</strong></a></p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Run the mock with <code>FAIL_EVERY=1</code> and send 12 identical requests one after another. The chapter's own run shows HTTP 200 for them. Which observations prove the breaker opened?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The status code cannot show it, because the stream's headers go out before the leader contacts the upstream. Look for the gateway log line <code>circuit breaker: open</code> after the tenth recorded failure, then <code>breaker short-circuited request</code> for later requests, and a mock request log that stops growing. See <a href="#test">make the mock misbehave</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The breaker has been open for the 10-second cooldown, and two requests arrive in the same instant. What does each get, and what happens if the probe fails?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The first moves the breaker to half-open and becomes the single probe. The second is refused because a probe is already in flight. If the probe fails, the breaker reopens with a fresh cooldown, and if it succeeds the breaker closes and clears its failures. One probe stops a stampede onto an upstream that is just recovering. See <a href="#circuit">circuit breaker</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The upstream returns 503 for every request for one minute at 100 requests a second. Compare the load with three naive retries against the retry budget of 10 tokens refilling at 0.5 a second.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Naive retries turn 100 requests a second into up to 400. The budget allows about 10 retries at the start plus 0.5 a second, so roughly 40 in the whole minute, and the extra load stays near zero. A retry cap per request does not bound total load, and a budget does. See <a href="#retry">retry budget</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You set <code>hedge_after_ms</code> to 50 when the p95 first-chunk latency is 800 ms. What happens to the upstream, and what is the right setting?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Nearly every request fires a backup, which roughly doubles upstream load. On a saturated GPU server that load raises latency for everyone, so the hedge makes the tail worse. Set the delay near the observed p95 so about 5% of requests hedge, and cap the share that may hedge. See <a href="#hedge">hedging</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague wants the <code>Permit</code> to record a failure automatically when it drops without a success. What goes wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A client disconnect or a cancelled hedge loser also drops the permit, so a healthy upstream would be charged with failures and the breaker would open on the wrong signal. Recording explicitly forces you to say which outcomes count as upstream faults. See <a href="#circuit">circuit breaker</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In what order do the three patterns apply to one request, and why is hedging gated on a closed breaker?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Breaker first because it is cheap and refuses fast, then the retry budget, then hedging. Hedging adds load, so firing it through an open or half-open breaker pushes traffic onto an upstream you have just decided is sick. The code requires a closed-path permit and a closed state before it hedges. See <a href="#tradeoffs">tradeoffs</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The goal is to absorb upstream misbehaviour without amplifying it, and each pattern covers a different failure shape.</li>
+    <li>A breaker opens after a threshold of failures in a window, waits out a cooldown, then lets exactly one probe through so recovery is not trampled.</li>
+    <li>Failures are recorded explicitly, never on drop, because a client disconnect is not an upstream fault.</li>
+    <li>A retry budget bounds the total extra load. A fixed retry count multiplies traffic during an outage.</li>
+    <li>Never retry or hedge once a byte has reached the client, and never retry a 4xx.</li>
+    <li>Hedging buys tail latency for a small, bounded share of extra load. Set it near p95, cap the share, and turn it off unless the breaker is closed.</li>
+  </ul>
+  <p>Three reliability behaviours now run that you cannot yet see. → <a href="05-observability.html">Observability</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener"><strong>The Tail at Scale</strong></a> — Dean and Barroso, 2013. The source for hedged requests and why tails dominate at fan-out.</li>
+    <li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener"><strong>Circuit Breaker</strong></a> — Martin Fowler, 2014. A short statement of the three states and why the breaker exists.</li>
+    <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener"><strong>Timeouts, retries, and backoff with jitter</strong></a> — Amazon Builders' Library, accessed 2026. Why retries amplify outages and how jitter and limits tame them.</li>
+    <li><a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener"><strong>Addressing Cascading Failures</strong></a> — Google SRE book, 2016. How retries and overload feed each other, and how to shed load.</li>
+    <li><a href="https://docs.rs/tower/latest/tower/retry/budget/index.html" target="_blank" rel="noopener"><strong>tower::retry::budget</strong></a> — docs.rs, accessed 2026. A production retry budget to compare with the one you wrote.</li>
+  </ul>
 </section>
 
 </main>

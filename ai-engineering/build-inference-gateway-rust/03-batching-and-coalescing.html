@@ -44,6 +44,9 @@
     <a href="#run">Prove it works</a>
     <a href="#limits">When NOT to coalesce</a>
     <a href="#checkpoint">Checkpoint</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -82,7 +85,7 @@
 
 <section id="key">
   <h2>Choosing the cache key</h2>
-  <p>The simplest correct key: hash the entire request body. If two requests have byte-identical bodies, they're truly identical. If they differ in any field — even a trailing whitespace — they get different keys, so we conservatively call the upstream twice. That's fine: we want false negatives, not false positives.</p>
+  <p>The simplest correct key: hash the entire parsed request body. If two requests parse to identical JSON, they're truly identical. If they differ in any field value, they get different keys, so we conservatively call the upstream twice. That's fine: we want false negatives, not false positives.</p>
 
   <p>Add to <code>infergw/Cargo.toml</code>:</p>
 
@@ -161,9 +164,9 @@ pub enum JoinResult {
 
 impl Coalescer {
     pub fn key_for(body: &amp;serde_json::Value) -&gt; String {
-        // Canonicalize by serializing through serde_json — fields keep insertion
-        // order from the original JSON, so two requests with reordered keys will
-        // hash differently. For coalescing that's acceptably conservative.
+        // Canonicalize by serializing through serde_json. Its default map type is
+        // sorted, so reordered keys and extra whitespace give the same key. Any
+        // difference in a value gives a different key, which is the safe direction.
         let s = serde_json::to_string(body).unwrap_or_default();
         let mut h = Sha256::new();
         h.update(s.as_bytes());
@@ -517,7 +520,7 @@ wait</code></pre>
   -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"identical"}],"stream":true}' \
   http://127.0.0.1:8080/v1/chat/completions</code></pre>
 </div>
-      <p>50 concurrent identical requests for 10 seconds. Without coalescing, the mock would log ~3000 incoming requests. With coalescing, you'll see roughly one every ~800ms (the duration of a complete mocked response), so ~12 total — a 250x reduction in upstream load. We'll measure this properly in Chapter 07.</p>
+      <p>50 concurrent identical requests for 10 seconds. Without coalescing, the mock would log about 600 incoming requests (50 workers, each finishing about 1.25 requests a second). With coalescing, you'll see roughly one every ~800ms (the duration of a complete mocked response), so ~12 total — about a 50x reduction in upstream load. We'll measure this properly in Chapter 07.</p>
     </div>
   </details>
 </section>
@@ -550,6 +553,61 @@ wait</code></pre>
   <p>Next we make the upstream call <em>itself</em> more resilient.</p>
 
   <p style="margin-top: 24px;"><a href="04-circuit-breakers-hedging.html"><strong>→ Chapter 04: Circuit breaker, retry budgets, and request hedging</strong></a></p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Fire three identical streaming requests at once, then three requests with different prompts. What should the gateway log and how many requests should the mock see each time? If the mock sees three for the identical set, what do you check?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Identical: one <code>coalesce: leader</code> line, two <code>coalesce: follower</code> lines, one request at the mock. Different: three leaders and three requests. If identical requests reach the mock three times, some field differs, since the key hashes the whole parsed body, or the requests did not overlap in time. See <a href="#run">prove it works</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two tenants send the same prompt with <code>temperature: 0.7</code> and overlap in time. What does coalescing do to them, and how do you fix the key?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Both receive the same sampled completion, which collapses the randomness each asked for, and one tenant sees text generated for the other. Skip coalescing when temperature is above zero and no seed is set, and put the tenant in the key for anything personalised or billed. See <a href="#limits">when not to coalesce</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A follower arrives after the leader has already sent five chunks. How does it get chunks one to five, and why does a broadcast channel alone not do it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A broadcast receiver sees only messages sent after it subscribes. The leader therefore also appends every frame to a replay buffer, and a late follower plays that back before switching to the live channel. See <a href="#design">the singleflight design</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A follower on a bad mobile link falls more than 256 frames behind. What happens to it, and to the leader and the other followers?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>That follower's receive returns <code>Lagged</code>, the code ends its stream with an error, and nobody else is affected. The channel is bounded, so a slow reader cannot slow the leader or hold unbounded memory in the channel. The replay buffer still grows with the response. See <a href="#code">the implementation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In chapter 02 a client disconnect stopped the upstream call. With a single client and no followers here, does it still?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. The leader runs in its own spawned task and the client is only a subscriber, so dropping the client does not cancel it. That is right when followers are listening and wasteful when nobody is. The fix is to check the channel's receiver count and abort the task when it reaches zero. See <a href="#code">the implementation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague wants to raise the hit rate by ignoring the <code>user</code> field when building the key. How do you decide?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Key order and whitespace are already normalised, because the key is built from parsed JSON. Ignoring a field is safe only if you can show it never changes the output, since a wrong merge hands one caller another caller's answer. Hashing everything can only miss a duplicate. Measure the follower ratio first and widen the key one proven-irrelevant field at a time. See <a href="#key">choosing the cache key</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Coalescing shares one upstream call among concurrent identical requests. The model server already batches different prompts, so the gateway only removes duplicate work.</li>
+    <li>It is a correctness decision. The key must cover every field that affects the output, and hashing the whole parsed body can miss a duplicate but never merge two different requests.</li>
+    <li>A broadcast channel delivers only what is sent after you subscribe, so the leader keeps a replay buffer for late joiners.</li>
+    <li>A follower that lags past the channel buffer is cut off with an error, and the leader and the other followers carry on.</li>
+    <li>Do not coalesce sampled requests without a seed, and scope the key by tenant when output is personalised or billed.</li>
+    <li>Moving the call into a spawned task means a client disconnect no longer cancels the upstream call, so you need a receiver count to stop it.</li>
+  </ul>
+  <p>Coalescing removes duplicate load but does nothing when the upstream fails or stalls. → <a href="04-circuit-breakers-hedging.html">Circuit breaker, retry budget and hedging</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.rs/tokio/latest/tokio/sync/broadcast/index.html" target="_blank" rel="noopener"><strong>tokio::sync::broadcast</strong></a> — docs.rs, accessed 2026. Lagging, capacity and closed-channel behaviour that the follower code depends on.</li>
+    <li><a href="https://pkg.go.dev/golang.org/x/sync/singleflight" target="_blank" rel="noopener"><strong>singleflight package</strong></a> — Go Packages, accessed 2026. The original pattern this chapter's name comes from, with its contract.</li>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener"><strong>Efficient Memory Management for Large Language Model Serving with PagedAttention</strong></a> — Kwon et al., 2023. Why the model server batches different prompts itself, and how its KV cache works.</li>
+    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener"><strong>Orca: A Distributed Serving System for Transformer-Based Generative Models</strong></a> — Yu et al., OSDI 2022. The paper that introduced iteration-level, continuous batching.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html" target="_blank" rel="noopener"><strong>Automatic Prefix Caching</strong></a> — vLLM docs, accessed 2026. The cache that prefix-aware routing in chapter 08 tries to hit.</li>
+  </ul>
 </section>
 
 </main>
