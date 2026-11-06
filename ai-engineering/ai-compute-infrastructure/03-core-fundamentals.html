@@ -44,6 +44,9 @@
     <a href="#runtimes">Distributed runtimes</a>
     <a href="#prod-debug">What "production debugging" means here</a>
     <a href="#triangle">The cost-perf-reliability triangle</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -84,7 +87,7 @@ ibstat                              # InfiniBand link state (if applicable)
 </code></pre></div>
   <div class="callout tip">
     <span class="callout-label">Xid errors</span>
-    <p>NVIDIA driver errors get a numeric Xid. <strong>Xid 79</strong> = GPU fell off bus (often hardware), <strong>Xid 31</strong> = MMU fault (often app), <strong>Xid 13/63</strong> = graphics engine fault, <strong>Xid 74</strong> = NVLink error, <strong>Xid 119/120</strong> = GSP RPC timeout. You don't need to memorize them all — you do need to know they exist and where to look them up.</p>
+    <p>NVIDIA driver errors get a numeric Xid. <strong>Xid 79</strong> = GPU fell off bus (often hardware), <strong>Xid 31</strong> = MMU fault (often app), <strong>Xid 13</strong> = graphics engine exception, <strong>Xid 63/64</strong> = GPU memory remapping event or failure, <strong>Xid 74</strong> = NVLink error, <strong>Xid 119/120</strong> = GSP RPC timeout. You don't need to memorize them all — you do need to know they exist and where to look them up.</p>
   </div>
 </section>
 
@@ -232,6 +235,61 @@ spec:
     <span class="callout-label">Senior signal</span>
     <p>When asked a design question, <em>name the triangle out loud</em> before answering. "I'm going to optimize for tail latency and reliability here, accepting ~20% higher steady-state cost, because this serves a customer-facing path." That single sentence raises your read.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>After a host driver update, new pods start on a node but report no GPUs. Walk through the mechanism that should have given them GPUs, and where it broke.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The container runtime calls the NVIDIA OCI hook, which reads the visible-devices settings and bind-mounts the device nodes and driver libraries into the container. After a driver change the toolkit or device plugin often does not restart cleanly, so the node stops advertising or injecting GPUs. Check the device plugin DaemonSet, the driver and toolkit versions and dmesg, then drain and replace the node. See <a href="#containers">containers and the NVIDIA toolkit</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An image built against a newer CUDA toolkit fails on a new cluster with "CUDA driver version is insufficient". Why, and which direction of mismatch is safe?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The host driver supplies the CUDA runtime. A driver at or above the toolkit version works, and a driver older than the toolkit fails at load. Upgrade the driver or rebuild against an older toolkit. See <a href="#containers">driver versus CUDA toolkit</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Single-node training runs at expected speed, but across nodes all-reduce reaches half of the expected throughput. What are the first two suspects and how do you confirm?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Suspect that NCCL picked TCP instead of InfiniBand or RoCE, or that GPUDirect RDMA is missing and transfers stage through host memory. Turn on NCCL debug output and read which transport each ring uses. A PCIe lane downgrade is the third suspect. See <a href="#networking">networking and the fabric</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Fifty inference pods restart after a node drain and each one pulls a 140 GB model from object storage. What goes wrong and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every restart pays a long first-byte and transfer cost, and fifty at once saturates the network, so recovery takes far longer than the outage. Stage or bake weights onto local NVMe and mmap them from there, with object storage as the source of truth only. See <a href="#storage">storage for weights</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Research training jobs and production inference share one GPU pool. How do you keep production safe, and what does that cost?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Use priority classes with preemption, quotas per namespace and disruption budgets on serving. The price is that preempted training loses work back to its last checkpoint. The alternative of separate pools gives clean isolation but leaves capacity idle, so choose by how bursty the research load is. See <a href="#k8s">Kubernetes for GPU workloads</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two jobs fail on different nodes, one with Xid 79 and one with Xid 31. How does that change who you look at first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Xid 79 means the GPU fell off the bus, which is often hardware, so cordon the node and start a repair path. Xid 31 is a memory-management fault, which is often the application, so look at the job first. Both are leads rather than verdicts, so confirm against dmesg and the Xid reference. See <a href="#linux">Linux for GPU hosts</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>GPU nodes are Linux machines first: NUMA layout, kernel modules, persistence and fabric services, and dmesg are the first stop in an incident.</li>
+    <li>Interconnect, not compute, is often the training bottleneck, and the wrong NCCL transport or missing GPUDirect RDMA halves throughput.</li>
+    <li>Model weights are large enough that staging them to local NVMe on pod start is a design requirement, not an optimisation.</li>
+    <li>Containers see GPUs through the NVIDIA toolkit hook, and a driver update without a clean toolkit and plugin restart yields pods with no GPUs.</li>
+    <li>Kubernetes does not know about GPUs until the device plugin advertises them, and fair sharing needs priority classes, quotas, disruption budgets and gang scheduling.</li>
+    <li>Production debugging starts with what changed, then narrows the blast radius.</li>
+  </ul>
+  <p>The two deep dives start with inference serving, where most of the tuning decisions live. → <a href="04-deep-dive-primary.html">Deep Dive — Inference Serving</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/" target="_blank" rel="noopener"><strong>Schedule GPUs</strong></a> — Kubernetes docs. How device plugins expose GPUs as schedulable resources.</li>
+    <li><a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html" target="_blank" rel="noopener"><strong>NVIDIA Container Toolkit</strong></a> — NVIDIA docs. How containers get device nodes and driver libraries, and the install and runtime configuration.</li>
+    <li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener"><strong>NCCL environment variables</strong></a> — NVIDIA docs. The settings behind transport selection, interface choice and debug output.</li>
+    <li><a href="https://docs.nvidia.com/deploy/cuda-compatibility/index.html" target="_blank" rel="noopener"><strong>CUDA Compatibility</strong></a> — NVIDIA docs. The rules for which toolkit versions run on which drivers.</li>
+    <li><a href="https://docs.nvidia.com/deploy/xid-errors/index.html" target="_blank" rel="noopener"><strong>XID Errors</strong></a> — NVIDIA docs. The reference for Xid codes and their likely causes.</li>
+  </ul>
 </section>
 
 <footer>
