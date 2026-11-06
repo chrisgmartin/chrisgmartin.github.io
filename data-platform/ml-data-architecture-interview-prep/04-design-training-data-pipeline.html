@@ -48,6 +48,9 @@
     <a href="#listening">What the interviewer is listening for</a>
     <a href="#probes">Follow-up probes</a>
     <a href="#levels">The answer at four levels</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -229,7 +232,7 @@ WHERE s.t - f.feature_ts &lt;= INTERVAL '7 days';                            -- 
 <section id="probes">
   <h2>Follow-up probes</h2>
   <ul>
-    <li><strong>"Data science wants to add a feature that needs 24 months of history. Tomorrow."</strong> — Backfill from raw events by month partition, idempotent, writing feature_history with correct feature_ts and an available_ts equal to the backfill time — <em>and</em> flag that the backfilled availability is a fiction: the model would not have had it then. Either accept the optimism knowingly, or set available_ts = feature_ts + normal job latency.</li>
+    <li><strong>"Data science wants to add a feature that needs 24 months of history. Tomorrow."</strong> — Backfill from raw events by month partition, idempotent, writing feature_history with the correct feature_ts. The honest available_ts is the backfill time, but the as-of join on available_ts would then never see that history. Either set available_ts = feature_ts + normal job latency and accept knowingly that the model would not have had the feature then, or train only on rows after the live job began.</li>
     <li><strong>"Cancellations get backdated on refund. Does that break anything?"</strong> — It changes labels after the fact. Store the label snapshot per dataset version; rebuild as a new version; compare. Report label-revision rate as a metric.</li>
     <li><strong>"How would you prove to the scientists it was the data?"</strong> — Rebuild the dataset with the as-of pipeline, retrain the same model, show AUC drop to a plausible ~0.75 and the feature-importance shift away from the leaking columns. Then show that number holds in production. Evidence, not argument.</li>
     <li><strong>"This is 8 GB. Why not just do it in pandas?"</strong> — You can; the value is the discipline, not the engine. Do it in SQL on the warehouse so the same job runs monthly, is versioned, and the next model reuses the spine step.</li>
@@ -250,6 +253,61 @@ WHERE s.t - f.feature_ts &lt;= INTERVAL '7 days';                            -- 
     </div>
   </details>
   <p>Next, the other half of the correctness problem — keeping features fresh and consistent when predictions happen in milliseconds: <a href="05-design-real-time-features.html">05 · Drill: Real-Time Features for Fraud &amp; Ranking</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A loan-default model joins each January application to the customer's credit limit as it is today. A customer who defaulted in March had the limit cut to zero. What does the model learn, and how do you build the join so it cannot?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It learns that a zero limit predicts default, which is the label encoded in a feature. Build the attribute from a slowly changing history with validity ranges and join on valid_from at or before t and t before valid_to. See <a href="#leakage">where leakage comes from</a> and <a href="#spine">the spine</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Churn is the label over the next 30 days, and cancellations can be recorded up to 30 days late. Today is 15 October. What is the newest month-start whose rows you may train on, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>1 August. A month needs its 30-day window plus 30 days of recording delay to be mature, so month_start plus 60 days must be on or before today. 1 August plus 60 days is 30 September; 1 September plus 60 days is 31 October. See <a href="#splits">splits and the label delay</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You backfill a feature for 24 months and write available_ts as the day of the backfill. What does the as-of join do with those rows, and what are your options?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The join sees no available value for any historical prediction time, so the backfilled history is invisible. You can set available_ts to feature_ts plus the normal job latency and accept that the model would not truly have had the feature then, or train only on rows after the live job began. Say which one you chose. See <a href="#probes">the follow-up probes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A new model must score prospects who have never been customers. Which split do you use, and what is wrong with reusing the churn model's split?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Split by entity, and still order by time. In the churn split the same subscriber appears in many months, which is fine when every month is a real prediction. For a model that must generalise to unseen entities, that repeat lets entity-specific patterns leak from train into validation. See <a href="#splits">splits and the label delay</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone proposes deduplicating and compacting the raw events table in place to save storage. What breaks in this design?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The dataset's recorded raw-partition watermarks then point at data that no longer exists, so a past training set cannot be rebuilt or diffed. Keep raw append-only and do all cleaning downstream in versioned layers. See <a href="#versioning">versioning the dataset</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Data science argues that 0.92 AUC proves the model is good and that production is a monitoring problem. How do you test that claim?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Treat the number as evidence of leakage, since 0.92 is too good for churn. Rebuild the dataset with the as-of pipeline, retrain the same model, and look for an AUC fall to a plausible level and a shift in feature importance away from the leaking columns. Then confirm the lower number holds in production. See <a href="#probes">the follow-up probes</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A metric that is too good, such as 0.92 AUC on churn, is evidence of leakage. Name the mechanism before you design.</li>
+    <li>Organise the pipeline around a spine of one row per entity, prediction time and label, and join every feature as of that time.</li>
+    <li>Attributes come from slowly changing history, windows use events strictly before t, and the as-of join uses availability time with a staleness bound.</li>
+    <li>Labels need a maturity gate with a number. Revised labels create a new dataset version rather than an in-place edit.</li>
+    <li>A training set is an immutable artifact, a snapshot or a manifest of hashes, that the model registry points at. It rests on an append-only raw layer.</li>
+    <li>Split by time, and by entity when the model must generalise to new entities. Run leakage checks as automated gates.</li>
+  </ul>
+  <p>Training sets are one half of correctness. The other half is serving fresh features in milliseconds. → <a href="05-design-real-time-features.html">Drill: Real-Time Features for Fraud &amp; Ranking</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.snowflake.com/en/sql-reference/constructs/asof-join" target="_blank" rel="noopener"><strong>ASOF JOIN</strong></a> — Snowflake documentation. The as-of join syntax behind the chapter's spine query.</li>
+    <li><a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" target="_blank" rel="noopener"><strong>Point-in-time joins</strong></a> — Feast documentation. The same idea as a feature-store API, including the timestamp rules.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/branching/" target="_blank" rel="noopener"><strong>Branching and Tagging</strong></a> — Apache Iceberg documentation. Tagging a snapshot so a model can point at an immutable dataset.</li>
+    <li><a href="https://scikit-learn.org/stable/modules/cross_validation.html" target="_blank" rel="noopener"><strong>Cross-validation: evaluating estimator performance</strong></a> — scikit-learn documentation. Includes the time-series split and why shuffled folds mislead on ordered data.</li>
+    <li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener"><strong>Rules of Machine Learning</strong></a> — Google for Developers. Guidance on training-serving skew and testing a model on data from after its training period.</li>
+  </ul>
 </section>
 
 </main>
