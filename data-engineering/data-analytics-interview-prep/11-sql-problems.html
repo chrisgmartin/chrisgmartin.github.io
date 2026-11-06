@@ -52,6 +52,9 @@
 
     <h2>Reference</h2>
     <a href="10-sql-patterns.html">← SQL pattern menu</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -537,14 +540,15 @@ ORDER BY j.cohort_month, j.months_since_signup;</code></pre>
     <div class="reveal-body">
 <div class="code-wrap">
 <div class="code-header"><span class="filename"><span class="dot"></span>percentile_cont.sql</span><button class="copy-btn">Copy</button></div>
-<pre><code class="language-sql">-- Snowflake / BigQuery / Postgres (Aggregate flavor)
+<pre><code class="language-sql">-- Snowflake / Postgres / Databricks (ordered-set aggregate)
+-- BigQuery: PERCENTILE_CONT(latency_ms, 0.5) OVER (PARTITION BY model_id), a window function with no GROUP BY form
 SELECT
   model_id,
   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency_ms) AS median_latency
 FROM inference_requests
 GROUP BY model_id;
 
--- Snowflake / BigQuery also support APPROX_PERCENTILE for huge data
+-- Snowflake / Databricks support APPROX_PERCENTILE for huge data; BigQuery uses APPROX_QUANTILES(latency_ms, 100)[OFFSET(50)]
 SELECT
   model_id,
   APPROX_PERCENTILE(latency_ms, 0.5) AS approx_median
@@ -572,12 +576,12 @@ SELECT
   AVG(latency_ms::FLOAT) AS median_latency  -- AVG handles even-count case (avg of two middle values)
 FROM ranked
 WHERE rn IN (
-  (total + 1) / 2,      -- middle when odd
-  (total + 2) / 2       -- second middle when even
+  FLOOR((total + 1) / 2.0),      -- middle when odd
+  FLOOR((total + 2) / 2.0)       -- second middle when even
 )
 GROUP BY model_id;</code></pre>
 </div>
-      <p>Trick: the two indices <code>(total+1)/2</code> and <code>(total+2)/2</code> are equal when <code>total</code> is odd (just the middle) and differ by 1 when even (the two middle values, which we average).</p>
+      <p>Trick: the two indices <code>FLOOR((total+1)/2.0)</code> and <code>FLOOR((total+2)/2.0)</code> are equal when <code>total</code> is odd (just the middle) and differ by 1 when even (the two middle values, which we average).</p>
     </div>
   </details>
 </section>
@@ -646,14 +650,18 @@ ORDER BY month;</code></pre>
 SELECT
   COUNT(*)                                                  AS users_signed_up,
   COUNT(*) FILTER (WHERE pricing_at  &gt;= signup_at)          AS reached_pricing,
-  COUNT(*) FILTER (WHERE checkout_at &gt;= pricing_at)         AS started_checkout,
-  COUNT(*) FILTER (WHERE purchase_at &gt;= checkout_at)        AS completed_purchase
+  COUNT(*) FILTER (WHERE pricing_at  &gt;= signup_at
+                     AND checkout_at &gt;= pricing_at)         AS started_checkout,
+  COUNT(*) FILTER (WHERE pricing_at  &gt;= signup_at
+                     AND checkout_at &gt;= pricing_at
+                     AND purchase_at &gt;= checkout_at)        AS completed_purchase
 FROM user_funnel
 WHERE signup_at IS NOT NULL;</code></pre>
 </div>
       <p><strong>Why MIN per event:</strong> first occurrence of each event type per user.</p>
       <p><strong>Why <code>&gt;=</code>:</strong> enforces order. A user who visited pricing <em>before</em> signing up shouldn't count for that stage. If you want strict ordering, use <code>&gt;</code> instead.</p>
-      <p><strong>FILTER (WHERE ...)</strong> is Postgres / Snowflake / BigQuery syntax. On older dialects use <code>COUNT(CASE WHEN ... THEN user_id END)</code>.</p>
+      <p><strong>Why each stage repeats the earlier tests:</strong> otherwise a user who reversed or skipped an earlier step still counts at a later one, and the stage counts stop nesting.</p>
+      <p><strong>FILTER (WHERE ...)</strong> is standard SQL that Postgres and DuckDB accept. Snowflake and BigQuery do not. There, use <code>COUNT(CASE WHEN ... THEN user_id END)</code>, or <code>COUNT_IF</code> (Snowflake) or <code>COUNTIF</code> (BigQuery).</p>
     </div>
   </details>
 
@@ -749,6 +757,62 @@ PIVOT (
     <span class="callout-label">Where these come from</span>
     <p>These 11 cover roughly 80% of the patterns you'll see in SQL interviews for data analytics engineering roles. Each one maps to a concept in <a href="04-sql-deep-dive.html">04-sql-deep-dive</a>. If a problem feels hard, the deep-dive section on that pattern is your remediation.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A customer has orders at 900, 800, 800, 800 and 700 dollars. You filter to the top three by revenue. How many rows do ROW_NUMBER, RANK and DENSE_RANK return?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>ROW_NUMBER returns three, with the tied 800s split arbitrarily by the tiebreaker. RANK assigns 1, 2, 2, 2, 5, so a filter of three or lower returns four rows. DENSE_RANK assigns 1, 2, 2, 2, 3 and returns all five. See <a href="#p2">top-N per group</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Subscription days for one customer are Jan 1, 2, 3, 5 and 6. What is each date minus its row number, and how many islands result?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Dec 31, Dec 31, Dec 31, Jan 1, Jan 1. Two distinct values mean two islands: Jan 1 to 3, and Jan 5 to 6. The constant offset within a run is the whole trick. See <a href="#p4">gaps and islands</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A user has events at 10:00, 10:20 and 11:30, with a 30-minute session rule. What are the <code>is_new_session</code> flags and session numbers?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Flags 1, 0, 1, because the first event has no previous row (LAG is NULL, so the ELSE branch gives 1) and 11:30 is 70 minutes after 10:20. The cumulative sum gives sessions 1, 1, 2. See <a href="#p5">sessionization</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In the funnel query, a user visited pricing before signing up, then started checkout after. If each stage tested only the adjacent step, what would be wrong, and what does the corrected query do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The user fails the pricing stage but still passes the checkout stage, because checkout follows pricing. Stage counts then stop nesting, and conversion between stages can exceed 100%. Each stage repeats all earlier tests. See <a href="#p10">funnel analysis</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Run the manual median on six latency values, 1 to 6. Which row numbers does it pick, and what result means something is wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Rows 3 and 4, giving 3.5. With five values it picks row 3 twice. A result of 4.0 for the six values would mean the index arithmetic used decimal division without FLOOR, so only row 4 matched. See <a href="#p8">median in SQL</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer has two orders with the same <code>ordered_at</code>, the latest. What does the correlated-subquery version of latest-per-group return, compared with ROW_NUMBER?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The correlated version returns both rows, since both equal the maximum timestamp. ROW_NUMBER with a unique tiebreaker returns exactly one, the same one every run. See <a href="#p1">latest row per group</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Latest per group is ROW_NUMBER with a unique tiebreaker; the correlated MAX version returns every tied row.</li>
+    <li>RANK and DENSE_RANK change how many rows survive a top-N filter when values tie, so ask which the business wants.</li>
+    <li>Gaps and islands groups consecutive days by date minus row number, and sessionization groups events by a cumulative sum of new-session flags.</li>
+    <li>Cohort retention is cohort assignment, an activity join, then a division by cohort size.</li>
+    <li>A funnel must repeat the earlier stage tests at each stage, or the counts stop nesting.</li>
+    <li>Dialects differ on FILTER, PERCENTILE_CONT and integer division, so state which warehouse you assume.</li>
+  </ul>
+  <p>When SQL is the wrong tool, the next chapter covers Python for data work. → <a href="12-python-for-data.html">Python for Data</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/current/functions-aggregate.html" target="_blank" rel="noopener"><strong>Aggregate Functions</strong></a> — PostgreSQL documentation, accessed 2026. PERCENTILE_CONT as an ordered-set aggregate.</li>
+    <li><a href="https://www.postgresql.org/docs/current/sql-expressions.html" target="_blank" rel="noopener"><strong>Value Expressions</strong></a> — PostgreSQL documentation, accessed 2026. The FILTER clause on aggregates, in the aggregate expressions section.</li>
+    <li><a href="https://docs.snowflake.com/en/sql-reference/functions/percentile_cont" target="_blank" rel="noopener"><strong>PERCENTILE_CONT</strong></a> — Snowflake documentation, accessed 2026. Median in Snowflake, with the WITHIN GROUP form.</li>
+    <li><a href="https://cloud.google.com/bigquery/docs/reference/standard-sql/navigation_functions" target="_blank" rel="noopener"><strong>Navigation functions</strong></a> — Google Cloud documentation, accessed 2026. BigQuery's PERCENTILE_CONT is a window function.</li>
+    <li><a href="https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions" target="_blank" rel="noopener"><strong>Aggregate functions</strong></a> — Google Cloud documentation, accessed 2026. COUNTIF and APPROX_QUANTILES in BigQuery.</li>
+    <li><a href="https://docs.snowflake.com/en/sql-reference/constructs/pivot" target="_blank" rel="noopener"><strong>PIVOT</strong></a> — Snowflake documentation, accessed 2026. The native pivot operator and its limits.</li>
+  </ul>
 </section>
 
 <footer>

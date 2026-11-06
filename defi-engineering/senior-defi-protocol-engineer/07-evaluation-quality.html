@@ -45,6 +45,9 @@
     <a href="#math">Covering the math</a>
     <a href="#state-explosion">Managing state explosion</a>
     <a href="#choice">Which tool when</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -96,7 +99,7 @@
         loanToken.approve(address(morpho), type(uint256).max);
         vm.prank(USER);
         uint256 shares = morpho.supply(marketParams, 100e18, 0, USER, "");
-        assertEq(shares, 100e18 * morpho.SHARES_OFFSET());
+        assertEq(shares, 100e18 * SharesMathLib.VIRTUAL_SHARES);
     }
 
     function test_supply_revertsOnZero() public {
@@ -161,7 +164,7 @@ contract LendingInvariantTest is Test {
         assertGe(m.totalSupplyAssets, m.totalBorrowAssets);
     }
 
-    /// @dev Solvency: no position is borrowing more than allowed.
+    /// @dev Solvency, in a handler with a fixed price and no time warp: no position is borrowing more than allowed.
     function invariant_allPositionsHealthy() public view {
         for (uint256 i; i &lt; handler.actorCount(); ++i) {
             assertTrue(morpho.isHealthy(marketParams, handler.actor(i)));
@@ -196,15 +199,11 @@ contract LendingInvariantTest is Test {
         return m.totalSupplyAssets &gt;= m.totalBorrowAssets;
     }
 
-    function echidna_noUnhealthyAfterAccrual() public returns (bool) {
+    function echidna_accrualNeverShrinksBorrow() public returns (bool) {
+        Market memory beforeM = morpho.market(id);
         morpho.accrueInterest(marketParams);
-        for (uint256 i; i &lt; actors.length; ++i) {
-            if (!morpho.isHealthy(marketParams, actors[i])) {
-                // Healthy now? Maybe it became unhealthy passively from accrual — that's fine.
-                // But this assertion catches "no one became unhealthy due to a state change".
-            }
-        }
-        return true;
+        Market memory afterM = morpho.market(id);
+        return afterM.totalBorrowAssets >= beforeM.totalBorrowAssets;
     }
 }
 </code></pre></div>
@@ -292,7 +291,7 @@ parametric rule noOpDoesNotChangeShares(method f) {
   <p>Fuzzing whole protocols is great, but pure mathematical sub-routines deserve dedicated coverage. Examples:</p>
   <ul>
     <li><strong>IRM curves.</strong> Closed-form unit tests at every boundary: U=0, U just below kink, U at kink, U just above, U=100%.</li>
-    <li><strong>Fixed-point ops.</strong> Round-trip identities: <code>wadDiv(wadMul(x, y), y) ≤ x</code>, etc.</li>
+    <li><strong>Fixed-point ops.</strong> Round-trip identities: with round-down variants, <code>wadDivDown(wadMulDown(x, y), y) ≤ x</code>. With round-half-up variants the round trip can land one wei off in either direction.</li>
     <li><strong>Accumulator math.</strong> Compound-interest accumulator never decreases; matches a Python reference at high precision.</li>
     <li><strong>Share / asset conversion.</strong> Symmetry, monotonicity, invertibility within rounding tolerance.</li>
   </ul>
@@ -352,6 +351,62 @@ function testFuzz_wadMulInverse(uint256 a, uint256 b) public {
       <tr><td>"Does my code shake out at scale?"</td><td>Public audit contest + bug bounty</td></tr>
     </tbody>
   </table>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A reviewer says 100% line coverage means the vault math is safe. What is wrong with that, and what do you add?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Coverage records which lines ran, not which properties were checked, and a suite of happy-path tests can cover every line and miss every edge case. Add invariant tests and fuzzing so that random sequences attack the properties. See <a href="#unit">unit and fork tests</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your invariant campaign passes in seconds, and a look at the handler shows every call reverted. What does the result mean, and how do you fix the setup?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The invariants held over an empty state, so the pass is vacuous. Find why the handler reverts, for example a missing approval or an input range that is too wide, bound the inputs, and set the fail-on-revert option so unexpected reverts fail the run. See <a href="#invariant">Foundry invariant testing</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Which tool do you choose for a 12-step borrow, accrue and liquidate sequence that must keep the market solvent, and which for the share-to-asset round trip for every input? Why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A stateful fuzzer with invariants for the sequence, because the state space is large and behaviour depends on order. Symbolic execution for the round trip, because it is a small mathematical property where a proof over all inputs is feasible. See <a href="#choice">which tool when</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The team adds a new periphery bundler every week. Do you write Certora specs for each one?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not as a rule. Formal verification pays off on a stable core with invariants that will hold for years, and it costs engineer-weeks. For fast-moving periphery, unit, fork and fuzz tests plus review give more protection per hour. See <a href="#certora">Certora and CVL</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A fuzz test asserts that dividing the product of two fixed-point numbers by one factor returns the other exactly, and it fails by one unit on some inputs. Is that a bug?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Usually not. Rounding makes the identity hold only within a tolerance, so assert it within one unit. Where direction matters, as with protocol-favor rounding, assert the direction as well, and treat an error larger than one unit as a scaling bug. See <a href="#math">covering the math</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A Certora run on a many-market, many-user protocol times out. Name two reductions and the risk each carries.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Symmetry reduction verifies against a few abstract users and relies on users being interchangeable. Market reduction verifies one market and relies on markets being independent, which holds in isolated designs but not in shared pools. Summaries replace hard code with an approximation and can hide real bugs if they are too loose. See <a href="#state-explosion">managing state explosion</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>No single tool catches everything: cheap, fast tests form the base, and slower, more rigorous tools sit above them.</li>
+    <li>Coverage counts executed lines, while invariants check properties across any sequence of calls.</li>
+    <li>An invariant campaign needs a handler that bounds inputs and tracks ghost state. A run where every call reverts proves nothing.</li>
+    <li>Fuzzers sample concrete sequences, and symbolic execution covers all inputs for small mathematical properties. Neither scales to a whole protocol by itself.</li>
+    <li>Formal verification fits a stable, high-value core and not fast-moving periphery.</li>
+    <li>Reduce users, markets and call depth to make proofs tractable, and read a property that is too costly to prove as a sign of coupling in the design.</li>
+  </ul>
+  <p>Verification exists to catch the failures the next chapter lists. → <a href="08-error-handling.html">Error Handling &amp; Failure Modes</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://book.getfoundry.sh/forge/invariant-testing" target="_blank" rel="noopener"><strong>Invariant Testing</strong></a> — Foundry Book, accessed 2026. Handlers, target selectors and the invariant configuration.</li>
+    <li><a href="https://github.com/crytic/echidna" target="_blank" rel="noopener"><strong>Echidna</strong></a> — Trail of Bits, source on GitHub. The property-based fuzzer, with its configuration and examples.</li>
+    <li><a href="https://github.com/crytic/medusa" target="_blank" rel="noopener"><strong>Medusa</strong></a> — Trail of Bits, source on GitHub. The parallel, coverage-guided fuzzer.</li>
+    <li><a href="https://github.com/a16z/halmos" target="_blank" rel="noopener"><strong>Halmos</strong></a> — a16z crypto, source on GitHub. Symbolic testing for Foundry-style tests.</li>
+    <li><a href="https://docs.certora.com/en/latest/" target="_blank" rel="noopener"><strong>Certora Prover documentation</strong></a> — Certora, accessed 2026. CVL rules, invariants, ghosts, hooks and summaries.</li>
+    <li><a href="https://github.com/morpho-org/morpho-blue/tree/main/certora" target="_blank" rel="noopener"><strong>Morpho Blue Certora specs</strong></a> — Morpho Labs, source on GitHub. A real set of specs for a lending core.</li>
+  </ul>
 </section>
 
 <footer>

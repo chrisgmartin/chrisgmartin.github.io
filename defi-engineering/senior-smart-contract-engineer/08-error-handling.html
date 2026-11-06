@@ -47,6 +47,9 @@
     <a href="#selectors">Selector collisions</a>
     <a href="#storage-collision">Storage collisions</a>
     <a href="#ror">Read-only reentrancy</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -73,10 +76,10 @@
       <tr><td>Math at extreme prices</td><td>v3 tick boundary bugs in forks</td></tr>
       <tr><td>Reentrancy via callbacks</td><td>imBTC / Lendf.Me 2020 ($25M)</td></tr>
       <tr><td>Sandwich/MEV</td><td>ongoing structural</td></tr>
-      <tr><td>TWAP manipulation</td><td>Mango Markets 2022 ($110M), Inverse Finance ($15M)</td></tr>
+      <tr><td>TWAP manipulation</td><td>Inverse Finance 2022 ($15.6M, thin SushiSwap TWAP); Mango Markets 2022 ($115M) was the same idea against a thin spot market</td></tr>
       <tr><td>Pool init races</td><td>numerous v3 first-LP scams</td></tr>
       <tr><td>Approval-related</td><td>InfiniteAllowance exploits</td></tr>
-      <tr><td>Selector collisions</td><td>Curve / Vyper Reentrancy 2023 ($60M)</td></tr>
+      <tr><td>Selector collisions</td><td>Poly Network 2021 ($611M)</td></tr>
       <tr><td>Storage collisions (proxies)</td><td>Audius 2022 ($6M)</td></tr>
       <tr><td>Read-only reentrancy</td><td>Curve 2022 (multiple integrators affected)</td></tr>
     </tbody>
@@ -157,7 +160,7 @@ function test_TickMath_MAX() public {
 <section id="twap">
   <h2>Oracle TWAP manipulation</h2>
   <p>Uniswap v2 introduced an on-chain TWAP. v3 made it cheaper. But a TWAP is only as resistant as its observation window and the depth of the pool it watches.</p>
-  <p>Attack: low-liquidity pool, attacker pushes price for one block (or several), inflated TWAP feeds into a lending protocol that uses it for collateral valuation. Mango Markets, Inverse Finance, and many others lost real money this way.</p>
+  <p>Attack: low-liquidity pool, attacker pushes price for one block (or several), inflated TWAP feeds into a lending protocol that uses it for collateral valuation. Inverse Finance lost about $15.6M this way in 2022, through a TWAP over a thin SushiSwap pool. Mango Markets lost over $100M to the same idea, pumping a thin market, though its price came from spot markets and not a TWAP.</p>
   <p>Defenses:</p>
   <ul>
     <li><strong>Long enough window.</strong> 30-minute TWAP across high-TVL pools.</li>
@@ -189,7 +192,7 @@ function test_TickMath_MAX() public {
 <section id="selectors">
   <h2>Selector collisions (4-byte clashes)</h2>
   <p>Function selectors are 4 bytes of keccak256 of the signature. With ~4 billion possible selectors, collisions are findable by brute force.</p>
-  <p>The Vyper-reentrancy / Curve incident in July 2023 wasn't a selector collision per se, but selector collisions are a real attack surface for:</p>
+  <p>The Curve incident of July 2023 was not a selector collision: a Vyper compiler bug broke the reentrancy lock. Selector collisions are still a real attack surface, and Poly Network lost $611M to one in 2021. They matter for:</p>
   <ul>
     <li><strong>Proxies.</strong> If a proxy's admin function shares a selector with an implementation function, calls can be misrouted. OpenZeppelin transparent proxies handle this; UUPS proxies require care.</li>
     <li><strong>Function dispatch in custom Yul.</strong> Hand-rolled dispatchers must validate selectors carefully.</li>
@@ -232,6 +235,64 @@ function getPrice() external view checkReentrancy returns (uint256) {
     <span class="callout-label">Senior signal</span>
     <p>Being able to enumerate these ten categories cold — with one paragraph of defense each — is a near-certain pass on the "what could go wrong" portion of a design round.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A lending market prices collateral with a Curve-style pool's virtual price. A withdrawal sends ETH to the caller, who reenters the lending market before the pool finishes updating. What does the market read, and what is one defense on each side?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It reads a price computed while the pool's balances and its LP supply disagree, so the value is wrong even though no storage is corrupt. The pool can make its view functions revert while its lock is held. The integrator can check the pool's lock state, call a lock-guarded function before reading, or use a price the pool snapshots outside swap context. See <a href="#ror">read-only reentrancy</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A fee-on-transfer token takes 5%. A router credits the full input to the pool's math. What happens to the invariant check, and how do you fix it without listing token addresses?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The pool received 95 but prices 100, so either the product check fails and swaps revert, or the math pays out against tokens that are not there and other providers absorb the loss. Measure the balance before and after the transfer and use the difference, and give such tokens an explicit opt-in path. See <a href="#fee-on-transfer">fee-on-transfer breakage</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A lending market borrows against a 10-minute TWAP of a pool holding about $200,000. Why is that unsafe, and which parameters do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The cost of holding the price off-market for a few blocks can be less than what a borrower extracts, and the average then carries the manipulated price. Lengthen the window, borrow against a deeper pool, require a second source such as Chainlink or Pyth within a tolerance, and refuse the price when liquidity falls below a floor. See <a href="#twap">oracle TWAP manipulation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An upgrade inserts a new variable at the top of a base contract behind a proxy. What breaks, and name two defenses.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every later variable shifts by one slot, so existing values are read as the wrong fields. Append new variables only, reserve storage gaps, use namespaced storage as in ERC-7201, and run a layout check such as the OpenZeppelin upgrades plugin. For an AMM core, the stronger answer is to make it immutable. See <a href="#storage-collision">storage collisions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Flash-swap callbacks are designed reentrancy. How do you keep them while stopping an ERC-777 token hook from reentering the pool?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Take a lock on the state-changing paths, usually a transient flag, and update state before any external call. Allow the designed callback only at a controlled point, protected by a post-call balance check. Make view functions revert while the lock is held so a mid-flight read cannot be used. See <a href="#reentrancy">reentrancy via callbacks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The 2023 Curve losses involved Vyper pools that had reentrancy guards in the source. Why is that not a contract-logic bug, and what does it add to your process?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A compiler bug allocated the lock's storage incorrectly in some versions, so the guard did not hold in the compiled code. Audit the compiler version as part of scope, pin it, and test the compiled bytecode on a fork rather than trusting the source. See <a href="#selectors">selector collisions and a compiler lesson</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Most DEX losses fall into a short list of categories, and a senior engineer can name each one with its defense.</li>
+    <li>Never trust a transfer amount: measure the balance change, and make fee-on-transfer support an explicit opt-in path.</li>
+    <li>Test price math at the minimum and maximum tick by name, and use <code>mulDiv</code> and safe casts instead of reimplementing them.</li>
+    <li>Callbacks are designed reentrancy, so lock mutating paths, update state before external calls, and make views revert while the lock is held.</li>
+    <li>A TWAP is only as safe as its window and the depth behind it, so combine a long window, a deep pool, a second source and a liquidity floor.</li>
+    <li>Proxy upgrades break on storage layout, so append only, reserve gaps or use namespaced storage, and keep the core immutable.</li>
+    <li>A bug can sit in the toolchain, as the 2023 Vyper lock bug did, so pin compiler versions and test the compiled bytecode.</li>
+  </ul>
+  <p>Knowing the failure modes is half the job, and the other half is the audit, governance and rollout process that catches them. → <a href="09-governance-and-audit.html">Governance &amp; Audit</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://github.com/vyperlang/vyper/security/advisories/GHSA-5824-cm3x-3c38" target="_blank" rel="noopener"><strong>Incorrectly allocated named re-entrancy locks</strong></a> — Vyper security advisory, 2023. The compiler bug behind the July 2023 Curve losses.</li>
+    <li><a href="https://ethereum.org/en/developers/docs/smart-contracts/security/" target="_blank" rel="noopener"><strong>Smart contract security</strong></a> — ethereum.org developer docs, accessed 2026. An overview of attack classes and the standard defenses.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/security-considerations.html" target="_blank" rel="noopener"><strong>Security Considerations</strong></a> — Solidity docs, accessed 2026. Reentrancy, gas limits and low-level call pitfalls, from the language authors.</li>
+    <li><a href="https://docs.uniswap.org/concepts/protocol/oracle" target="_blank" rel="noopener"><strong>Price Oracles</strong></a> — Uniswap Labs docs, accessed 2026. How the on-chain oracle builds a TWAP and what limits manipulation.</li>
+    <li><a href="https://docs.openzeppelin.com/upgrades-plugins/writing-upgradeable" target="_blank" rel="noopener"><strong>Writing Upgradeable Contracts</strong></a> — OpenZeppelin docs, accessed 2026. Storage layout rules, gaps and what a safe upgrade changes.</li>
+    <li><a href="https://rekt.news/inverse-finance-rekt" target="_blank" rel="noopener"><strong>Inverse Finance - Rekt</strong></a> — Rekt, 2022. A worked write-up of the thin-pool TWAP manipulation.</li>
+    <li><a href="https://rekt.news/polynetwork-rekt" target="_blank" rel="noopener"><strong>Poly Network - Rekt</strong></a> — Rekt, 2021. A write-up of the function-selector collision exploit.</li>
+  </ul>
 </section>
 
 <footer>

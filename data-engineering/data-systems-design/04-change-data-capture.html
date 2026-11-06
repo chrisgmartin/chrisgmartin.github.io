@@ -45,6 +45,9 @@
     <a href="#outbox">Dual writes &amp; the outbox</a>
     <a href="#tooling">The tooling landscape</a>
     <a href="#heuristic">When to choose what</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -314,6 +317,62 @@ COMMIT;
     </div>
   </details>
   <p>Next, the biggest architectural fork of them all — and the trade-off matrix that decides it: <a href="05-batch-vs-streaming.html">05 · Batch vs Streaming</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A pipeline polls orders on updated_at every hour. Legal asks for account erasure, and the source rows are hard-deleted. What does the warehouse show a week later, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The deleted rows are still there. A poll only sees rows that exist, so a row that vanishes produces no signal. Capturing deletes needs the replication log, where a delete is a change event with a before image, or a soft-delete flag in the source. See <a href="#approaches">three approaches, compared</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The source takes writes all through an initial snapshot of a large table. How does log-based CDC avoid losing the writes made during the load, and why is a change seen twice harmless?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The snapshot is anchored to a log position and streaming resumes at or before that position, so nothing committed in between is missed. A change seen in both places is deduplicated by primary key and log offset, because the sink is idempotent. Overlap is allowed, loss is not. See <a href="#architecture">snapshot and stream architecture</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After a connector restart the sink receives a change for order 7 with log position 900, then a replayed change for the same order with position 850. What stops the older one from overwriting the newer, and why not compare event timestamps?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The merge applies a change only when its log position is greater than the one stored on the row, so the replay is a no-op. Timestamps can tie within a millisecond and clocks skew, and ordering by them can revert updates or resurrect deleted rows. See <a href="#correctness">deletes, order and exactly-once</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A service updates an order row, then publishes OrderShipped to Kafka in the same request. About one order in ten thousand is shipped in the database but has no event. Diagnose it and fix it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>This is a dual write: no transaction spans the database and the broker, so a crash or failed publish between them leaves the two disagreeing, and retries add duplicates. Write the event to an outbox table in the same transaction as the state change, then let CDC read the outbox and publish it. See <a href="#outbox">dual writes and the outbox</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A reference table has 8 million rows with a trustworthy updated_at, no deletes, and an hourly freshness target. The team has three people. Do you stand up Debezium, and what would change your answer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. A query-based poll meets the SLA, needs only SELECT, and has no connector or replication slot to run. Move to log-based CDC if deletes must be captured, if freshness drops below the poll interval, or if the scans start to load the source. See <a href="#heuristic">when to choose what</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Update events from a Postgres table arrive with a sparse before image, and your audit needs the old values. What is the likely cause and what does the fix cost?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>By default Postgres writes only the key columns of the old row to the log. Setting the table's replica identity to full records the whole old row, at the price of more log volume and more write overhead. See <a href="#event-shape">the shape of a CDC event</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>CDC turns a database's state into an ordered stream of changes. The warehouse table is then a materialised view of that stream.</li>
+    <li>Query-based capture is cheap and fine for small, append-heavy tables with an hourly or looser target, but it silently misses hard deletes and intermediate states.</li>
+    <li>Log-based capture reads the replication log, so it is low-impact, complete and ordered. It is the default when deletes, latency or table size matter.</li>
+    <li>Every deployment is snapshot then stream, anchored to a log position. Overlap is deduplicated by key and offset, and loss is not allowed.</li>
+    <li>Order by log position, never by wall clock, and apply a change only if it is newer than the stored one.</li>
+    <li>Keep the raw change log append-only, then merge the latest change per key into a current-state table. Replay and new sinks come free.</li>
+    <li>Never dual-write. Put the event in an outbox table in the same transaction and let CDC deliver it.</li>
+  </ul>
+  <p>Once changes flow, the next fork is how fast to process them and whether the pipeline should be batch or streaming. → <a href="05-batch-vs-streaming.html">Batch vs Streaming</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html" target="_blank" rel="noopener"><strong>Debezium connector for PostgreSQL</strong></a> — Debezium project documentation. Snapshots, event structure, replica identity and tombstones, as the chapter uses them.</li>
+    <li><a href="https://arxiv.org/abs/2010.12597" target="_blank" rel="noopener"><strong>DBLog: A Watermark Based Change-Data-Capture Framework</strong></a> — Andreas et al., Netflix, 2020. The algorithm behind incremental snapshots that run alongside the live stream.</li>
+    <li><a href="https://www.postgresql.org/docs/current/logicaldecoding.html" target="_blank" rel="noopener"><strong>Logical Decoding</strong></a> — PostgreSQL documentation. How the write-ahead log is exposed as a change stream, and what replication slots hold.</li>
+    <li><a href="https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/" target="_blank" rel="noopener"><strong>Reliable Microservices Data Exchange With the Outbox Pattern</strong></a> — Gunnar Morling, Debezium blog, 2019. The dual-write problem and the outbox fix in a working example.</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html" target="_blank" rel="noopener"><strong>Outbox Event Router</strong></a> — Debezium documentation. How outbox rows become keyed topic events.</li>
+  </ul>
 </section>
 
 </main>

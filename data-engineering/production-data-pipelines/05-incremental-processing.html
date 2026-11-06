@@ -44,6 +44,9 @@
     <a href="#cdc">Change data capture</a>
     <a href="#backfills">Backfills that don't double-count</a>
     <a href="#ladder">The leveling ladder</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -309,7 +312,10 @@ WHEN NOT MATCHED AND src.op IN ('c','u') THEN INSERT
 -- Idempotent by construction: re-running the same range yields the same table,
 -- because each partition is fully recomputed from raw and swapped, not appended.
 
--- Spark / Iceberg / Hive dynamic partition overwrite:
+-- Spark / Iceberg / Hive dynamic partition overwrite.
+-- Spark's default overwrite mode is static, which would replace every partition.
+-- Set spark.sql.sources.partitionOverwriteMode=dynamic first (Hive serde tables
+-- always overwrite dynamically).
 INSERT OVERWRITE TABLE analytics.fct_orders
 PARTITION (event_date)
 SELECT
@@ -349,6 +355,63 @@ WHERE CAST(event_ts AS DATE) BETWEEN DATE '2024-01-01'
   </div>
   <p>You now have the machinery to process only what changed and to rebuild history safely. The remaining question is how you <em>prove</em> the output is right — and stop a bad load before it reaches consumers: <a href="06-reconciliation-and-validation.html">06 · Reconciliation &amp; Validation</a>.</p>
 </section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A table has 2 billion rows and a nightly full refresh that now misses its freshness target. What do you give up by going incremental, and what keeps the incremental result honest?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A full refresh is correct for free and costs time and money. Incremental returns the cost and takes on state, boundary conditions and drift from what a full refresh would produce. Keep a full refresh cheap enough to run periodically, or in a lower environment, and reconcile the incremental table against it. See <a href="#why">why incremental, and the risk it carries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A dbt model filters <code>WHERE updated_at &gt; (SELECT MAX(updated_at) FROM {{ this }})</code>. Name two rows it loses, and the change that makes re-reading safe.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It loses rows that share the boundary timestamp, because of the strict comparison, and rows that were edited or arrived late with an older timestamp, because they are never re-read. Use <code>&gt;=</code> with a lookback overlap and a unique-key merge. A guard such as updating only when the source version is newer means the overlap re-applies old data without clobbering new data. See <a href="#watermarks">watermarks and off-by-one bugs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Pick a load strategy for each: a click log that never changes, an accounts table whose rows are edited, and a daily revenue aggregate you can recompute from raw. Give the reason for each.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Append for the click log, with a dedup key downstream because replays duplicate rows. Merge on the account key, with a rule for which version is newer. Insert-overwrite for the aggregate, because a re-run replaces the partition instead of accumulating. Choose by the shape of change, not by habit. See <a href="#strategies">the five load strategies</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A backfill job runs <code>INSERT OVERWRITE ... PARTITION (event_date)</code> for January on Spark with default settings. What would you expect for February's data, and what do you check or set before the run?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Spark's default partition overwrite mode is static, so it can replace every partition and wipe February. Set the mode to dynamic so only partitions that receive rows are replaced, and test on a copy by comparing row counts for days outside the window before and after. See <a href="#backfills">backfills that don't double-count</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A CDC feed delivers an update, then a delete, for one account, but the delete is consumed first because they landed in different partitions. How do you stop the account being resurrected, and do you hard-delete or soft-delete?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Key the topic by primary key so changes to one row stay in one partition, and apply by log sequence number, rejecting any change that is not newer than the stored one. Soft-delete in analytics because it keeps history and makes the apply idempotent; you cannot un-hard-delete. Hard-delete only where policy requires erasure. See <a href="#cdc">change data capture</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A 30-day backfill fails on day 14. What lets you resume, and what must be true before you call it done?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Because each partition is recomputed from raw and overwritten, you re-run day 14 and continue; nothing accumulates. It is done when per-partition counts and sums match the source, not when the job exits cleanly, and it should not have advanced the production watermark. See <a href="#backfills">backfills</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Full refresh buys correctness at a cost in time and money; incremental buys the cost back and risks drift, so keep a full refresh to reconcile against.</li>
+    <li>Choose the load strategy from the shape of change: append for immutable events, merge for keyed mutable rows, insert-overwrite when a whole partition can be recomputed.</li>
+    <li>A strict greater-than on the high-water mark loses ties and late edits; use an overlap, a dedup and an idempotent merge with a newer-version guard.</li>
+    <li>Microbatch makes per-period overwrite, lookback and parallel backfill a configuration rather than hand-rolled code.</li>
+    <li>Log-based CDC supplies deletes and commit order; apply it by log position so replays are no-ops, and soft-delete in analytics.</li>
+    <li>Check how an engine overwrites partitions before a backfill, because Spark's default is static and can wipe the table.</li>
+    <li>A backfill overwrites partitions, runs apart from steady state, and finishes when reconciliation matches the source.</li>
+  </ul>
+  <p>Proving the output is right, and stopping a bad load before consumers see it, is reconciliation and validation. → <a href="06-reconciliation-and-validation.html">Reconciliation &amp; Validation</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.getdbt.com/docs/build/incremental-models" target="_blank" rel="noopener"><strong>dbt: About incremental models</strong></a> — dbt Labs docs. is_incremental(), unique_key and the full-refresh behaviour.</li>
+    <li><a href="https://docs.getdbt.com/docs/build/incremental-microbatch" target="_blank" rel="noopener"><strong>dbt: Incremental microbatch</strong></a> — dbt Labs docs. event_time, batch_size, lookback and per-batch backfills.</li>
+    <li><a href="https://docs.getdbt.com/docs/build/snapshots" target="_blank" rel="noopener"><strong>dbt: Snapshots</strong></a> — dbt Labs docs. Timestamp and check strategies for SCD Type 2 history.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/" target="_blank" rel="noopener"><strong>Iceberg: Spark Writes</strong></a> — Apache Iceberg docs. MERGE INTO and INSERT OVERWRITE, including static versus dynamic overwrite mode.</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html" target="_blank" rel="noopener"><strong>Debezium connector for PostgreSQL</strong></a> — Debezium docs. Change event structure, operation codes, delete tombstones and log positions.</li>
+  </ul>
+</section>
+
 
 </main>
 </div>
