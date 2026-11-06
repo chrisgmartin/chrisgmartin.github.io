@@ -47,6 +47,9 @@
     <a href="#governance">Governance attacks</a>
     <a href="#token-quirks">ERC-20 quirks</a>
     <a href="#checklist">A pre-merge checklist</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -112,7 +115,7 @@
     <li>Attacker deposits 1 wei. Mints 1 share.</li>
     <li>Attacker transfers (donates) 1e18 of the underlying directly to the vault. totalAssets is now 1e18 + 1, totalShares is still 1.</li>
     <li>Victim deposits 1.5e18. With <code>shares = assets × totalShares / totalAssets</code>, victim gets <code>1.5e18 × 1 / (1e18 + 1) = 1</code> share (rounded down).</li>
-    <li>Victim's deposit is split between attacker (now holds 50% of shares) and the donation pool. Attacker withdraws their 1 share and walks away with ~0.5x the victim's deposit.</li>
+    <li>Victim's deposit is split between attacker (now holds 50% of shares) and the donation pool. Totals are now 2.5e18 + 1 assets over 2 shares. Attacker redeems their 1 share for about 1.25e18, having paid 1e18 + 1, so they gain about 0.25e18 and the victim is left with a share worth about 1.25e18 for a 1.5e18 deposit.</li>
   </ol>
 
   <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Mitigation 1: virtual shares (OpenZeppelin v5)
@@ -131,9 +134,11 @@ function _deposit(uint256 assets, address receiver) internal {
     _mint(receiver, shares);
 }
 
-// Mitigation 3 (Morpho Blue): SHARES_OFFSET — shares are 1e6× the assets at parity
-uint256 public constant SHARES_OFFSET = 1e6;
-// First supply: 1 wei assets =&gt; 1e6 shares. Donating 1 wei doesn't move the ratio meaningfully.
+// Mitigation 3 (Morpho Blue): virtual shares and virtual assets in every conversion
+uint256 internal constant VIRTUAL_SHARES = 1e6;
+uint256 internal constant VIRTUAL_ASSETS = 1;
+// shares = assets * (totalShares + VIRTUAL_SHARES) / (totalAssets + VIRTUAL_ASSETS)
+// First supply: 1 wei assets =&gt; 1e6 shares. A donation barely moves the ratio.
 </code></pre></div>
 
   <div class="callout warn">
@@ -149,9 +154,9 @@ uint256 public constant SHARES_OFFSET = 1e6;
     <thead><tr><th>Operation</th><th>Round shares</th><th>Round assets</th></tr></thead>
     <tbody>
       <tr><td>Deposit (assets→shares)</td><td>Down</td><td>—</td></tr>
-      <tr><td>Withdraw (shares→assets)</td><td>—</td><td>Down</td></tr>
+      <tr><td>Redeem (shares→assets)</td><td>—</td><td>Down</td></tr>
       <tr><td>Mint (shares→assets)</td><td>—</td><td>Up</td></tr>
-      <tr><td>Redeem (assets→shares)</td><td>Up</td><td>—</td></tr>
+      <tr><td>Withdraw (assets→shares)</td><td>Up</td><td>—</td></tr>
       <tr><td>Borrow (assets→shares)</td><td>Up</td><td>—</td></tr>
       <tr><td>Repay (shares→assets)</td><td>—</td><td>Up</td></tr>
     </tbody>
@@ -183,12 +188,14 @@ uint256 public constant SHARES_OFFSET = 1e6;
 contract Vault {
     uint256 public totalAssets;
 
-    function withdraw(uint256 amount, bytes calldata data) external nonReentrant {
-        totalAssets -= amount;             // updated
+    function withdraw(uint256 shares, bytes calldata data) external nonReentrant {
+        uint256 amount = shares * totalAssets / totalShares;
+        totalAssets -= amount;             // assets updated first
         asset.safeTransfer(msg.sender, amount);
         if (data.length != 0) ICallback(msg.sender).onWithdraw(data);
-        // What if msg.sender is itself called by another protocol that reads totalAssets here?
-        // Actually fine in this case — totalAssets is committed before the call.
+        // During the callback totalAssets has dropped but totalShares has not,
+        // so pricePerShare() below returns a price that is too low.
+        totalShares -= shares;             // shares burned only after the external calls
     }
 
     function pricePerShare() external view returns (uint256) {
@@ -305,6 +312,61 @@ function rpow(uint256 x, uint256 n, uint256 base) internal pure returns (uint256
       </ul>
     </div>
   </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A vault converts shares with shares = assets × (supply + 1e6) / (totalAssets + 1). An attacker deposits 1 wei into the empty vault, donates 1e18, and a victim then deposits 1.5e18. Roughly how many shares does the victim get, what is the position worth, and why does the attack stop paying?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The attacker holds 1e6 shares and the victim receives about 3e6, so the victim's shares still redeem for about 1.5e18. The attacker's 1e6 shares redeem for about 0.5e18 against 1e18 paid, because the virtual shares absorb part of the donation. See <a href="#donation">share inflation and the donation attack</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate's borrow function rounds the new debt shares down. What can an attacker do?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Borrow amounts small enough that the shares round to zero or to less than their share of the debt, and take assets without taking on matching debt. Repeat it in a loop on a cheap chain to drain value. Borrow shares round up. See <a href="#rounding">rounding direction</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your oracle wrapper checks that the update is fresh but not that the answer is positive. The feed returns 0 during an outage with a current timestamp. What happens?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The zero passes the freshness test and is used as a price, so collateral is valued at nothing and healthy positions become liquidatable. A zero price for the loan token would instead allow free borrows. Check that the answer is positive as well as fresh. See <a href="#oracle">oracle staleness</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vault's withdraw function lowers total assets, sends the tokens, runs a callback, and only then lowers total shares. It is marked non-reentrant. What can another protocol that reads its price per share see, and how do you fix it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>During the callback, assets have dropped and shares have not, so the view returns a price that is too low, and the lock does not stop a view call from another contract. Update assets and shares together before any external call, or make the view revert while a transient lock is set. See <a href="#reentrancy">reentrancy in callbacks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A rate formula divides by one minus utilization. Which inputs break it, and what two guards do you add?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>At 100% utilization the divisor is zero, and above 100% the subtraction underflows. Clamp utilization to at most 1 before the formula, and clamp the output between a minimum and maximum rate, then test the boundaries. See <a href="#irm-math">IRM math at extreme utilization</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A user supplies 100 units of a fee-on-transfer token to your market, and 98 arrive. What breaks, and what are your options?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The books credit 100 while the contract holds 98, so the last suppliers to withdraw cannot be paid in full. Either measure the balance change and credit what arrived, or refuse such tokens, and in a permissionless design state clearly that they are unsupported. See <a href="#token-quirks">ERC-20 quirks</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Read every pull request through the bug taxonomy: bad debt, share inflation, rounding, stale oracles, callbacks, rate extremes, governance and token quirks.</li>
+    <li>Bad debt appears when prices gap faster than liquidators act, so keep a gap between max borrow LTV and LLTV, add pre-liquidations and socialise at zero collateral.</li>
+    <li>The donation attack works because shares round down against an asset balance anyone can raise, and virtual shares or dead shares remove it.</li>
+    <li>Rounding goes against the user in every conversion, and one wei in the wrong direction can be turned into a drain.</li>
+    <li>Views can be re-entered, so any view that others read as a price must be consistent during callbacks or revert.</li>
+    <li>Token behaviour is input you do not control: missing return values, fees, rebasing, blocklists and odd decimals each need a decision.</li>
+  </ul>
+  <p>Finding these bugs before launch is the work of audit, which the next chapter covers along with governance. → <a href="09-governance-and-audit.html">Governance &amp; Audit</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://blog.openzeppelin.com/a-novel-defense-against-erc4626-inflation-attacks" target="_blank" rel="noopener"><strong>A Novel Defense Against ERC4626 Inflation Attacks</strong></a> — OpenZeppelin, 2022. The virtual-offset defence and why it works.</li>
+    <li><a href="https://github.com/morpho-org/morpho-blue/blob/main/src/libraries/SharesMathLib.sol" target="_blank" rel="noopener"><strong>SharesMathLib.sol</strong></a> — Morpho Labs, source on GitHub. Virtual shares and the up and down variants of each conversion.</li>
+    <li><a href="https://github.com/d-xo/weird-erc20" target="_blank" rel="noopener"><strong>Weird ERC20 Tokens</strong></a> — d-xo, on GitHub. A catalogue of token behaviours that break integrations, with examples.</li>
+    <li><a href="https://github.com/crytic/building-secure-contracts" target="_blank" rel="noopener"><strong>Building Secure Contracts</strong></a> — Trail of Bits, on GitHub. Vulnerability classes, development guidelines and fuzzing guides.</li>
+    <li><a href="https://docs.soliditylang.org/en/latest/security-considerations.html" target="_blank" rel="noopener"><strong>Security Considerations</strong></a> — Solidity docs, accessed 2026. Reentrancy, checks-effects-interactions and other pitfalls from the compiler authors.</li>
+  </ul>
 </section>
 
 <footer>
