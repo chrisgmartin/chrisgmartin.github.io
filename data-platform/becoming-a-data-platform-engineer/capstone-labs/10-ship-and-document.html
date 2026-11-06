@@ -105,6 +105,15 @@
   QUALITY:        dbt tests + freshness checks   ·   CI/CD: GitHub Actions
   OBSERVABILITY:  structured logs + Dagster UI</div>
 
+  <p>One small file first. Every script in the repo has a working default for the Compose stack, and <code>.env</code> is gitignored, so document the knobs in a committed <code>.env.example</code> rather than asking a stranger to create config they do not need:</p>
+  <div class="code-wrap"><div class="code-header"><span>.env.example</span></div><pre><code class="language-bash"># Optional overrides. Every script defaults to the Compose stack below;
+# export these (for example `set -a; source .env`) only if your stack differs.
+GRIDDP_DSN=postgresql://griddp:griddp@localhost:5432/marketplace     # generator/generate.py
+PG_CONN="host=localhost port=5432 dbname=marketplace user=griddp password=griddp"   # ingest/extract_postgres.py
+WAREHOUSE=warehouse.duckdb                                            # ingest/extract_postgres.py
+SERVING_PG_DSN=postgresql://griddp:griddp@localhost:5432/marketplace  # ingest/publish_to_serving.py
+DUCKDB_PATH=warehouse.duckdb                                          # ingest/publish_to_serving.py</code></pre></div>
+
   <p>Now write the README. Open <code>README.md</code> in your repo root and use this as a template — fill in the bracketed bits and keep the structure:</p>
 
   <div class="code-wrap"><div class="code-header"><span>README.md</span></div><pre><code class="language-markdown"># mini-GridDP
@@ -144,10 +153,10 @@ all runnable with one Compose stack.
 
 ## What it does
 
-- Simulates a GPU-rental marketplace: customers, GPUs, rentals, prices,
-  marketplace events, and a high-volume stream of GPU telemetry.
+- Simulates a GPU-rental marketplace: customers, GPUs, rentals, a price
+  history, and a high-volume stream of GPU telemetry.
 - Lands raw data into a **bronze** layer incrementally and idempotently.
-- Models a **medallion** warehouse: silver (cleaned, with an SCD2 customer
+- Models a **medallion** warehouse: silver (cleaned, with an SCD2 price
   dimension) and gold (a star schema: `dim_customer`, `dim_gpu`, `dim_date`,
   `fct_rentals`, `fct_telemetry_hourly`).
 - Rolls the telemetry firehose up into an hourly fact.
@@ -156,19 +165,26 @@ all runnable with one Compose stack.
 
 ## Run it from scratch
 
-Requires Docker and [uv](https://docs.astral.sh/uv/). One sequence, top to bottom:
+Requires Docker and [uv](https://docs.astral.sh/uv/) (plus the `duckdb` CLI,
+same minor version as the `duckdb` package in `pyproject.toml`, if you want to
+poke at the warehouse). One sequence, top to bottom:
 
 ```bash
 git clone https://github.com/&lt;you&gt;/mini-griddp.git
 cd mini-griddp
-cp .env.example .env            # defaults work as-is for local
-docker compose up -d            # Postgres, Redpanda, Dagster, Metabase
-uv run python generator/generate.py --seed   # seed sources
-uv run dagster job execute -m dagster_app -j build_platform  # ingest → dbt → rollup
+docker compose up -d                              # Postgres, Redpanda, Dagster placeholder, Metabase
+docker compose ps                                 # wait for postgres + redpanda to show (healthy)
+uv run python generator/generate.py               # seed the Postgres source (uv builds the venv first time)
+uv run python generator/telemetry_producer.py     # let it run a minute, then Ctrl-C
+uv run dagster job execute -j full_pipeline -m dagster_app.definitions   # ingest → dbt → rollup
+uv run python ingest/publish_to_serving.py        # gold + metrics → Postgres `serving` schema
 ```
 
-Then open the dashboard at **http://localhost:3000** (Metabase) and the
-orchestration UI at **http://localhost:3001** (Dagster).
+Then open Metabase at **http://localhost:3001**, connect it to Postgres
+(host `postgres`, database `marketplace`, schema `serving`) and rebuild the
+dashboard from the SQL in `dashboards/`. For the Dagster UI, free port 3000
+from the placeholder and run the real thing:
+`docker compose stop dagster && uv run dagster dev`, then **http://localhost:3000**.
 
 ## Project layout
 
@@ -186,7 +202,7 @@ realization of that design.
     <span class="callout-label">Why the diagram matters</span>
     <p>A reviewer skims for ten seconds before deciding whether to keep reading. An architecture diagram in the first screen says "this person thinks in systems" faster than any paragraph. Put it high, keep it monospace, and make sure the boxes match what's actually in the repo.</p>
   </div>
-  <p>Adjust the command names to match what <em>your</em> repo actually uses (your Dagster job name, your generator flags). The template is a skeleton — the value is that every command in it really works, which we verify next.</p>
+  <p>Adjust the command names if <em>your</em> repo drifted from the labs (a renamed Dagster job, an extra generator flag). The template is a skeleton — the value is that every command in it really works, which we verify next.</p>
 </section>
 
 <section id="runbook">
@@ -199,26 +215,25 @@ rm -rf griddp-check
 git clone https://github.com/&lt;you&gt;/mini-griddp.git griddp-check
 cd griddp-check
 
-# 2. Config from the template
-cp .env.example .env
-
-# 3. Bring up the stack
+# 2. Bring up the stack
 docker compose up -d
-docker compose ps              # all services should be "running"/"healthy"
+docker compose ps              # postgres and redpanda show (healthy); the rest "running"
 
-# 4. Seed the sources
-uv run python generator/generate.py --seed
+# 3. Seed the sources: Postgres rows, then a minute of telemetry
+uv run python generator/generate.py
+uv run python generator/telemetry_producer.py    # Ctrl-C after a minute
 
-# 5. Build the platform: ingest -> dbt -> rollups
-uv run dagster job execute -m dagster_app -j build_platform
+# 4. Build the platform: ingest -> dbt -> rollups, then publish for BI
+uv run dagster job execute -j full_pipeline -m dagster_app.definitions
+uv run python ingest/publish_to_serving.py
 
-# 6. Open the results
-open http://localhost:3000     # Metabase dashboard  (xdg-open on Linux)
-open http://localhost:3001     # Dagster UI</code></pre></div>
+# 5. Open the results
+open http://localhost:3001     # Metabase  (xdg-open on Linux)
+docker compose stop dagster &amp;&amp; uv run dagster dev   # then open http://localhost:3000</code></pre></div>
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p><code>docker compose ps</code> lists every service running. The generator prints how many rows it seeded into Postgres and how many telemetry events it produced to Redpanda. The Dagster run finishes green with each asset materialized in order. Metabase loads your dashboard with non-empty charts — rentals by GPU, hourly telemetry, revenue metrics. If any step fails, that failure is a <strong>bug in your README</strong>, not a nuisance — fix the docs (or the code) until the sequence is clean.</p>
+    <p><code>docker compose ps</code> lists four containers. The generator prints <code>inserted 50 customers</code>, <code>10 GPUs</code>, <code>400 rentals</code>; the producer ticks out <code>sent 10 readings</code> every five seconds. The Dagster run logs each asset's <code>STEP_SUCCESS</code> in order, two passing asset checks, and <code>RUN_SUCCESS</code>. The publish prints nine <code>publishing …</code> lines. Metabase shows its setup screen (a fresh clone has no Metabase state; connect <code>serving</code> as in Lab 08 and the queries under <code>dashboards/</code> return rows). If any step fails, that failure is a <strong>bug in your README</strong>, not a nuisance — fix the docs (or the code) until the sequence is clean.</p>
   </div>
 
   <div class="callout warn">
@@ -238,7 +253,7 @@ open http://localhost:3001     # Dagster UI</code></pre></div>
   <p><strong>3. Practice a two-minute verbal walkthrough.</strong> You will be asked "tell me about a project" in every interview. Rehearse the answer out loud until it's smooth:</p>
   <ul>
     <li><strong>0:00–0:20 — what &amp; why.</strong> "Mini-GridDP is an end-to-end data platform for a GPU-rental marketplace. I built it to practice every layer of a real platform on one machine."</li>
-    <li><strong>0:20–1:20 — the path of one record.</strong> Trace a rental from Postgres → bronze → silver (with the SCD2 customer dim) → the gold star schema → a metric → a dashboard chart. The data-flow story shows you understand the whole, not just pieces.</li>
+    <li><strong>0:20–1:20 — the path of one record.</strong> Trace a rental from Postgres → bronze → silver (priced through the SCD2 price dimension) → the gold star schema → a metric → a dashboard chart. The data-flow story shows you understand the whole, not just pieces.</li>
     <li><strong>1:20–2:00 — a decision and a tradeoff.</strong> Pick one thing you chose and one thing you'd do differently at scale (e.g. "DuckDB is perfect on a laptop; in production I'd swap the gold layer onto a warehouse and keep the same dbt models").</li>
   </ul>
 
