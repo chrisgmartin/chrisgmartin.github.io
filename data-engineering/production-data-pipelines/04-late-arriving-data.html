@@ -44,6 +44,9 @@
     <a href="#bitemporal">Bitemporal modeling &amp; as-of joins</a>
     <a href="#lambda-kappa">Lambda, Kappa &amp; safe restatements</a>
     <a href="#ladder">The leveling ladder</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -136,6 +139,7 @@ USING (
         s.event_ts,
         CAST(s.event_ts AS DATE)  AS event_date,   -- partition key = EVENT time
         s.ingested_at,
+        s.source_updated_at,
         -- if the same order_id was corrected multiple times in the window,
         -- keep only the newest version by source update time
         ROW_NUMBER() OVER (
@@ -189,9 +193,10 @@ WHEN NOT MATCHED AND src.rn = 1 THEN INSERT
 -- Insert the new version at its true valid-from, and re-close the
 -- version that was previously "current" so windows never overlap.
 
--- 1) Close the previously-open version right before the late change begins.
+-- 1) Close the previously-open version where the late change begins.
+--    Windows are half-open [valid_from, valid_to), as in the as-of join below.
 UPDATE dim_customer AS d
-SET valid_to    = DATEADD('day', -1, :late_valid_from),
+SET valid_to    = :late_valid_from,
     is_current  = FALSE
 WHERE d.customer_id = :customer_id
   AND d.is_current  = TRUE
@@ -304,6 +309,64 @@ JOIN dim_customer AS d
   </div>
   <p>Next, the machinery that makes all of this cheap enough to run every hour — and the backfills that let you rebuild history without double-counting: <a href="05-incremental-processing.html">05 · Incremental Processing &amp; Backfills</a>.</p>
 </section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A team partitions daily revenue by the time their job ran. A purchase made at 23:58 reaches the pipeline at 00:04. Which day does it land in, and why does the team never see any "late" data?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It lands on the next day, so the day it happened on is short and the next is long. Nothing looks late because processing time is stamped when the job runs, and by construction it is never behind itself. The error is hidden, not absent. Event time is the only axis for business questions, and lateness is the gap between it and arrival. See <a href="#three-clocks">three clocks</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A phone flushes a week of queued events today. Your nightly job filters <code>event_ts &gt;= CURRENT_DATE - 3</code>. What happens to those events, and how do you rewrite the filter?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>They are skipped, because their event time is outside the window even though they arrived today. Filter on ingestion time to decide what to reprocess, and partition on event time to decide where each row lands. Anything older than the lookback horizon needs a periodic wide sweep or a reconciliation-triggered restatement. See <a href="#lookback">batch lookback</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A stream sets the watermark to the newest event time seen minus 5 minutes, with 10 minutes of allowed lateness. A record for a closed window arrives 20 minutes late. What does the engine do with it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The watermark has passed the window and the grace period is spent, so the record is dropped or sent to a side output instead of updating the result. Records within the grace period would have re-fired the window with a corrected value. Bigger delays catch more stragglers but make every result later. See <a href="#watermarks">watermarks and allowed lateness</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An order arrives for a customer who is not yet in <code>dim_customer</code>. Compare three ways to handle it and say which you ship.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Insert an inferred stub row for the key with an inferred flag and update it in place when the real row arrives; the surrogate key never changes, so no fact needs rewiring. Parking the fact keeps integrity but hides revenue until the dimension shows. Dropping it is data loss. Ship the stub. See <a href="#facts-dims">late facts and late dimensions</a>.</p></div></details>
+    </li>
+    <li>
+      <p>On the 5th you learn a customer moved to a higher tier on the 1st. You insert a back-dated version into the SCD2 table. What else must happen before month-end reports are right?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Close the previously open version at the new valid-from, and re-point facts from the 1st onward that were joined to the old surrogate key, or resolve the dimension at query time with an as-of join. Without that, loaded facts keep the old tier and history stays wrong. See <a href="#facts-dims">late dimensions</a> and <a href="#bitemporal">as-of joins</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Finance restates revenue after a late settlement. The growth team's dashboard also moves. Which one needs bitemporal tables, and what do you give the other?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Finance, because it must reproduce a past report as it was known on a given date and explain why it later changed, which needs both valid time and system time. The dashboard gets SCD2 valid time plus a published completeness rule, such as final after three days and provisional before. Bitemporal is overhead you pay only when past reports can legitimately change and someone must explain it. See <a href="#bitemporal">bitemporal modeling</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Event time is the axis for business numbers; ingestion time decides what to rescan; processing time is an accident of when you ran.</li>
+    <li>Late data is structural, from offline clients, retries, out-of-order partitions, extraction cutoffs and upstream corrections, and no bound on lateness exists.</li>
+    <li>A watermark or a batch lookback is a chosen completeness horizon: bigger catches more stragglers and delays every number.</li>
+    <li>A lookback filters on ingestion time and writes by event time, and the merge is idempotent so rescans never double count.</li>
+    <li>A late fact gets an inferred dimension row, never a drop; a late dimension version needs the facts re-pointed or an as-of join.</li>
+    <li>Bitemporal modeling is for numbers that may be restated and must be explained; elsewhere state a final-after-T completeness rule.</li>
+    <li>Restate by rebuilding one partition and swapping it atomically from immutable raw data.</li>
+  </ul>
+  <p>Making the rescans cheap enough to run every hour, and the backfills that rebuild history, is the work of incremental processing. → <a href="05-incremental-processing.html">Incremental Processing &amp; Backfills</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf" target="_blank" rel="noopener"><strong>The Dataflow Model</strong></a> — Akidau et al., VLDB, 2015. The source of event time, windows, watermarks and triggers as a way to trade correctness, latency and cost.</li>
+    <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/" target="_blank" rel="noopener"><strong>Flink: Generating Watermarks</strong></a> — Apache Flink docs. Bounded out-of-orderness strategies and idle sources, with code.</li>
+    <li><a href="https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html" target="_blank" rel="noopener"><strong>Structured Streaming Programming Guide</strong></a> — Apache Spark docs. Event-time windows, watermarking and late-data handling in Spark.</li>
+    <li><a href="https://martinfowler.com/articles/bitemporal-history.html" target="_blank" rel="noopener"><strong>Bitemporal History</strong></a> — Martin Fowler, 2021. Valid time and transaction time, and why both matter once records are corrected.</li>
+    <li><a href="https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-2/" target="_blank" rel="noopener"><strong>Slowly Changing Dimension Type 2</strong></a> — Kimball Group. The standard treatment of versioned dimension rows.</li>
+    <li><a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/" target="_blank" rel="noopener"><strong>Questioning the Lambda Architecture</strong></a> — Jay Kreps, O'Reilly Radar, 2014. The original argument for replay over two code paths.</li>
+  </ul>
+</section>
+
 
 </main>
 </div>

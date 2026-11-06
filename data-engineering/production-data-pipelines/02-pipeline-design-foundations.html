@@ -44,6 +44,9 @@
     <a href="#modeling">Modeling for pipelines</a>
     <a href="#ingestion">Push, pull, and CDC</a>
     <a href="#ladder">Leveling ladder</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -248,6 +251,63 @@ def load_orders_partition(warehouse, order_date: date) -> int:
   </div>
   <p>With the foundations in place, the next question is <em>who runs all this, in what order, and what happens when a step fails</em> — that's orchestration. Next: <a href="03-orchestration.html">03 · Orchestration</a>.</p>
 </section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>An orders load runs a plain <code>INSERT ... SELECT</code> into the target. The worker dies after the insert commits but before the task reports success, and the scheduler retries. What is in the table afterwards, and what is the smallest change that fixes it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every row from that run is in the table twice, so counts and sums double. Make the run own its partition: replace the whole <code>order_date</code> partition, or merge on the natural key, so a retry converges on the same result. See <a href="#idempotency">idempotency and determinism</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The partition-overwrite does its delete and insert in one transaction. What goes wrong if you run them as two separate committed statements?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A crash between them leaves the partition empty, and readers see missing data until someone notices. Even without a crash, readers can query between the two statements and see a partial day. One transaction, or a native partition swap, means readers see the old partition or the new one and nothing between. See <a href="#idempotency">idempotency and determinism</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A product manager asks for a "real-time" orders dashboard. The people using it check it a few times an hour. Which cadence do you propose, and what do you avoid taking on by doing so?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A batch or micro-batch refresh every few minutes. Streaming makes out-of-order and late events a continuous problem, with watermarks and state to run, while a late record in batch is absorbed by re-running a partition. Choose streaming only when a consumer's latency target rules batch out. See <a href="#batch-stream">batch, micro-batch, streaming</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A backfill job filters rows with <code>WHERE updated_at &gt; CURRENT_TIMESTAMP - INTERVAL '1 day'</code>. Which property does it break, and how would you rewrite it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It breaks determinism and with it re-runnability: the result depends on when the job runs, so a backfill of last month loads the wrong rows. Bind the filter to the run's data interval, as in a templated date parameter, so the same inputs always give the same output. See <a href="#idempotency">determinism killers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A regulator says card numbers must never land in the warehouse. Does that mean ETL for the whole stack?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Redact or tokenise in a small step before landing, which is the case where ETL is still right, and keep ELT for everything after it. You still get an immutable raw layer, just one that holds already-masked data, and transforms stay as versioned SQL. ETL is the exception you scope, not the default. See <a href="#etl-elt">ETL vs ELT</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The nightly pull on <code>updated_at</code> has run for a year. Finance finds orders in the warehouse that were deleted in the app. Why did the pipeline never remove them, and what are your options?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A hard delete leaves no row with a newer <code>updated_at</code>, so the query never sees it. Options are log-based CDC, which delivers deletes in commit order; soft deletes at source; or a periodic full-key reconciliation. Pick by correctness bar and by how much operating cost you can carry. See <a href="#ingestion">push, pull and CDC</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Almost every pipeline is ingest, store, transform and serve, with orchestration, observability and a catalog drawn underneath rather than inline.</li>
+    <li>Streaming does not remove the hard problems, it makes late and out-of-order data permanent, so choose it for a stated latency need and start from a correct batch design.</li>
+    <li>ELT is the default because raw data lands immutably and every downstream table can be re-derived by re-running SQL; ETL stays for masking before landing and heavy non-SQL work.</li>
+    <li>A DAG describes what runs when it is task-centric and what exists when it is asset-centric, and the second fits ELT better.</li>
+    <li>Idempotency means each run owns a partition and replaces it atomically, or merges on a natural key, so retries and backfills are safe.</li>
+    <li>Determinism fails when logic depends on the wall clock or unordered limits, so parameterise on the data interval, not on now.</li>
+    <li>Incremental pulls on a timestamp miss hard deletes, so say how deletes reach the warehouse before you are asked.</li>
+  </ul>
+  <p>Something has to run these steps in order and recover when one fails, which is the job of the orchestrator. → <a href="03-orchestration.html">Orchestration</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html" target="_blank" rel="noopener"><strong>Airflow: DAGs</strong></a> — Apache Airflow docs. The task-centric graph model and how runs are scheduled against data intervals.</li>
+    <li><a href="https://docs.getdbt.com/docs/build/incremental-strategy" target="_blank" rel="noopener"><strong>dbt: About incremental strategy</strong></a> — dbt Labs docs. Append, merge, delete+insert and insert_overwrite, with which warehouse supports which.</li>
+    <li><a href="https://docs.databricks.com/aws/en/lakehouse/medallion" target="_blank" rel="noopener"><strong>What is the medallion lakehouse architecture?</strong></a> — Databricks docs. The bronze, silver and gold layering, described by the vendor that named it.</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html" target="_blank" rel="noopener"><strong>Debezium connector for PostgreSQL</strong></a> — Debezium docs. How log-based CDC reads the write-ahead log and surfaces inserts, updates and deletes.</li>
+    <li><a href="https://queue.acm.org/detail.cfm?id=2187821" target="_blank" rel="noopener"><strong>Idempotence Is Not a Medical Condition</strong></a> — Pat Helland, ACM Queue, 2012. Why messaging and retries force idempotent handling, argued from first principles.</li>
+  </ul>
+</section>
+
 
 </main>
 </div>

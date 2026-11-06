@@ -45,6 +45,9 @@
     <a href="#failure">Deep dive · Failure modes</a>
     <a href="#tradeoffs">Steps 5–6 · Trade-offs &amp; evolution</a>
     <a href="#second">A second prompt to rehearse</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -165,7 +168,7 @@
   <h2>Deep dive · Late-arriving data</h2>
   <p>The interviewer pulls the first thread: "refunds and disputes land days or weeks after the original order — how do you handle that?" This is <a href="04-late-arriving-data.html">Chapter 04</a> made concrete. Answer in three moves, narrating the level climb as you go.</p>
   <p><strong>1 · Event time, not processing time.</strong> Every fact is stamped with the processor's <code>event_time</code> (when the money moved) and an <code>ingested_at</code> (when we saw it). All marts aggregate by <em>event date</em>, never by load date — otherwise a refund processed today silently corrupts today's revenue instead of correcting the original day's.</p>
-  <p><strong>2 · Lookback window + idempotent merge.</strong> Each incremental run doesn't just process "since the last watermark" — it re-scans a <strong>lookback window</strong> (say 7 days, sized to the p99 of observed lateness) and merges by natural key. Late events landing inside the window get folded into their correct event-date partition; the merge is idempotent so re-processing is a no-op when nothing changed.</p>
+  <p><strong>2 · Lookback window + idempotent merge.</strong> Each incremental run doesn't just process "since the last watermark" — it re-scans a <strong>lookback window</strong> of arrivals (say 7 days, enough to survive a stalled run) and merges by natural key. Late events landing inside the window get folded into their correct event-date partition; the merge is idempotent so re-processing is a no-op when nothing changed.</p>
   <div class="code-wrap">
 <div class="code-header"><span class="filename"><span class="dot"></span>fct_payments.sql</span><button class="copy-btn">Copy</button></div>
 <pre><code class="language-sql">-- dbt incremental model: absorbs late-arriving payment events by
@@ -189,10 +192,11 @@ with src as (
         ingested_at
     from {{ ref('stg_payments') }}
     {% if is_incremental() %}
-      -- reprocess a lookback window so stragglers land in the RIGHT day.
-      -- 7d >= p99 observed lateness for captures/refunds; disputes handled by SCD2 below.
-      where event_time >= (
-          select dateadd('day', -7, max(event_time)) from {{ this }}
+      -- window on ARRIVAL (ingested_at), not event_time, so a refund that lands
+      -- today with an old event_time is still re-read and merged into its own
+      -- event_date. 7d of arrivals survives a stalled run; disputes use SCD2 below.
+      where ingested_at >= (
+          select dateadd('day', -7, max(ingested_at)) from {{ this }}
       )
     {% endif %}
 )
@@ -378,6 +382,63 @@ daily_close()</code></pre>
     <p>Same six steps, opposite conclusion. In the finance scenario correctness dominated and you chose batch; here latency dominates and you chose streaming — and in both you <em>named why</em> against the SLAs. Interviewers are calibrating exactly that: can you run a repeatable process and still reach the design the requirements actually call for? Drill both until the framework is automatic, then move to <a href="10-practice-questions.html">Chapter 10</a> to pressure-test the individual mechanisms, and reread <a href="11-day-of.html">Chapter 11</a> the morning of.</p>
   </div>
 </section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>The prompt describes an app database, a payments provider, late events and a requirement that revenue tie out to the processor. Which of those drive the design, and what do they decide about batch versus streaming?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Two sources with different semantics, explicit late data, and a hard reconciliation against an external source of truth. Together they make this a financial pipeline where correctness beats latency. Nothing needs sub-second freshness and streaming would make reconciliation harder, so choose batch or micro-batch, hourly for ops and a daily close for finance. See <a href="#clarify">clarify and set SLAs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A refund for a capture made three weeks ago arrives today. The incremental model re-reads a seven-day lookback. Does the filter go on event time or ingestion time, and which partition does the refund end up in?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>On ingestion time, because the refund arrives today with an old event time and an event-time filter would never re-read it. The merge on the payment event id then writes it into its own event-date partition, so the original day is corrected and today's revenue is untouched. See <a href="#late-data">late-arriving data</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The recon query joins source and target with a full outer join and tiers its result into OK, WARN and BREAK. What does the join type catch that an inner join would hide, and who sets the tiers?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It surfaces days or currencies present on one side only: a settlement with no matching events means a missed ingest, and events with no settlement may be unsettled captures. An inner join would drop both silently. Finance agrees the tolerance up front, with zero for exact ties and a small rounding band logged as a warning. See <a href="#reconciliation">reconciliation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The payments API is down for two hours during the run. What happens to orders marts and payments marts, and how do events missed in that window get back?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Orders publish on time and payments hold with a stale flag, because failure domains are separate. A poll-based reconciler fetches events the webhooks missed, and the daily settlement reconciliation is the backstop: a permanently lost event shows up as a break and gets backfilled. Webhooks are at-least-once and deduplicated on event id. See <a href="#failure">failure modes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Ops now wants dashboards under a minute stale, while finance still needs exact daily numbers. Do you move the whole pipeline to streaming? Argue it.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Add a streaming path for the operational view only and keep the reconciled batch as the finance source of truth, so finance does not pay the complexity tax for an ops requirement. The deciding factors are the freshness SLA each consumer has and how much reconciliation difficulty each can accept. See <a href="#tradeoffs">trade-offs and evolution</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Take the clickstream prompt with offline mobile clients. Which decisions from the payments design flip, and which carry over unchanged?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Latency now dominates and approximate numbers are acceptable, so streaming with event-time watermarks and bounded allowed lateness is justified. What carries over is the dedup key for at-least-once uploads, a dead-letter path, freshness and volume monitors, and a nightly batch recount from the lake as the corrective source. See <a href="#second">a second prompt to rehearse</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Run the same six steps on any prompt: clarify, set SLAs, sketch breadth first, deep-dive late data, reconciliation and failure, then state trade-offs and evolution.</li>
+    <li>Name the load-bearing parts of the prompt back to the interviewer, and choose batch or streaming against the SLAs rather than by reflex.</li>
+    <li>Late data is absorbed by a lookback on arrival time and an idempotent merge on a natural key, with each row landing in its event date.</li>
+    <li>Reconcile against an independent source of truth by day and currency, with tiers agreed in advance, inside a write-audit-publish gate.</li>
+    <li>Handle failure by domain, and let the reconciliation backstop double as the recovery mechanism for events lost in an outage.</li>
+    <li>Add a streaming path only for the consumer that needs it, and keep the reconciled batch as the finance source of truth.</li>
+    <li>The same process can reach the opposite design when requirements differ, as the clickstream prompt shows.</li>
+  </ul>
+  <p>Next, test the individual mechanisms with questions at each level, with answers climbing from foundational to staff. → <a href="10-practice-questions.html">Practice Questions</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.stripe.com/webhooks" target="_blank" rel="noopener"><strong>Stripe: Receive Stripe events in your webhook endpoint</strong></a> — Stripe docs. At-least-once delivery, retries and duplicate events, which is why the pipeline dedups on event id.</li>
+    <li><a href="https://docs.stripe.com/reports/payout-reconciliation" target="_blank" rel="noopener"><strong>Stripe: Payout reconciliation report</strong></a> — Stripe docs. How a processor's own report ties payouts to the transactions behind them.</li>
+    <li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener"><strong>Stripe: Idempotent requests</strong></a> — Stripe API reference. A production idempotency-key design.</li>
+    <li><a href="https://docs.getdbt.com/docs/build/incremental-strategy" target="_blank" rel="noopener"><strong>dbt: About incremental strategy</strong></a> — dbt Labs docs. Merge, insert_overwrite and microbatch, which the model in this chapter relies on.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/branching/" target="_blank" rel="noopener"><strong>Iceberg: Branching and Tagging</strong></a> — Apache Iceberg docs. Branches as the staging area in write-audit-publish.</li>
+  </ul>
+</section>
+
 
 </main>
 </div>
