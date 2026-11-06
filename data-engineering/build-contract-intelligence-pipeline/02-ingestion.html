@@ -43,6 +43,9 @@
     <a href="#ingest">Ingest function</a>
     <a href="#cli">CLI wrapper</a>
     <a href="#verify">Verify</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -161,7 +164,9 @@ from ci.models import Document
 
 def derive_document_id(file_bytes: bytes, customer_id: str) -&gt; tuple[str, str]:
     h = hashlib.sha256(file_bytes).hexdigest()
-    document_id = f"doc_{customer_id[:8]}_{h[:16]}"
+    # Hash the whole customer_id with the content, so tenants never share an id
+    scoped = hashlib.sha256(f"{customer_id}:{h}".encode()).hexdigest()
+    document_id = f"doc_{customer_id[:8]}_{scoped[:16]}"
     return document_id, h
 
 
@@ -217,7 +222,7 @@ def ingest_file(path: Path, customer_id: str | None = None) -&gt; dict:
   <ul>
     <li><strong>Idempotent</strong>: re-running on the same file returns <code>status: exists</code>; no duplicate row.</li>
     <li><strong>Content-derived ID</strong>: same file from a different path produces the same document_id.</li>
-    <li><strong>Per-customer namespace</strong>: prefix the hash with customer_id, so two customers' "Acme_MSA.pdf" don't collide.</li>
+    <li><strong>Per-customer namespace</strong>: the id hashes the full customer_id together with the content hash, so two customers who upload the same "Acme_MSA.pdf" get different ids. The readable prefix is cosmetic and cannot carry the uniqueness.</li>
   </ul>
 </section>
 
@@ -319,6 +324,61 @@ def test_ingest_is_idempotent(tmp_path: Path):
   </div>
 
   <p>Run: <code>pytest tests/test_ingestion.py -v</code>. The first two tests should pass; the third requires a real fixture PDF.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A PDF already ingested as <code>acme_msa.pdf</code> is copied into the inbox again as <code>acme_nda.pdf</code>, byte for byte. What does <code>ci ingest</code> report, and which <code>doc_class</code> does the table hold afterwards?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It reports <code>exists</code> for the new file, and the row keeps <code>master_service_agreement</code>. The id comes from the content, so the lookup finds the old row and returns before classification is stored. A better filename never corrects a wrong class. See <a href="#document-id">document_id</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You run <code>ci ingest</code> twice on a folder of two PDFs and <code>psql</code> now shows three rows, not two. What happened, and what does it say about the id?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>One file changed between runs: it was re-saved, annotated or re-exported, so its bytes and hash changed and it became a new document. A content-derived id treats every byte change as a new identity. If versions of one contract must stay linked, that link needs its own column or table. See <a href="#document-id">document_id</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The id suffix hashes <code>customer_id</code> together with the content hash, rather than prefixing only the first eight characters of the customer id. Which two tenants break the shortcut, and what would the second one see?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Tenants such as <code>customer_1</code> and <code>customer_2</code> share the same first eight characters, so an identical file gets an identical id. The second tenant's <code>s.get</code> finds the first tenant's row and returns <code>exists</code>, so it never gets a row of its own and its file is attached to another tenant's record. See <a href="#ingest">Ingest function</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two <code>ci ingest</code> processes start on the same inbox at the same moment. What can go wrong with the check-then-insert in <code>ingest_file</code>, and how do you make it safe?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Both can see no row, both add one, and the slower commit fails on the primary key with an integrity error. Catch that error and report <code>exists</code>, or write the insert as <code>INSERT ... ON CONFLICT DO NOTHING</code> so the database decides. The lookup is a fast path, not a lock. See <a href="#ingest">Ingest function</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A customer re-exports the same contract from their system every week. The text is identical, but the PDF bytes differ because of an embedded timestamp. What does ingestion do, and would you hash the text instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each export becomes a new document, so storage and extraction cost grow and the same contract appears many times. Hashing normalised text removes those duplicates. The price is that two files with the same words but different signatures or stamps collapse into one. Choose by whether the signed bytes or the words are your record. See <a href="#document-id">document_id</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You run <code>alembic revision --autogenerate</code> and the new migration file contains empty upgrade and downgrade functions. What is the most likely cause?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Alembic compares the database with <code>target_metadata</code>, and that value is unset or the models module was never imported, so the metadata holds no tables. Set <code>target_metadata = Base.metadata</code> in <code>env.py</code> and import the models before it. See <a href="#migration">Initial migration</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The document id comes from the file's content and the customer, so the same bytes give the same id from any path and re-running ingest adds no rows.</li>
+    <li>Any byte change makes a new document, so versions of one contract need an explicit link; the hash cannot express them.</li>
+    <li>A readable prefix cannot carry uniqueness: the id must depend on the whole customer id, or tenants with similar names collide.</li>
+    <li>A lookup before an insert is a fast path; only a constraint, or a conflict-tolerant insert, is safe when two processes run at once.</li>
+    <li>Classification by filename runs once, at first ingest, and a re-ingest never corrects it.</li>
+    <li>An empty autogenerated migration means Alembic cannot see your models, not that the database is already right.</li>
+  </ul>
+  <p>Documents are in the table and identified, so the next step turns their pages into structured fields. → <a href="03-extraction.html">Extraction: OCR + LLM</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/16/sql-insert.html" target="_blank" rel="noopener"><strong>INSERT</strong></a> — PostgreSQL 16 docs. The ON CONFLICT clause for conflict-tolerant, idempotent writes.</li>
+    <li><a href="https://www.postgresql.org/docs/16/ddl-constraints.html" target="_blank" rel="noopener"><strong>Constraints</strong></a> — PostgreSQL 16 docs. Primary key and unique constraints as the real guard against duplicates.</li>
+    <li><a href="https://alembic.sqlalchemy.org/en/latest/autogenerate.html" target="_blank" rel="noopener"><strong>Auto Generating Migrations</strong></a> — Alembic docs, accessed 2026. What autogenerate compares, and why it can return an empty migration.</li>
+    <li><a href="https://docs.sqlalchemy.org/en/20/orm/session_basics.html" target="_blank" rel="noopener"><strong>Session Basics</strong></a> — SQLAlchemy 2.0 docs. Session lifetime, commit and rollback, the pattern behind db_session.</li>
+    <li><a href="https://docs.python.org/3/library/hashlib.html" target="_blank" rel="noopener"><strong>hashlib</strong></a> — Python docs. SHA-256 and the other digests in the standard library.</li>
+  </ul>
 </section>
 
 </main>
