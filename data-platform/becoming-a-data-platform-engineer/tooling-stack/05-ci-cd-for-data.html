@@ -64,7 +64,7 @@
 
 <div class="callout tip">
   <span class="callout-label">Setup — do this first</span>
-  <p>You'll work in a GitHub repo for your <strong>mini-griddp</strong> platform — the dbt project you've been building. If it isn't on GitHub yet, create a repo and push it: <code>git init &amp;&amp; git add . &amp;&amp; git commit -m "init" &amp;&amp; gh repo create mini-griddp --public --source=. --push</code>. You need the project tracked in git for any of this to work — CI runs <em>on</em> your repo. Keep this page open beside the GitHub <strong>Actions</strong> tab; you'll watch workflows run there.</p>
+  <p>You'll work in a GitHub repo for your <strong>mini-griddp</strong> platform — the <a href="../the-de-craft/07-transformation-with-dbt.html">dbt</a> project you've been building. If it isn't on GitHub yet, create a repo and push it: <code>git init &amp;&amp; git add . &amp;&amp; git commit -m "init" &amp;&amp; gh repo create mini-griddp --public --source=. --push</code>. You need the project tracked in git for any of this to work — CI runs <em>on</em> your repo. Keep this page open beside the GitHub <strong>Actions</strong> tab; you'll watch workflows run there.</p>
 </div>
 
 <section id="why">
@@ -86,7 +86,7 @@
 
 <section id="ci">
   <h2>Continuous Integration — main is always green</h2>
-  <p>Continuous Integration is a simple rule with big consequences: <strong>on every push and every pull request, automatically run your tests; if they fail, the change is blocked.</strong> Nothing broken gets into the shared <code>main</code> branch.</p>
+  <p>Continuous Integration is a simple rule with big consequences: <strong>on every push and every <a href="01-professional-git.html">pull request</a>, automatically run your tests; if they fail, the change is blocked.</strong> Nothing broken gets into the shared <code>main</code> branch.</p>
   <p>Here's the flow of a single change through CI/CD, from your laptop to production:</p>
   <div class="flow">  PUSH branch         OPEN pull request        MERGE to main          DEPLOY
   ──────────────────────────────────────────────────────────────────────────▶
@@ -165,7 +165,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: dbt build --target prod   # build against the REAL warehouse</code></pre></div>
+      - run: dbt build --target prod   # build against the REAL warehouse
+        working-directory: griddp_dbt  # where dbt_project.yml lives</code></pre></div>
   <p>Real teams rarely go straight to production. They promote a change through <strong>environments</strong>, each a separate target with its own warehouse/schema:</p>
   <div class="flow">   dev  ──────────▶  staging  ──────────▶  prod
    your laptop /     a prod-like copy       the real thing
@@ -189,6 +190,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: griddp_dbt   # the dbt project from Chapters 07 and 11
     steps:
       # 1. Get the PR's code onto the runner
       - name: Check out the repo
@@ -204,22 +208,69 @@ jobs:
       - name: Install dbt
         run: pip install dbt-duckdb
 
-      # 4. Build models AND run their tests against a throwaway DuckDB file.
+      # 4. The runner starts empty, so create the raw tables dbt reads.
+      - name: Create raw tables
+        run: python ../ci/seed_raw.py ci.duckdb
+
+      # 5. Build models AND run their tests against a throwaway DuckDB file.
       #    The runner is destroyed after the job, so the database is disposable.
       - name: dbt build (models + tests)
         run: dbt build --target ci
         env:
-          DBT_PROFILES_DIR: ./ci   # use a CI-only profiles.yml (below)</code></pre></div>
-  <p>That <code>--target ci</code> needs a connection. Add a tiny CI-only profile that points dbt at a local DuckDB file — no server, no secrets, no real warehouse:</p>
-  <div class="code-wrap"><div class="code-header"><span>ci/profiles.yml</span></div><pre><code class="language-yaml">mini_griddp:            # must match the profile name in dbt_project.yml
+          DBT_PROFILES_DIR: ${{ github.workspace }}/ci   # CI-only profiles.yml (below)</code></pre></div>
+  <p>Two things in that file differ from your laptop. Every <code>run</code> step happens inside <code>griddp_dbt/</code>, because that is the folder with <code>dbt_project.yml</code>. And the database is empty: on your laptop you created <code>rentals</code> and <code>customers</code> by hand in Chapters 07 and 11, so CI needs a script that does the same. Add the CI-only profile first. It points dbt at a local DuckDB file, so there is no server, no secret and no real warehouse:</p>
+  <div class="code-wrap"><div class="code-header"><span>ci/profiles.yml</span></div><pre><code class="language-yaml">griddp:                 # must match `profile:` in griddp_dbt/dbt_project.yml
   target: ci
   outputs:
     ci:
       type: duckdb
-      path: ci.duckdb   # a throwaway file, created fresh on each run</code></pre></div>
+      path: ci.duckdb   # a throwaway file, created fresh on each run
+      threads: 4</code></pre></div>
+  <p>Then the script that recreates the raw tables, the same five rentals and three customers you loaded by hand:</p>
+  <div class="code-wrap"><div class="code-header"><span>ci/seed_raw.py</span></div><pre><code class="language-python">"""Create the raw tables dbt reads, in an empty DuckDB file.
+
+Locally you made these by hand (Chapter 07, Chapter 11). A CI runner starts
+with nothing, so this script rebuilds the same two tables.
+Usage: python ../ci/seed_raw.py ci.duckdb
+"""
+import sys
+
+import duckdb
+
+con = duckdb.connect(sys.argv[1])
+con.execute("""
+  CREATE OR REPLACE TABLE rentals AS
+  SELECT *, current_timestamp AS loaded_at FROM (VALUES
+    (1, 101, 'A100',  10, 2.50, TIMESTAMP '2026-06-01 09:00'),
+    (2, 102, 'H100',   5, 4.00, TIMESTAMP '2026-06-01 11:00'),
+    (3, 101, 'A100',   8, 2.50, TIMESTAMP '2026-06-02 09:00'),
+    (4, 103, 'L40S',  20, 1.25, TIMESTAMP '2026-06-02 14:00'),
+    (5, 102, 'H100',   3, 4.00, TIMESTAMP '2026-06-03 08:00')
+  ) AS t(rental_id, customer_id, gpu_model, hours_used, price_per_hour, rented_at)
+""")
+con.execute("""
+  CREATE OR REPLACE TABLE customers AS
+  SELECT * FROM (VALUES (101, 'Ada'), (102, 'Ben'), (103, 'Cleo')) AS t(customer_id, name)
+""")
+print("raw tables:", con.execute("SELECT count(*) FROM rentals").fetchone()[0], "rentals,",
+      con.execute("SELECT count(*) FROM customers").fetchone()[0], "customers")</code></pre></div>
+  <p>You can run the job's commands on your laptop before pushing. From the repo root:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd griddp_dbt
+export DBT_PROFILES_DIR="$(cd ../ci &amp;&amp; pwd)"
+python ../ci/seed_raw.py ci.duckdb
+dbt build --target ci</code></pre></div>
+  <p>The script prints <code>raw tables: 5 rentals, 3 customers</code>, and the build ends with:</p>
+  <div class="code-wrap"><div class="code-header"><span>output</span></div><pre><code class="language-text">Concurrency: 4 threads (target='ci')
+...
+Finished running 2 table models, 10 data tests, 2 view models in 0 hours 0 minutes and 0.28 seconds (0.28s).
+
+Completed successfully
+
+Done. PASS=14 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=14</code></pre></div>
+  <p>This assumes <code>griddp_dbt/</code> holds the Chapter 07 models, the Chapter 11 tests and the exercise's <code>assert_revenue_non_negative</code> test. Keep <code>ci.duckdb</code>, <code>target/</code> and <code>logs/</code> out of git.</p>
   <p>Commit both files on a branch, push, and open a pull request:</p>
   <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git checkout -b add-ci
-git add .github/workflows/dbt-ci.yml ci/profiles.yml
+git add .github/workflows/dbt-ci.yml ci/profiles.yml ci/seed_raw.py
 git commit -m "Add dbt CI on every pull request"
 git push -u origin add-ci
 gh pr create --fill          # open the PR from the terminal</code></pre></div>
@@ -285,7 +336,7 @@ gh pr create --fill          # open the PR from the terminal</code></pre></div>
     <div class="collapse-card-body">
       <p>A safety net you haven't tested is just a hope. Add a step that makes the build <em>fail</em> when a dbt test fails (it already does — <code>dbt build</code> exits non-zero on a failing test, which fails the job), then deliberately break a model on a branch and confirm the PR is blocked.</p>
       <p><strong>1.</strong> On a new branch, add a test that you know will fail — e.g. mark a column you know has duplicates as <code>unique</code>, or a nullable column as <code>not_null</code> — in a model's <code>.yml</code>:</p>
-      <div class="code-wrap"><div class="code-header"><span>models/staging/schema.yml (deliberately broken)</span></div><pre><code class="language-yaml">models:
+      <div class="code-wrap"><div class="code-header"><span>griddp_dbt/models/staging/schema.yml (deliberately broken)</span></div><pre><code class="language-yaml">models:
   - name: stg_rentals
     columns:
       - name: customer_id     # one customer rents many times
@@ -294,11 +345,11 @@ gh pr create --fill          # open the PR from the terminal</code></pre></div>
           - not_null</code></pre></div>
       <p><strong>2.</strong> Push the branch and open a PR:</p>
       <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git checkout -b break-it
-git add models/staging/schema.yml
+git add griddp_dbt/models/staging/schema.yml
 git commit -m "Add a test that should fail in CI"
 git push -u origin break-it
 gh pr create --fill</code></pre></div>
-      <p><strong>3.</strong> Watch the <strong>dbt CI</strong> check. The <code>dbt build</code> step runs the test, the test fails, dbt exits with a non-zero code, the step fails, and the job fails — turning the PR check <strong>red ✗</strong>. With a branch-protection rule requiring this check, the <strong>Merge button is disabled</strong>: the bad change cannot reach <code>main</code>.</p>
+      <p><strong>3.</strong> Watch the <strong>dbt CI</strong> check. The <code>dbt build</code> step runs the test, the test fails (locally the same change prints <code>FAIL 2 unique_stg_rentals_customer_id</code> and <code>Done. PASS=10 WARN=0 ERROR=1 SKIP=4 NO-OP=0 REUSED=0 TOTAL=15</code>), dbt exits with a non-zero code, the step fails, and the job fails — turning the PR check <strong>red ✗</strong>. With a branch-protection rule requiring this check, the <strong>Merge button is disabled</strong>: the bad change cannot reach <code>main</code>.</p>
       <p><strong>The point:</strong> you just watched the safety net catch something. A real bug — a duplicate key, a null in a primary key — would be stopped exactly the same way, on the PR, before it ever touched production. That's the entire value of CI in one demonstration. (Now revert the broken test so your <code>main</code> stays green.)</p>
     </div>
   </details>

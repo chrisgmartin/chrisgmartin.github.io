@@ -172,8 +172,8 @@ COMMIT;
 import psycopg2
 
 WAREHOUSE = "griddp.duckdb"           # local DuckDB file = our warehouse
-PG = dict(host="localhost", port=5432, dbname="postgres",
-          user="postgres", password="postgres")
+PG = dict(host="localhost", port=5432, dbname="source",
+          user="griddp", password="griddp_pw")
 
 def get_watermark(con):
     """The highest rental_id we've already loaded (0 if the table is empty)."""
@@ -182,7 +182,7 @@ def get_watermark(con):
             rental_id   BIGINT PRIMARY KEY,
             customer_id BIGINT,
             gpu_model   VARCHAR,
-            updated_at  TIMESTAMP
+            created_at  TIMESTAMP
         )""")
     row = con.execute("SELECT max(rental_id) FROM bronze_rentals").fetchone()
     return row[0] or 0
@@ -192,7 +192,7 @@ def extract_new_rows(watermark):
     pg = psycopg2.connect(**PG)
     cur = pg.cursor()
     cur.execute(
-        "SELECT rental_id, customer_id, gpu_model, updated_at "
+        "SELECT rental_id, customer_id, gpu_model, created_at "
         "FROM rentals WHERE rental_id > %s ORDER BY rental_id",
         (watermark,),
     )
@@ -209,7 +209,7 @@ def load_idempotent(con, rows):
         ON CONFLICT (rental_id) DO UPDATE SET
             customer_id = excluded.customer_id,
             gpu_model   = excluded.gpu_model,
-            updated_at  = excluded.updated_at
+            created_at  = excluded.created_at
     """, rows)
 
 def main():
@@ -232,12 +232,12 @@ if __name__ == "__main__":
 python extract_rentals.py     # second run: should load NOTHING new</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>The <strong>first</strong> run prints <code>watermark ... = 0</code>, pulls all your rentals (say 200), and ends with <code>bronze_rentals now has 200 row(s)</code>. The <strong>second</strong> run prints the watermark as the highest id (e.g. <code>200</code>), reports <code>pulled 0 new row(s)</code>, and still ends with <code>200 row(s)</code> — <strong>not 400</strong>. The watermark skipped re-fetching; the upsert guaranteed no duplicates even if rows <em>had</em> come back. That's a correct incremental, idempotent load.</p>
+    <p>The <strong>first</strong> run prints <code>watermark ... = 0</code>, pulls all your rentals (8 if you seeded the Course 2 sample), and ends with <code>bronze_rentals now has 8 row(s)</code>. The <strong>second</strong> run prints the watermark as the highest id (<code>8</code>), reports <code>pulled 0 new row(s)</code>, and still ends with <code>8 row(s)</code> — <strong>not 16</strong>. The watermark skipped re-fetching; the upsert guaranteed no duplicates even if rows <em>had</em> come back. That's a correct incremental, idempotent load.</p>
   </div>
   <p>To see the increment actually work, insert a couple of fresh rentals into Postgres and run the script a third time — it will report exactly those new rows and nothing else.</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal · add new source rows, then re-run</span></div><pre><code class="language-bash">docker compose exec -T postgres psql -U postgres -c \
-  "INSERT INTO rentals (customer_id, gpu_model, updated_at)
-   VALUES (7, 'H100', now()), (7, 'A100', now());"
+  <div class="code-wrap"><div class="code-header"><span>terminal · add new source rows, then re-run</span></div><pre><code class="language-bash">docker compose exec -T postgres psql -U griddp -d source -c \
+  "INSERT INTO rentals (rental_id, customer_id, gpu_model, hours, price_per_hour)
+   VALUES (9, 7, 'H100', 2.0, 4.00), (10, 7, 'A100', 1.0, 2.50);"
 python extract_rentals.py     # -> pulled 2 new row(s); total grows by exactly 2</code></pre></div>
 </section>
 
@@ -283,12 +283,12 @@ python extract_rentals.py     # -> pulled 2 new row(s); total grows by exactly 2
 
 con = duckdb.connect("griddp.duckdb")
 con.execute("""CREATE TABLE IF NOT EXISTS bronze_rentals
-    (rental_id BIGINT, customer_id BIGINT, gpu_model VARCHAR, updated_at TIMESTAMP)""")
+    (rental_id BIGINT, customer_id BIGINT, gpu_model VARCHAR, created_at TIMESTAMP)""")
 
-pg = psycopg2.connect(host="localhost", dbname="postgres",
-                      user="postgres", password="postgres")
+pg = psycopg2.connect(host="localhost", dbname="source",
+                      user="griddp", password="griddp_pw")
 cur = pg.cursor()
-cur.execute("SELECT rental_id, customer_id, gpu_model, updated_at FROM rentals")  # FULL pull
+cur.execute("SELECT rental_id, customer_id, gpu_model, created_at FROM rentals")  # FULL pull
 con.executemany("INSERT INTO bronze_rentals VALUES (?, ?, ?, ?)", cur.fetchall())  # plain INSERT
 print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre></div>
       <p>Two changes do it: (1) read the current max <code>rental_id</code> from bronze and add a <code>WHERE rental_id &gt; %s</code> to the source query; (2) make the table's key a <code>PRIMARY KEY</code> and switch the <code>INSERT</code> to an <code>ON CONFLICT</code> upsert.</p>
@@ -297,15 +297,15 @@ print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre
 con = duckdb.connect("griddp.duckdb")
 con.execute("""CREATE TABLE IF NOT EXISTS bronze_rentals
     (rental_id BIGINT PRIMARY KEY, customer_id BIGINT,
-     gpu_model VARCHAR, updated_at TIMESTAMP)""")            # 1a. key for upsert
+     gpu_model VARCHAR, created_at TIMESTAMP)""")            # 1a. key for upsert
 
 # 1b. high-watermark: highest id we already have (0 if empty)
 watermark = con.execute("SELECT max(rental_id) FROM bronze_rentals").fetchone()[0] or 0
 
-pg = psycopg2.connect(host="localhost", dbname="postgres",
-                      user="postgres", password="postgres")
+pg = psycopg2.connect(host="localhost", dbname="source",
+                      user="griddp", password="griddp_pw")
 cur = pg.cursor()
-cur.execute("SELECT rental_id, customer_id, gpu_model, updated_at "
+cur.execute("SELECT rental_id, customer_id, gpu_model, created_at "
             "FROM rentals WHERE rental_id > %s ORDER BY rental_id", (watermark,))  # 1c. incremental
 rows = cur.fetchall()
 
@@ -314,7 +314,7 @@ if rows:   # a second run finds nothing new, and executemany() rejects an empty 
         ON CONFLICT (rental_id) DO UPDATE SET
             customer_id = excluded.customer_id,
             gpu_model   = excluded.gpu_model,
-            updated_at  = excluded.updated_at""", rows)  # 2. idempotent
+            created_at  = excluded.created_at""", rows)  # 2. idempotent
 print(con.execute("SELECT count(*) FROM bronze_rentals").fetchone())</code></pre></div>
       <p>Run it twice: the count holds steady instead of doubling. If you instinctively reached for "store the max, filter above it, upsert on the key," the core skill of ingestion has landed — it's the same shape for files (track loaded filenames) and APIs (track the cursor token).</p>
     </div>
