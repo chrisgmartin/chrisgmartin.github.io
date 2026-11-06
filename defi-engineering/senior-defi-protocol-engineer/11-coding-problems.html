@@ -46,6 +46,9 @@
     <a href="#p8">P8: Simple liquidation</a>
     <a href="#p9">P9: Health-factor binary search</a>
     <a href="#p10">P10: Flash-loan-based liquidator</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -183,11 +186,12 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
         balance[msg.sender] += msg.value;
     }
 
-    function withdraw(uint256 amount) external {
-        require(balance[msg.sender] &gt;= amount, "INSUF");
+    function withdraw() external {
+        uint256 amount = balance[msg.sender];
+        require(amount &gt; 0, "INSUF");
         (bool ok,) = msg.sender.call{value: amount}("");
         require(ok, "TX_FAILED");
-        balance[msg.sender] -= amount;
+        balance[msg.sender] = 0;
     }
 
     function transfer(address to, uint256 amount) external {
@@ -200,18 +204,20 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
 
   <details class="reveal">
     <summary>Reveal answer</summary>
-    <p><strong>Bug:</strong> <code>withdraw</code> performs the external call <em>before</em> updating <code>balance</code>. A malicious contract's <code>receive</code> can re-enter <code>withdraw</code> and drain the bank — the balance check still passes because the deduction hasn't happened yet.</p>
+    <p><strong>Bug:</strong> <code>withdraw</code> performs the external call <em>before</em> zeroing <code>balance</code>. A malicious contract's <code>receive</code> can re-enter <code>withdraw</code> and be paid the same amount again, and again, until the bank is empty. A related path is cross-function: the hook calls <code>transfer</code> to move the not-yet-cleared credit to an accomplice, who withdraws it later.</p>
+    <p>The version that subtracts <code>amount</code> after the call is not drainable under Solidity 0.8, because the later subtractions underflow and revert the whole transaction. It is still the wrong order, and it is exploitable in pre-0.8 code or inside an <code>unchecked</code> block.</p>
     <p><strong>Fix (CEI):</strong></p>
 
-  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw(uint256 amount) external {
-    require(balance[msg.sender] &gt;= amount, "INSUF");
-    balance[msg.sender] -= amount;                        // Effects first
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">function withdraw() external {
+    uint256 amount = balance[msg.sender];
+    require(amount &gt; 0, "INSUF");
+    balance[msg.sender] = 0;                              // Effects first
     (bool ok,) = msg.sender.call{value: amount}("");      // Interactions last
     require(ok, "TX_FAILED");
 }
 </code></pre></div>
 
-    <p>Additional belt-and-braces: add a <code>nonReentrant</code> modifier (transient-storage version in 0.8.24+).</p>
+    <p>Additional belt-and-braces: add a <code>nonReentrant</code> modifier to every function that touches balances, not only <code>withdraw</code>. A transient-storage version works from 0.8.24 with assembly and from 0.8.28 with the <code>transient</code> keyword.</p>
   </details>
 </section>
 
@@ -249,7 +255,7 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
       <li>Attacker sends 1e18 of the underlying directly to the contract (does not call deposit).</li>
       <li>Victim deposits 2e18. <code>shares = 2e18 * 1 / (1 + 1e18) = 1</code> (rounds down).</li>
       <li>Vault now holds ~3e18, distributed as 1 share to attacker, 1 share to victim.</li>
-      <li>Attacker redeems 1 share, receives ~1.5e18 — half the victim's deposit.</li>
+      <li>Attacker redeems 1 share and receives ~1.5e18, having paid ~1e18. The attacker nets ~0.5e18, a quarter of the victim's deposit, and the victim holds a share worth ~1.5e18 for 2e18 paid.</li>
     </ol>
     <p><strong>Fixes:</strong></p>
     <ul>
@@ -257,7 +263,7 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
       <li>Or mint and burn a chunk of "dead shares" on first deposit so the ratio cannot be inflated.</li>
       <li>Or use a SHARES_OFFSET (e.g., 1e6) so the first deposit mints 1e6× shares.</li>
     </ul>
-    <p>Bonus bug: <code>totalShares == 0</code> with <code>ta != 0</code> (donation before first deposit) would compute <code>shares = assets * 0 / ta = 0</code>, locking the first depositor out. The virtual-shares pattern fixes this too.</p>
+    <p>Root cause: the vault reads <code>balanceOf</code> as its asset total, so anyone can move the exchange rate by sending tokens in. Tracking assets in a storage variable closes the direct donation, but virtual shares remain the standard defence, because they also bound the loss from rounding when the supply is tiny.</p>
   </details>
 </section>
 
@@ -304,7 +310,7 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
 }
 </code></pre></div>
 
-    <p><strong>Discussion points:</strong> Linear decay is the simplest; production auctions (e.g., Liquity v2 redemptions, Aave's MEV-resistant liquidations) often use exponential decay or piecewise curves. <code>maxPayment</code> protects against price spikes between block submission and inclusion. For liquidations, the auction is parameterized by the position's debt/collateral, not a fixed quantity.</p>
+    <p><strong>Discussion points:</strong> Linear decay is the simplest; production auctions often use exponential or stepped decay curves. MakerDAO's collateral auctions, for example, offer linear, stairstep and exponential price curves. <code>maxPayment</code> protects against price spikes between block submission and inclusion. For liquidations, the auction is parameterized by the position's debt/collateral, not a fixed quantity.</p>
   </details>
 </section>
 
@@ -383,7 +389,7 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
 
 <section id="p9">
   <h2>P9 — Binary search for the price at which a position becomes unhealthy</h2>
-  <p>Given a position with collateral <code>C</code>, borrow <code>B</code>, LLTV <code>L</code>, find the largest oracle price <code>p</code> at which the position is still healthy. (Useful for off-chain liquidator simulation.)</p>
+  <p>Given a position with collateral <code>C</code>, borrow <code>B</code>, LLTV <code>L</code>, find the smallest oracle price <code>p</code> at which the position is still healthy. Below it, the position is liquidatable. (Useful for off-chain liquidator simulation.)</p>
   <details class="reveal">
     <summary>Reveal answer</summary>
 
@@ -422,10 +428,11 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
     }
 
     // 2. Called back by the lender with the funds
-    function onFlashLoan(address /*initiator*/, address /*token*/, uint256 amount, uint256 fee, bytes calldata data)
+    function onFlashLoan(address initiator, address /*token*/, uint256 amount, uint256 fee, bytes calldata data)
         external override returns (bytes32)
     {
         require(msg.sender == address(lender), "AUTH");
+        require(initiator == address(this), "UNTRUSTED_INITIATOR");   // ERC-3156: anyone can start a loan to this receiver
         (address borrower, uint256 seize, bytes memory swapData) = abi.decode(data, (address, uint256, bytes));
 
         // Approve core to pull loan token
@@ -447,11 +454,67 @@ function redeem(uint256 shares, address receiver, address owner) public returns 
     <ul>
       <li>The flow is callback-driven: <code>lender → onFlashLoan → core.liquidate → router.swap → lender</code>.</li>
       <li>Real searchers will pre-compute the optimal <code>seize</code> off-chain (binary search over the slippage curve) and pass it in.</li>
+      <li>Check both the caller and the initiator in the callback. Without the initiator check, a third party can start a flash loan with this contract as receiver and crafted <code>data</code> (ERC-3156 security considerations).</li>
       <li>Use <code>forceApprove</code> (OZ v5) for USDT compatibility.</li>
       <li>If the swap fails (illiquid collateral), the entire tx reverts — searcher loses gas but no principal.</li>
       <li>Production liquidator bots use MEV-Boost / private mempools to avoid frontrunning.</li>
     </ul>
   </details>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Run the chapter's constant-product function with an input of 1,000, reserves of 10,000 and 10,000, and a fee of 30 basis points. What should it return, and what does 909 tell you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It returns 906. A result of 909 means the fee was not applied, because the fee must come off the input before the constant-product formula. The division also truncates, which favors the pool. See <a href="#p1">P1</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The power function accrues interest over one year of seconds, about 31.5 million. Roughly how many loop iterations does it take, and what must happen on overflow?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 25, since squaring halves the remaining exponent each time and 2 to the 25th is about 33.5 million. On overflow it must revert, because wrapped arithmetic in assembly would silently produce a smaller rate and understate debt. See <a href="#p2">P2</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The naive vault reads its token balance as its asset total. Does moving the total into a storage variable remove the share-inflation problem?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It closes the direct donation, because sending tokens no longer changes the rate. It does not remove the rounding loss when supply is tiny, so virtual shares are still the standard defence. See <a href="#p5">P5</a>.</p></div></details>
+    </li>
+    <li>
+      <p>In the Bank, the fixed version clears the balance before paying. A teammate adds a reentrancy lock to withdraw only. Is the contract now safe against the attack through transfer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If the order is fixed, the balance is already zero when the hook runs, so there is nothing to move. If the order is not fixed, a lock on withdraw alone does not stop the hook calling transfer, which has no lock and moves the uncleared credit to an accomplice. Fix the order and guard every function that touches balances. See <a href="#p4">P4</a>.</p></div></details>
+    </li>
+    <li>
+      <p>When is binary search the right tool for finding a liquidation price, and when is it the wrong one?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Health is linear in price for a single collateral, so solve for the price directly. Binary search fits monotone health functions with no closed form, such as concentrated-liquidity or structured collateral. See <a href="#p9">P9</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The flash liquidator's callback checks that the caller is the lender but ignores the initiator argument. What can a third party do, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>They can start a flash loan from the lender with the liquidator as receiver and their own data, making the contract run actions they chose. Require the initiator to be the contract itself, as ERC-3156 shows. See <a href="#p10">P10</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Fee comes off the input before the constant-product formula, and truncation favors the pool.</li>
+    <li>Exponentiation by squaring takes about log2 of the exponent in steps, and it must revert on overflow instead of wrapping.</li>
+    <li>Share-inflation bugs start from a rate that outsiders can move and a supply small enough that rounding hurts, and virtual shares address both.</li>
+    <li>Reentrancy fixes are about order first: clear state before paying, and guard every function that touches the same state.</li>
+    <li>A closed form beats a search when the function is linear, and a search earns its place only where none exists.</li>
+    <li>A flash-loan receiver must check the lender and the initiator, because anyone can start a loan to it.</li>
+  </ul>
+  <p>Next, the off-chain side: reading and monitoring the chain. → <a href="12-data-pipelines.html">Data &amp; Pipelines</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://uniswap.org/whitepaper.pdf" target="_blank" rel="noopener"><strong>Uniswap v2 whitepaper</strong></a> — Adams, Zinsmeister and Robinson, 2020. The constant-product formula, fees and the price oracle.</li>
+    <li><a href="https://github.com/Uniswap/v2-core/blob/master/contracts/UniswapV2Pair.sol" target="_blank" rel="noopener"><strong>UniswapV2Pair.sol</strong></a> — Uniswap, source on GitHub. A reference swap with its end-of-call invariant check.</li>
+    <li><a href="https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/FullMath.sol" target="_blank" rel="noopener"><strong>FullMath.sol</strong></a> — Uniswap, source on GitHub. The full-precision multiply-divide the chapter sketches.</li>
+    <li><a href="https://github.com/makerdao/dss/blob/master/src/clip.sol" target="_blank" rel="noopener"><strong>clip.sol</strong></a> — MakerDAO, source on GitHub. A production collateral Dutch auction.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-3156" target="_blank" rel="noopener"><strong>ERC-3156: Flash Loans</strong></a> — Ethereum Improvement Proposals, 2020. The flash lender and borrower interfaces, with the receiver checks.</li>
+  </ul>
 </section>
 
 <footer>

@@ -43,6 +43,9 @@
     <a href="#upgradeable">Upgradeable vs immutable</a>
     <a href="#governance-knobs">Governed vs trustless params</a>
     <a href="#permissions">Permissioned vs permissionless market creation</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -56,14 +59,14 @@
 <header class="hero">
   <span class="eyebrow">Section B · Technical Core</span>
   <h1>Applied Patterns</h1>
-  <p class="subtitle">Six patterns you'll see again and again in modern DeFi protocols. For each: the shape, where it's used, what the tradeoffs are, what a senior would say when asked to defend it.</p>
+  <p class="subtitle">Seven patterns you'll see again and again in modern DeFi protocols. For each: the shape, where it's used, what the tradeoffs are, what a senior would say when asked to defend it.</p>
 </header>
 
 <section id="singleton">
   <h2>1. Singleton vs factory</h2>
   <p>In a <strong>factory</strong> pattern, each market is its own contract; the factory deploys them. In a <strong>singleton</strong>, one contract holds all markets in storage, keyed by market parameters.</p>
 
-  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Singleton — Morpho Blue / Euler v2 style
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Singleton — Morpho Blue style
 contract LendingCore {
     mapping(Id =&gt; Market) public market;
     mapping(Id =&gt; mapping(address =&gt; Position)) public position;
@@ -137,7 +140,7 @@ contract LendingCore {
   <p>Production callouts:</p>
   <ul>
     <li><strong>Inflation attack.</strong> The first depositor can mint 1 share, donate underlying, and dilute later depositors who round down to 0 shares. Mitigations: virtual shares (OpenZeppelin), dead shares (Solady), or refusing the first deposit below a minimum.</li>
-    <li><strong>Rounding everywhere.</strong> Round shares down on deposit; round assets up on redeem. Round consistently across all <code>preview*</code> / <code>convert*</code> functions.</li>
+    <li><strong>Rounding everywhere.</strong> Round against the user, as EIP-4626 recommends: shares down on deposit, assets up on mint, shares up on withdraw, assets down on redeem. The <code>convertTo*</code> functions must round down.</li>
     <li><strong>Reentrancy on rebasing or fee-on-transfer underlying.</strong> Use <code>safeTransferFrom</code>, measure balance before/after, and reject tokens that don't conform.</li>
     <li><strong>Curated risk vaults.</strong> A common pattern in modern lending: a vault holds depositor capital and allocates across multiple isolated markets according to a curator's policy. Users see one share token; risk is curated.</li>
   </ul>
@@ -182,7 +185,8 @@ contract LendingBundler {
   <h2>4. Callbacks &amp; flash loans</h2>
   <p>A callback hands control to the caller mid-transaction, then expects state to be settled by the time control returns. This is how flash loans, leverage routers, and atomic liquidation-with-swap all work.</p>
 
-  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Generic callback pattern — borrow with a callback to swap the loan into collateral
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-solidity">// Generic callback pattern — a borrow-style entry point that calls back before the final check.
+// (Morpho Blue itself has callbacks on supply, repay, supplyCollateral, liquidate and flashLoan, not on borrow.)
 function borrow(
     MarketParams calldata p,
     uint256 assets,
@@ -201,7 +205,7 @@ function borrow(
     IERC20(p.loanToken).safeTransfer(receiver, assets);
 
     // Optional callback — receiver can use loan tokens, deposit collateral, etc.
-    if (data.length != 0) IMorphoBorrowCallback(msg.sender).onMorphoBorrow(assets, data);
+    if (data.length != 0) IBorrowCallback(msg.sender).onBorrow(assets, data);
 
     // Check health AFTER the callback
     if (!_isHealthy(id, p, onBehalf)) revert UnhealthyPosition();
@@ -298,6 +302,61 @@ function pause() external onlyGuardian { paused = true; }
     <span class="callout-label">The frame</span>
     <p>"Permissionless markets + curated vaults" is the dominant new design pattern in lending. Defend it by noting: (a) it shrinks the core, (b) it makes curation economically incentivized, (c) it lets the protocol stay neutral while users still get curated UX. Defend the alternative by noting: (a) most users do not pick vaults thoughtfully, (b) protocol reputation suffers from every bad market on it, (c) governance-listed markets are easier to communicate.</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A bug is found in a singleton core's interest accrual after launch. What does the singleton's blast radius mean here compared with a factory, and why do teams accept it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every market runs the same code over the same storage, so the bug touches all markets at once, where a factory could at least deploy fixed copies for new markets. Teams accept it because the core is small, immutable and heavily audited, markets are isolated by parameters, and the gas and composability gains are real. See <a href="#singleton">singleton versus factory</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An empty ERC-4626 vault with no protection. An attacker deposits 1 unit, then donates 10,000 units straight to the vault. A victim then deposits 15,000. How many shares does the victim get, and what is the victim's position worth? Name two mitigations.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The victim gets floor(15,000 × 1 / 10,001) = 1 share, out of 2 shares over 25,001 assets, so it redeems for about 12,500 and loses about 2,500 to the attacker. A deposit of 10,000 or less would mint zero shares. Use virtual shares, dead shares, or a minimum first deposit. See <a href="#erc4626">ERC-4626 vault adapters</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Users approve a bundler contract for an unlimited amount, and a bug is later found in the bundler. The core is immutable and unaffected. Why does this still matter, and what do you do about it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The approval points at the bundler, so an attacker who can make it call transferFrom can pull tokens from every user who approved it, whatever the core does. Approve only the amount needed or use a permit, keep no balances in the bundler between calls, and review the bundler as if it held funds. See <a href="#periphery">periphery and router separation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does the core check health after the callback instead of before, and why is a blanket reentrancy lock the wrong tool for it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The callback may deposit collateral or swap to restore health, so only the state at the end of the call is meaningful. Callbacks reenter on purpose, so a blanket lock would block the feature. The protection is effects before interactions plus the post-callback invariant check. See <a href="#callbacks">callbacks and flash loans</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An upgrade to a UUPS proxy ships an implementation that does not contain the upgrade function. What happens, and how do you prevent it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The proxy can never be upgraded again, because the upgrade logic lives in the implementation and has been replaced. Prevent it with an upgrade test on a fork that performs a second upgrade after the first, and with tooling that checks upgrade safety. See <a href="#upgradeable">upgradeable versus immutable</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A proposal adds an owner-only setter for the oracle on live markets, justified as an emergency tool. How do you respond?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An oracle is a trustless parameter, since changing it moves the price every position is judged by, so one key could liquidate or protect anyone. Emergency needs belong with a guardian who can pause and cannot redirect value, and parameter lists belong behind a timelock. See <a href="#governance-knobs">governance-gated knobs versus trustless parameters</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A singleton core wins on gas, composability and one set of invariants, and its price is a blast radius that covers every market.</li>
+    <li>ERC-4626 vaults round against the user and need a defence against the first-depositor inflation attack, such as virtual shares, dead shares or a minimum deposit.</li>
+    <li>The core holds invariants and money, the periphery holds UX, and UX needs never justify a new knob in the core.</li>
+    <li>Callbacks reenter on purpose, so correctness comes from effects first and a post-callback invariant check, and views need care too.</li>
+    <li>The default is an immutable core with upgradeable periphery. If you must upgrade the core, use a long timelock and treat the key as the top target.</li>
+    <li>Keep three classes apart: trustless market parameters, timelocked allow-lists, and a narrow guardian pause. Permissionless markets relocate curation to vaults and do not remove it.</li>
+  </ul>
+  <p>How you prove such a design is correct is the next chapter. → <a href="07-evaluation-quality.html">Evaluation &amp; Quality</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-4626" target="_blank" rel="noopener"><strong>ERC-4626: Tokenized Vaults</strong></a> — Ethereum Improvement Proposals, 2021. The standard, including its rounding rules and security considerations.</li>
+    <li><a href="https://docs.openzeppelin.com/contracts/5.x/erc4626" target="_blank" rel="noopener"><strong>ERC-4626</strong></a> — OpenZeppelin docs, accessed 2026. The inflation attack and the virtual-offset defence.</li>
+    <li><a href="https://github.com/morpho-org/morpho-blue/blob/main/src/interfaces/IMorphoCallbacks.sol" target="_blank" rel="noopener"><strong>IMorphoCallbacks.sol</strong></a> — Morpho Labs, source on GitHub. The callback surface of a minimal core.</li>
+    <li><a href="https://docs.openzeppelin.com/upgrades-plugins/proxies" target="_blank" rel="noopener"><strong>Proxy Upgrade Pattern</strong></a> — OpenZeppelin docs, accessed 2026. Transparent and UUPS proxies, with their failure modes.</li>
+    <li><a href="https://eips.ethereum.org/EIPS/eip-2612" target="_blank" rel="noopener"><strong>EIP-2612: Permit</strong></a> — Ethereum Improvement Proposals, 2020. Signature-based approvals used by the periphery pattern.</li>
+  </ul>
 </section>
 
 <footer>
