@@ -92,14 +92,14 @@
   <table>
     <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>gpu_id</code></td><td>string</td><td>Which card — joins to <code>dim_gpu</code></td></tr>
+      <tr><td><code>gpu_id</code></td><td>integer</td><td>Which card — the Lab 01 <code>gpu_id</code>, so it joins to <code>dim_gpu</code></td></tr>
       <tr><td><code>ts</code></td><td>ISO timestamp</td><td>When the reading was taken</td></tr>
       <tr><td><code>util_pct</code></td><td>float 0–100</td><td>How busy the GPU is</td></tr>
       <tr><td><code>temp_c</code></td><td>float</td><td>Core temperature, Celsius</td></tr>
       <tr><td><code>power_w</code></td><td>float</td><td>Power draw, watts</td></tr>
     </tbody>
   </table>
-  <p>Create a small producer beside the generator. It reads the set of currently-active GPUs (here we just simulate a fixed fleet for the lab) and pushes a reading for each, on a loop. Notice we <strong>key each message by <code>gpu_id</code></strong> — that keeps all of one card's readings on the same partition, which matters once you scale to multiple consumers.</p>
+  <p>Create a small producer beside the generator. It reads the set of currently-active GPUs (here we simulate a fixed fleet: one card per catalog GPU from Lab 01) and pushes a reading for each, on a loop. Notice we <strong>key each message by <code>gpu_id</code></strong> — that keeps all of one card's readings on the same partition, which matters once you scale to multiple consumers.</p>
   <div class="code-wrap"><div class="code-header"><span>generator/telemetry_producer.py</span></div><pre><code class="language-python">import json, random, time
 from datetime import datetime, timezone
 from confluent_kafka import Producer
@@ -107,12 +107,13 @@ from confluent_kafka import Producer
 TOPIC = "telemetry"
 BROKER = "localhost:19092"   # Redpanda's external listener from the Lab 01 compose
 
-# A small simulated fleet of active rentals. In the real platform this list
-# would come from the rentals table; for the lab a fixed set is plenty.
-ACTIVE_GPUS = [f"gpu-{i:03d}" for i in range(1, 21)]   # 20 cards
+# A small simulated fleet: one active card per catalog GPU, keyed by the
+# Lab 01 gpu_id (1-10) so readings join dim_gpu. In the real platform this
+# list would come from the rentals table; for the lab a fixed set is plenty.
+ACTIVE_GPUS = list(range(1, 11))   # 10 cards
 
 
-def reading(gpu_id: str) -> dict:
+def reading(gpu_id: int) -> dict:
     """One realistic-ish telemetry sample for a GPU under load."""
     util = random.gauss(78, 12)                 # mostly busy, some idle dips
     util = max(0.0, min(100.0, util))
@@ -133,7 +134,7 @@ def main(interval_s: float = 5.0):
         while True:
             for gpu_id in ACTIVE_GPUS:
                 event = reading(gpu_id)
-                producer.produce(TOPIC, key=gpu_id, value=json.dumps(event))
+                producer.produce(TOPIC, key=str(gpu_id), value=json.dumps(event))
                 sent += 1
             producer.flush()             # push this batch to Redpanda
             print(f"  sent {len(ACTIVE_GPUS)} readings (total {sent})")
@@ -160,6 +161,7 @@ if __name__ == "__main__":
     <li><strong>Land it raw and untouched.</strong> Bronze keeps the data exactly as it arrived (plus a load timestamp). No cleaning, no joins — that's the next stage's job. Raw stays cheap and to the side.</li>
   </ul>
   <div class="code-wrap"><div class="code-header"><span>ingest/consume_stream.py</span></div><pre><code class="language-python">import json
+import sys
 import duckdb
 from confluent_kafka import Consumer
 
@@ -167,16 +169,18 @@ TOPIC = "telemetry"
 BROKER = "localhost:19092"
 DB = "warehouse.duckdb"
 BATCH = 200          # land in chunks of this many readings
+DRAIN = "--drain" in sys.argv   # land what is waiting, then exit once the topic is idle
+IDLE_POLLS_TO_EXIT = 5          # ...idle meaning this many empty 1s polls in a row
 
 DDL = """
 CREATE SCHEMA IF NOT EXISTS bronze;
 CREATE TABLE IF NOT EXISTS bronze.telemetry (
-    gpu_id     VARCHAR,
-    ts         TIMESTAMP,
+    gpu_id     INTEGER,
+    ts         TIMESTAMPTZ,                 -- an instant, not a wall-clock reading
     util_pct   DOUBLE,
     temp_c     DOUBLE,
     power_w    DOUBLE,
-    loaded_at  TIMESTAMP DEFAULT now()
+    loaded_at  TIMESTAMPTZ DEFAULT now()    -- when the row landed (Lab 06 reads this)
 );
 """
 
@@ -207,12 +211,17 @@ def main():
     print(f"Consuming '{TOPIC}' → {DB} (batch={BATCH}). Ctrl-C to stop.")
 
     buffer = []
+    idle_polls = 0
     try:
         while True:
             msg = consumer.poll(1.0)        # wait up to 1s for a message
             if msg is None:
                 flush(con, buffer)          # idle → flush whatever we have
+                idle_polls += 1
+                if DRAIN and idle_polls >= IDLE_POLLS_TO_EXIT:
+                    break                   # drained: nothing new for a few seconds
                 continue
+            idle_polls = 0
             if msg.error():
                 print("  consumer error:", msg.error())
                 continue
@@ -221,10 +230,11 @@ def main():
             if len(buffer) >= BATCH:
                 flush(con, buffer)
     except KeyboardInterrupt:
+        pass
+    finally:
         flush(con, buffer)
         total = con.execute("SELECT count(*) FROM bronze.telemetry").fetchone()[0]
         print(f"\nStopped. bronze.telemetry now holds {total} readings.")
-    finally:
         consumer.close()
         con.close()
 
@@ -236,11 +246,15 @@ if __name__ == "__main__":
     <span class="callout-label">Why a consumer group?</span>
     <p>The <code>group.id</code> makes Redpanda remember how far this consumer has read (its <em>offset</em>). Stop it and restart, and it resumes where it left off instead of re-landing everything — that's how streaming ingestion stays idempotent without you tracking position by hand.</p>
   </div>
+  <div class="callout tip">
+    <span class="callout-label">Two ways to stop</span>
+    <p>Run it bare and it listens until you press Ctrl-C: that is how you'll use it in this lab. Run it with <code>--drain</code> and it lands everything waiting in the topic, then exits on its own once nothing new has arrived for five seconds. That is the mode an orchestrator needs, and Lab 05 will call it that way.</p>
+  </div>
 </section>
 
 <section id="rollup">
   <h2>Roll up to an hourly fact</h2>
-  <p>Here's the payoff. Bronze now holds thousands of tiny raw readings — and we are <strong>never going to query them from the warehouse</strong>. Instead we collapse them into one row per GPU per hour. That's a 700-to-1 reduction (a card sampled every 5s = 720 readings/hour → 1 rollup row), and it's the only telemetry the rest of the platform ever sees.</p>
+  <p>Here's the payoff. Bronze now holds hundreds of tiny raw readings (thousands if you let it run) — and we are <strong>never going to query them from the warehouse</strong>. Instead we collapse them into one row per GPU per hour. That's a 700-to-1 reduction (a card sampled every 5s = 720 readings/hour → 1 rollup row), and it's the only telemetry the rest of the platform ever sees.</p>
   <p>Add this as a dbt model in your gold marts (the dbt project from Lab 03). It buckets readings into hourly windows, aggregates them, and joins <code>dim_gpu</code> so business attributes ride along:</p>
   <div class="code-wrap"><div class="code-header"><span>dbt/models/marts/fct_telemetry_hourly.sql</span></div><pre><code class="language-sql">{{ config(materialized='table') }}
 
@@ -269,8 +283,7 @@ rolled as (
 select
     r.gpu_id,
     r.hour,
-    g.gpu_model,
-    g.region,
+    g.model,
     r.avg_util_pct,
     r.max_temp_c,
     r.avg_power_w,
@@ -278,13 +291,13 @@ select
 from rolled r
 left join {{ ref('dim_gpu') }} g on r.gpu_id = g.gpu_id
 </code></pre></div>
-  <p>You'll need to register bronze as a dbt source so <code>source('bronze', 'telemetry')</code> resolves. Add it to your sources file:</p>
-  <div class="code-wrap"><div class="code-header"><span>dbt/models/marts/_sources.yml</span></div><pre><code class="language-yaml">version: 2
-sources:
-  - name: bronze
-    schema: bronze
-    tables:
-      - name: telemetry
+  <p>You'll need to register the new bronze table so <code>source('bronze', 'telemetry')</code> resolves. Add one line to the Lab 03 sources file (a second file declaring a source called <code>bronze</code> would make dbt stop with a duplicate-source error):</p>
+  <div class="code-wrap"><div class="code-header"><span>dbt/models/staging/_sources.yml (add one table)</span></div><pre><code class="language-yaml">    tables:
+      - name: customers
+      - name: gpus
+      - name: rentals
+      - name: gpu_prices
+      - name: telemetry     # landed by the Lab 04 stream consumer
 </code></pre></div>
   <p>Prefer raw SQL while you're learning the shape? The same rollup, runnable directly against DuckDB, looks like this — useful for sanity-checking before the dbt run:</p>
   <div class="code-wrap"><div class="code-header"><span>standalone SQL (DuckDB)</span></div><pre><code class="language-sql">CREATE SCHEMA IF NOT EXISTS gold;
@@ -292,15 +305,14 @@ CREATE OR REPLACE TABLE gold.fct_telemetry_hourly AS
 SELECT
     t.gpu_id,
     date_trunc('hour', t.ts)        AS hour,
-    g.gpu_model,
-    g.region,
+    g.model,
     round(avg(t.util_pct), 1)       AS avg_util_pct,
     max(t.temp_c)                   AS max_temp_c,
     round(avg(t.power_w), 1)        AS avg_power_w,
     count(*)                        AS sample_count
 FROM bronze.telemetry t
 LEFT JOIN gold.dim_gpu g ON t.gpu_id = g.gpu_id
-GROUP BY t.gpu_id, date_trunc('hour', t.ts), g.gpu_model, g.region;</code></pre></div>
+GROUP BY t.gpu_id, date_trunc('hour', t.ts), g.model;</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">The dual path, stated plainly</span>
     <p>Raw telemetry lives in bronze: high-volume, append-only, <em>never joined</em> to dimensions, never hit by a dashboard. Only the <strong>rollup</strong> — orders of magnitude smaller — enters the modeled warehouse and joins business data. Keeping the firehose to one side and serving aggregates is the core scale move from Systems Design <a href="../../data-platform-systems-design/index.html">ch. 05</a> and <a href="../../data-platform-systems-design/index.html">ch. 14</a>. Get this pattern into your bones; you'll reach for it on every high-volume source you ever meet.</p>
@@ -315,10 +327,10 @@ uv run python ingest/consume_stream.py
 # leave this running; it prints "landed N readings" as batches arrive</code></pre></div>
   <div class="code-wrap"><div class="code-header"><span>terminal 2 — produce the firehose</span></div><pre><code class="language-bash">cd mini-griddp
 uv run python generator/telemetry_producer.py
-# prints "sent 20 readings (total N)" every 5 seconds — let it run ~3–5 min</code></pre></div>
+# prints "sent 10 readings (total N)" every 5 seconds — let it run ~3–5 min</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>Terminal 2 ticking out <code>sent 20 readings</code> every few seconds, and terminal 1 answering with <code>landed 200 readings → bronze.telemetry</code> as each batch fills. After a few minutes, <strong>Ctrl-C both</strong> (consumer prints its final total). You should have a few thousand readings landed.</p>
+    <p>Terminal 2 ticking out <code>sent 10 readings</code> every five seconds, and terminal 1 answering with <code>landed 200 readings → bronze.telemetry</code> as each batch fills (every 100 seconds) and a smaller <code>landed</code> line whenever the stream goes quiet for a second. After a few minutes, <strong>Ctrl-C both</strong> (consumer prints its final total). Five minutes gives you about 600 readings.</p>
   </div>
   <p>Now build the rollup. With dbt:</p>
   <div class="code-wrap"><div class="code-header"><span>terminal — build the rollup</span></div><pre><code class="language-bash">cd mini-griddp/dbt
@@ -327,12 +339,12 @@ uv run dbt run --select fct_telemetry_hourly</code></pre></div>
   <div class="code-wrap"><div class="code-header"><span>terminal — inspect</span></div><pre><code class="language-bash">duckdb ../warehouse.duckdb -c "
   SELECT count(*) AS raw_readings FROM bronze.telemetry;
   SELECT count(*) AS rollup_rows  FROM gold.fct_telemetry_hourly;
-  SELECT gpu_id, hour, avg_util_pct, max_temp_c, sample_count
+  SELECT gpu_id, hour, model, avg_util_pct, max_temp_c, sample_count
   FROM gold.fct_telemetry_hourly
   ORDER BY hour, gpu_id LIMIT 8;"</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p><code>raw_readings</code> in the thousands, but <code>rollup_rows</code> only around <strong>20</strong> (one per GPU for the single hour you ran). The sample rows show <code>avg_util_pct</code> near 78, <code>max_temp_c</code> in the 80s, and a <code>sample_count</code> of a few dozen per GPU — and each row carries <code>gpu_model</code> / <code>region</code> from the join. That collapse from thousands of rows to ~20 <em>is</em> the win: the warehouse now answers "how hot did each card run this hour?" without ever touching the firehose.</p>
+    <p><code>raw_readings</code> in the hundreds, but <code>rollup_rows</code> only <strong>10</strong> (one per GPU for the single hour you ran; 20 if your run straddled the top of an hour). The sample rows show <code>avg_util_pct</code> near 78, <code>max_temp_c</code> in the high 80s, and a <code>sample_count</code> of a few dozen per GPU — and each row carries <code>model</code> from the join. That collapse from hundreds of rows to 10 <em>is</em> the win: the warehouse now answers "how hot did each card run this hour?" without ever touching the firehose.</p>
   </div>
 </section>
 
@@ -340,7 +352,7 @@ uv run dbt run --select fct_telemetry_hourly</code></pre></div>
   <h2>What this looks like at real scale</h2>
   <div class="callout warn">
     <span class="callout-label">The real firehose</span>
-    <p>You ran 20 GPUs sampled every 5 seconds for a few minutes. The Systems Design reference marketplace runs <strong>thousands of GPUs sampled every second — on the order of 150 million telemetry samples per day</strong>. At that volume, DuckDB on a laptop is the wrong tool: raw telemetry lands in a columnar engine built for ingest and aggregation at scale (the reference uses <strong>ClickHouse</strong>), and the hourly rollup is itself rolled up into a <strong>daily</strong> one, which may feed a <strong>monthly</strong> — a <em>rollup cascade</em>. Each tier is read far more often than it's written, so paying the aggregation cost once and reading the small result many times is what keeps queries fast and costs sane.</p>
+    <p>You ran 10 GPUs sampled every 5 seconds for a few minutes. The Systems Design reference marketplace runs <strong>thousands of GPUs sampled every second — on the order of 150 million telemetry samples per day</strong>. At that volume, DuckDB on a laptop is the wrong tool: raw telemetry lands in a columnar engine built for ingest and aggregation at scale (the reference uses <strong>ClickHouse</strong>), and the hourly rollup is itself rolled up into a <strong>daily</strong> one, which may feed a <strong>monthly</strong> — a <em>rollup cascade</em>. Each tier is read far more often than it's written, so paying the aggregation cost once and reading the small result many times is what keeps queries fast and costs sane.</p>
     <p>But the <em>shape</em> is identical to what you just built: land raw to the side, aggregate into time-bucketed facts, serve only the rollups. You've learned the pattern; production just swaps the engines and adds tiers. See Systems Design <a href="../../data-platform-systems-design/index.html">ch. 14</a> for the full-scale version.</p>
   </div>
 </section>
@@ -350,7 +362,7 @@ uv run dbt run --select fct_telemetry_hourly</code></pre></div>
   <p>You've added the streaming path and the firehose rollup to the platform. Save it.</p>
   <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp
 git add generator/telemetry_producer.py ingest/consume_stream.py \
-        dbt/models/marts/fct_telemetry_hourly.sql dbt/models/marts/_sources.yml
+        dbt/models/marts/fct_telemetry_hourly.sql dbt/models/staging/_sources.yml
 git commit -m "Lab 04: telemetry firehose — produce, land to bronze, roll up to fct_telemetry_hourly"</code></pre></div>
   <div class="callout tip">
     <span class="callout-label">Don't commit the data</span>
@@ -367,12 +379,12 @@ git commit -m "Lab 04: telemetry firehose — produce, land to bronze, roll up t
       <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every dashboard load would scan the raw firehose — 720 readings per GPU per hour at a 5-second interval, on the order of 150 million a day at the reference scale — so query time and cost grow with the fleet. Raw stays landed to one side; dashboards read <code>fct_telemetry_hourly</code>, where those 720 readings are one row. See <a href="#goal">the dual path</a> and <a href="#rollup">the rollup</a>.</p></div></details>
     </li>
     <li>
-      <p>You run the producer (20 GPUs, one reading each every 5 seconds) for four minutes, all inside one clock hour. Roughly how many rows should <code>bronze.telemetry</code> and <code>fct_telemetry_hourly</code> hold — and what changes if the four minutes straddle the top of the hour?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 20 × 12 × 4 = 960 raw readings and 20 rollup rows, each with a <code>sample_count</code> near 48. Straddle the hour and you get 40 rollup rows: <code>date_trunc('hour', ts)</code> buckets by clock hour, not by elapsed time, so each GPU's samples split across two rows. See <a href="#rollup">Roll up to an hourly fact</a> and <a href="#run">Run it end to end</a>.</p></div></details>
+      <p>You run the producer (10 GPUs, one reading each every 5 seconds) for four minutes, all inside one clock hour. Roughly how many rows should <code>bronze.telemetry</code> and <code>fct_telemetry_hourly</code> hold — and what changes if the four minutes straddle the top of the hour?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 10 × 12 × 4 = 480 raw readings and 10 rollup rows, each with a <code>sample_count</code> near 48. Straddle the hour and you get 20 rollup rows: <code>date_trunc('hour', ts)</code> buckets by clock hour, not by elapsed time, so each GPU's samples split across two rows. See <a href="#rollup">Roll up to an hourly fact</a> and <a href="#run">Run it end to end</a>.</p></div></details>
     </li>
     <li>
       <p>Every message is produced with <code>key=gpu_id</code>. With a 3-partition topic and three consumers, what does that key guarantee — and what does it not?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The same key always goes to the same partition, so all of one card's readings stay in order and are handled by a single consumer. It does not give each GPU a partition of its own: twenty keys are hashed across three partitions, so every partition carries several cards. See <a href="#produce">Produce the telemetry stream</a>.</p></div></details>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The same key always goes to the same partition, so all of one card's readings stay in order and are handled by a single consumer. It does not give each GPU a partition of its own: ten keys are hashed across three partitions, so every partition carries several cards. See <a href="#produce">Produce the telemetry stream</a>.</p></div></details>
     </li>
     <li>
       <p>You rename the consumer's <code>group.id</code> from <code>telemetry-lander</code> to <code>telemetry-lander-v2</code> and restart it. What lands in <code>bronze.telemetry</code>?</p>
@@ -395,8 +407,7 @@ git commit -m "Lab 04: telemetry firehose — produce, land to bronze, roll up t
 
 select
     gpu_id,
-    gpu_model,
-    region,
+    model,
     cast(hour as date)                          as day,
     -- weight each hour's average by its sample_count for a true daily mean
     round(sum(avg_util_pct * sample_count)
@@ -404,7 +415,7 @@ select
     max(max_temp_c)                             as max_temp_c,
     sum(sample_count)                           as sample_count
 from {{ ref('fct_telemetry_hourly') }}
-group by gpu_id, gpu_model, region, cast(hour as date)</code></pre></div>
+group by gpu_id, model, cast(hour as date)</code></pre></div>
       <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp/dbt
 uv run dbt run --select fct_telemetry_daily
 duckdb ../warehouse.duckdb -c "SELECT * FROM gold.fct_telemetry_daily ORDER BY gpu_id LIMIT 5;"</code></pre></div>

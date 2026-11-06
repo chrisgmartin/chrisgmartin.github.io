@@ -63,7 +63,7 @@
 
 <div class="callout tip">
   <span class="callout-label">Setup — do this first</span>
-  <p>You need <strong>Dagster installed</strong> in your project's virtual environment (from Course 5) and the scripts from <strong>Labs 02–04 working</strong>: <code>ingest/extract_postgres.py</code> populates bronze from Postgres, <code>ingest/consume_stream.py</code> lands telemetry, and your <code>dbt/</code> project builds silver + gold. Have the Compose stack up (<code>docker compose up -d</code>) so Postgres and Redpanda are reachable. Run each script once by hand first to confirm they still work — Dagster only orchestrates what already runs.</p>
+  <p>You need <strong>Dagster installed</strong> in the project's virtual environment (<code>uv add dagster dagster-webserver</code> from the repo root) and the scripts from <strong>Labs 02–04 working</strong>: <code>ingest/extract_postgres.py</code> populates bronze from Postgres, <code>ingest/consume_stream.py</code> lands telemetry, and your <code>dbt/</code> project builds silver + gold. Have the Compose stack up (<code>docker compose up -d</code>) so Postgres and Redpanda are reachable. Run each script once by hand first to confirm they still work — Dagster only orchestrates what already runs.</p>
 </div>
 
 <section id="goal">
@@ -83,7 +83,7 @@
                        both bronze layers must land BEFORE dbt runs                            │
                                                                                                │
          dbt produces dim/fct tables ──────────────────────────────────────────────────────────┘
-                       the hourly rollup reads the telemetry that dbt staged
+                       the hourly rollup joins the dim_gpu that dbt just built
   ──────────────────────────────────────────────────────────────────────────────────────────────────────
   Dagster reads these arrows and runs:  bronze_business + telemetry_bronze  →  dbt_build  →  fct_telemetry_hourly</div>
   <p>You declare the boxes and the arrows. Dagster does the scheduling.</p>
@@ -92,9 +92,10 @@
 <section id="assets">
   <h2>Define the assets</h2>
   <p>An asset is just a Python function decorated with <code>@asset</code>. The function name becomes the asset's name; its return is metadata about what it produced; and its function <em>arguments</em> name the assets it depends on. That argument-equals-dependency trick is the whole magic — Dagster reads the signature and builds the graph.</p>
-  <p>Create <code>dagster_app/assets.py</code>. We'll reuse the exact scripts you already wrote, calling them as subprocesses so there's a single source of truth for each step. (You could also import and call the functions directly — both are common; subprocess keeps the lab honest about what's actually running.)</p>
+  <p>Make <code>dagster_app/</code> a package (<code>mkdir -p dagster_app &amp;&amp; touch dagster_app/__init__.py</code>) and create <code>dagster_app/assets.py</code>. We'll reuse the exact scripts you already wrote, calling them as subprocesses from the repo root so there's a single source of truth for each step and every relative path (<code>warehouse.duckdb</code>) means what it meant when you ran them by hand. (You could also import and call the functions directly — both are common; subprocess keeps the lab honest about what's actually running.)</p>
 
   <div class="code-wrap"><div class="code-header"><span>dagster_app/assets.py</span></div><pre><code class="language-python">import subprocess
+import sys
 from pathlib import Path
 
 from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
@@ -102,9 +103,9 @@ import duckdb
 
 # Project paths — adjust if your repo root differs.
 REPO = Path(__file__).resolve().parents[1]
-INGEST = REPO / "ingest"
 DBT_DIR = REPO / "dbt"
-WAREHOUSE = REPO / "warehouse" / "griddp.duckdb"
+WAREHOUSE = REPO / "warehouse.duckdb"
+PYTHON = sys.executable            # the project venv's interpreter
 
 
 def _run(context: AssetExecutionContext, cmd: list[str], cwd: Path) -> str:
@@ -125,7 +126,7 @@ def _run(context: AssetExecutionContext, cmd: list[str], cwd: Path) -> str:
 def bronze_business(context: AssetExecutionContext) -> MaterializeResult:
     """Extract customers, gpus, rentals, prices from Postgres into the bronze layer.
     Wraps ingest/extract_postgres.py from Lab 02."""
-    _run(context, ["python", "extract_postgres.py"], cwd=INGEST)
+    _run(context, [PYTHON, "ingest/extract_postgres.py"], cwd=REPO)
     con = duckdb.connect(str(WAREHOUSE), read_only=True)
     rows = con.execute("select count(*) from bronze.rentals").fetchone()[0]
     con.close()
@@ -135,8 +136,8 @@ def bronze_business(context: AssetExecutionContext) -> MaterializeResult:
 @asset(group_name="bronze")
 def telemetry_bronze(context: AssetExecutionContext) -> MaterializeResult:
     """Drain the Redpanda telemetry topic and land it into bronze.
-    Wraps ingest/consume_stream.py from Lab 04."""
-    _run(context, ["python", "consume_stream.py", "--drain"], cwd=INGEST)
+    Wraps ingest/consume_stream.py from Lab 04 in its --drain mode."""
+    _run(context, [PYTHON, "ingest/consume_stream.py", "--drain"], cwd=REPO)
     con = duckdb.connect(str(WAREHOUSE), read_only=True)
     rows = con.execute("select count(*) from bronze.telemetry").fetchone()[0]
     con.close()
@@ -147,34 +148,28 @@ def telemetry_bronze(context: AssetExecutionContext) -> MaterializeResult:
 def dbt_build(context: AssetExecutionContext) -> MaterializeResult:
     """Run `dbt build` to produce silver staging + the gold star schema
     (dim_customer, dim_gpu, dim_date, fct_rentals). From Lab 03.
-    Depends on BOTH bronze assets — dbt reads the tables they land."""
-    _run(context, ["dbt", "build", "--target", "dev"], cwd=DBT_DIR)
+    Depends on BOTH bronze assets — dbt reads the tables they land.
+    The telemetry rollup (and anything built on it) is excluded here; that is the next asset."""
+    _run(context, ["dbt", "build", "--profiles-dir", ".",
+                   "--exclude", "fct_telemetry_hourly+"], cwd=DBT_DIR)
     return MaterializeResult(metadata={"dbt": MetadataValue.text("silver + gold built")})
 
 
 @asset(group_name="gold", deps=[dbt_build])
 def fct_telemetry_hourly(context: AssetExecutionContext) -> MaterializeResult:
-    """Roll the raw telemetry firehose into an hourly fact.
-    Depends on dbt_build because it reads the staged silver telemetry. From Lab 04."""
-    con = duckdb.connect(str(WAREHOUSE))
-    con.execute("""
-        create or replace table gold.fct_telemetry_hourly as
-        select
-            gpu_id,
-            date_trunc('hour', event_ts)      as hour,
-            count(*)                           as reading_count,
-            avg(utilization_pct)               as avg_utilization,
-            max(temperature_c)                 as max_temp_c,
-            avg(power_watts)                   as avg_power_watts
-        from silver.stg_telemetry
-        group by 1, 2
-    """)
+    """Roll the raw telemetry firehose into an hourly fact: the Lab 04 dbt model.
+    Depends on dbt_build because it joins the dim_gpu that dbt just rebuilt."""
+    _run(context, ["dbt", "run", "--profiles-dir", ".",
+                   "--select", "fct_telemetry_hourly+"], cwd=DBT_DIR)
+    con = duckdb.connect(str(WAREHOUSE), read_only=True)
     rows = con.execute("select count(*) from gold.fct_telemetry_hourly").fetchone()[0]
     con.close()
     return MaterializeResult(metadata={"hourly_rows": MetadataValue.int(rows)})
 </code></pre></div>
 
-  <p>Two ways to declare a dependency, both shown above:</p>
+  <p>The rollup is a dbt model (Lab 04), so the two gold assets split one dbt project by selection. The trailing <code>+</code> is dbt's graph operator for "and everything downstream of it": <code>dbt_build</code> excludes the rollup and its descendants, and the rollup asset runs exactly that set. Without the <code>+</code>, a later model built on the rollup (Lab 07 adds one) would run inside <code>dbt_build</code> and fail on a fresh warehouse, because the rollup it reads does not exist yet. That keeps the rollup its own box in the graph, which is what you want to re-materialize after a telemetry drain without touching the star schema.</p>
+
+  <p>Two ways to declare a dependency:</p>
   <table>
     <thead><tr><th>Style</th><th>How</th><th>When to use</th></tr></thead>
     <tbody>
@@ -186,18 +181,33 @@ def fct_telemetry_hourly(context: AssetExecutionContext) -> MaterializeResult:
 
   <p>Now make Dagster aware of the file. Create <code>dagster_app/definitions.py</code>, which is the entry point Dagster loads:</p>
 
-  <div class="code-wrap"><div class="code-header"><span>dagster_app/definitions.py</span></div><pre><code class="language-python">from dagster import Definitions, load_assets_from_modules
+  <div class="code-wrap"><div class="code-header"><span>dagster_app/definitions.py</span></div><pre><code class="language-python">from dagster import (
+    Definitions,
+    load_assets_from_modules,
+    load_asset_checks_from_modules,
+    in_process_executor,
+)
 
 from dagster_app import assets
 
 all_assets = load_assets_from_modules([assets])
+all_checks = load_asset_checks_from_modules([assets])   # @asset_check functions (none yet)
 
 defs = Definitions(
     assets=all_assets,
+    asset_checks=all_checks,
+    # DuckDB allows one writer per file. Run assets one at a time in this
+    # process instead of Dagster's default of one subprocess per asset.
+    executor=in_process_executor,
 )
 </code></pre></div>
 
-  <p>And a tiny <code>pyproject.toml</code> stanza (or <code>dagster.yaml</code>) so <code>dagster dev</code> knows which module holds your definitions. The simplest path is a <code>pyproject.toml</code> at the repo root:</p>
+  <div class="callout warn">
+    <span class="callout-label">Why the executor line matters</span>
+    <p>Dagster's default executor runs every asset in its own subprocess, and independent assets run at the same time. The two bronze assets are independent, so both would open <code>warehouse.duckdb</code> for writing at once, and the second one dies with <code>Could not set lock on file</code>: a DuckDB file has exactly one writer. <code>in_process_executor</code> runs the graph one step at a time, which is the right trade for a single-file warehouse. A server warehouse would not need it.</p>
+  </div>
+
+  <p>And a tiny <code>pyproject.toml</code> stanza so <code>dagster dev</code> knows which module holds your definitions. Add it to the <code>pyproject.toml</code> at the repo root:</p>
 
   <div class="code-wrap"><div class="code-header"><span>pyproject.toml (add this)</span></div><pre><code class="language-toml">[tool.dagster]
 module_name = "dagster_app.definitions"
@@ -206,16 +216,17 @@ code_location_name = "mini_griddp"
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>No errors yet — these are definitions, not runs. Sanity-check the wiring without launching the UI: <code>dagster asset list</code> should print four assets — <code>bronze_business</code>, <code>telemetry_bronze</code>, <code>dbt_build</code>, <code>fct_telemetry_hourly</code>. If it complains it can't find a module, you're likely running from the wrong directory or your package isn't importable — run from the repo root and make sure <code>dagster_app/</code> has an <code>__init__.py</code>.</p>
+    <p>No errors yet — these are definitions, not runs. Sanity-check the wiring without launching the UI: <code>uv run dagster asset list -m dagster_app.definitions</code> should print four assets — <code>bronze_business</code>, <code>dbt_build</code>, <code>fct_telemetry_hourly</code>, <code>telemetry_bronze</code> (alphabetical). If it complains it can't find a module, you're likely running from the wrong directory or your package isn't importable — run from the repo root and make sure <code>dagster_app/</code> has an <code>__init__.py</code>.</p>
   </div>
 </section>
 
 <section id="graph">
   <h2>Run the graph</h2>
-  <p>Launch Dagster's local development server. It starts a web UI and watches your code for changes:</p>
+  <p>Launch Dagster's local development server. It starts a web UI and watches your code for changes. The Lab 01 placeholder container is holding port 3000, so stop it first; from now on the real Dagster runs on your laptop:</p>
 
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># from the repo root, with your venv active
-dagster dev
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># from the repo root
+docker compose stop dagster     # free port 3000 (the Lab 01 placeholder)
+uv run dagster dev
 
 # it prints something like:
 #   Serving dagster-webserver on http://127.0.0.1:3000
@@ -241,7 +252,7 @@ dagster dev
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>The two bronze assets start <em>first and in parallel</em> (they have no dependency on each other). Only once both are green does <code>dbt_build</code> start. Then <code>fct_telemetry_hourly</code> runs last. Every box ends green, and clicking one shows the metadata you returned — <code>bronze_rental_rows</code>, <code>hourly_rows</code>, and so on — plus the streamed subprocess logs. If a box goes red, click it, read the logs (Dagster captured the script's stderr for you), fix, and click <strong>Materialize</strong> on just that asset.</p>
+    <p>The two bronze assets go first (they have no dependency on each other, so Dagster is free to pick either order; the in-process executor runs them one after the other). Only once both are green does <code>dbt_build</code> start. Then <code>fct_telemetry_hourly</code> runs last. The telemetry step takes a few seconds longer than the rest: it waits for the topic to go quiet before it exits. Every box ends green, and clicking one shows the metadata you returned — <code>bronze_rental_rows</code>, <code>hourly_rows</code>, and so on — plus the streamed subprocess logs. If a box goes red, click it, read the logs (Dagster captured the script's stderr for you), fix, and click <strong>Materialize</strong> on just that asset.</p>
   </div>
 
   <div class="callout tip">
@@ -257,16 +268,19 @@ dagster dev
   <div class="code-wrap"><div class="code-header"><span>dagster_app/definitions.py (updated)</span></div><pre><code class="language-python">from dagster import (
     Definitions,
     load_assets_from_modules,
+    load_asset_checks_from_modules,
     define_asset_job,
     ScheduleDefinition,
     AssetSelection,
+    in_process_executor,
 )
 
 from dagster_app import assets
 
 all_assets = load_assets_from_modules([assets])
+all_checks = load_asset_checks_from_modules([assets])
 
-# A job that materializes every asset in the pipeline.
+# A job that materializes every asset in the pipeline (and runs its checks).
 pipeline_job = define_asset_job(
     name="full_pipeline",
     selection=AssetSelection.all(),
@@ -282,8 +296,10 @@ daily_schedule = ScheduleDefinition(
 
 defs = Definitions(
     assets=all_assets,
+    asset_checks=all_checks,
     jobs=[pipeline_job],
     schedules=[daily_schedule],
+    executor=in_process_executor,   # one DuckDB writer at a time
 )
 </code></pre></div>
 
@@ -323,15 +339,15 @@ defs = Definitions(
 docker compose up -d
 
 # materialize the entire pipeline as one job, headless
-dagster job execute -j full_pipeline -m dagster_app.definitions
+uv run dagster job execute -j full_pipeline -m dagster_app.definitions
 
 # ...then peek at the result in DuckDB
-duckdb warehouse/griddp.duckdb \
+duckdb warehouse.duckdb \
   "select count(*) as hourly_rows from gold.fct_telemetry_hourly;"</code></pre></div>
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>Dagster logs each asset starting and finishing in dependency order — <code>bronze_business</code> and <code>telemetry_bronze</code> first, then <code>dbt_build</code>, then <code>fct_telemetry_hourly</code> — and a final "RUN_SUCCESS". The DuckDB query returns a positive <code>hourly_rows</code> count. That single command just did what used to be four manual steps in the right order. That's the lab.</p>
+    <p>Dagster logs each asset's <code>STEP_START</code> and <code>STEP_SUCCESS</code> in dependency order — <code>bronze_business</code> and <code>telemetry_bronze</code> first, then <code>dbt_build</code>, then <code>fct_telemetry_hourly</code> — and a final <code>RUN_SUCCESS</code>. The DuckDB query returns <code>hourly_rows</code> of 10 (one per GPU for the hour you streamed in Lab 04; more if the stream crossed an hour boundary). That single command just did what used to be four manual steps in the right order. That's the lab.</p>
   </div>
 </section>
 
@@ -339,12 +355,13 @@ duckdb warehouse/griddp.duckdb \
   <h2>Commit Lab 05</h2>
   <p>Your orchestration layer now exists in code. Commit it so your history keeps telling the story:</p>
   <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd mini-griddp
-git add dagster_app/ pyproject.toml
+printf '.tmp_dagster_home_*/\n' &gt;&gt; .gitignore
+git add dagster_app/ pyproject.toml uv.lock .gitignore
 git status                 # confirm only the orchestration files are staged
 git commit -m "Lab 05: Dagster asset graph + daily schedule (ingest → dbt → rollup)"</code></pre></div>
   <div class="callout tip">
     <span class="callout-label">Don't commit run state</span>
-    <p>When <code>dagster dev</code> runs, it writes a local <code>$DAGSTER_HOME</code> (or a <code>tmp</code> instance) full of run history and logs. Add it to <code>.gitignore</code> — it's machine state, not source. Your repo should contain the <em>definitions</em>, never the run database.</p>
+    <p>With no <code>DAGSTER_HOME</code> set, <code>dagster dev</code> writes a temporary instance in the repo root, <code>.tmp_dagster_home_&lt;random&gt;/</code>, full of run history and logs. It normally removes the folder on a clean exit; the <code>.gitignore</code> line above covers the times it doesn't. Your repo should contain the <em>definitions</em>, never the run database.</p>
   </div>
 </section>
 
@@ -370,7 +387,7 @@ git commit -m "Lab 05: Dagster asset graph + daily schedule (ingest → dbt → 
     </li>
     <li>
       <p><code>dbt_build</code> is a single box standing for every dbt model. What do you give up compared with one Dagster asset per model, and when is the single box still the right call?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Granularity. If one model fails the whole box is red, a retry re-runs every model, and the graph cannot show which table is stale or let you rebuild one mart. For a small project that builds in seconds, one box is simpler and perfectly honest. As models multiply or get slow, per-model assets win — which is where Lab 06 heads with the dagster-dbt integration. See <a href="#assets">Define the assets</a>.</p></div></details>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Granularity. If one model fails the whole box is red, a retry re-runs every model, and the graph cannot show which table is stale or let you rebuild one mart. For a small project that builds in seconds, one box is simpler and perfectly honest. As models multiply or get slow, per-model assets win — the dagster-dbt integration (<code>@dbt_assets</code>) turns every model into its own asset and every dbt test into an asset check. This capstone keeps the single box. See <a href="#assets">Define the assets</a>.</p></div></details>
     </li>
     <li>
       <p>A teammate has one nightly script with nothing downstream of it and asks why it needs Dagster at all. Where is the line?</p>
@@ -394,7 +411,7 @@ def hourly_rollup_not_empty() -> AssetCheckResult:
         passed=bool(rows > 0),
         metadata={"row_count": MetadataValue.int(rows)},
     )</code></pre></div>
-      <p>Save (the server auto-reloads), open <code>fct_telemetry_hourly</code> in the UI, and click <strong>Materialize</strong>. Under the asset you'll now see a <strong>Checks</strong> tab with <code>hourly_rollup_not_empty</code> reporting <strong>Passed</strong> and the <code>row_count</code> metadata.</p>
+      <p>Save (the server auto-reloads; <code>load_asset_checks_from_modules</code> in <code>definitions.py</code> is what picks the new function up), open <code>fct_telemetry_hourly</code> in the UI, and click <strong>Materialize</strong>. Under the asset you'll now see a <strong>Checks</strong> tab with <code>hourly_rollup_not_empty</code> reporting <strong>Passed</strong> and the <code>row_count</code> metadata.</p>
       <p><strong>Prefer a downstream asset instead?</strong> Add one that depends on <code>fct_telemetry_hourly</code> — for example a <code>leaderboard_top_gpus</code> asset that selects the ten busiest GPUs by total readings — declare <code>deps=[fct_telemetry_hourly]</code>, and watch it appear as a new box hanging off the bottom of the graph. Re-materialize all and confirm it runs dead last.</p>
       <p>Either way, you've extended a live, orchestrated pipeline by adding one declaration — no scheduling logic, no ordering code. That's the power you just unlocked.</p>
     </div>

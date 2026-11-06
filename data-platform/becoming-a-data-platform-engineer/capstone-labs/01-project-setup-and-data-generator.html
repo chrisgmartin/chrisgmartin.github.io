@@ -119,10 +119,12 @@
       - --smp 1
       - --overprovisioned
       - --node-id 0
-      - --kafka-addr PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+      # Two listeners: containers reach the broker as redpanda:9092,
+      # your laptop reaches it as localhost:19092 (Lab 04 uses this one).
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
     ports:
-      - "9092:9092"
+      - "19092:19092"
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 5s
@@ -134,7 +136,7 @@
     container_name: griddp-dagster
     # We run Dagster locally with `dagster dev` in later labs; this service
     # is a placeholder webserver so the UI port is reserved and documented.
-    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000"]
+    command: ["dagster-webserver", "--empty-workspace", "-h", "0.0.0.0", "-p", "3000"]
     ports:
       - "3000:3000"
     depends_on:
@@ -155,7 +157,7 @@ volumes:
 
   <div class="callout tip">
     <span class="callout-label">Why these choices</span>
-    <p>The named volume <code>pgdata</code> keeps your data when containers restart, so you don't regenerate on every reboot. Health checks let downstream services wait until Postgres is genuinely ready, not just started. Metabase maps to host port <strong>3001</strong> so it doesn't collide with Dagster on 3000. We'll wire up Dagster and Metabase properly in Labs 05 and 08 — for now they just need to be reachable.</p>
+    <p>The named volume <code>pgdata</code> keeps your data when containers restart, so you don't regenerate on every reboot. Health checks let downstream services wait until Postgres is genuinely ready, not just started. Metabase maps to host port <strong>3001</strong> so it doesn't collide with Dagster on 3000. Redpanda gets two listeners because a Kafka client connects to whatever address the broker <em>advertises</em>: other containers need <code>redpanda:9092</code>, but a script on your laptop needs <code>localhost:19092</code>, so the broker advertises both. We'll wire up Dagster and Metabase properly in Labs 05 and 08 — for now they just need to be reachable.</p>
   </div>
 
   <p>Bring the stack up. The first run pulls images and may take a few minutes:</p>
@@ -164,7 +166,7 @@ docker compose ps           # show the status of each service</code></pre></div>
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p><code>docker compose ps</code> lists four containers. <code>griddp-postgres</code> and <code>griddp-redpanda</code> show status <code>healthy</code> (give them ~15 seconds). Visiting <code>http://localhost:3001</code> shows the Metabase setup screen, and <code>http://localhost:3000</code> shows the Dagster UI. If Postgres isn't healthy, run <code>docker compose logs postgres</code> and check that port 5432 isn't already in use by a local install.</p>
+    <p><code>docker compose ps</code> lists four containers. <code>griddp-postgres</code> and <code>griddp-redpanda</code> show status <code>healthy</code> (give them ~15 seconds). Visiting <code>http://localhost:3000</code> shows the Dagster UI with an empty workspace (no code location yet; Lab 05 adds one), and <code>http://localhost:3001</code> shows the Metabase setup screen once it has finished booting, which takes a minute or two. If Postgres isn't healthy, run <code>docker compose logs postgres</code> and check that port 5432 isn't already in use by a local install.</p>
   </div>
 </section>
 
@@ -233,17 +235,16 @@ CREATE INDEX idx_customers_created_at ON customers(created_at);</code></pre></di
 
 <section id="generator">
   <h2>The data generator</h2>
-  <p>The generator is the marketplace's heartbeat — it plays thousands of customers signing up and renting GPUs. We'll write it in Python using <code>psycopg</code> (the modern Postgres driver) and <code>Faker</code> for realistic names. Set up an isolated environment in the <code>generator/</code> folder with <strong>uv</strong>:</p>
+  <p>The generator is the marketplace's heartbeat — it plays thousands of customers signing up and renting GPUs. We'll write it in Python using <code>psycopg</code> (the modern Postgres driver) and <code>Faker</code> for realistic names. Set up one Python environment at the repo root with <strong>uv</strong>; every later lab (<code>duckdb</code>, <code>dbt</code>, <code>dagster</code>) adds its packages to this same project:</p>
 
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd generator
-uv init --no-workspace          # creates pyproject.toml if you don't have one
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv init --bare                  # a pyproject.toml at the repo root, nothing else
 uv add "psycopg[binary]" faker  # the Postgres driver + fake-data library</code></pre></div>
 
   <p>Now write <code>generator/generate.py</code>. It loads the schema, then inserts customers, GPUs with a price history, and a few hundred rentals spread across the last 90 days:</p>
 
   <div class="code-wrap"><div class="code-header"><span>mini-griddp/generator/generate.py</span></div><pre><code class="language-python">"""Populate the marketplace source database with realistic data.
 
-Run after `docker compose up`:   uv run python generate.py
+Run from the repo root after `docker compose up`:   uv run python generator/generate.py
 Re-running rebuilds the schema and regenerates from scratch.
 """
 import os
@@ -358,8 +359,8 @@ if __name__ == "__main__":
 
 <section id="run">
   <h2>Run it &amp; verify</h2>
-  <p>With the stack up and Postgres healthy, run the generator from inside the <code>generator/</code> folder:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generate.py</code></pre></div>
+  <p>With the stack up and Postgres healthy, run the generator from the repo root:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generator/generate.py</code></pre></div>
 
   <p>It prints its progress: schema created, customers, GPUs, rentals. Now confirm the data is really in Postgres by querying it directly with <code>psql</code>:</p>
   <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># connect to the running container's database
@@ -384,19 +385,19 @@ ORDER BY total_hours DESC;
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p><code>customers</code> → <strong>50</strong>, <code>gpus</code> → <strong>10</strong>, <code>gpu_prices</code> → somewhere between <strong>10 and 30</strong> (1–3 points each), and <code>rentals</code> → <strong>400</strong>. The grouped query returns all ten models with rental counts and total hours, ordered by usage. Because the generator is seeded, your counts will match exactly on every run. If a count is zero, the insert step failed silently — re-run and read the printed progress lines.</p>
+    <p><code>customers</code> → <strong>50</strong>, <code>gpus</code> → <strong>10</strong>, <code>gpu_prices</code> → <strong>23</strong> (1–3 points per GPU; the seed fixes it at 23), and <code>rentals</code> → <strong>400</strong>. The grouped query returns all ten models with rental counts and total hours, ordered by usage. Because the generator is seeded, your counts will match exactly on every run. If a count is zero, the insert step failed silently — re-run and read the printed progress lines.</p>
   </div>
 </section>
 
 <section id="commit">
   <h2>Commit</h2>
-  <p>You just gave the platform a beating heart. Lock it in. From the repo root:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">cd ..                    # back to mini-griddp/ root
-git add docker-compose.yml generator/
+  <p>You just gave the platform a beating heart. Lock it in. From the repo root, ignore the virtualenv first, then commit the stack, the generator and the project files:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">printf '.venv/\n__pycache__/\n.env\n' &gt;&gt; .gitignore
+git add docker-compose.yml generator/ pyproject.toml uv.lock .gitignore
 git commit -m "Lab 01: Compose stack + Postgres source schema + data generator"</code></pre></div>
   <div class="callout tip">
     <span class="callout-label">Mind the secrets</span>
-    <p>Our credentials here (<code>griddp/griddp</code>) are fine to commit because this is a throwaway local database — but build the habit now: real connection strings and passwords belong in <code>.env</code> (gitignored), referenced from Compose. Check <code>git status</code> shows no stray <code>.venv</code> or <code>__pycache__</code> folders; if it does, add them to <code>.gitignore</code> before committing.</p>
+    <p>Our credentials here (<code>griddp/griddp</code>) are fine to commit because this is a throwaway local database — but build the habit now: real connection strings and passwords belong in <code>.env</code> (gitignored), referenced from Compose. Check <code>git status</code> shows no stray <code>.venv</code> or <code>__pycache__</code> folders; if it does, they are missing from <code>.gitignore</code>.</p>
   </div>
 </section>
 
@@ -479,7 +480,7 @@ conn.execute(
     ),
 )</code></pre></div>
       <p><strong>3. Re-run and verify:</strong></p>
-      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generate.py
+      <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python generator/generate.py
 docker compose exec postgres psql -U griddp -d marketplace \
   -c "SELECT rg.code, count(*) AS rentals
       FROM rentals r JOIN regions rg ON rg.region_id = r.region_id

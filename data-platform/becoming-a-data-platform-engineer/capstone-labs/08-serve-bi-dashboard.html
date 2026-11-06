@@ -62,7 +62,7 @@
 
 <div class="callout tip">
   <span class="callout-label">Setup — do this first</span>
-  <p>Bring up the stack from Lab 01 with <code>docker compose up -d</code>, and confirm <strong>Metabase</strong> is running (the <code>metabase</code> service in your Compose file). You also need your <strong>gold marts</strong> from Lab 03 (<code>dim_customer</code>, <code>dim_gpu</code>, <code>fct_rentals</code>, <code>fct_telemetry_hourly</code>) and the <strong>semantic metrics</strong> from Lab 07 built and populated. If <code>dbt build</code> ran clean at the end of Lab 07, you're ready. Keep this page beside your browser and your terminal.</p>
+  <p>Bring up the stack from Lab 01 with <code>docker compose up -d</code>, and confirm <strong>Metabase</strong> answers at <a href="http://localhost:3001" target="_blank" rel="noopener">http://localhost:3001</a> (the <code>metabase</code> service in your Compose file; give it a minute to boot). You also need your <strong>gold marts</strong> from Lab 03 (<code>dim_customer</code>, <code>dim_gpu</code>, <code>fct_rentals</code>, <code>fct_telemetry_hourly</code>) and the <strong>semantic metrics</strong> from Lab 07 built and populated. If <code>uv run dbt build</code> ran clean at the end of Lab 07, you're ready. Keep this page beside your browser and your terminal.</p>
 </div>
 
 <section id="goal">
@@ -83,7 +83,7 @@
                            └──────────────┘  + charts
   ─────────────────────────────────────────────────────────────────────────▶
   governed numbers: every chart reads the SAME marts/metrics, so the numbers agree</div>
-  <p>By the end you'll have a single dashboard with five charts — GMV over time, utilization by GPU model, fill rate, top customers by revenue, and telemetry health — all reading from the governed gold layer so the numbers match everywhere.</p>
+  <p>By the end you'll have a single dashboard with five charts — GMV over time, utilization by GPU model, ARPU per month, top customers by revenue, and telemetry health — all reading from the governed gold layer so the numbers match everywhere.</p>
 </section>
 
 <section id="connect">
@@ -104,39 +104,42 @@
 
   <h3>Step 1 — Publish gold to Postgres</h3>
   <p>We already have Postgres running (it's our <em>source</em> for rentals/customers, but a separate schema keeps serving data clean). The simplest robust approach: a tiny publish script that reads each gold table from DuckDB and writes it into a <code>serving</code> schema in Postgres. DuckDB can attach Postgres directly, so this is a handful of lines:</p>
-  <div class="code-wrap"><div class="code-header"><span>ingest/publish_to_serving.py</span></div><pre><code class="language-python">"""Publish gold marts + metrics from DuckDB into Postgres `serving` schema
+  <div class="code-wrap"><div class="code-header"><span>ingest/publish_to_serving.py</span></div><pre><code class="language-python">"""Publish gold marts + metric views from DuckDB into a Postgres `serving` schema
 so Metabase (which has no DuckDB driver) can read them natively."""
 import duckdb, os
 
-PG = os.environ["SERVING_PG_DSN"]  # e.g. postgresql://griddp:griddp@postgres:5432/griddp
+PG = os.environ.get(
+    "SERVING_PG_DSN",
+    "postgresql://griddp:griddp@localhost:5432/marketplace",   # the Lab 01 database
+)
 DUCKDB_PATH = os.environ.get("DUCKDB_PATH", "warehouse.duckdb")
 
-# Tables to serve: the gold star schema + the Lab 07 metrics view.
+# Tables to serve: the gold star schema + the Lab 07 metric views.
 TABLES = [
-    "dim_customer", "dim_gpu", "dim_date",
-    "fct_rentals", "fct_telemetry_hourly",
-    "metrics_daily",          # the governed semantic metrics from Lab 07
+    ("gold", "dim_customer"), ("gold", "dim_gpu"), ("gold", "dim_date"),
+    ("gold", "fct_rentals"), ("gold", "fct_telemetry_hourly"),
+    ("metrics", "metric_revenue"), ("metrics", "metric_arpu"),
+    ("metrics", "metric_revenue_by_model"), ("metrics", "metric_utilization"),
 ]
 
-con = duckdb.connect(DUCKDB_PATH, read_only=True)
+# Not read_only=True: DuckDB would then open the attached Postgres read-only too.
+con = duckdb.connect(DUCKDB_PATH)
 con.execute("INSTALL postgres; LOAD postgres;")
 con.execute(f"ATTACH '{PG}' AS pg (TYPE postgres);")
 con.execute("CREATE SCHEMA IF NOT EXISTS pg.serving;")
 
-for t in TABLES:
-    print(f"publishing {t} -> serving.{t}")
+for schema, t in TABLES:
+    print(f"publishing {schema}.{t} -> serving.{t}")
     con.execute(f"DROP TABLE IF EXISTS pg.serving.{t};")
-    con.execute(f"CREATE TABLE pg.serving.{t} AS SELECT * FROM main_marts.{t};")
+    con.execute(f"CREATE TABLE pg.serving.{t} AS SELECT * FROM {schema}.{t};")
 
 print("done — gold published to Postgres serving schema")
 con.close()</code></pre></div>
-  <p>Adjust <code>main_marts</code> to whatever schema your dbt gold models land in (check <code>dbt_project.yml</code>). Run it from the repo root:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">export SERVING_PG_DSN="postgresql://griddp:griddp@localhost:5432/griddp"
-export DUCKDB_PATH="warehouse.duckdb"
-uv run python ingest/publish_to_serving.py</code></pre></div>
+  <p>The defaults match the Lab 01 database and the <code>gold</code> and <code>metrics</code> schemas from Labs 03 and 07; set <code>SERVING_PG_DSN</code> only if yours differ. The views become plain tables on the Postgres side, which is what you want a BI tool to hit. Run it from the repo root:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">uv run python ingest/publish_to_serving.py</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>One <code>publishing &lt;table&gt; -&gt; serving.&lt;table&gt;</code> line per table, then <code>done</code>. Confirm in Postgres: <code>docker compose exec postgres psql -U griddp -c "\dt serving.*"</code> lists your six serving tables with row counts that match the warehouse.</p>
+    <p>One <code>publishing &lt;schema&gt;.&lt;table&gt; -&gt; serving.&lt;table&gt;</code> line per table, then <code>done</code>. Confirm in Postgres: <code>docker compose exec postgres psql -U griddp -d marketplace -c "\dt serving.*"</code> lists nine serving tables. Spot-check one count: <code>SELECT count(*) FROM serving.fct_rentals</code> is 400, the same as the warehouse.</p>
   </div>
   <div class="callout tip">
     <span class="callout-label">This belongs in Dagster</span>
@@ -144,21 +147,22 @@ uv run python ingest/publish_to_serving.py</code></pre></div>
   </div>
 
   <h3>Step 2 — Point Metabase at the serving database</h3>
-  <p>Open Metabase at <a href="http://localhost:3000" target="_blank" rel="noopener">http://localhost:3000</a>. On first run it walks you through creating an admin account (use any email/password — it's local). Then add the database:</p>
+  <p>Open Metabase at <a href="http://localhost:3001" target="_blank" rel="noopener">http://localhost:3001</a> (Compose publishes it on 3001; 3000 is Dagster). On first run it walks you through creating an admin account (use any email/password — it's local). Then add the database:</p>
   <table>
     <thead><tr><th>Field</th><th>Value</th></tr></thead>
     <tbody>
       <tr><td>Database type</td><td><strong>PostgreSQL</strong></td></tr>
+      <tr><td>Display name</td><td><code>serving</code></td></tr>
       <tr><td>Host</td><td><code>postgres</code> (the Compose service name — Metabase reaches it on the Docker network)</td></tr>
       <tr><td>Port</td><td><code>5432</code></td></tr>
-      <tr><td>Database name</td><td><code>griddp</code></td></tr>
+      <tr><td>Database name</td><td><code>marketplace</code></td></tr>
       <tr><td>Username / Password</td><td><code>griddp</code> / <code>griddp</code></td></tr>
-      <tr><td>Schemas</td><td>limit to <code>serving</code> so analysts only see governed tables</td></tr>
+      <tr><td>Schemas</td><td>Only these: <code>serving</code>, so analysts only see governed tables, not the operational <code>public</code> schema</td></tr>
     </tbody>
   </table>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>Metabase says "Connection successful," then syncs and shows your six <code>serving.*</code> tables under <strong>Browse data</strong>. If the host fails, you're probably running Metabase outside Docker — then use <code>localhost</code> instead of <code>postgres</code>.</p>
+    <p>Metabase says "Connection successful," then syncs and shows your nine <code>serving.*</code> tables under <strong>Browse data</strong>. If the host fails, you're probably running Metabase outside Docker — then use <code>localhost</code> instead of <code>postgres</code>.</p>
   </div>
 </section>
 
@@ -167,29 +171,25 @@ uv run python ingest/publish_to_serving.py</code></pre></div>
   <p>Metabase is a GUI, so there are no files to type here — but every chart is just a saved <strong>question</strong>, and behind every question is SQL. We'll give you the SQL for each so you understand exactly what the chart shows (and so you can paste it into Metabase's native SQL editor, which is the fastest path). For each: click <strong>+ New → SQL query</strong>, pick the <code>serving</code> database, paste the SQL, run, choose the visualization, and <strong>Save</strong>. Then create a dashboard called <strong>"Marketplace Overview"</strong> and add each saved question to it.</p>
 
   <h3>1 — GMV over time (line chart)</h3>
-  <p>GMV (gross marketplace value) is the headline number — total rental value transacted per day. Read it straight from the governed metrics table so it matches finance's number exactly.</p>
-  <div class="code-wrap"><div class="code-header"><span>Question: GMV over time</span></div><pre><code class="language-sql">SELECT day, gmv
-FROM serving.metrics_daily
-ORDER BY day;</code></pre></div>
-  <p>Visualization: <strong>Line</strong>, x = <code>day</code>, y = <code>gmv</code>. Format the y-axis as currency.</p>
+  <p>GMV (gross merchandise value) is the headline number — total rental value billed per day. Read it straight from the governed <code>metric_revenue</code> you published so it matches finance's number exactly.</p>
+  <div class="code-wrap"><div class="code-header"><span>Question: GMV over time</span></div><pre><code class="language-sql">SELECT rental_date, gmv
+FROM serving.metric_revenue
+ORDER BY rental_date;</code></pre></div>
+  <p>Visualization: <strong>Line</strong>, x = <code>rental_date</code>, y = <code>gmv</code>. Format the y-axis as currency.</p>
 
   <h3>2 — Utilization % by GPU model (bar chart)</h3>
-  <p>The ops lead's number: of the hours each GPU model <em>could</em> have been rented, what fraction actually was. We derive it from the telemetry rollup, which knows when each GPU was busy.</p>
-  <div class="code-wrap"><div class="code-header"><span>Question: Utilization by GPU model</span></div><pre><code class="language-sql">SELECT g.gpu_model,
-       ROUND(100.0 * SUM(t.busy_minutes)
-             / NULLIF(SUM(t.total_minutes), 0), 1) AS utilization_pct
-FROM serving.fct_telemetry_hourly t
-JOIN serving.dim_gpu g ON g.gpu_key = t.gpu_key
-GROUP BY g.gpu_model
+  <p>The ops lead's number: how hard each GPU model is working. It comes from the Lab 07 <code>metric_utilization</code>, which already weights every hour of the telemetry rollup by its sample count, so the chart cannot quietly average the averages.</p>
+  <div class="code-wrap"><div class="code-header"><span>Question: Utilization by GPU model</span></div><pre><code class="language-sql">SELECT model, utilization_pct
+FROM serving.metric_utilization
 ORDER BY utilization_pct DESC;</code></pre></div>
-  <p>Visualization: <strong>Bar</strong>, x = <code>gpu_model</code>, y = <code>utilization_pct</code>. (If your rollup names columns differently, adjust — the shape is "busy ÷ available.")</p>
+  <p>Visualization: <strong>Bar</strong>, x = <code>model</code>, y = <code>utilization_pct</code>. With the Lab 04 producer every model sits in the mid-70s, so the bars are close; a real fleet would not be.</p>
 
-  <h3>3 — Fill rate (single number / trend)</h3>
-  <p>Fill rate = of the rental <em>requests</em> the marketplace received, what share were filled by an available GPU. It's a marketplace-health metric: a low fill rate means demand you couldn't serve.</p>
-  <div class="code-wrap"><div class="code-header"><span>Question: Fill rate</span></div><pre><code class="language-sql">SELECT day, fill_rate
-FROM serving.metrics_daily
-ORDER BY day;</code></pre></div>
-  <p>Visualization: <strong>Line</strong> for the trend, or a <strong>Number</strong> showing the latest day with a sparkline. Format <code>fill_rate</code> as a percentage.</p>
+  <h3>3 — ARPU per month (line / single number)</h3>
+  <p>The finance lead's second number: average take-rate revenue per active customer, per month, straight from <code>metric_arpu</code>. It's a health metric for the customer base: falling ARPU means more customers are spending less.</p>
+  <div class="code-wrap"><div class="code-header"><span>Question: ARPU per month</span></div><pre><code class="language-sql">SELECT year_month, arpu, active_customers
+FROM serving.metric_arpu
+ORDER BY year_month;</code></pre></div>
+  <p>Visualization: <strong>Line</strong> for the trend, or a <strong>Number</strong> showing the latest full month. Format <code>arpu</code> as currency. The current month is partial, so its value is low; that is the data, not a bug.</p>
 
   <h3>4 — Top customers by revenue (table or bar)</h3>
   <p>The account manager's view: who are our biggest customers? Join the rentals fact to the customer dimension and sum revenue.</p>
@@ -198,7 +198,7 @@ ORDER BY day;</code></pre></div>
        ROUND(SUM(r.revenue), 2) AS total_revenue,
        COUNT(*)                 AS rentals
 FROM serving.fct_rentals r
-JOIN serving.dim_customer c ON c.customer_key = r.customer_key
+JOIN serving.dim_customer c ON c.customer_id = r.customer_id
 GROUP BY c.customer_name, c.tier
 ORDER BY total_revenue DESC
 LIMIT 10;</code></pre></div>
@@ -209,7 +209,7 @@ LIMIT 10;</code></pre></div>
   <div class="code-wrap"><div class="code-header"><span>Question: Telemetry health</span></div><pre><code class="language-sql">WITH latest AS (
   SELECT MAX(hour) AS h FROM serving.fct_telemetry_hourly
 )
-SELECT COUNT(DISTINCT t.gpu_key)            AS reporting_gpus,
+SELECT COUNT(DISTINCT t.gpu_id)             AS reporting_gpus,
        (SELECT COUNT(*) FROM serving.dim_gpu) AS total_gpus
 FROM serving.fct_telemetry_hourly t, latest
 WHERE t.hour = latest.h;</code></pre></div>
@@ -217,18 +217,18 @@ WHERE t.hour = latest.h;</code></pre></div>
 
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>Five saved questions, each rendering real data, all added to one <strong>Marketplace Overview</strong> dashboard. Drag the tiles into a sensible layout — headline GMV and fill rate up top, utilization and top customers below, telemetry health as a small corner KPI.</p>
+    <p>Five saved questions, each rendering real data, all added to one <strong>Marketplace Overview</strong> dashboard. Drag the tiles into a sensible layout — headline GMV and ARPU up top, utilization and top customers below, telemetry health as a small corner KPI.</p>
   </div>
 </section>
 
 <section id="govern">
   <h2>Build on the governed layer</h2>
-  <p>Look back at those five queries. Notice what they <em>don't</em> do: they never recompute a business definition in the BI tool. GMV and fill rate come straight from <code>serving.metrics_daily</code> — the metrics you defined once in Lab 07. Revenue and utilization read the gold facts and dimensions, not raw bronze. That discipline is the whole point of a <strong>governed dashboard</strong>.</p>
+  <p>Look back at those five queries. Notice what they <em>don't</em> do: they never recompute a business definition in the BI tool. GMV, utilization and ARPU come straight from the <code>serving.metric_*</code> tables — the metrics you defined once in Lab 07. Top customers and telemetry health read the gold facts and dimensions, not raw bronze. That discipline is the whole point of a <strong>governed dashboard</strong>.</p>
   <p>The failure mode it prevents is the classic one: finance's slide says GMV was $4.1M, the ops dashboard says $3.8M, and a meeting gets eaten arguing about whose number is right. The cause is almost always that someone redefined "GMV" with a slightly different filter inside a BI question. When every chart reads the <em>same</em> marts and the <em>same</em> metrics table, that argument can't happen — the numbers agree because they come from one definition.</p>
   <table>
     <thead><tr><th>Don't</th><th>Do</th></tr></thead>
     <tbody>
-      <tr><td>Write <code>SUM(price * hours) WHERE status='paid'</code> ad-hoc in a chart</td><td>Read <code>gmv</code> from <code>metrics_daily</code> — defined once, in version control</td></tr>
+      <tr><td>Write <code>SUM(price * hours) WHERE status='paid'</code> ad-hoc in a chart</td><td>Read <code>gmv</code> from <code>metric_revenue</code> — defined once, in version control</td></tr>
       <tr><td>Join bronze/raw tables in Metabase to "just get the number quickly"</td><td>Build only on gold marts the platform tests and ships</td></tr>
       <tr><td>Let each analyst invent their own "active customer" filter</td><td>Encode shared definitions upstream so everyone inherits them</td></tr>
     </tbody>
@@ -243,17 +243,17 @@ WHERE t.hour = latest.h;</code></pre></div>
   <h2>Run it &amp; view the dashboard</h2>
   <p>Let's do a clean end-to-end pass, the way you would before showing it to someone. From the repo root, with the stack up:</p>
   <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># 1. rebuild gold + metrics so the warehouse is current
-cd dbt && dbt build && cd ..
+cd dbt && uv run dbt build && cd ..
 
 # 2. publish the fresh gold into the Postgres serving schema
 uv run python ingest/publish_to_serving.py
 
 # 3. (in Metabase) hit the refresh icon on the dashboard, or
 #    Settings -> Databases -> serving -> "Sync database schema now"</code></pre></div>
-  <p>Open <a href="http://localhost:3000" target="_blank" rel="noopener">http://localhost:3000</a> and go to your <strong>Marketplace Overview</strong> dashboard.</p>
+  <p>Open <a href="http://localhost:3001" target="_blank" rel="noopener">http://localhost:3001</a> and go to your <strong>Marketplace Overview</strong> dashboard.</p>
   <div class="callout insight">
     <span class="callout-label">✓ You should see</span>
-    <p>A single dashboard with all five charts populated: a GMV line trending across the days the generator produced, a utilization bar chart with one bar per GPU model, a fill-rate trend, a top-10 customers table sorted by revenue, and a telemetry-health KPI. Hover any point and it shows real values. <strong>That's your platform serving an answer to a human</strong> — the loop is closed.</p>
+    <p>A single dashboard with all five charts populated: a GMV line across the 90 days the generator produced, a utilization bar chart with one bar per GPU model, an ARPU trend over four months, a top-10 customers table sorted by revenue, and a telemetry-health KPI reading 10 of 10. Hover any point and it shows real values. <strong>That's your platform serving an answer to a human</strong> — the loop is closed.</p>
   </div>
   <div class="callout warn">
     <span class="callout-label">If a chart is empty</span>
@@ -294,11 +294,11 @@ git commit -m "Lab 08: serve gold to Postgres + Marketplace Overview dashboard"<
       <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>An error: for that moment <code>serving.fct_rentals</code> does not exist, and the moment grows with the table. Build the new copy under a temporary name and swap it in — a rename, or the drop and create inside one transaction — so a reader always finds a complete table. Drop-and-recreate is idempotent, but it is not invisible to readers. See <a href="#connect">Step 1 — Publish gold to Postgres</a>.</p></div></details>
     </li>
     <li>
-      <p>The telemetry-health tile reads <code>reporting_gpus = 17</code>, <code>total_gpus = 20</code>. Which other tile do you stop trusting, which are unaffected, and what do you check before raising an alarm?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Utilization by GPU model — it is derived from the telemetry rollup, so three silent cards skew it. GMV, fill rate and top customers come from rentals and the metrics table and are untouched. Before alarming anyone, check whether those three cards simply had no active rental in the latest hour (telemetry is emitted per active rental) or whether readings are being dropped upstream. See <a href="#dashboard">Build the dashboard</a>.</p></div></details>
+      <p>The telemetry-health tile reads <code>reporting_gpus = 7</code>, <code>total_gpus = 10</code>. Which other tile do you stop trusting, which are unaffected, and what do you check before raising an alarm?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Utilization by GPU model — it is derived from the telemetry rollup, so three silent cards skew it. GMV, ARPU and top customers come from rentals and the metric tables and are untouched. Before alarming anyone, check whether those three cards simply had no active rental in the latest hour (telemetry is emitted per active rental) or whether readings are being dropped upstream. See <a href="#dashboard">Build the dashboard</a>.</p></div></details>
     </li>
     <li>
-      <p>The account manager wants "GMV for enterprise customers only". <code>metrics_daily</code> has no tier column, and you could write the number in a chart from <code>fct_rentals</code> in five minutes. What decides whether you should?</p>
+      <p>The account manager wants "GMV for enterprise customers only". <code>metric_revenue</code> has no tier column, and you could write the number in a chart from <code>fct_rentals</code> in five minutes. What decides whether you should?</p>
       <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether the number will outlive today. A chart-level query re-derives GMV with its own filter and expression, which is exactly how the $4.1M-versus-$3.8M argument starts. For throwaway exploration, labelled as such, that is fine. If it will sit on the dashboard beside the governed GMV, or be reused, define it upstream — GMV by tier in dbt, tested and published — so it cannot drift. See <a href="#govern">Build on the governed layer</a>.</p></div></details>
     </li>
   </ol>
@@ -309,15 +309,15 @@ git commit -m "Lab 08: serve gold to Postgres + Marketplace Overview dashboard"<
       <p><strong>Hints:</strong> the <code>tier</code> lives on <code>dim_customer</code>; revenue lives on <code>fct_rentals</code>. Group by tier. A bar or pie chart reads well for a handful of tiers.</p>
       <div class="code-wrap"><div class="code-header"><span>solution sketch — revenue_by_tier.sql</span></div><pre><code class="language-sql">SELECT c.tier,
        ROUND(SUM(r.revenue), 2) AS total_revenue,
-       COUNT(DISTINCT c.customer_key) AS customers
+       COUNT(DISTINCT c.customer_id) AS customers
 FROM serving.fct_rentals r
-JOIN serving.dim_customer c ON c.customer_key = r.customer_key
+JOIN serving.dim_customer c ON c.customer_id = r.customer_id
 GROUP BY c.tier
 ORDER BY total_revenue DESC;</code></pre></div>
       <p>In Metabase: <strong>+ New → SQL query</strong> → <code>serving</code> DB → paste → run → <strong>Bar</strong> (x = <code>tier</code>, y = <code>total_revenue</code>) → <strong>Save</strong> as "Revenue by tier" → open the dashboard → <strong>Add → Question</strong> → pick it. Then:</p>
       <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">git add dashboards/marketplace-overview/revenue_by_tier.sql
 git commit -m "Lab 08: add revenue-by-tier chart"</code></pre></div>
-      <p><strong>You should see</strong> a sixth tile on the dashboard showing how revenue concentrates across tiers — often a steep curve, with enterprise driving most of it. If yours is flat, your generator may weight tiers evenly; that's fine, the chart still works.</p>
+      <p><strong>You should see</strong> a sixth tile on the dashboard with <code>free</code> on top, then <code>pro</code>, then <code>enterprise</code>. That is the generator showing through: it makes half the customers free and only a tenth enterprise, and a rental's price does not depend on tier, so the chart mostly counts heads. A real marketplace would look very different; the governed number is still right.</p>
     </div>
   </details>
 </section>
