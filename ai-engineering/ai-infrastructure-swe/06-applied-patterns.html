@@ -44,6 +44,9 @@
     <a href="#idempotent">Idempotent retries</a>
     <a href="#replay">Deterministic replay</a>
     <a href="#build-list">Things to prototype before the loop</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -74,7 +77,7 @@
       <tr><td>Backend call</td><td>HTTP/gRPC to vLLM/Triton/internal; stream tokens back</td></tr>
     </tbody>
   </table>
-  <p><strong>Circuit breakers</strong>: after N failures in a window, open the breaker — subsequent calls fail fast without hitting the backend. After a cool-down, half-open: let one probe through. If it succeeds, close.</p>
+  <p><strong>Circuit breakers</strong>: after N failures in a window, open the breaker — subsequent calls fail fast without hitting the backend. After a cool-down, half-open: let a probe through, and close on success. The sketch below admits every call once the cool-down passes; a production breaker admits one probe and re-opens if it fails.</p>
   <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-rust">use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct CircuitBreaker {
@@ -263,6 +266,62 @@ transitions:
     <li><strong>A retry-with-backoff combinator</strong> (chapter 11's problem) with jitter and a retry budget.</li>
   </ol>
   <p>None take more than 4 hours each. All directly map to interview questions you'll get.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A model backend starts failing. Describe what a circuit breaker does over the next few minutes, state by state, and what the breaker buys you.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>After a threshold of failures in a window it opens, and calls fail fast without touching the backend. After a cool-down it goes half-open and lets a probe through; success closes it and failure reopens it. The backend gets room to recover and callers stop waiting on timeouts. See <a href="#gateway">Inference gateway with circuit breakers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The gateway can hedge calls. Which of a document search, a model completion with an idempotency key and a create-payment tool call may be hedged, and where do you set the hedge delay?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The search and the keyed completion may be hedged, because duplicates are harmless or deduplicated. Never hedge the payment unless the downstream deduplicates on the same key. Set the delay near the p95 of latency, and cap hedges at a small fraction of traffic so a slow backend does not double fleet load. See <a href="#hedging">Request hedging</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An internal price lookup and a feature that runs user-supplied Python are both agent tools. How do you isolate each, and why not use the same mechanism for both?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Call the price lookup in-process or as an internal RPC service, since you wrote it and it is read-only. Run the user code in a container-level sandbox such as gVisor or a Firecracker microVM, which gives strong isolation at the price of slow startup. Stronger isolation costs latency, so spend it only where the code is untrusted. See <a href="#sandbox">Agent execution sandbox</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A tool process completes a side effect and crashes before the router persists the result. The orchestrator retries. What happens, and what makes this safe end to end?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The retry sees an in-progress or missing record and executes again, so the side effect is doubled. The fix is to make the downstream effect idempotent too, by passing the same idempotency key to the system that performs it, so duplicates are recognised there. See <a href="#idempotent">Idempotent retries</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A regulator asks why an agent acted at 2:14pm last Tuesday. An engineer proposes re-running the stored prompt. Why does that not answer the question, and what should the log hold?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Model calls are not deterministic, so a re-run may return something different from what happened. The log must hold the prompt, model version, sampling config and response, each tool call with arguments, key and result, approvals, and snapshots of retrieved data. See <a href="#replay">Deterministic replay</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two executor instances both believe they own the same agent run. Which mechanisms stop them corrupting it, and what does each cover?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A Postgres advisory lock means only one instance advances a run at a time, and a version column with optimistic concurrency rejects a stale write if a second instance slips through. The lock prevents the conflict and the version check catches it if the lock fails. See <a href="#plan-executor">Plan executor with persistence</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A gateway layers edge, auth, routing, resilience, observability and the backend call, and its circuit breaker fails fast while a backend recovers.</li>
+    <li>Hedge only idempotent calls, at about the p95, and cap hedges as a fraction of traffic so a slow backend cannot double the fleet's load.</li>
+    <li>Pick isolation for the risk: in-process or RPC for tools you wrote, WASM for plugins, and container or microVM sandboxes for untrusted code. Never shell out from the service process.</li>
+    <li>The tool router validates arguments, checks authority, gates high-risk tools on approval, and records intent before the call and outcome after it.</li>
+    <li>A plan executor is a persisted state machine with one owner per run, optimistic concurrency, hard limits on time, steps and cost, and a cancel signal.</li>
+    <li>Idempotent retries need an in-progress record and a downstream that deduplicates on the same key, and replay needs prompts and responses recorded, since model calls are not deterministic.</li>
+  </ul>
+  <p>Patterns need evidence that they work, so the next chapter covers SLOs, load tests, chaos, fuzzing and error budgets. → <a href="07-evaluation-quality.html">Evaluation &amp; quality</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener"><strong>CircuitBreaker</strong></a> — Martin Fowler. The states and thresholds of the pattern in a short form.</li>
+    <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener"><strong>The Tail at Scale</strong></a> — Dean and Barroso, Communications of the ACM, 2013. Hedged and tied requests, and why the tail dominates at fan-out.</li>
+    <li><a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/" target="_blank" rel="noopener"><strong>Using load shedding to avoid overload</strong></a> — Amazon Builders' Library. How to reject work early so a service stays inside its capacity.</li>
+    <li><a href="https://stripe.com/blog/idempotency" target="_blank" rel="noopener"><strong>Designing robust and predictable APIs with idempotency</strong></a> — Stripe, 2017. Idempotency keys and the recovery of in-progress requests.</li>
+    <li><a href="https://gvisor.dev/docs/" target="_blank" rel="noopener"><strong>gVisor documentation</strong></a> — Google. What a user-space kernel sandbox isolates and what it costs.</li>
+    <li><a href="https://docs.wasmtime.dev/" target="_blank" rel="noopener"><strong>Wasmtime documentation</strong></a> — Bytecode Alliance. Embedding a capability-controlled WASM runtime in a Rust service.</li>
+  </ul>
 </section>
 
 <footer>

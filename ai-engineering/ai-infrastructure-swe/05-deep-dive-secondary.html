@@ -47,6 +47,9 @@
     <a href="#multi-step">Multi-step plans</a>
     <a href="#partial-state">Partial-state recovery</a>
     <a href="#sub-agent">Sub-agent isolation</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -270,6 +273,62 @@ loop:
     <span class="callout-label">Interview line</span>
     <p>"Sub-agent isolation is just process isolation for the agent world — each one is its own run with its own state, budget, and tool scope. The parent kicks one off, awaits a result, doesn't share execution context."</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Product asks for per-tenant quotas, cost accounting and an audit trail on model calls. Why can you not get these by exposing the model server directly, and where do they live?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Inference servers such as vLLM, Triton and TGI batch and generate tokens; they have no auth, quotas, cost accounting, audit, agent state or idempotency. Those belong in the Rust infrastructure layer between the public contract and the GPU fleet. See <a href="#why-this-layer">Why this layer exists</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A streamed completion fails after 40 tokens. Does the gateway retry it automatically? Contrast with a failure before the first token.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. A retry would bill the user again and may repeat side effects, so decide explicitly between erroring, restarting from scratch or returning the partial output. A network error before any token was emitted is safe to retry. See <a href="#calling-vllm">Calling vLLM/Triton</a> and <a href="#streaming">Streaming responses</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A user closes the browser mid-stream. What must the gateway do, and what does it cost if it does not?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Cancel the upstream call as soon as the client disconnects, by propagating cancellation through the request future. If it does not, the model server keeps generating tokens nobody reads and spends GPU time for nothing. See <a href="#streaming">Streaming responses</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Twenty vLLM replicas sit behind a round-robin balancer and the prefix-cache hit rate is poor, though every request begins with the same long system prompt. What changes, and what must you keep out of the shared prefix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Route by affinity, for example consistent hashing on a stable prefix hash, so requests that share a prefix land on the same replica, and keep the system prompt to a few versioned strings. Keep tenant-specific secrets out of cacheable prefixes, since shared prefix state can leak across tenants. See <a href="#prompt-cache">Prompt-cache awareness</a> and <a href="#kv-cache">KV-cache sharing concerns</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The orchestrator crashes after dispatching a payment tool call but before it records the result. On restart, what prevents a second payment?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The intent event was written before dispatch, the call carried an idempotency key, and a completed-steps log plus a single-owner lock decide who resumes. The retry reuses the same key, so the tool returns the first outcome instead of paying again. See <a href="#partial-state">Partial-state recovery</a>.</p></div></details>
+    </li>
+    <li>
+      <p>For an agent that can move money, would you favour ReAct or plan-then-execute, and what does your executor need either way?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Plan-then-execute is the usual choice there, because an explicit plan is more predictable, easier to checkpoint and easier to bound in cost; ReAct wins when the task needs mid-run adaptation. Either way the executor needs a well-defined state machine with persisted steps. See <a href="#multi-step">Multi-step plans</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Inference servers are batching text generators, and everything else lives in the Rust layer above them: auth, quotas, streaming, retries, hedging and agent state.</li>
+    <li>Retry a model call only when nothing has been emitted. A mid-stream failure needs an explicit decision, because a blind retry re-bills and can repeat side effects.</li>
+    <li>Stream tokens over SSE with a bounded channel for backpressure, keepalives for proxies, and upstream cancellation when the client disconnects.</li>
+    <li>Prefix-cache hit rate depends on affinity routing and stable, versioned system prompts, and secrets must stay out of cacheable prefixes.</li>
+    <li>The agent loop is an infrastructure problem: dispatch tools with validated arguments, per-call deadlines, idempotency keys and approval gates for high-tier actions.</li>
+    <li>Make runs resumable by persisting after every step, executing steps idempotently, and allowing one owner per run; give each sub-agent its own run, budget and narrower tools.</li>
+  </ul>
+  <p>Next come the production patterns that put these pieces together: the gateway, hedging, the sandbox, the tool router and the plan executor. → <a href="06-applied-patterns.html">Applied patterns</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener"><strong>vLLM documentation</strong></a> — vLLM project. The OpenAI-compatible server, batching and serving features your gateway wraps.</li>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener"><strong>Efficient Memory Management for Large Language Model Serving with PagedAttention</strong></a> — Kwon et al., 2023. The paper behind vLLM's KV-cache management and why memory limits throughput.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html" target="_blank" rel="noopener"><strong>Automatic Prefix Caching</strong></a> — vLLM documentation. How prefix reuse works, which is what affinity routing depends on.</li>
+    <li><a href="https://html.spec.whatwg.org/multipage/server-sent-events.html" target="_blank" rel="noopener"><strong>Server-sent events</strong></a> — WHATWG HTML Standard. The wire format, reconnection and comment lines used for keepalives.</li>
+    <li><a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener"><strong>The Tail at Scale</strong></a> — Dean and Barroso, Communications of the ACM, 2013. The case for hedged requests and other tail-latency techniques.</li>
+    <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener"><strong>Building effective agents</strong></a> — Anthropic, 2024. Workflow and agent patterns, and when each is worth its cost.</li>
+  </ul>
 </section>
 
 <footer>
