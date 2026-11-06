@@ -47,6 +47,9 @@
     <a href="#partial-load">Partial model loading</a>
     <a href="#recovery">Recovery patterns</a>
     <a href="#idempotency">Idempotency for inference retries</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
 
     <h2>Navigation</h2>
     <a href="index.html">↺ All guides</a>
@@ -100,7 +103,7 @@ nvidia-smi --query-gpu=memory.used,memory.free --format=csv
 # Inside the process:
 python -c "import torch; print(torch.cuda.memory_summary())"
 # Time-series view (one second resolution):
-dcgmi dmon -e 252,140  # FB_USED, FB_FREE
+dcgmi dmon -e 252,251  # FB_USED, FB_FREE
 </code></pre></div>
   <div class="callout warn">
     <span class="callout-label">vLLM-specific</span>
@@ -251,6 +254,63 @@ dcgmi dmon -e 252,140  # FB_USED, FB_FREE
     <span class="callout-label">Interview-grade closing</span>
     <p>"My design assumption is that any individual GPU, node, or replica can die without warning. The system has to absorb that — retries with idempotency, graceful drains, circuit breakers in front of melting backends, and bounded queues so failure shows up as predictable 429s rather than wandering tails."</p>
   </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A vLLM service ran cleanly for a week and now hits CUDA out-of-memory as traffic grows. A second service fails at startup. How do the causes and fixes differ?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A startup failure means the weights, activations and KV reservation do not fit, so lower the memory fraction or context length, or change precision or tensor-parallel shape. A failure under load means KV-cache pressure from rising concurrency, so cap concurrent sequences and consider an FP8 cache. When the failure happens tells you which. See <a href="#cuda-oom">CUDA out-of-memory</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A training job stops making progress with no error and the GPUs look busy. What is probably happening, and what do you set so it fails instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>One rank crashed or stalled, and the others wait for it inside a collective. Enable the NCCL error handling and timeout settings so the job errors out and restarts instead of hanging forever. Use NCCL debug output to find which rank is missing. See <a href="#nccl">NCCL hangs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A node kernel-panics. It held one rank of a 64-GPU training job and one of two replicas of an online service. What survives, and what should have been in place?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The service survives only if its replicas were on different nodes, and the training job is lost back to its last checkpoint. Anti-affinity by node or rack, at least two replicas, regular checkpoints to durable storage and automatic cordon on Xid bursts bound the damage. See <a href="#kernel-panics">kernel panics and node death</a>.</p></div></details>
+    </li>
+    <li>
+      <p>An inference queue fills during a traffic spike. Why is rejecting at the gateway better than letting requests wait?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Waiting turns overload into long tails and timeouts, and users who have already given up still consume GPU time. A fast 429 with a retry hint at the edge, per-tenant limits and a queue-time drop keep failure predictable and protect high-priority traffic. See <a href="#queue-overflow">queue overflow and backpressure</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Outputs reach 2,000 tokens at about 50 tokens per second, and the TTFT target is under a second. How do you set timeouts instead of the 30-second default?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Use a short connect timeout, a first-token timeout of the TTFT target plus slack, and a total timeout of at least 40 seconds for the longest output, so about 60 with margin. Add a streaming heartbeat to catch stuck decoders. A flat 30 seconds would cut off valid long generations. See <a href="#timeouts">request timeouts</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A four-way tensor-parallel server starts with one shard failing to load. The other three hang and the pod never becomes ready. Why, and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The shards wait at a synchronisation barrier for a rank that has exited, so nothing errors. Use a startup probe that kills the pod, an init watchdog, all ranks in one pod so a failure is a process exit, and weights pre-staged on local NVMe for fast, deterministic loading. See <a href="#partial-load">partial model loading</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Know the failure buckets: hardware, driver, CUDA and app, collectives, orchestration, fabric, storage and serving. Knowing the bucket is half the diagnosis.</li>
+    <li>For CUDA out-of-memory, when it happens, at load, first request, under load or at a training step, points to the cause.</li>
+    <li>Collective hangs do not error, so set watchdogs and timeouts in production and read NCCL logs for the rank that is waiting.</li>
+    <li>A single GPU, node or replica will die without warning, so design for it with checkpoints, anti-affinity and automatic cordon.</li>
+    <li>Reject early and loudly: bounded queues, per-tenant limits and 429s with a retry policy beat wandering tail latency.</li>
+    <li>Set timeouts from the output budget rather than defaults, since a flat 30 seconds is wrong for LLM requests.</li>
+    <li>Recovery patterns have names: restart with backoff, drain and replace, circuit breaker, bulkhead, graceful drain and checkpoint-resume.</li>
+  </ul>
+  <p>Next the guide covers the quota, cost, change and audit disciplines that let a small team run this fleet. → <a href="09-governance-and-audit.html">Governance &amp; Audit</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html" target="_blank" rel="noopener"><strong>NCCL troubleshooting</strong></a> — NVIDIA docs. Debugging hangs, transport selection and network problems.</li>
+    <li><a href="https://docs.nvidia.com/deploy/xid-errors/index.html" target="_blank" rel="noopener"><strong>XID Errors</strong></a> — NVIDIA docs. Meaning and likely causes of driver error codes.</li>
+    <li><a href="https://pytorch.org/docs/stable/notes/cuda.html" target="_blank" rel="noopener"><strong>CUDA semantics: memory management</strong></a> — PyTorch docs. The caching allocator, fragmentation and the memory summary tools.</li>
+    <li><a href="https://github.com/kubernetes/node-problem-detector" target="_blank" rel="noopener"><strong>Node Problem Detector</strong></a> — Kubernetes project. Surfacing node-level faults so they can trigger cordon and remediation.</li>
+    <li><a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener"><strong>Handling Overload</strong></a> — Google SRE Book, 2016. Load shedding, graceful degradation and retry behaviour under saturation.</li>
+    <li><a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener"><strong>Addressing Cascading Failures</strong></a> — Google SRE Book, 2016. Why retries and queues spread failure and how to stop it.</li>
+  </ul>
 </section>
 
 <footer>
