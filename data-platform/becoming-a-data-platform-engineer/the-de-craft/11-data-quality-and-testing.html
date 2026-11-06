@@ -64,7 +64,7 @@
 
 <div class="callout tip">
   <span class="callout-label">Setup — do this first</span>
-  <p>You'll extend the dbt marketplace project from <a href="07-transformation-with-dbt.html">Chapter 07</a>. Open a terminal in that project (the folder with <code>dbt_project.yml</code>), confirm <code>dbt build</code> still runs clean, and keep this page beside it. Everything here is plain dbt and SQL — no new installs.</p>
+  <p>You'll extend the <code>griddp_dbt</code> project from <a href="07-transformation-with-dbt.html">Chapter 07</a>, including its exercise (three models, five tests, on the seeded DuckDB file). Open a terminal in that folder (the one with <code>dbt_project.yml</code>), run <code>dbt build --profiles-dir .</code> and confirm <code>PASS=8</code>, then keep this page beside it. Every <code>dbt</code> command below takes the same <code>--profiles-dir .</code>. No new installs.</p>
 </div>
 
 <section id="why">
@@ -96,7 +96,7 @@
       <tr><td><strong>Freshness</strong></td><td>Is the data recent enough?</td><td>A stalled upstream job — yesterday's numbers shown as today's.</td></tr>
       <tr><td><strong>Volume</strong></td><td>Is the row count in a normal range?</td><td>A half-loaded file (too few rows) or a duplicated load (too many).</td></tr>
       <tr><td><strong>Schema</strong></td><td>Are the columns &amp; types what we expect?</td><td>An upstream rename or dropped column that silently breaks a join.</td></tr>
-      <tr><td><strong>Validity / values</strong></td><td>Are individual values sane?</td><td>Negative revenue, a status of <code>"banana"</code>, a NULL where a key must exist.</td></tr>
+      <tr><td><strong>Validity / values</strong></td><td>Are individual values sane?</td><td>Negative revenue, a <code>gpu_model</code> of <code>"banana"</code>, a NULL where a key must exist.</td></tr>
       <tr><td><strong>Uniqueness</strong></td><td>Is each key represented once?</td><td>Duplicate rows that double-count and inflate every metric.</td></tr>
       <tr><td><strong>Referential integrity</strong></td><td>Do foreign keys point to real rows?</td><td>A rental referencing a customer that doesn't exist — orphaned facts.</td></tr>
     </tbody>
@@ -107,23 +107,25 @@
 <section id="testing">
   <h2>Testing in the pipeline</h2>
   <p>A <strong>test</strong> in data engineering is a query that returns the rows that <em>violate</em> a rule. Zero rows returned means the test passes; any rows returned means it fails. That's the entire mental model, and dbt builds on it. You met four built-in tests in Chapter 07 — here they are as the front line of defense:</p>
-  <div class="code-wrap"><div class="code-header"><span>models/marts/_marts.yml</span></div><pre><code class="language-yaml">models:
-  - name: fct_rentals
+  <div class="code-wrap"><div class="code-header"><span>models/staging/schema.yml</span></div><pre><code class="language-yaml">models:
+  - name: stg_rentals
     columns:
       - name: rental_id
         tests:
-          - not_null          # every fact must have a key
+          - not_null          # every rental must have a key
           - unique            # …and it must appear exactly once
       - name: customer_id
         tests:
           - not_null
           - relationships:    # referential integrity
-              to: ref('dim_customers')
-              field: customer_id
-      - name: status
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
+      - name: gpu_model
         tests:
           - accepted_values:  # validity — the only allowed values
-              values: ['active', 'completed', 'cancelled']</code></pre></div>
+              arguments:
+                values: ['A100', 'H100', 'L40S', 'RTX4090']</code></pre></div>
   <p>Those four — <code>not_null</code>, <code>unique</code>, <code>relationships</code>, <code>accepted_values</code> — handle the common cases declaratively. But some rules don't fit a column dropdown. For those, dbt gives you two escape hatches.</p>
   <p>A <strong>singular test</strong> is just a hand-written SQL file in <code>tests/</code> that selects the bad rows. Want to assert revenue is never negative? Write the query that finds negatives:</p>
   <div class="code-wrap"><div class="code-header"><span>tests/assert_revenue_non_negative.sql</span></div><pre><code class="language-sql">-- Passes only if this returns zero rows.
@@ -131,19 +133,21 @@
 select
     rental_id,
     revenue
-from {{ ref('fct_rentals') }}
+from {{ ref('stg_rentals') }}
 where revenue &lt; 0</code></pre></div>
   <p>A <strong>generic test</strong> wraps that pattern in a reusable macro so you can apply it by name to any column (e.g. a <code>non_negative</code> test) — handy once you're writing the same check in several models. And separate from both is <strong>unit testing your transform logic</strong>: feeding a model a tiny set of fixed input rows and asserting the exact output, so you catch a broken <code>CASE</code> statement or off-by-one window function regardless of what today's real data happens to look like:</p>
-  <div class="code-wrap"><div class="code-header"><span>models/marts/_marts.yml (unit test)</span></div><pre><code class="language-yaml">unit_tests:
+  <div class="code-wrap"><div class="code-header"><span>models/staging/unit_tests.yml</span></div><pre><code class="language-yaml">unit_tests:
   - name: revenue_is_hours_times_rate
-    model: fct_rentals
+    model: stg_rentals
     given:
-      - input: ref('stg_rentals')
+      - input: source('griddp', 'rentals')
         rows:
-          - {rental_id: 1, hours: 2, hourly_rate: 5.00}
+          - {rental_id: 1, customer_id: 101, gpu_model: A100, hours_used: 2,
+             price_per_hour: 5.00, rented_at: '2026-06-01 09:00:00'}
     expect:
       rows:
-        - {rental_id: 1, revenue: 10.00}   # 2 × 5.00</code></pre></div>
+        - {rental_id: 1, customer_id: 101, gpu_model: A100, hours_used: 2,
+           price_per_hour: 5.00, revenue: 10.00, rental_date: '2026-06-01'}   # 2 × 5.00</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">Data tests vs. unit tests</span>
     <p>They answer different questions. A <strong>data test</strong> asks "is <em>today's data</em> clean?" — it runs against whatever loaded. A <strong>unit test</strong> asks "is <em>my code</em> correct?" — it runs against fixed fake rows and would catch a logic bug even on a perfect day. Mature pipelines use both: unit tests guard the transform, data tests guard the data flowing through it.</p>
@@ -159,7 +163,7 @@ where revenue &lt; 0</code></pre></div>
     <thead><tr><th>Tests (known-knowns)</th><th>Observability (unknown-unknowns)</th></tr></thead>
     <tbody>
       <tr><td>You declare the rule explicitly.</td><td>The monitor learns the baseline automatically.</td></tr>
-      <tr><td>"<code>status</code> must be in this list."</td><td>"This table usually gets ~10k rows/day; today it got 200 — that's anomalous."</td></tr>
+      <tr><td>"<code>gpu_model</code> must be in this list."</td><td>"This table usually gets ~10k rows/day; today it got 200 — that's anomalous."</td></tr>
       <tr><td>Catches violations you predicted.</td><td>Catches drift you never thought to check.</td></tr>
       <tr><td>Pass / fail, binary.</td><td>Anomaly score — "this looks off, take a look."</td></tr>
     </tbody>
@@ -177,7 +181,7 @@ where revenue &lt; 0</code></pre></div>
   <p>A contract spells out, in writing and in code, three things about a source:</p>
   <ul>
     <li><strong>Schema</strong> — the exact columns, types, and which fields are guaranteed non-null. (The <code>customer_id</code> will always be a non-null integer.)</li>
-    <li><strong>Semantics</strong> — what the values <em>mean</em>. (<code>status = 'completed'</code> means the rental ended and was billed — not "in progress".)</li>
+    <li><strong>Semantics</strong> — what the values <em>mean</em>. (<code>hours_used</code> is billed hours, rounded up, not wall-clock hours.)</li>
     <li><strong>SLA</strong> — the freshness and availability promise. (This table updates by 06:00 UTC daily; we'll give 30 days' notice before any breaking change.)</li>
   </ul>
   <p>The point of writing it down is that an upstream change now becomes a <em>contract violation</em> — something the producing team agreed not to do silently — instead of a surprise that breaks your dashboard at 2 a.m. Where tests catch bad data after it's loaded, a contract catches a breaking change <em>before</em> it's even published. That's what people mean by <strong>"shifting quality left"</strong>: moving the check as close as possible to where data is produced, where it's cheapest to fix.</p>
@@ -189,13 +193,44 @@ where revenue &lt; 0</code></pre></div>
 
 <section id="hands-on">
   <h2>Hands-on: add a test suite, then break it</h2>
-  <p>Time to make this real. You'll add a suite of tests to the marketplace project, then deliberately introduce a bad row and watch the suite catch it — the full fail&rarr;fix&rarr;pass loop that defines test-driven data work.</p>
-  <p><strong>Step 1 — declare the tests.</strong> Add (or extend) the schema file for your marts so the keys, the relationship, and the value set are all covered:</p>
-  <div class="code-wrap"><div class="code-header"><span>models/marts/_marts.yml</span></div><pre><code class="language-yaml">version: 2
-
+  <p>Time to make this real. You'll add a suite of tests to the <code>griddp_dbt</code> project, then deliberately introduce a bad row and watch the suite catch it — the full fail&rarr;fix&rarr;pass loop that defines test-driven data work. The raw data lives in the DuckDB file from Chapter 07, so every command runs from <code>griddp_dbt/</code> with no server.</p>
+  <p><strong>Step 1: give the raw data something to test against.</strong> Chapter 07's <code>rentals</code> table has no load timestamp and there is no customers table yet, so add both. The <code>loaded_at</code> column is what freshness reads, and <code>customers</code> is the parent table for the relationship test:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">python -c "
+import duckdb
+con = duckdb.connect('griddp.duckdb')
+con.execute('ALTER TABLE rentals ADD COLUMN loaded_at TIMESTAMP DEFAULT current_timestamp')
+con.execute('UPDATE rentals SET loaded_at = current_timestamp')
+con.execute('''
+  CREATE OR REPLACE TABLE customers AS
+  SELECT * FROM (VALUES (101, 'Ada'), (102, 'Ben'), (103, 'Cleo')) AS t(customer_id, name)
+''')
+"</code></pre></div>
+  <p>Add the staging model for it. Like every staging model, it renames and selects, nothing more:</p>
+  <div class="code-wrap"><div class="code-header"><span>models/staging/stg_customers.sql</span></div><pre><code class="language-sql">select customer_id, name as customer_name
+from {{ source('griddp', 'customers') }}</code></pre></div>
+  <p><strong>Step 2: declare the tests and a freshness check.</strong> Replace <code>sources.yml</code> so it knows about <code>customers</code> and puts a freshness threshold on <code>rentals</code>. dbt's source freshness compares the newest <code>loaded_at</code> value with the clock:</p>
+  <div class="code-wrap"><div class="code-header"><span>models/staging/sources.yml</span></div><pre><code class="language-yaml">version: 2
+sources:
+  - name: griddp
+    description: "Raw tables loaded into the warehouse."
+    schema: main
+    tables:
+      - name: rentals
+        loaded_at_field: loaded_at      # a timestamp column on the table
+        config:
+          freshness:
+            warn_after:  {count: 12, period: hour}
+            error_after: {count: 24, period: hour}   # fail if no load in 24h
+      - name: customers</code></pre></div>
+  <p>Then replace <code>schema.yml</code> so the keys, the relationship and the value set are all covered:</p>
+  <div class="code-wrap"><div class="code-header"><span>models/staging/schema.yml</span></div><pre><code class="language-yaml">version: 2
 models:
-  - name: fct_rentals
-    description: One row per GPU rental, with revenue.
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+  - name: stg_rentals
+    description: "One cleaned row per GPU rental, with revenue computed."
     columns:
       - name: rental_id
         tests: [not_null, unique]
@@ -203,54 +238,50 @@ models:
         tests:
           - not_null
           - relationships:
-              to: ref('dim_customers')
-              field: customer_id
-      - name: status
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
+      - name: gpu_model
         tests:
           - accepted_values:
-              values: ['active', 'completed', 'cancelled']</code></pre></div>
-  <p><strong>Step 2 — add a freshness check.</strong> dbt's source freshness watches a raw source's load time. Point it at your <code>rentals</code> source and set a threshold:</p>
-  <div class="code-wrap"><div class="code-header"><span>models/staging/_sources.yml</span></div><pre><code class="language-yaml">sources:
-  - name: marketplace
-    tables:
-      - name: rentals
-        loaded_at_field: loaded_at      # a timestamp column on the table
-        freshness:
-          warn_after:  {count: 12, period: hour}
-          error_after: {count: 24, period: hour}   # fail if no load in 24h</code></pre></div>
-  <p><strong>Step 3 — run the suite on clean data.</strong> Run the tests and the freshness check:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt test                    # run all data tests
-dbt source freshness        # run the freshness check</code></pre></div>
+              arguments:
+                values: ['A100', 'H100', 'L40S', 'RTX4090']</code></pre></div>
+  <p><strong>Step 3: run the suite on clean data.</strong> Run the tests and the freshness check:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash">dbt test --profiles-dir .                    # run all data tests
+dbt source freshness --profiles-dir .        # run the freshness check</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see — everything green</span>
-    <p>Each test prints <code>PASS</code>, ending with a line like <code>Done. PASS=6 WARN=0 ERROR=0 SKIP=0 TOTAL=6</code>, and freshness reports <code>PASS</code>. Green across the board — your data satisfies every rule you declared. Now let's prove the tests actually <em>work</em> by breaking one.</p>
+    <p>Each test prints <code>PASS</code>, ending with <code>Done. PASS=9 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=9</code>, and freshness reports <code>PASS</code>. Green across the board — your data satisfies every rule you declared. Now let's prove the tests actually <em>work</em> by breaking one.</p>
   </div>
-  <p><strong>Step 4 — introduce a bad row.</strong> Insert a duplicate <code>rental_id</code> into the source so the <code>unique</code> test should catch it:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># duplicate an existing rental_id straight into the source table
-docker compose exec -T postgres psql -U postgres -c \
-  "INSERT INTO rentals (rental_id, customer_id, status, hours, hourly_rate)
-   SELECT rental_id, customer_id, status, hours, hourly_rate
-   FROM rentals ORDER BY rental_id LIMIT 1;"
+  <p><strong>Step 4: introduce a bad row.</strong> Insert a duplicate <code>rental_id</code> into the source so the <code>unique</code> test should catch it:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># copy the first rental straight into the source table again
+python -c "
+import duckdb
+con = duckdb.connect('griddp.duckdb')
+con.execute('INSERT INTO rentals SELECT * FROM rentals ORDER BY rental_id LIMIT 1')
+"
 
-dbt build                   # rebuild models, then run their tests</code></pre></div>
+dbt build --profiles-dir .   # rebuild models, then run their tests</code></pre></div>
   <div class="callout danger">
     <span class="callout-label">✓ You should see — a FAILING test</span>
     <p>The run goes red. Among the output you'll see something like:</p>
-    <pre><code class="language-bash">FAIL 1 unique_fct_rentals_rental_id
+    <pre><code class="language-bash">9 of 13 FAIL 1 unique_stg_rentals_rental_id ....... [FAIL 1 in 0.05s]
   Got 1 result, configured to fail if != 0
-Done. PASS=5 WARN=0 ERROR=1 SKIP=0 TOTAL=6</code></pre>
-    <p>This is the moment of value: a machine caught a duplicate that would have double-counted revenue, and it caught it <em>before</em> the number reached anyone. In CI, this exact failure would have blocked the pull request.</p>
+Done. PASS=8 WARN=0 ERROR=1 SKIP=4 NO-OP=0 REUSED=0 TOTAL=13</code></pre>
+    <p>The four skipped nodes are the two marts and their tests: <code>dbt build</code> will not build a table on data that failed a test. This is the moment of value: a machine caught a duplicate that would have double-counted revenue, and it caught it <em>before</em> the number reached anyone. In CI, this exact failure would have blocked the pull request.</p>
   </div>
-  <p><strong>Step 5 — fix it and confirm green.</strong> Remove the duplicate and re-run:</p>
-  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># delete the duplicate, keeping one copy of each rental_id
-docker compose exec -T postgres psql -U postgres -c \
-  "DELETE FROM rentals a USING rentals b
-   WHERE a.ctid &lt; b.ctid AND a.rental_id = b.rental_id;"
+  <p><strong>Step 5: fix it and confirm green.</strong> Remove the duplicate and re-run:</p>
+  <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># delete the duplicate, keeping the first copy of each rental_id
+python -c "
+import duckdb
+con = duckdb.connect('griddp.duckdb')
+con.execute('DELETE FROM rentals WHERE rowid NOT IN (SELECT min(rowid) FROM rentals GROUP BY rental_id)')
+"
 
-dbt build                   # rebuild + re-test</code></pre></div>
+dbt build --profiles-dir .   # rebuild + re-test</code></pre></div>
   <div class="callout insight">
     <span class="callout-label">✓ You should see — back to green</span>
-    <p><code>Done. PASS=6 WARN=0 ERROR=0 SKIP=0 TOTAL=6</code>. The duplicate is gone, the <code>unique</code> test passes again, and you've watched a single rule go fail&rarr;fix&rarr;pass. That red-to-green loop is exactly what runs on every commit once these tests live in CI — your platform now defends itself.</p>
+    <p><code>Done. PASS=13 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=13</code>. The duplicate is gone, the <code>unique</code> test passes again, the marts rebuild, and you've watched a single rule go fail&rarr;fix&rarr;pass. That red-to-green loop is exactly what runs on every commit once these tests live in CI — your platform now defends itself.</p>
   </div>
 </section>
 
@@ -266,7 +297,7 @@ dbt build                   # rebuild + re-test</code></pre></div>
   <p>Two courses remain, and they change register. <strong>Course 5 (Tooling)</strong> hardens the professional workflow <em>around</em> these components — environments, packaging, CI/CD, secrets, the engineering hygiene that turns "it runs on my machine" into "it runs reliably for a team." <strong>Course 6 (Capstone)</strong> then assembles everything you've built into one coherent, end-to-end system you can put your name on.</p>
   <div class="callout tip">
     <span class="callout-label">Commit your work</span>
-    <p>Before you leave the craft, commit the test suite to <code>mini-griddp</code> with a clear message — <code>git commit -m "Add data quality tests to marketplace project"</code>. A repo with tests is a repo that signals seriousness. This is the work that makes a portfolio convincing.</p>
+    <p>Before you leave the craft, commit the test suite to <code>mini-griddp</code> with a clear message — <code>git commit -m "Add data quality tests to griddp_dbt"</code>. A repo with tests is a repo that signals seriousness. This is the work that makes a portfolio convincing.</p>
   </div>
 </section>
 
@@ -275,16 +306,16 @@ dbt build                   # rebuild + re-test</code></pre></div>
   <p>Answer from memory before opening each one.</p>
   <ol>
     <li>
-      <p>A refactor accidentally changes revenue in <code>fct_rentals</code> to <code>hours + hourly_rate</code>. Today's data passes <code>not_null</code>, <code>unique</code>, <code>accepted_values</code> and the non-negative revenue test. Why did none of them notice, and which kind of test would have?</p>
+      <p>A refactor accidentally changes revenue in <code>stg_rentals</code> to <code>hours_used + price_per_hour</code>. Today's data passes <code>not_null</code>, <code>unique</code>, <code>accepted_values</code> and the non-negative revenue test. Why did none of them notice, and which kind of test would have?</p>
       <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Those are data tests: they ask "is today's data clean?", and a wrong-but-plausible revenue is non-null, unique and positive. A <em>unit test</em> asks "is my code correct?" — it feeds the model fixed rows (2 hours at 5.00) and asserts the exact output (10.00), so it fails on the logic bug however clean the day's data is. Mature pipelines run both. See <a href="#testing">Data tests vs. unit tests</a>.</p></div></details>
     </li>
     <li>
-      <p>Finance gives you a rule: a rental whose <code>status</code> is <code>cancelled</code> must have zero revenue. None of the four built-in tests can express that. What do you write, and what exactly does it select?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A singular test: a SQL file in <code>tests/</code> that selects the rows that <em>violate</em> the rule — <code>from {{ ref('fct_rentals') }} where status = 'cancelled' and revenue &lt;&gt; 0</code>. Zero rows back means pass; any row is a failure with the offending rentals already listed. If the same check is needed on several models, wrap it as a generic test. See <a href="#testing">Testing in the pipeline</a>.</p></div></details>
+      <p>Finance gives you a rule: no single rental may run longer than a week, 168 hours. None of the four built-in tests can express that. What do you write, and what exactly does it select?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A singular test: a SQL file in <code>tests/</code> that selects the rows that <em>violate</em> the rule — <code>from {{ ref('stg_rentals') }} where hours_used &gt; 168</code>. Zero rows back means pass; any row is a failure with the offending rentals already listed. If the same check is needed on several models, wrap it as a generic test. See <a href="#testing">Testing in the pipeline</a>.</p></div></details>
     </li>
     <li>
-      <p>The "revenue by customer tier" dashboard adds up to less than total revenue in <code>fct_rentals</code>. No test on the fact's own columns for nulls, duplicates or values is failing. Which quality dimension has broken, how does it make money disappear, and which built-in test guards it?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Referential integrity: some rentals carry a <code>customer_id</code> with no row in <code>dim_customers</code>, so the join to the dimension silently drops those orphaned facts and their revenue. The <code>relationships</code> test — every value must exist in the parent table — is the guard. See <a href="#dimensions">The dimensions of quality</a>.</p></div></details>
+      <p>A "revenue by customer name" report adds up to less than the total revenue in <code>stg_rentals</code>. No test on the rentals' own columns for nulls, duplicates or values is failing. Which quality dimension has broken, how does it make money disappear, and which built-in test guards it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Referential integrity: some rentals carry a <code>customer_id</code> with no row in <code>stg_customers</code>, so the join to the customers table silently drops those orphaned rentals and their revenue. The <code>relationships</code> test — every value must exist in the parent table — is the guard. See <a href="#dimensions">The dimensions of quality</a>.</p></div></details>
     </li>
     <li>
       <p>In step 4 the source table ends up with <em>two</em> rows sharing a <code>rental_id</code>, yet the failure reads "Got 1 result". What is the one result — and if the build had not stopped there, what would the dashboard have shown?</p>
@@ -292,41 +323,48 @@ dbt build                   # rebuild + re-test</code></pre></div>
     </li>
     <li>
       <p>One night the upstream load half-completes: 200 rentals arrive instead of the usual ~10,000. Every row is valid, unique and joins cleanly, so the dbt tests pass. A colleague concludes the tests are useless and wants to replace them with an anomaly-detection tool that "learns everything". What is each approach good at, and what do you keep?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep both. Tests encode rules you are sure of — they are binary, fail loud and early, and can block a build or a pull request; a learned baseline will never know that <code>status = 'banana'</code> is forbidden. Observability learns what normal looks like for freshness, volume and schema, and flags drift nobody wrote a rule for — exactly the 200-row night — but as an anomaly score to look at, not a contract. Known rules go in tests; the surprises are what monitors are for. See <a href="#observability">Data observability</a>.</p></div></details>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keep both. Tests encode rules you are sure of — they are binary, fail loud and early, and can block a build or a pull request; a learned baseline will never know that <code>gpu_model = 'banana'</code> is forbidden. Observability learns what normal looks like for freshness, volume and schema, and flags drift nobody wrote a rule for — exactly the 200-row night — but as an anomaly score to look at, not a contract. Known rules go in tests; the surprises are what monitors are for. See <a href="#observability">Data observability</a>.</p></div></details>
     </li>
     <li>
-      <p>The product team renames the source column <code>status</code> to <code>rental_status</code>. Compare when you find out, and what it costs, in a world with only downstream dbt tests and in a world with a data contract on that source.</p>
+      <p>The product team renames the source column <code>hours_used</code> to <code>billed_hours</code>. Compare when you find out, and what it costs, in a world with only downstream dbt tests and in a world with a data contract on that source.</p>
       <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>With only downstream tests you find out after the change has shipped, when your build breaks — or a dashboard does — and the bill is a fire drill, a dent in trust and a backfill. With a contract the schema is an explicit, versioned agreement, so the rename is a contract violation caught on the producer's side, before it is published, and costs them a code review. Same bug; the only variable is how far left it was caught. See <a href="#contracts">Data contracts</a>.</p></div></details>
     </li>
   </ol>
   <details class="collapse-card">
     <summary><strong>Exercise — Guard revenue and freshness (15 minutes)</strong></summary>
     <div class="collapse-card-body">
-      <p>Two assertions every revenue pipeline should have. <strong>(1)</strong> Write a singular test that fails if any rental has negative revenue. <strong>(2)</strong> Add a freshness check that fails if no rentals data loaded today. Then prove each one by introducing a violation, running it, and fixing it.</p>
+      <p>Two assertions every revenue pipeline should have. <strong>(1)</strong> Write a singular test that fails if any rental has negative revenue. <strong>(2)</strong> Prove the freshness check you added in step 2 fails when nothing loaded today. For each one, introduce a violation, run it, and fix it.</p>
       <div class="code-wrap"><div class="code-header"><span>tests/assert_revenue_non_negative.sql</span></div><pre><code class="language-sql">-- (1) Passes only if zero rows come back.
 select rental_id, revenue
-from {{ ref('fct_rentals') }}
+from {{ ref('stg_rentals') }}
 where revenue &lt; 0</code></pre></div>
-      <div class="code-wrap"><div class="code-header"><span>models/staging/_sources.yml</span></div><pre><code class="language-yaml"># (2) Fail if the newest load is more than a day old.
-sources:
-  - name: marketplace
-    tables:
-      - name: rentals
-        loaded_at_field: loaded_at
-        freshness:
-          error_after: {count: 24, period: hour}   # nothing loaded today -> ERROR</code></pre></div>
       <div class="code-wrap"><div class="code-header"><span>terminal</span></div><pre><code class="language-bash"># prove the revenue test catches a bad value
-docker compose exec -T postgres psql -U postgres -c \
-  "UPDATE rentals SET hourly_rate = -5 WHERE rental_id = (SELECT min(rental_id) FROM rentals);"
-dbt build       # -> assert_revenue_non_negative FAILs (1 result)
+python -c "
+import duckdb
+duckdb.connect('griddp.duckdb').execute('UPDATE rentals SET price_per_hour = -5 WHERE rental_id = 1')
+"
+dbt build --profiles-dir .   # -> assert_revenue_non_negative FAILs (1 result), PASS=9 ERROR=1 SKIP=4 TOTAL=14
 
-# fix it and re-run
-docker compose exec -T postgres psql -U postgres -c \
-  "UPDATE rentals SET hourly_rate = 5 WHERE hourly_rate &lt; 0;"
-dbt build       # -> PASS again
+# fix it and re-run (rental 1 was an A100 at 2.50)
+python -c "
+import duckdb
+duckdb.connect('griddp.duckdb').execute('UPDATE rentals SET price_per_hour = 2.50 WHERE price_per_hour &lt; 0')
+"
+dbt build --profiles-dir .   # -> PASS=14 again
 
-# prove freshness: an old loaded_at trips the check
-dbt source freshness   # ERROR if loaded_at is older than 24h</code></pre></div>
+# (2) prove freshness: age every load by two days
+python -c "
+import duckdb
+duckdb.connect('griddp.duckdb').execute(\"UPDATE rentals SET loaded_at = current_timestamp - INTERVAL 2 DAY\")
+"
+dbt source freshness --profiles-dir .   # ERROR STALE: newest load is older than 24h
+
+# fix it: pretend the load ran just now
+python -c "
+import duckdb
+duckdb.connect('griddp.duckdb').execute('UPDATE rentals SET loaded_at = current_timestamp')
+"
+dbt source freshness --profiles-dir .   # PASS</code></pre></div>
       <p>If you wrote the negative-revenue query as "select the rows that violate the rule" without being told to, the core instinct of data testing has landed: <strong>a test is a query for the bad rows, and clean means none.</strong> That single idea generalizes to every assertion you'll ever write.</p>
     </div>
   </details>
