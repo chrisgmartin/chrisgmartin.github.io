@@ -108,10 +108,10 @@
     <thead><tr><th>Service</th><th>Role in the platform</th><th>Reached from your laptop at</th></tr></thead>
     <tbody>
       <tr><td><strong>Postgres</strong></td><td>The <em>source</em> — an operational database holding raw application tables we ingest from.</td><td><code>localhost:5432</code> (psql / client)</td></tr>
-      <tr><td><strong>Redpanda</strong></td><td>The <em>stream</em> — a Kafka-compatible broker carrying events between producers and consumers.</td><td><code>localhost:9092</code> (Kafka API)</td></tr>
+      <tr><td><strong>Redpanda</strong></td><td>The <em>stream</em> — a Kafka-compatible broker carrying events between producers and consumers.</td><td><code>localhost:19092</code> (Kafka API; containers use <code>redpanda:9092</code>)</td></tr>
       <tr><td><strong>DuckDB</strong></td><td>The <em>warehouse / lakehouse</em>. <strong>In-process</strong> — not a server. It runs as a library <em>inside</em> your dbt and Dagster containers, reading/writing a single <code>.duckdb</code> file on a shared volume.</td><td>— (no port; it's a file)</td></tr>
       <tr><td><strong>Dagster</strong></td><td><em>Orchestration</em> — schedules and runs your jobs (ingest, dbt builds) and serves a web UI for runs and assets.</td><td><code>localhost:3000</code> (web UI)</td></tr>
-      <tr><td><strong>Metabase</strong></td><td><em>BI / presentation</em> — point-and-click charts and SQL over the warehouse and Postgres.</td><td><code>localhost:3001</code> (web UI)</td></tr>
+      <tr><td><strong>Metabase</strong></td><td><em>BI / presentation</em> — point-and-click charts and SQL over Postgres. Stock Metabase has no DuckDB driver, so the pipeline publishes the gold tables it should see into a Postgres schema (Capstone Lab 08).</td><td><code>localhost:3001</code> (web UI)</td></tr>
       <tr><td><strong>MinIO</strong> <em>(optional)</em></td><td><em>Object storage</em> — an S3-compatible bucket for raw files / a lake layer. Lets you practice the cloud storage pattern locally.</td><td><code>localhost:9000</code> API · <code>9001</code> console</td></tr>
     </tbody>
   </table>
@@ -121,7 +121,7 @@
     <p>Server databases (Postgres) run as their own process and you connect over the network. DuckDB is the opposite: it's a <em>library</em> that runs inside whatever process opens it — your dbt run, your Dagster job, a Python script. So there's no "DuckDB service" to start. Instead, every container that uses it mounts the <em>same</em> named volume and opens the same <code>warehouse.duckdb</code> file. The "service" is really just a shared file on disk.</p>
   </div>
 
-  <p>The connections, end to end: scripts write rows into <strong>Postgres</strong> and/or events onto <strong>Redpanda</strong>; <strong>Dagster</strong> runs jobs that read from those sources and load <strong>DuckDB</strong> (via dbt or Python, in-process); <strong>Metabase</strong> connects to DuckDB (and Postgres) to draw charts. Optionally raw files land in <strong>MinIO</strong> first. One private network ties them together.</p>
+  <p>The connections, end to end: scripts write rows into <strong>Postgres</strong> and/or events onto <strong>Redpanda</strong>; <strong>Dagster</strong> runs jobs that read from those sources and load <strong>DuckDB</strong> (via dbt or Python, in-process); <strong>Metabase</strong> connects to Postgres to draw charts, reading a serving schema the pipeline publishes from DuckDB. Optionally raw files land in <strong>MinIO</strong> first. One private network ties them together.</p>
 </section>
 
 <section id="compose">
@@ -154,10 +154,12 @@ services:
       - start
       - --smp=1
       - --overprovisioned
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      # Two listeners: containers reach the broker as redpanda:9092,
+      # your laptop reaches it as localhost:19092 (a client connects to the ADVERTISED address).
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
     ports:
-      - "9092:9092"
+      - "19092:19092"
     volumes:
       - redpandadata:/var/lib/redpanda/data
     networks: [platform]
@@ -188,13 +190,14 @@ services:
       redpanda:
         condition: service_healthy
 
-  # ── BI: charts & SQL over the warehouse ───────────────────────────
+  # ── BI: charts & SQL over a Postgres serving schema ───────────────
+  # Stock Metabase has no DuckDB driver (and DuckDB allows one writer per file),
+  # so BI reads Postgres; the pipeline publishes gold into it (Capstone Lab 08).
   metabase:
     image: metabase/metabase:v0.50.21
     ports:
       - "3001:3000"                     # Metabase serves on 3000 inside; we publish 3001
     volumes:
-      - warehouse:/warehouse            # read the same DuckDB file
       - metabasedata:/metabase-data
     environment:
       MB_DB_FILE: /metabase-data/metabase.db
@@ -240,8 +243,8 @@ volumes:
   </table>
 
   <div class="callout insight">
-    <span class="callout-label">The shared volume is the trick</span>
-    <p>Notice <code>warehouse:</code> is mounted into both <code>dagster</code> and <code>metabase</code>. That's how an in-process warehouse becomes "shared" — Dagster writes the DuckDB file, Metabase reads the same file. Two containers, one file, no server.</p>
+    <span class="callout-label">The shared volume is the trick (and where it stops)</span>
+    <p>Notice <code>warehouse:</code> is a named volume mounted into <code>dagster</code>. That's how an in-process warehouse survives restarts and can be shared by every process in that container: dbt and the Dagster jobs open the same file, no server. Metabase does <em>not</em> mount it. Stock Metabase has no DuckDB driver, and DuckDB allows a single writer per file, so a BI tool holding the file open would fight the pipeline for the lock. BI reads Postgres instead, and the pipeline publishes the gold tables into a serving schema there (Capstone Lab 08).</p>
   </div>
 </section>
 
@@ -389,7 +392,7 @@ open http://localhost:9001    # MinIO console (optional)</code></pre></div>
     </li>
     <li>
       <p>A teammate reviewing the Compose file asks where the <code>duckdb</code> service is, and offers to add one with a published port so Metabase has something to connect to. What do you tell them, and what in the file already does that job?</p>
-      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>There is nothing to start: DuckDB is a library that runs inside whichever process opens the file, not a server you connect to over the network. The sharing is done by the named volume <code>warehouse</code>, mounted into both <code>dagster</code> and <code>metabase</code>, so both open the same <code>/warehouse/warehouse.duckdb</code> — two containers, one file, no server. See <a href="#services">Why DuckDB has no container</a> and <a href="#compose">The shared volume is the trick</a>.</p></div></details>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>There is nothing to start: DuckDB is a library that runs inside whichever process opens the file, not a server you connect to over the network. The named volume <code>warehouse</code> keeps the file, and every job in the <code>dagster</code> container opens the same <code>/warehouse/warehouse.duckdb</code>. Metabase is the exception: it has no DuckDB driver and a second process holding the file would contend for DuckDB's single writer lock, so BI reads a Postgres serving schema that the pipeline publishes. See <a href="#services">Why DuckDB has no container</a> and <a href="#compose">The shared volume is the trick</a>.</p></div></details>
     </li>
     <li>
       <p><code>docker compose up -d</code> fails with "address already in use" for 5432 because your laptop already runs its own Postgres. Which number in <code>"5432:5432"</code> do you change, and does <code>POSTGRES_HOST</code> or anything Dagster uses to reach the database need to change with it?</p>
