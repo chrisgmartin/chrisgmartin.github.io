@@ -7,12 +7,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Start Here — Serving Open-Weight Models</title>
 <!-- HEAD:seo -->
-<meta name="description" content="Why Harbourline is moving two workloads to open-weight models, the vocabulary of serving, and the metrics the guide measures everything against.">
+<meta name="description" content="Running an open-weight model is a capacity problem dressed as a machine-learning problem: the questions are how many bytes move per token, how many requests…">
 <link rel="canonical" href="https://christopherm.xyz/ai-engineering/serving-open-weight-models/00-START-HERE">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Field Guides">
 <meta property="og:title" content="Start Here — Serving Open-Weight Models">
-<meta property="og:description" content="Why Harbourline is moving two workloads to open-weight models, the vocabulary of serving, and the metrics the guide measures everything against.">
+<meta property="og:description" content="Running an open-weight model is a capacity problem dressed as a machine-learning problem: the questions are how many bytes move per token, how many requests…">
 <meta property="og:url" content="https://christopherm.xyz/ai-engineering/serving-open-weight-models/00-START-HERE">
 <meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
 <meta property="og:image:width" content="1200">
@@ -36,8 +36,12 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
-    <a href="#check">✓ Check yourself</a>
+    <a href="#why">Why run the model yourself</a>
+    <a href="#metrics">The four numbers</a>
+    <a href="#memory">Where the bytes go</a>
+    <a href="#vocab">The vocabulary</a>
+    <a href="#harbourline">The running example</a>
+    <a href="#folder">The chapters, in order</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
 
@@ -52,12 +56,133 @@
 <header class="hero">
   <span class="eyebrow">Section A · Orient</span>
   <h1>Start Here</h1>
-  <p class="subtitle">Why Harbourline is moving two workloads to open-weight models, the vocabulary of serving, and the metrics the guide measures everything against.</p>
+  <p class="subtitle">Running an open-weight model is a capacity problem dressed as a machine-learning problem: the questions are how many bytes move per token, how many requests share each pass, and what that costs per million tokens against an API price. Start here for why Harbourline is doing it, the four numbers every chapter measures against, and the vocabulary.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="why">
+  <h2>Why run the model yourself</h2>
+  <p>An API is the right default for almost every team. Someone else owns the GPUs, the upgrades and the on-call rota, and the price per million tokens already includes the utilisation they achieve by pooling thousands of customers. Three things move a workload off the API: a volume high enough that the rented GPUs would be busy most of the day, a constraint on where data may go that a vendor contract cannot satisfy, or a latency or customisation need the API does not offer, such as a fine-tuned adapter the vendor will not host. Cost alone rarely does it on its own, because a self-hosted GPU that sits at 20 percent utilisation costs more per token than the API it replaced.</p>
+  <p>This guide is for the engineer who has one of those three reasons and must now make the thing work: pick a model, fit it into GPU memory with room for requests, make a decode step fast, choose an engine, size a deployment against a latency objective, and keep it running. Each chapter explains the mechanism first, because every optimisation in serving is a consequence of where a decode step spends its time, and an engineer who knows that can reason about a new technique the week it appears. <a href="01-build-or-buy.html">Chapter 01</a> does the build-or-buy arithmetic for both Harbourline workloads and says which reason tipped each one.</p>
+</section>
+
+<section id="metrics">
+  <h2>The four numbers</h2>
+  <p>Serving is measured with four quantities, and a design that improves one usually spends another. Time to first token (TTFT) is the wait before the first output token appears, dominated by prefill: the pass over the whole prompt. Time per output token (TPOT), also called inter-token latency, is the gap between tokens once streaming starts, dominated by decode. Throughput is output tokens per second across all requests on a GPU, what a batch is for. Goodput is the share of that throughput delivered inside the latency objective; a GPU producing 3,000 tokens a second at a TTFT of four seconds has high throughput and, for an interactive assistant, almost no goodput.</p>
+  <table>
+    <thead><tr><th>Number</th><th>What dominates it</th><th>Who feels it</th><th>What moves it</th></tr></thead>
+    <tbody>
+      <tr><td>TTFT</td><td>Prefill over the prompt; queueing</td><td>Interactive users</td><td>Prefix caching, chunked prefill, admission control, more GPUs</td></tr>
+      <tr><td>TPOT</td><td>Decode: one forward pass per token, memory-bound</td><td>Anyone reading a stream</td><td>Quantisation, smaller KV cache, speculative decoding, smaller batch</td></tr>
+      <tr><td>Throughput</td><td>How many requests share each decode pass</td><td>The finance team</td><td>Continuous batching, larger batch, KV memory headroom</td></tr>
+      <tr><td>Goodput</td><td>Throughput that meets the SLO</td><td>Both</td><td>The batch size that keeps p95 TTFT and TPOT inside budget</td></tr>
+    </tbody>
+  </table>
+  <p>A batch job cares about throughput and cost; an assistant cares about TTFT and TPOT. The same model on the same GPUs is configured differently for each, and <a href="08-capacity-cost-and-slos.html">chapter 08</a> turns the four numbers into a sizing worksheet.</p>
+</section>
+
+<section id="memory">
+  <h2>Where the bytes go</h2>
+  <p>A GPU's memory is the budget everything else is paid from. The weights take a fixed share: two bytes per parameter in BF16, one in FP8, about half a byte at four-bit. What remains holds the key-value cache, the per-token state every request keeps for the whole conversation, plus activations and the engine's working space. The number of requests that can run at once is the free memory divided by the KV cache a request needs, and that is why nearly every serving technique is either a way to shrink the weights, shrink the cache, or reuse one pass across more requests.</p>
+  <div class="flow">  one 80 GB GPU, 70B-class model
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ weights  BF16: 140 GB (does not fit)   FP8: 70 GB   INT4: ~35 GB             │
+  │ ──────────────────────────────────────────────────────────────────────────── │
+  │ KV cache  = (80 GB − weights − working space) ÷ KV bytes per token           │
+  │            → the number of concurrent tokens you can hold                    │
+  │ ──────────────────────────────────────────────────────────────────────────── │
+  │ activations + engine working space  (a few GB)                               │
+  └──────────────────────────────────────────────────────────────────────────────┘
+  shrink weights (ch. 03) · shrink or share the cache (ch. 04) · more tokens per pass (ch. 05)</div>
+  <p>Decode is memory-bound: for each new token the GPU reads every weight once and every cached key and value for the request, and does comparatively little arithmetic with them. Batching many requests into one pass reads the weights once for all of them, which is where throughput comes from and why the cache, not compute, is usually the ceiling. <a href="02-anatomy-of-a-decode-step.html">Chapter 02</a> does this arithmetic for the model Harbourline chose, and the paging that makes the cache usable is explained in <a href="../paged-attention-deep-dive/index.html">PagedAttention from First Principles</a>.</p>
+</section>
+
+<section id="vocab">
+  <h2>The vocabulary</h2>
+  <table>
+    <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Open-weight model</td><td>A model whose weights can be downloaded and run under a licence. Not the same as open source: the training data and code may not be published and the licence may restrict use.</td></tr>
+      <tr><td class="term">Prefill</td><td>The pass over the whole prompt that fills the KV cache. Compute-heavy; sets TTFT.</td></tr>
+      <tr><td class="term">Decode</td><td>One forward pass per generated token, reusing the cache. Memory-bound; sets TPOT.</td></tr>
+      <tr><td class="term">KV cache</td><td>The keys and values every layer computed for every token so far, kept so they are not recomputed. Grows with context length.</td></tr>
+      <tr><td class="term">Quantisation</td><td>Storing weights (and sometimes activations or the cache) in fewer bits. Trades a measured accuracy loss for memory and bandwidth.</td></tr>
+      <tr><td class="term">Continuous batching</td><td>Adding and removing requests from the running batch at every decode step instead of waiting for a batch to finish.</td></tr>
+      <tr><td class="term">Prefix caching</td><td>Reusing the KV cache of a prompt prefix that many requests share, such as a system prompt.</td></tr>
+      <tr><td class="term">Speculative decoding</td><td>Guessing several tokens cheaply and verifying them in one pass of the large model; faster when the guesses are usually right.</td></tr>
+      <tr><td class="term">Tensor and pipeline parallelism</td><td>Splitting one model's layers across GPUs by slicing each matrix (tensor) or by assigning whole layers (pipeline).</td></tr>
+      <tr><td class="term">Engine</td><td>The serving software: vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp. Owns batching, the cache and the API.</td></tr>
+      <tr><td class="term">Constrained decoding</td><td>Masking the next-token distribution so output follows a grammar or JSON schema.</td></tr>
+      <tr><td class="term">Goodput</td><td>Throughput that arrives within the latency objective. The number to size against.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="harbourline">
+  <h2>The running example: Harbourline Insurance</h2>
+  <p>Harbourline is a fictional mid-size property-and-casualty insurer, about two million policies in the US and UK, shared with the other AI Engineering guides. Two workloads are moving to a self-hosted open-weight model, for different reasons, and the chapters size and tune both. All figures are illustrative.</p>
+  <table>
+    <thead><tr><th>Workload</th><th>Shape</th><th>Objective</th><th>Why self-host</th></tr></thead>
+    <tbody>
+      <tr><td>A: nightly claims batch</td><td>About 6,000 claims a night, about 1,500 input and 300 output tokens each: roughly 9 million input and 1.8 million output tokens a night</td><td>Finish inside a four-hour window at the lowest cost per claim</td><td>Steady volume, latency-insensitive, and the tuned model from <a href="../finetuning-and-alignment-deep-dive/index.html">Fine-Tuning and Preference Alignment</a> needs a home</td></tr>
+      <tr><td>B: help-centre RAG assistant</td><td>About 13,000 sessions a day, prompts about 3,000 tokens of which a shared 1,200-token system prompt, answers about 250 tokens</td><td>TTFT at or under 800 ms at p95, at least 30 output tokens a second per stream</td><td>UK data residency for policy documents, and a shared prefix that caching turns into a large saving</td></tr>
+    </tbody>
+  </table>
+  <p>The target is a 70B-class dense model in FP8 or four-bit weights on two H100 80 GB GPUs in a UK region, compared throughout against the API models it replaces at the prices in <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html">the neocloud pricing comparison</a>. The arithmetic is kept consistent across chapters so that a number in chapter 08 can be traced to the memory picture in chapter 02.</p>
+</section>
+
+<section id="folder">
+  <h2>The chapters, in order</h2>
+  <h3>Section B · Decide and understand</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="01-build-or-buy.html">01 Build or Buy</a></td><td>The cost crossover at Harbourline's volumes, utilisation as the hidden variable, residency, latency, operational burden, the hybrid</td></tr>
+      <tr><td><a href="02-anatomy-of-a-decode-step.html">02 Anatomy of a Decode Step</a></td><td>Prefill and decode, why decode is memory-bound, KV arithmetic, MQA and GQA, the four numbers, the roofline</td></tr>
+    </tbody>
+  </table>
+  <h3>Section C · Making it fast</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="03-quantization.html">03 Quantization</a></td><td>The precision ladder, GPTQ, AWQ, GGUF and FP8, calibration, measuring the loss, fitting 70B on two GPUs</td></tr>
+      <tr><td><a href="04-attention-and-kv-cache-optimisations.html">04 Attention and KV-Cache Optimisations</a></td><td>FlashAttention, paged and prefix caching, KV quantisation, chunked prefill, sliding windows, what each buys</td></tr>
+      <tr><td><a href="05-speculative-decoding-and-batching.html">05 Speculative Decoding and Batching</a></td><td>Draft models, Medusa and EAGLE, acceptance arithmetic, continuous batching and its scheduler, when speculation hurts</td></tr>
+    </tbody>
+  </table>
+  <h3>Section D · Running it</h3>
+  <table>
+    <thead><tr><th>Chapter</th><th>What it settles</th></tr></thead>
+    <tbody>
+      <tr><td><a href="06-engines-and-formats.html">06 Engines and Formats</a></td><td>vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp, MLX; formats; a feature table as of November 2026</td></tr>
+      <tr><td><a href="07-deployment-topologies.html">07 Deployment Topologies</a></td><td>Laptop to edge, tensor and pipeline parallelism, disaggregated prefill and decode, autoscaling, GPU selection</td></tr>
+      <tr><td><a href="08-capacity-cost-and-slos.html">08 Capacity, Cost and SLOs</a></td><td>Sizing from tokens per second, goodput under the SLO, cost per million tokens, cold starts, the worksheet</td></tr>
+      <tr><td><a href="09-structured-output-and-constrained-decoding.html">09 Structured Output and Constrained Decoding</a></td><td>Grammar and schema enforcement, tool-call formats, the latency and quality cost, the libraries</td></tr>
+      <tr><td><a href="10-operating-in-production.html">10 Operating in Production</a></td><td>Observability, canary upgrades, adapters, guardrail placement, the incidents and the runbook</td></tr>
+    </tbody>
+  </table>
+  <p>The request path in front of the engine, with batching, hedging and circuit breakers, is built in <a href="../build-inference-gateway-rust/index.html">Build an Inference Gateway in Rust</a>; this guide stops at the engine's API.</p>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Self-hosting pays when volume keeps GPUs busy, when data may not leave, or when the API cannot host what you need; cost alone at low utilisation argues the other way.</li>
+    <li>TTFT, TPOT, throughput and goodput are the four numbers; a batch job and an assistant weight them differently and are configured differently on the same hardware.</li>
+    <li>GPU memory is the budget: weights first, then the KV cache, and the cache decides how many requests run at once.</li>
+    <li>Decode is memory-bound, so every optimisation shrinks the weights, shrinks or shares the cache, or spreads one pass over more tokens.</li>
+    <li>Keep the arithmetic traceable: the memory picture in chapter 02 is the source of every capacity and cost number later in the guide.</li>
+  </ul>
+  <p>Begin with the decision that justifies the rest: does this workload belong on your GPUs at all? → <a href="01-build-or-buy.html">Build or Buy</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener"><strong>Efficient Memory Management for Large Language Model Serving with PagedAttention</strong></a> — Kwon et al., 2023. The vLLM paper: why the KV cache, not compute, limits a serving system, and what paging recovers.</li>
+    <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener"><strong>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</strong></a> — Dao et al., 2022. The clearest statement of the memory-bound view of attention that the rest of the guide relies on.</li>
+    <li><a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener"><strong>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</strong></a> — Ainslie et al., 2023. Why current open-weight models have far fewer key-value heads than attention heads, and what that does to the cache.</li>
+    <li><a href="https://github.com/mlabonne/llm-course" target="_blank" rel="noopener"><strong>LLM Course</strong></a> — Maxime Labonne, updated 2026. The reading list that prompted this guide; its LLM Engineer track covers running, optimising and deploying.</li>
+  </ul>
 </section>
 
 </main>
