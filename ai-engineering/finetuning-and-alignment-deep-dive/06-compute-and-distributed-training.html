@@ -19,14 +19,14 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
-<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
-<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<link rel="icon" href="../../assets/favicon.svg?v=21" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=21" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=21">
 <!-- /HEAD:seo -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
 <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="../../assets/style.css?v=20">
-<script defer src="../../assets/script.js?v=20"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=21">
+<script defer src="../../assets/script.js?v=21"></script>
 </head>
 <body>
 
@@ -37,6 +37,12 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#precision">Mixed precision: BF16 by default, FP8 with a profile</a>
+    <a href="#memory-tools">Gradient checkpointing and accumulation</a>
+    <a href="#parallel">DDP, FSDP and ZeRO: what each one shards</a>
+    <a href="#when">When one GPU is enough</a>
+    <a href="#renting">Choosing and renting a GPU</a>
+    <a href="#plan">A costed plan for Harbourline</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -58,7 +64,174 @@
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p><a href="05-preference-alignment.html">Chapter 05</a> ended with two training stages and no bill. This chapter works out how many GPU-hours they take and what a pound or dollar of that buys. It covers numeric precision, the two tricks that trade compute for memory, what data parallelism, FSDP and DeepSpeed ZeRO each shard, how to choose and rent a GPU, and a costed plan for Harbourline's LoRA run and the full fine-tune it replaces.</p>
+  <p>The model is the 8.19 B-parameter checkpoint from <a href="04-supervised-fine-tuning.html">chapter 04</a>. Token counts and utilisation figures are illustrative. Prices are from vendor pages in November 2026 and change often.</p>
+</section>
+
+<section id="precision">
+  <h2>Mixed precision: BF16 by default, FP8 with a profile</h2>
+  <p>Mixed precision keeps the heavy matrix multiplications in a 16-bit format and the delicate parts in FP32. Micikevicius et al. (2017) set out the FP16 recipe: an FP32 master copy of the weights, plus loss scaling to shift small gradients into FP16's range, which tops out at 65,504.</p>
+  <p>BF16 trades differently. It keeps FP32's 8-bit exponent, so its largest value is about 3.4 × 10<sup>38</sup>, and gives up mantissa: 7 bits, a machine epsilon of 0.0078 against FP16's 0.00098. Kalamkar et al. (2019) note that FP16 needs loss scaling and BF16 does not. That makes BF16 the default wherever it is supported, and it is why <a href="04-supervised-fine-tuning.html#memory">chapter 04</a> warns about pure-BF16 weight updates: the coarse mantissa that is harmless in a matrix multiply rounds away small updates to the weights.</p>
+  <p>FP8 goes further. Micikevicius et al. (2022) define two encodings, E4M3 and E5M2. NVIDIA lists the H100 SXM's FP8 throughput at 3,958 TFLOPS "with sparsity" against 1,979 for BF16, so the dense figures are half: about 990 for BF16 and 1,979 for FP8. DeepSeek-V3's report shows FP8 training working at very large scale.</p>
+  <div class="callout insight">
+    <span class="callout-label">FP8 doubles the peak, not your throughput</span>
+    <p>A fine-tune on 2,000-token sequences also spends time in attention, normalisation, data loading and communication, and none of that gets 2× faster. For Harbourline, stay on BF16. Reconsider FP8 only after a profile shows matrix multiplies dominate and a held-out comparison shows no quality loss. An FP8 fine-tune of this model was not measured for this chapter.</p>
+  </div>
+</section>
+
+<section id="memory-tools">
+  <h2>Gradient checkpointing and accumulation</h2>
+  <p>Backpropagation needs each layer's activations from the forward pass. Chen et al. (2016) showed that storing a subset and recomputing the rest brings memory to O(√n) for n layers, for the cost of one extra forward pass. The ZeRO paper gives a case: a 1.5 B GPT-2 at sequence length 1,024 and batch 32 needs about 60 GB of activations, which checkpointing cuts to about 8 GB at roughly 33% recomputation overhead.</p>
+  <p>That overhead shows in the FLOP count. A full fine-tune costs 2<em>N</em> per token forward and 4<em>N</em> backward, 6<em>N</em>, and 8<em>N</em> with checkpointing. With LoRA the frozen weights need no weight gradient, so a step is 4<em>N</em>, or 6<em>N</em> with checkpointing. TRL enables checkpointing by default. If the activations fit without it, switching it off cuts a LoRA run's compute by a third and a full fine-tune's by a quarter. Harbourline's LoRA run has about 60 GB free (<a href="04-supervised-fine-tuning.html#memory">chapter 04</a>), so try micro-batch 1 or 2 without checkpointing and measure the peak. On long contexts the answer flips, because activations scale with sequence length.</p>
+  <p><strong>Gradient accumulation</strong> sums gradients over several micro-batches before one optimiser step. The effective batch is micro-batch × accumulation steps × GPUs, so Harbourline's 32 can be 4 × 8 on one GPU or 4 × 2 on four. It costs no extra memory beyond the gradient buffer, which makes it the standard way to decouple the batch you want from the one that fits.</p>
+</section>
+
+<section id="parallel">
+  <h2>DDP, FSDP and ZeRO: what each one shards</h2>
+  <p>Plain <strong>data parallelism</strong> (DDP) puts a full copy of the model, gradients and optimiser state on every GPU, gives each GPU different data, and averages gradients between steps. It scales throughput and not model size: every GPU still needs the 131 GB.</p>
+  <p><strong>ZeRO</strong> (Rajbhandari et al., 2019) removes that redundancy in three cumulative stages. Stage 1 shards the optimiser state, stage 2 adds the gradients, and stage 3 adds the parameters. The paper's per-GPU formulas, with <em>Ψ</em> parameters, <em>K</em> = 12 for mixed-precision Adam and <em>N<sub>d</sub></em> GPUs, are 4<em>Ψ</em> + <em>K</em><em>Ψ</em>/<em>N<sub>d</sub></em> for stage 1, 2<em>Ψ</em> + (2 + <em>K</em>)<em>Ψ</em>/<em>N<sub>d</sub></em> for stage 2, and (2 + 2 + <em>K</em>)<em>Ψ</em>/<em>N<sub>d</sub></em> for stage 3. Stages 1 and 2 keep DDP's communication volume, and stage 3 adds 50%. This script evaluates the formulas for Qwen3-8B:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>zero_memory.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># zero_memory.py: static GB per GPU for each ZeRO stage (formulas from Rajbhandari et al., 2019, Figure 1).
+N, K, GB = 8_190_735_360, 12, 1e9      # Qwen3-8B parameters; K = 12 for mixed-precision Adam
+print("GPUs   stage 0  stage 1  stage 2  stage 3")
+for d in (1, 2, 4, 8):
+    row = [(2 + 2 + K) * N, 4 * N + K * N / d, 2 * N + (2 + K) * N / d, (2 + 2 + K) * N / d]
+    print(f"{d:4d}" + "".join(f"{x / GB:9.1f}" for x in row))</code></pre>
+</div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">GPUs   stage 0  stage 1  stage 2  stage 3
+   1    131.1    131.1    131.1    131.1
+   2    131.1     81.9     73.7     65.5
+   4    131.1     57.3     45.0     32.8
+   8    131.1     45.0     30.7     16.4</code></pre></div>
+  <p>Against an 80 GB card, two GPUs cannot hold a full fine-tune even at stage 3, which leaves 65.5 GB static and about 14 GB for everything else. Four GPUs work with stage 2 at 45.0 GB, or stage 3 at 32.8 GB. Hugging Face's guidance is to use ZeRO-3 only when the model does not fit under ZeRO-2, because ZeRO-2 communicates less. On four H100s ZeRO-2 is the right choice. ZeRO does not shard activations: each GPU still holds its own micro-batch.</p>
+  <p><strong>FSDP</strong> is PyTorch's implementation of the same idea. Hugging Face's Accelerate documentation maps FSDP <code>FULL_SHARD</code> to ZeRO stage 3, and the PyTorch FSDP paper (Zhao et al., 2023) reports performance comparable to DDP while supporting significantly larger models. DeepSpeed adds offload, which moves optimiser and gradient state to CPU memory in ZeRO-2 (ZeRO-Offload) and can push more to CPU or NVMe in ZeRO-3 (ZeRO-Infinity). Offload trades speed for fit.</p>
+  <p>TRL runs on Accelerate, which configures either backend, so pick the one your team can debug. FSDP needs no extra package, and DeepSpeed has the offload options.</p>
+</section>
+
+<section id="when">
+  <h2>When one GPU is enough</h2>
+  <p>Harbourline's LoRA run needs about 17 GB static plus activations, so one H100 holds it with room to spare. You do not need distributed training to start, and QLoRA stretches one card further: Dettmers et al. fine-tuned a 65 B model on one 48 GB GPU.</p>
+  <p>A full fine-tune of the same model needs four GPUs, from the table above. A full fine-tune of a 70 B model needs 16 bytes × 70 × 10<sup>9</sup> parameters, which is 1.12 TB of static state. Spread over 8 GPUs that is 140 GB each, and over 16 it is 70 GB each, still leaving no room for activations. You would need 32 GPUs, across four nodes, where the network between nodes becomes part of your cost. LoRA or QLoRA on the 70 B model is the realistic route.</p>
+  <p>Parallelism buys time, not money. Data-parallel LoRA on four GPUs finishes in about a quarter of the wall-clock time for about the same GPU-hours. Use more GPUs when iteration speed matters and one when the budget does.</p>
+</section>
+
+<section id="renting">
+  <h2>Choosing and renting a GPU</h2>
+  <p>Three parts differ between GPUs: memory, compute, and price. These are the November 2026 numbers.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>GPU</th><th>Memory</th><th>BF16 compute</th><th>On demand, Together AI</th><th>On demand, RunPod</th></tr></thead>
+    <tbody>
+      <tr><td class="term">H100 SXM</td><td>80 GB, 3.35 TB/s</td><td>About 990 TFLOPS dense</td><td>$3.99 per GPU-hour</td><td>$3.99</td></tr>
+      <tr><td class="term">H200</td><td>141 GB, 4.8 TB/s</td><td>Same as H100</td><td>$5.99</td><td>$5.29</td></tr>
+      <tr><td class="term">B200</td><td>180 GB</td><td>Not verified here</td><td>$8.19</td><td>$7.99</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The H200 has the same compute as the H100 and more memory and bandwidth. At Together's prices it costs 1.50 times as much per hour, so for a compute-bound job it is 50% more expensive per run. Pay for it when its memory removes a sharding setup you would otherwise build. The B200 costs 2.05 times the H100. NVIDIA claims 3× the training performance for a DGX B200 system against a DGX H100, a vendor figure for a whole system. The break-even rule is general: a GPU with price ratio <em>R</em> must run your job <em>R</em> times faster just to cost the same. Measure on a short run before committing.</p>
+  <p>Provider choice is a larger lever than GPU choice. Across the providers in the <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html#table">neocloud pricing comparison</a>, on-demand H100 prices run from $3.90 to $6.16 per GPU-hour, and Lambda and Crusoe change theirs on 16 November and 1 December. Compare cost per completed job, not per hour, as <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html#adjustments">the fairness adjustments</a> explain. Preemptible capacity at $1.99 on Together halves the rate, so it wins only if interruptions waste under half your work. That needs checkpoint-and-resume to work, which you must test first. See also <a href="../../data-science/data-science-for-neoclouds/03-training-fine-tuning.html">Training and Fine-Tuning Workflows</a> and the <a href="../ai-compute-infrastructure/index.html">AI compute infrastructure guide</a>.</p>
+</section>
+
+<section id="plan">
+  <h2>A costed plan for Harbourline</h2>
+  <p>The method: estimate FLOPs, divide by the throughput the GPU sustains, multiply by the hourly price. For training, Kaplan et al. (2020) estimate compute as about 6<em>ND</em> for <em>N</em> parameters and <em>D</em> tokens, and the checkpointing and LoRA adjustments from earlier give 6<em>ND</em> for the LoRA run and 8<em>ND</em> for the full fine-tune. Peak is 989 TFLOPS per H100, and a real run sustains a share of it. The plan uses 35% for a single GPU and 30% for the sharded run. Replace them after 50 steps.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>gpu_cost.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># gpu_cost.py: GPU-hours and dollars for the Harbourline runs. Token counts and utilisation are illustrative.
+N = 8_190_735_360                      # parameters
+D = 22_000 * 2_000 * 2                 # examples x tokens each x epochs = 88 M tokens
+PEAK, PRICE = 989e12, 3.99             # H100 BF16 dense FLOP/s; USD per H100-hour (Nov 2026)
+# FLOPs per token with checkpointing: LoRA 6N (2N forward, 2N recompute, 2N activation gradients);
+# full fine-tune 8N (adds 2N of weight gradients).
+for name, k, gpus, utils in [("LoRA r=16, 1 GPU", 6, 1, (0.25, 0.35, 0.45)),
+                             ("Full fine-tune, 4 GPUs", 8, 4, (0.20, 0.30, 0.40))]:
+    print(f"{name}: {k}ND = {k * N * D:.2e} FLOPs")
+    for u in utils:
+        h = k * N * D / (u * PEAK) / 3600
+        print(f"  {u:.0%} utilisation: {h:4.1f} GPU-h, {h / gpus:4.2f} h wall, ${h * PRICE:5.2f}")
+dpo = 8 * N * 5_400 * 4_000 / (0.35 * PEAK) / 3600        # 5,400 pairs, two 2,000-token sequences each
+print(f"DPO, LoRA, 1 GPU, 1 epoch: {dpo:.1f} GPU-h, ${dpo * PRICE:.2f}")
+lora, full = (6 * N * D / (0.35 * PEAK) / 3600), (8 * N * D / (0.30 * PEAK) / 3600)
+print(f"Plan, LoRA (4 SFT + 2 DPO runs, +25% overhead): {(4 * lora + 2 * dpo) * 1.25:.1f} GPU-h, ${(4 * lora + 2 * dpo) * 1.25 * PRICE:.2f}")
+print(f"Plan, full (4 SFT runs, +25% overhead): {4 * full * 1.25:.1f} GPU-h, ${4 * full * 1.25 * PRICE:.2f}")
+for g, p in (("H200", 5.99), ("B200", 8.19)):
+    print(f"{g} at ${p}/h must be {p / PRICE:.2f}x faster than H100 at ${PRICE}/h to break even")</code></pre>
+</div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">LoRA r=16, 1 GPU: 6ND = 4.32e+18 FLOPs
+  25% utilisation:  4.9 GPU-h, 4.86 h wall, $19.39
+  35% utilisation:  3.5 GPU-h, 3.47 h wall, $13.85
+  45% utilisation:  2.7 GPU-h, 2.70 h wall, $10.77
+Full fine-tune, 4 GPUs: 8ND = 5.77e+18 FLOPs
+  20% utilisation:  8.1 GPU-h, 2.02 h wall, $32.31
+  30% utilisation:  5.4 GPU-h, 1.35 h wall, $21.54
+  40% utilisation:  4.0 GPU-h, 1.01 h wall, $16.16
+DPO, LoRA, 1 GPU, 1 epoch: 1.1 GPU-h, $4.53
+Plan, LoRA (4 SFT + 2 DPO runs, +25% overhead): 20.2 GPU-h, $80.57
+Plan, full (4 SFT runs, +25% overhead): 27.0 GPU-h, $107.70
+H200 at $5.99/h must be 1.50x faster than H100 at $3.99/h to break even
+B200 at $8.19/h must be 2.05x faster than H100 at $3.99/h to break even</code></pre></div>
+  <p>The inputs are 22,000 examples at 2,000 tokens over two epochs, which is 88 M tokens. The 8.19 B parameter count slightly overstates <em>N</em>, since the embedding table does lookups, not multiplies. At 6<em>ND</em> this gives 4.32 × 10<sup>18</sup> FLOPs for the LoRA run, which at 35% of 989 TFLOPS is 3.5 hours and $13.85 at $3.99. The full fine-tune is 8<em>ND</em>, or 5.77 × 10<sup>18</sup> FLOPs, and at 30% it takes 5.4 GPU-hours, which is 1.35 hours on four GPUs and $21.54.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Route</th><th>One SFT run</th><th>Plan</th><th>GPU-hours</th><th>Cost at $3.99</th></tr></thead>
+    <tbody>
+      <tr><td class="term">LoRA</td><td>3.5 GPU-h, $13.85</td><td>4 SFT runs and 2 DPO runs</td><td>20.2</td><td>$80.57</td></tr>
+      <tr><td class="term">Full fine-tune, 4 GPUs</td><td>5.4 GPU-h, $21.54</td><td>4 SFT runs</td><td>27.0</td><td>$107.70</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Plans include a 25% allowance for loading and idle time, which is an assumption. The LoRA plan covers three learning rates and one rank-64 SFT run, plus two beta values for DPO from <a href="05-preference-alignment.html">chapter 05</a>. The full plan has no DPO stage, since full-parameter DPO needs a second 16.4 GB reference model.</p>
+  <div class="callout tip">
+    <span class="callout-label">Check tokens per second after 50 steps</span>
+    <p>The 35% assumption means the LoRA run should process 0.35 × 989 × 10<sup>12</sup> / (6 × 8.19 × 10<sup>9</sup>), about 7,000 tokens per second. If your logs show 3,500, your run costs twice the plan, and the fix, such as packing, removing checkpointing or a larger micro-batch, comes before the sweep, not after.</p>
+  </div>
+  <p>The compute bill is small either way, so it should not drive the decision. What does is everything around it: sweeps multiply the cost by the number of runs, a resumable full-fine-tune checkpoint with optimiser state is about 131 GB where a LoRA adapter is about 175 MB, and four GPUs bring a distributed setup to debug. LoRA wins on all three, and a measured gap on the held-out set in <a href="07-evaluating-a-tuned-model.html">chapter 07</a> is the only thing that should send you to full fine-tuning. Serving cost follows the same per-job logic, as in <a href="../ai-engineer-interview-prep/10-latency-and-cost-at-scale.html#budget">the latency and cost budget</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>The LoRA run has 60 GB of free memory. A teammate asks to turn off gradient checkpointing. What do you expect to gain, and what do you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>LoRA's step is 4<em>N</em> per token without checkpointing and 6<em>N</em> with it, so the run's compute falls by a third. Check that the activations still fit by measuring peak memory at micro-batch 1 or 2, and confirm the loss curve is unchanged. See <a href="#memory-tools">checkpointing</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You want to fully fine-tune the 8.19 B model on two H100s with ZeRO-3. Compute the static memory per GPU and say whether it works.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>16 bytes × 8.19 B / 2 GPUs is 65.5 GB per GPU. That leaves about 14 GB on an 80 GB card for activations, logits and overhead, which is too tight. Four GPUs gives 32.8 GB at stage 3, or 45.0 GB at stage 2. See <a href="#parallel">what each one shards</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A B200 costs $8.19 per hour and an H100 $3.99. What speedup does the B200 need on your job to be the cheaper option, and how do you find out whether it gets there?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>8.19 / 3.99 is 2.05, so it must be 2.05 times faster. NVIDIA's 3× figure is for a whole system on an unspecified workload, so run a short fixed number of steps on each GPU, compare tokens per second, and compute cost per completed job. See <a href="#renting">choosing and renting</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your first 50 steps of the LoRA run show 3,500 tokens per second. What does that do to the plan's cost, and what do you try before launching the sweep?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The plan assumed about 7,000 tokens per second at 35% utilisation, so the run takes twice as long and costs about twice as much, roughly $27.70 per run. Try packing, a larger micro-batch, or turning off checkpointing if memory allows, then re-measure. See <a href="#plan">a costed plan</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>DDP copies everything onto every GPU, while ZeRO and FSDP shard optimiser state, then gradients, then parameters, at the price of more communication at the last stage.</li>
+    <li>Harbourline's LoRA run fits on one H100, and a full fine-tune of the same model needs four, with ZeRO-2 enough at that size.</li>
+    <li>A pricier GPU with price ratio R must be R times faster to cost the same per job, so measure tokens per second on your own run.</li>
+    <li>At $3.99 an hour the LoRA route costs about $81 for the whole plan and the full fine-tune route about $108, so the choice rests on sweeps, checkpoint size and quality, not on compute.</li>
+  </ul>
+  <p>With a trained and costed model in hand, the remaining question is whether it is any good. → <a href="07-evaluating-a-tuned-model.html">Evaluating a Tuned Model</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener"><strong>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</strong></a> — Rajbhandari et al., 2019. The three stages, the memory formulas and the communication cost.</li>
+    <li><a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener"><strong>PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</strong></a> — Zhao et al., 2023. How FSDP implements sharding and how it compares with DDP.</li>
+    <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener"><strong>Mixed Precision Training</strong></a> — Micikevicius et al., 2017. FP32 master weights and loss scaling.</li>
+    <li><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener"><strong>DeepSeek-V3 Technical Report</strong></a> — DeepSeek-AI, 2024. FP8 mixed-precision training validated at large scale.</li>
+    <li><a href="https://huggingface.co/docs/accelerate/concept_guides/fsdp_and_deepspeed" target="_blank" rel="noopener"><strong>FSDP vs DeepSpeed</strong></a> — Hugging Face Accelerate docs. How the two backends' settings map to each other.</li>
+  </ul>
 </section>
 
 </main>
