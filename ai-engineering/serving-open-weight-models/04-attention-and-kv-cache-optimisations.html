@@ -37,6 +37,12 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#flash">FlashAttention: the same answer, fewer trips to memory</a>
+    <a href="#prefix">Prefix caching: the shared 1,200 tokens</a>
+    <a href="#kv-quant">KV-cache quantization: half the bytes per token</a>
+    <a href="#chunked">Chunked prefill: keeping decode steady</a>
+    <a href="#window">Sliding windows: a model property, not a switch</a>
+    <a href="#buys">What each technique buys at Harbourline</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -58,7 +64,157 @@
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p><a href="02-anatomy-of-a-decode-step.html">Chapter 02</a> showed that decode is limited by bytes moved, and <a href="03-quantization.html">chapter 03</a> shrank the weights until a 70B model fit on two H100 80 GB GPUs. This chapter covers what is left: how attention is computed, how the cache is shared, and how many bytes each cached token costs.</p>
+  <p>Paged allocation, the base layer of every modern engine, is taught in the <a href="../paged-attention-deep-dive/index.html#kvcache">paged attention guide</a> and is assumed here. Five techniques sit on top of it, each with its mechanism, its Harbourline numbers, and the case where it does nothing.</p>
+  <p>All figures use Llama 3.3 70B. The Llama 3 paper gives the 70B architecture as 80 layers, 64 query heads and 8 KV heads, and the Llama 3.3 model card says it uses grouped-query attention. With a head dimension of 128, the cache costs 2 × 80 × 8 × 128 × 2 bytes = 327,680 bytes, or 320 KiB, per token in BF16. A Workload B request of 3,250 tokens holds about 1.07 GB of cache. The pool left after FP8 weights on two GPUs is about 68 GB, which holds 207,500 tokens, or 64 such requests.</p>
+</section>
+
+<section id="flash">
+  <h2>FlashAttention: the same answer, fewer trips to memory</h2>
+  <p>Standard attention writes the full score matrix to GPU memory, reads it back for the softmax, writes the probabilities, and reads them again for the multiply by V. For one Harbourline prompt of 3,250 tokens, one layer and 64 heads at 2 bytes, the scores alone are 3,250² × 64 × 2 B = 1.35 GB. Four passes through HBM move 5.4 GB. At 3.35 TB/s that is 1.6 ms per layer and about 130 ms over 80 layers on one GPU, or about 65 ms when tensor parallelism gives each of two GPUs half the heads. This assumes four passes and no overlap. The term is quadratic in prompt length and pure memory traffic.</p>
+  <p>FlashAttention (Dao et al., 2022) removes the term. It splits Q, K and V into tiles that fit in on-chip SRAM, computes scores for one tile at a time, keeps running softmax statistics so earlier tiles can be rescaled, and writes only the output. The paper calls it an IO-aware exact attention algorithm: it counts HBM reads and writes, not just FLOPs, and computes the same function as standard attention.</p>
+  <p>The three versions differ in how well they use the GPU, not in what they compute.</p>
+  <ul>
+    <li><strong>FlashAttention-2</strong> (2023) repartitions work across thread blocks and warps. The authors report about 2× over the first version, reaching 50 to 73% of theoretical peak FLOPs on A100 where the first reached 25 to 40%.</li>
+    <li><strong>FlashAttention-3</strong> (2024) targets Hopper. It overlaps data movement and tensor-core work asynchronously and interleaves matrix multiplies with softmax. The authors report 1.5 to 2.0× over the previous version on H100, FP16 at up to 740 TFLOPs/s (75% utilisation) against about 35% for FlashAttention-2, and FP8 close to 1.2 PFLOPs/s.</li>
+  </ul>
+  <p>The FP8 path is the one place where "exact" needs a caveat. It quantizes inside the kernel, so its output differs from the BF16 kernel. The authors report 2.6× lower numerical error than a baseline FP8 attention, which is not zero error.</p>
+  <p>In decode the query is one token, so no N × N matrix exists and the gain is small. It pays in prefill, which sets Workload B's time to first token. The engine selects the backend from the GPU, so check its start-up log on the H100s to confirm it picked the Hopper kernel. On A100 fleets the best kernel is the second version.</p>
+</section>
+
+<section id="prefix">
+  <h2>Prefix caching: the shared 1,200 tokens</h2>
+  <p>A token's key and value vectors depend on every token before it. That is why a cache can only be reused for a prefix: two requests that begin with the same token ids have identical KV for those positions, and the first position where they differ invalidates everything after. vLLM documents automatic prefix caching as reusing the KV cache of existing queries when a new query shares the same prefix, and notes that it reduces prefill time, not decoding time. SGLang builds the same idea on a radix tree (RadixAttention), and TensorRT-LLM stores filled blocks in a radix search tree with reuse on by default. Sharing works on whole blocks of a fixed token count, so a partial block at the end of the shared prefix is recomputed.</p>
+  <p>At Harbourline, every Workload B prompt starts with the same 1,200-token system prompt, followed by retrieved passages that differ per question. The shared head is 40% of an average 3,000-token prompt. Three numbers follow, using 13,000 sessions a day and an illustrative prefill rate of 15,000 tokens/s for the pair, about 2.1 PFLOP/s at 140 GFLOP per token, roughly half the pair's dense FP8 peak.</p>
+  <ul>
+    <li><strong>Compute.</strong> 1,200 × 13,000 = 15.6 million of 39 million prefill tokens a day are skipped. That is about 17 minutes of the pair's day. Prefix caching does not move the cost line at this volume.</li>
+    <li><strong>Latency.</strong> Each request skips 1,200 / 15,000 s = 80 ms of prefill, out of about 217 ms for 3,250 tokens. Against an 800 ms p95 budget that is headroom for queueing.</li>
+    <li><strong>Memory.</strong> The prefix is stored once. At an illustrative peak of 1.5 requests/s, each lasting about 9 s (0.8 s to first token, then 250 tokens at 30/s), about 14 streams are in flight. Sharing replaces 14 copies of 393 MB with one, saving 13 × 393 MB = 5.1 GB of the 68 GB pool.</li>
+  </ul>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>kv_budget.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python"># Llama 3.3 70B, two H100 80 GB, FP8 weights
+LAYERS, KV_HEADS, HEAD_DIM = 80, 8, 128
+POOL_GB = 68                      # 2 x 72 GB usable, minus 70 GB weights, minus ~6 GB activations and graphs
+PROMPT, ANSWER, SHARED = 3000, 250, 1200
+SESSIONS_PER_DAY = 13_000
+PREFILL_TOK_S = 15_000            # assumed prefill rate for the pair; measure yours
+
+def kv_per_token(bytes_per_value):
+    return 2 * LAYERS * KV_HEADS * HEAD_DIM * bytes_per_value   # K and V
+
+for name, b in (("BF16 KV", 2), ("FP8 KV", 1)):
+    per_tok = kv_per_token(b)
+    tokens = POOL_GB * 1e9 / per_tok
+    print(f"{name}: {per_tok:,} B/token, pool {tokens:,.0f} tokens, "
+          f"{tokens / (PROMPT + ANSWER):.0f} requests of {PROMPT + ANSWER:,} tokens, "
+          f"{tokens / 32_000:.1f} requests of 32,000 tokens")
+
+saved_tokens = SHARED * SESSIONS_PER_DAY
+print(f"prefix hit saves {saved_tokens:,} of {PROMPT * SESSIONS_PER_DAY:,} prefill tokens a day "
+      f"({SHARED / PROMPT:.0%}), {saved_tokens / PREFILL_TOK_S / 60:.0f} GPU-pair minutes, "
+      f"{SHARED / PREFILL_TOK_S * 1000:.0f} ms of TTFT per request")
+streams = 14
+print(f"14 streams share one prefix copy: saves {(streams - 1) * SHARED * kv_per_token(2) / 1e9:.1f} GB of KV")</code></pre>
+  </div>
+  <p>Multi-turn sessions add a second prefix, turn one's prompt and answer. Both hits need nothing variable before the shared text.</p>
+  <div class="callout warn">
+    <span class="callout-label">One timestamp in the first line turns the cache off</span>
+    <p>If the system prompt begins with the date, the user's name or a request id, the first differing token ends the match and the 1,200 shared tokens are recomputed every time. Put variable text last and watch the engine's prefix hit-rate metric rather than assuming it works.</p>
+  </div>
+  <p>The cache also lives per replica. Hugging Face's TGI v3 notes warn that with several replicas behind a load balancer a user's next request may land on a replica without the prefix, and suggest sticky sessions, with the caveat that they may be unnecessary. Harbourline's single replica avoids this, but the second replica in <a href="08-capacity-cost-and-slos.html">chapter 08</a> will not. API-side prompt caching is in <a href="../ai-engineer-interview-prep/10-latency-and-cost-at-scale.html#caching">latency and cost at scale</a>. Block hashing and eviction are in the <a href="../paged-attention-deep-dive/index.html#prefix-cache">paged attention guide</a>.</p>
+</section>
+
+<section id="kv-quant">
+  <h2>KV-cache quantization: half the bytes per token</h2>
+  <p>The KV cache can be quantized separately from the weights, and it is a different bargain: weights are read once per step regardless of batch, while the cache is read once per sequence and grows with context. FP8 KV halves the cost per token from 320 KiB to 160 KiB. That doubles the pool in tokens (207,500 to 415,000) and halves the cache bytes each decode step reads.</p>
+  <p>vLLM exposes it as <code>--kv-cache-dtype fp8</code>, with <code>fp8_e4m3</code> and <code>fp8_e5m2</code> variants. Two details matter for quality. With no calibration all scaling factors default to 1.0, and the docs recommend calibrating scales on a dataset with llm-compressor. Per-attention-head scales work only with the Flash Attention backend and need that calibration. A separate flag keeps chosen layers, such as sliding-window layers, at native precision. TensorRT-LLM lists FP8 KV on Hopper and Blackwell.</p>
+  <p>What does it buy at Harbourline? Less than the headline suggests. Workload B at peak holds 14 streams of 3,250 tokens, 14.9 GB of cache in a 68 GB pool, so capacity is not the constraint. Workload A holds more: at an average 1,650 tokens of context, the BF16-KV pool fits about 125 concurrent claims and the FP8-KV pool about 250. Idealised step time is (70 GB of weights + cache read) / 6.7 TB/s, about 20.5 ms either way, because doubling the sequences while halving the bytes reads the same 68 GB. That is about 6,100 against 12,200 tokens/s. Workload A needs 1.8 million output tokens in four hours, which is 125 tokens/s. Both ceilings are far above it, and both are bandwidth-only upper bounds; chapter 08 uses measured throughput.</p>
+  <p>So at Harbourline's prompt shapes the recommendation is to leave the cache in BF16. The case where it flips is long context: a 32,000-token document costs 10.5 GB of cache in BF16, so the pool holds 6 such requests and FP8 KV holds 13. If Harbourline moved claim-file summarisation onto this model, FP8 KV would be the first thing to enable. Before doing so, run the Harbourline evaluation set on both settings, including long-context questions, because the error is not visible in perplexity on short text.</p>
+</section>
+
+<section id="chunked">
+  <h2>Chunked prefill: keeping decode steady</h2>
+  <p>The SARATHI paper states the problem: prefill saturates GPU compute even at small batch sizes, while decode leaves it mostly idle. If an engine runs a whole 3,250-token prefill as one step, every other stream waits. At the assumed 15,000 tokens/s that step takes about 217 ms, against a stream budget of 33 ms per token (30 tokens/s).</p>
+  <p>Chunked prefill splits the prompt and mixes each chunk with the running decodes. SARATHI describes chunked prefills plus decode-maximal batching, and reports up to 1.25× end-to-end throughput on LLaMA-33B on A100. In vLLM V1 the scheduler serves pending decodes first, then fills the remaining token budget with prefill, splitting a prompt that does not fit. The budget is <code>max_num_batched_tokens</code>, and the docs state the trade directly: smaller values give better inter-token latency, larger values give better time to first token.</p>
+  <p>Setting it for Harbourline is arithmetic. A decode step with 14 streams takes about 12.7 ms (70 GB of weights plus 14.9 GB of cache over 6.7 TB/s). To keep every step under 33 ms, a chunk can add (33 − 12.7) ms × 15,000 tokens/s, about 300 tokens. An uncached 3,250-token prompt then takes 11 chunks and about 360 ms to first token, against about 230 ms unchunked. With the prefix hit, 2,050 tokens take 7 chunks and about 230 ms. The new request pays about 130 ms more so that fourteen others do not stall, which fits the 800 ms budget.</p>
+  <div class="callout tip">
+    <span class="callout-label">Prefix caching and chunking pay for each other</span>
+    <p>A prefix hit removes four of the new request's eleven chunks, so tune the token budget with prefix caching on and benchmark on a warm cache. The scheduler is covered in the <a href="../paged-attention-deep-dive/index.html#chunked-prefill">paged attention guide</a>.</p>
+  </div>
+  <p>The setting flips for Workload A, which has no stream-rate target: use a large budget, since vLLM's docs suggest values above 8,192 for throughput.</p>
+</section>
+
+<section id="window">
+  <h2>Sliding windows: a model property, not a switch</h2>
+  <p>With sliding-window attention each token attends only to the previous W tokens. Mistral 7B uses W = 4,096. Because layers stack, information still travels W × k tokens by layer k, a theoretical span of about 131,000 tokens at the last layer. The cache keeps only the last W positions in a rolling buffer, position i at slot i mod W. The Mistral paper reports an 8× smaller cache at 32,000 tokens with no loss in quality.</p>
+  <p>This does nothing for Harbourline: Workload B's 3,250-token requests fit inside one 4,096 window. The Llama 3 architecture as published has no window, and a window cannot be bolted onto a trained model without retraining, since the model learned to use the whole context. It matters when you choose a model: some architectures window some layers, so the per-token cache is smaller than the formula above. Compute it from the model's own config, layer by layer, and do not reuse 320 KiB. Engines handle the mixed case: vLLM can skip FP8 on sliding-window layers, and TensorRT-LLM frees blocks that leave a layer's window.</p>
+</section>
+
+<section id="buys">
+  <h2>What each technique buys at Harbourline</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Technique</th><th>What it changes</th><th>Workload B</th><th>Workload A</th><th>Flips when</th></tr></thead>
+    <tbody>
+      <tr><td>FlashAttention</td><td>Prefill memory traffic</td><td>About 65 ms of score traffic per prompt gone (estimate)</td><td>Same, on 9M prefill tokens</td><td>Never off; version depends on the GPU</td></tr>
+      <tr><td>Prefix caching</td><td>Prefill tokens, shared KV</td><td>80 ms TTFT, 5.1 GB, 17 GPU-min/day</td><td>Little: claims share no head</td><td>Variable text precedes the shared prompt</td></tr>
+      <tr><td>FP8 KV cache</td><td>Bytes per cached token</td><td>None: 14.9 of 68 GB used</td><td>Doubles pool; not needed at 125 tokens/s</td><td>Contexts near 32,000 tokens</td></tr>
+      <tr><td>Chunked prefill</td><td>Step time during prefill</td><td>Keeps steps under 33 ms at a cost of about 130 ms TTFT</td><td>Large budget, no stream target</td><td>A tighter or looser stream-rate SLO</td></tr>
+      <tr><td>Sliding window</td><td>Cache per token</td><td>None below 4,096 tokens</td><td>None</td><td>Model chosen has windowed layers</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The techniques that reduce work (FlashAttention, prefix caching) pay at Harbourline's volumes. Those that reduce capacity pressure (FP8 KV, windows) do not, because 68 GB is generous for 14 streams. <a href="05-speculative-decoding-and-batching.html">Chapter 05</a> moves from storing the cache to spending each memory-bound step on more than one token.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague says FlashAttention-3 is faster because it approximates softmax. What is wrong with that, and where does the speed come from?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The algorithm is exact. The speed comes from moving less data through HBM and from using Hopper's asynchronous tensor cores and tensor memory accelerator more fully. Only the FP8 path is lossy. See <a href="#flash">FlashAttention</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Harbourline adds the current date and the customer's first name as the first line of the help-centre system prompt. Prefix-cache hit rate falls from near 100% to near zero. Why, and what is the fix?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Keys and values depend on all earlier tokens, so a match must start at position zero and stops at the first differing token. A first line that varies per request ends every match at once. Move the variable text after the shared 1,200 tokens. See <a href="#prefix">prefix caching</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Workload B has 14 streams in flight at peak. A teammate proposes FP8 KV cache to "double our capacity". Using the numbers in this chapter, do you agree?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Peak use is 14 × 1.07 GB = 14.9 GB of a 68 GB pool, so capacity is not binding and FP8 KV would add quality risk for nothing. It would matter at contexts near 32,000 tokens, where the pool holds 6 requests in BF16. See <a href="#kv-quant">KV-cache quantization</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You set <code>max_num_batched_tokens</code> to 16,384 on the interactive deployment and p95 time to first token improves but users report stuttering streams. What happened, and what do you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A large budget lets one prefill occupy a whole step, so running streams stall for the length of that step: better TTFT, worse inter-token latency. Reduce the budget to about the size that keeps the step under the per-token budget, here about 300 tokens at the assumed prefill rate. See <a href="#chunked">chunked prefill</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>FlashAttention is exact attention that avoids writing the N × N score matrix to HBM; it speeds up prefill, not decode.</li>
+    <li>A KV cache can only be reused as a prefix, so prefix caching depends on keeping variable text out of the head of the prompt.</li>
+    <li>At Harbourline, the shared 1,200-token prompt saves 40% of prefill tokens and about 80 ms of TTFT per request, but only about 17 GPU-minutes a day.</li>
+    <li>FP8 KV halves the cache per token, and pays only when the pool is the constraint, which for Harbourline means contexts near 32,000 tokens.</li>
+    <li>Chunked prefill trades the new request's TTFT for the other streams' steadiness, and its token budget should be derived from the per-token latency target.</li>
+    <li>Sliding windows belong to the trained model, so compute cache cost from its config.</li>
+  </ul>
+  <p>The other half of the job is getting more than one token out of each memory-bound step. → <a href="05-speculative-decoding-and-batching.html">Speculative Decoding and Batching</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener"><strong>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</strong></a> — Dao et al., 2022. Good for the tiling argument and the IO-complexity analysis.</li>
+    <li><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener"><strong>FlashAttention-2</strong></a> — Dao, 2023. Good for how work partitioning, not the algorithm, accounts for the 2× gain.</li>
+    <li><a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener"><strong>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</strong></a> — Shah et al., 2024. Good for what Hopper-specific kernels do and the FP8 accuracy claim.</li>
+    <li><a href="https://arxiv.org/abs/2308.16369" target="_blank" rel="noopener"><strong>SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills</strong></a> — Agrawal et al., 2023. Good for why prefill and decode should share a batch.</li>
+    <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener"><strong>Mistral 7B</strong></a> — Jiang et al., 2023. Good for the sliding-window span and the rolling buffer cache.</li>
+ <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener"><strong>vLLM: Optimization and Tuning</strong></a> — vLLM documentation. Good for the chunked-prefill token budget.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html" target="_blank" rel="noopener"><strong>vLLM: Quantized KV Cache</strong></a> — vLLM documentation. Good for the dtype options, scaling and calibration caveats.</li>
+  </ul>
 </section>
 
 </main>
