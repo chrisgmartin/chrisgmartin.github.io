@@ -139,6 +139,7 @@
     d.connect(pf,dc);
     d.note(30,276,'decode reads every weight per token:\nbatch more requests into one pass',{size:9.5});
     d.note(230,296,'goodput = tokens inside the SLO',{size:10});
+  };
   B['ai-engineering/finetuning-and-alignment-deep-dive']=function(d){
     d.title('Teach the model, then prove it');
     var base=d.box(14,62,96,44,'base checkpoint\nsomeone else trained',{size:9.5});
