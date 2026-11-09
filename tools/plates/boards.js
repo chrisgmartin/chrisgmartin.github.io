@@ -141,6 +141,7 @@
     d.note(296,224,'defend here:\nleast privilege\nconfirm writes\nno exfil channel',{size:9.5});
     d.note(14,224,'filters catch\nstrings, not\nintent',{size:9.5});
     d.note(14,296,'99% holds × 40k sessions a day = hundreds of failures');
+  };
   B['ai-engineering/serving-open-weight-models']=function(d){
     d.title('Memory-bound, so budget the bytes');
     d.text(200,50,'one 80 GB GPU',{size:10.5});
@@ -154,6 +155,7 @@
     d.connect(pf,dc);
     d.note(30,276,'decode reads every weight per token:\nbatch more requests into one pass',{size:9.5});
     d.note(230,296,'goodput = tokens inside the SLO',{size:10});
+  };
   B['ai-engineering/finetuning-and-alignment-deep-dive']=function(d){
     d.title('Teach the model, then prove it');
     var base=d.box(14,62,96,44,'base checkpoint\nsomeone else trained',{size:9.5});
