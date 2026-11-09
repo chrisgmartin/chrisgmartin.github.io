@@ -36,7 +36,13 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#ladder">The precision ladder</a>
+    <a href="#mechanics">Scales, absmax and zero-point</a>
+    <a href="#weight-only">Weight-only against weights and activations</a>
+    <a href="#methods">GPTQ, AWQ, GGUF, FP8, SmoothQuant</a>
+    <a href="#calibration">Calibration data</a>
+    <a href="#measuring">Measuring the loss</a>
+    <a href="#fit">Fitting 70B on two H100s</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -56,9 +62,173 @@
   <p class="subtitle">The precision ladder from BF16 to INT4, weight-only against weight-and-activation methods, GPTQ, AWQ, GGUF and FP8, calibration data, what accuracy you lose and how to measure it, and fitting a 70B-class model on Harbourline's GPUs.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="ladder">
+  <h2>The precision ladder</h2>
+  <p>The <a href="02-anatomy-of-a-decode-step.html#memory-bound">previous chapter</a> showed that a decode step is a weight read, so the cheapest way to speed it up is to make the weights smaller. A 70B-parameter model has 70 × 10<sup>9</sup> weights, and the bytes per weight set the memory bill:</p>
+  <div class="table-wrap" style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Format</th><th>Bits</th><th>70B weights</th><th>What it keeps</th></tr></thead>
+    <tbody>
+      <tr><td>FP32</td><td>32</td><td>280 GB</td><td>Full range and precision. Training master copy; rarely served.</td></tr>
+      <tr><td>BF16</td><td>16</td><td>140 GB</td><td>FP32's range with fewer mantissa bits. The release format of many open models and the quality baseline.</td></tr>
+      <tr><td>FP8 E4M3</td><td>8</td><td>70 GB</td><td>A float with 4 exponent and 3 mantissa bits, so range and relative precision survive coarsely. Hopper and newer run it natively.</td></tr>
+      <tr><td>INT8</td><td>8</td><td>70 GB</td><td>256 evenly spaced levels per scale. Fine when values are well behaved; outliers hurt.</td></tr>
+      <tr><td>INT4</td><td>4</td><td>35 GB plus scales</td><td>16 evenly spaced levels per scale. Needs small groups and care.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>FP8 has two encodings, E4M3 and E5M2, proposed in <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">Micikevicius et al. (2022)</a>. E5M2 trades mantissa for range and E4M3 the reverse. The paper reports that FP8 post-training quantization worked on language models trained in 16 bits that did not quantize well to INT8. The reason is where the resolution sits: a float spends its levels densely near zero and sparsely at large magnitudes, while an integer grid is uniform, so one large value stretches it and starves the small values. The next section measures that.</p>
+</section>
+
+<section id="mechanics">
+  <h2>Scales, absmax and zero-point</h2>
+  <p>Mapping a float tensor to integers needs a scale. In <strong>absmax</strong> (symmetric) quantization, scale = max|w| ÷ qmax, where qmax is 127 for INT8 and 7 for INT4, and each weight becomes q = round(w ÷ scale), clipped. The dequantized value is q × scale. <strong>Zero-point</strong> (asymmetric) quantization uses the range [min, max] instead: scale = (max − min) ÷ (2<sup>bits</sup> − 1) and an integer offset so that zero maps exactly. It wastes fewer levels when values are lopsided, as activations can be; weights are roughly symmetric, so absmax is the usual choice for them.</p>
+  <p>A worked case. Weights [0.12, −0.5, 0.03, 0.9] with INT8 absmax: scale = 0.9 ÷ 127 = 0.00709, giving q = [17, −71, 4, 127] and dequantized values [0.1205, −0.5032, 0.0284, 0.9], so the largest error is 0.0032. Quantize the same four to INT4: scale = 0.9 ÷ 7 = 0.129, and 0.12 rounds to q = 1 (0.129) while 0.03 rounds to 0. The small weights are lost, and the cure is the scale granularity. One scale for a whole tensor is cheap and fragile. One per output channel is the common default for FP8 and INT8 weights. One per group of 32 to 128 weights is what makes INT4 usable, and it costs memory: a 16-bit scale per 128-weight group adds 16 ÷ 128 = 0.125 bits per weight.</p>
+  <p>The script below runs on a synthetic slab of weights with a standard deviation of 0.02 and 8 outliers 25 times larger, and prints the error relative to the weights' own spread. It uses only the standard library.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>absmax.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import random
+from math import sqrt
+
+def quant_absmax(w, bits, group):
+    """Symmetric absmax quantization with one scale per `group` consecutive weights."""
+    qmax = 2 ** (bits - 1) - 1                       # 127 for INT8, 7 for INT4
+    out = []
+    for i in range(0, len(w), group):
+        block = w[i:i + group]
+        scale = max(abs(x) for x in block) / qmax
+        for x in block:
+            q = max(-qmax - 1, min(qmax, round(x / scale)))
+            out.append(q * scale)                    # dequantized value
+    return out
+
+random.seed(0)
+w = [random.gauss(0, 0.02) for _ in range(8192 * 16)]    # one weight slab, std 0.02
+for i in random.sample(range(len(w)), 8):
+    w[i] *= 25                                           # a few outliers
+
+std = sqrt(sum(x * x for x in w) / len(w))
+print("bits  group   relative RMS error")
+for bits, group in [(8, len(w)), (8, 128), (4, len(w)), (4, 128), (4, 32)]:
+    d = quant_absmax(w, bits, group)
+    rms = sqrt(sum((a - b) ** 2 for a, b in zip(d, w)) / len(w))
+    print(f"{bits:>4}  {group:>6}  {rms / std:8.4f}")</code></pre>
+  </div>
+  <p>Output from running it with Python 3:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">bits  group   relative RMS error
+   8  131072    0.1235
+   8     128    0.0082
+   4  131072    0.9793
+   4     128    0.1294
+   4      32    0.0989</code></pre></div>
+  <p>With one scale for the whole slab, INT4 loses essentially all the information (0.98, an error as big as the signal) because the outliers set a coarse grid. Groups of 128 bring INT4 to 0.13 and groups of 32 to 0.10, and INT8 per group is nearly clean at 0.008. This is a synthetic slab, not Llama's weights, so read it as the shape of the effect.</p>
+</section>
+
+<section id="weight-only">
+  <h2>Weight-only against weights and activations</h2>
+  <p>You can quantize the weights alone, or the weights and the activations they multiply. The notation is W4A16 (4-bit weights, 16-bit activations) or W8A8. The choice follows the roofline.</p>
+  <p><strong>Weight-only (W4A16, W8A16).</strong> The kernel loads the small weights, unpacks them to 16 bits in registers, and multiplies at 16-bit speed. Bytes read fall, arithmetic does not. That is exactly what a memory-bound decode step needs: INT4 at about 4.2 bits is 36 GB instead of 70 GB for FP8, so the weight read per GPU falls from 10.4 ms to about 5.4 ms. It does little for compute-bound prefill, and the unpacking can slow it. In vLLM's hardware table, AWQ, GPTQ and the Marlin kernels run on Hopper, and Marlin "always runs with 16-bit activations".</p>
+  <p><strong>Weights and activations (W8A8).</strong> Both operands are 8-bit, so the matrix multiply itself runs on the 8-bit tensor cores. On the H100 SXM that is 1,979 TFLOPS dense for FP8 against 989.5 for BF16, so prefill gets up to twice the compute as well as half the bytes. The vLLM documentation says FP8 weight and activation quantization is accelerated on GPUs such as the H100, with FP8 compute on compute capability 8.9 and newer (Ada, Hopper, Blackwell), while Ampere only gets weight-only FP8 through Marlin. It also claims a 2x cut in model memory and up to 1.6x higher throughput.</p>
+  <p>The catch is activations. They have large outlier channels that weights lack, which is what <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8()</a> (Dettmers et al., 2022) found: it keeps the outlier feature dimensions in a 16-bit multiply and the other 99.9 percent of values in 8 bits. <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant</a> (Xiao et al., 2022) takes the other route and moves the difficulty offline, rescaling activations down and the matching weights up in a mathematically equivalent transformation, so W8A8 INT8 works, with a reported speedup of up to 1.56x and 2x less memory.</p>
+  <p>So, for the Harbourline pair: use FP8 W8A8 as the default, since it speeds both phases and has the best accuracy record, and pick INT4 weight-only when memory is the binding constraint. The exception is hardware: a pair of A100s has no FP8 tensor cores, and there W4A16 or INT8 is the choice.</p>
+</section>
+
+<section id="methods">
+  <h2>GPTQ, AWQ, GGUF, FP8 and what each one is for</h2>
+  <ul>
+    <li><strong>GPTQ.</strong> Frantar et al.'s <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ</a> (2022) is a one-shot post-training method that quantizes the weights layer by layer, adjusting the weights not yet quantized to compensate for the rounding error using a small calibration set. The paper reports 3 or 4 bits per weight with negligible accuracy loss, and a 175B model quantized in about four GPU hours.</li>
+    <li><strong>AWQ.</strong> <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">Activation-aware Weight Quantization</a> (Lin et al., 2023) observes that protecting about 1 percent of salient weight channels greatly reduces error, picks those channels from the activation magnitudes rather than the weights, and scales them up before quantizing, with no backpropagation or reconstruction.</li>
+    <li><strong>GGUF k-quants.</strong> The llama.cpp format stores quantized blocks with their scales in one file. Its <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md" target="_blank" rel="noopener">quantize README</a> lists, for Llama 3.1 8B, Q4_K_M at 4.89 bits per weight, Q5_K_M at 5.70, Q6_K at 6.56 and Q8_0 at 8.50. The "4" in the name is not the cost: scaled to 70B, Q4_K_M is 70 × 10<sup>9</sup> × 4.89 ÷ 8 ≈ 43 GB, not 35. An importance matrix computed on calibration text lowers the loss. GGUF is the format for llama.cpp and Ollama, and vLLM can load it, but <a href="06-engines-and-formats.html">the engines chapter</a> covers which engine fits a production server.</li>
+    <li><strong>FP8 on Hopper and Blackwell.</strong> vLLM's recommended FP8 recipe, <code>FP8_DYNAMIC</code>, uses static per-channel weight scales and dynamic per-token activation scales. The documentation says it needs no calibration data and that simple round-to-nearest recovers accuracy, which makes it the lowest-effort option on the ladder.</li>
+  </ul>
+  <p>Embedding and output-head matrices are usually left in 16 bits; the vLLM recipe above ignores <code>lm_head</code>. For Llama 3.3 70B that head is 128,256 × 8,192 = 1.05 × 10<sup>9</sup> parameters, which is 2.1 GB at BF16 against 1.05 GB at FP8, so "70 GB" in FP8 is really about 71 GB in practice.</p>
+</section>
+
+<section id="calibration">
+  <h2>Calibration data</h2>
+  <p>GPTQ, AWQ and static activation scales need to see typical inputs to choose their scales and compensations. The calibration set is a sample of text run through the model once. It matters for the same reason a held-out set does: methods fit to it. Calibrating on generic web text tunes the scales for web text, not for policy questions full of deductible tables and clause numbers.</p>
+  <p>For Harbourline, calibrate on the real prompt shape: the system prompt, retrieved policy chunks, and questions, drawn from a sample that is <em>not</em> in the evaluation set from the <a href="../llm-evals-deep-dive/02-building-the-eval-set.html">eval-set chapter</a>. Otherwise the quantized model is fit to the exam. FP8 with dynamic scales needs no calibration data, one reason it is the default.</p>
+</section>
+
+<section id="measuring">
+  <h2>Measuring the loss</h2>
+  <p>Perplexity is the usual first check, and it is not enough. It averages the next-token loss over every token of a text, most of which are easy, so a model can stay within a fraction of a percent of baseline perplexity while getting a rare, important token wrong more often: a digit in a deductible, a clause number. Kurtic et al.'s study, <a href="https://arxiv.org/abs/2411.02355" target="_blank" rel="noopener">"Give Me BF16 or Give Me Death?"</a>, ran over 500,000 evaluations across the Llama 3.1 family and reports that FP8 W8A8 is effectively lossless across model sizes, well-tuned INT8 W8A8 loses roughly 1 to 3 percent, and INT4 weight-only is more competitive than expected. Treat that as a prior and verify it for your model.</p>
+  <p>The check that decides is the Harbourline labelled set, run on the BF16 baseline and each candidate with identical prompts and decoding. Compare item by item, not by average. Suppose, illustratively, that on 400 items INT4 turns 22 correct answers wrong and 9 wrong answers right. The net loss is 13 items, 3.25 points. An exact two-sided sign test on the 31 changed items gives p ≈ 0.03, so the drop is unlikely to be noise, which the two accuracy percentages alone (88.0 and 84.8) do not show. The paired method is the one in <a href="../llm-evals-deep-dive/05-the-ship-decision.html#paired">the ship decision chapter</a>.</p>
+  <p>Then slice it. Quantization hurts unevenly, so split the results by deductibles and limits, exclusions, identifiers, long prompts and any structured-output cases, and look for the slice where flips concentrate. If INT4 loses on identifiers only, keep FP8 where memory allows.</p>
+</section>
+
+<section id="fit">
+  <h2>Fitting 70B on two H100s with KV headroom</h2>
+  <p>Weights are the first claim on memory and the KV cache gets the rest. Two H100 80 GB GPUs hold 160 GB. Leaving 10 percent unallocated, take 0.90 × 80 = 72 GB usable per GPU, 144 GB for the pair, and subtract an assumed 3 GB per GPU for activations and CUDA graphs, 6 GB in all. The cache costs 327,680 B per token (<a href="02-anatomy-of-a-decode-step.html#kv-cache">chapter 02</a>), so a 3,250-token request takes 1.065 GB. The table shows the arithmetic, with weights at 16, 8 and 4.16 bits per weight:</p>
+  <div class="table-wrap" style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Format</th><th>Weights</th><th>Left for KV (144 − 6 − weights)</th><th>Tokens (÷ 327,680 B)</th><th>Requests of 3,250 tokens</th></tr></thead>
+    <tbody>
+      <tr><td>BF16</td><td>140.0 GB</td><td>−2.0 GB</td><td>none</td><td>0</td></tr>
+      <tr><td>FP8</td><td>70.0 GB</td><td>68.0 GB</td><td>207,520</td><td>63.9</td></tr>
+      <tr><td>INT4, groups of 128</td><td>36.4 GB</td><td>101.6 GB</td><td>310,159</td><td>95.4</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The INT4 row assumes a 16-bit scale and a 4-bit zero-point per 128 weights. BF16 does not fit with any headroom: even at 100 percent of memory only 160 − 140 − 6 = 14 GB would remain, about 13 requests, and with the 90 percent convention the weights alone overrun the budget. FP8 holds about 64 concurrent requests at the full 3,250 tokens, the batch the last chapter used. INT4 holds about 95 and halves the weight read. Now the cache limits the batch, which is the case for the techniques in <a href="04-attention-and-kv-cache-optimisations.html">chapter 04</a>: an FP8 cache halves the 320 KiB per token and doubles the 64 to about 127 requests.</p>
+  <p>Which one for Harbourline? FP8, because it is lossless on the evidence above, speeds prefill as well, and 64 concurrent requests is several times the roughly ten concurrent streams Workload B peaks at. It flips to INT4 if the 400-item set shows no loss and you want one GPU, not two: 36.4 GB of weights leaves 72 − 36.4 − 3 = 32.6 GB, about 31 requests on a single H100, half the hourly bill with no inter-GPU all-reduce, at the price of lower peak capacity.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>INT4 weight-only quantization cuts the decode weight read roughly in half versus FP8, yet barely changes time to first token. Why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Decode is memory-bound, so fewer bytes per step helps directly. Prefill is compute-bound and, with 16-bit activations, still multiplies at 16-bit speed after the weights are unpacked, so it gains nothing and may lose a little to the unpacking. See <a href="#weight-only">weight-only against weights and activations</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A weight tensor has typical values around 0.02 and one outlier at 0.5. With a single INT4 absmax scale for the whole tensor, what happens to the typical weights, and what fixes it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The scale is 0.5 ÷ 7 = 0.071, so a weight of 0.02 becomes round(0.28) = 0 and almost all typical weights vanish. Per-group scales confine the outlier to its own group of 32 to 128 weights, at about 0.125 bits per weight extra for a 16-bit scale per 128. See <a href="#mechanics">scales, absmax and zero-point</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vendor shows the INT4 model within 0.5 percent of baseline perplexity and says it is ready to ship. What do you run before agreeing, and why can perplexity mislead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Run the labelled set on both models, compare per item, and slice by deductibles, identifiers and exclusions. Perplexity averages over mostly easy tokens and can hide errors on the rare ones that carry a deductible or clause number. See <a href="#measuring">measuring the loss</a>.</p></div></details>
+    </li>
+    <li>
+      <p>On the 400-item set, a quantized model turns 22 right answers wrong and 9 wrong answers right. A colleague notes the accuracy only moved from 88.0 to 84.8 percent and calls it noise. How do you respond?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Only the 31 changed items carry information, and a two-sided sign test on 22 against 9 gives p ≈ 0.03, so the drop is unlikely to be chance. See <a href="#measuring">measuring the loss</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The team wants to keep BF16 on the two H100s for maximum quality: "140 GB fits in 160 GB." What is wrong with that plan?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The KV cache needs memory too. After the reserve and overhead nothing is left, and even with every byte spare only about 13 requests fit. See <a href="#fit">fitting 70B on two H100s</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You are choosing between FP8 on two GPUs and INT4 on one for Workload B, and both pass the quality set. What decides it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Capacity and risk against cost. One GPU halves the bill and avoids the all-reduce but holds about 31 requests rather than 64, so check it against the peak concurrency and the p95 TTFT budget. INT4 wins if the peak fits in 31 with room; FP8 wins if it does not. See <a href="#fit">the fit table</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Quantization shrinks the bytes a decode step reads, so it speeds the memory-bound phase directly: 70B is 140 GB in BF16, 70 GB in FP8 and about 36 GB in INT4 with group scales.</li>
+    <li>Absmax scaling lets one outlier ruin the grid, which is why INT4 needs per-group scales and why scale granularity matters more than the bit width alone.</li>
+    <li>Weight-only schemes speed decode; weight-and-activation schemes such as FP8 W8A8 speed prefill as well, because the multiply runs on 8-bit tensor cores.</li>
+    <li>FP8 on Hopper is the default: the evidence for Llama 3.1 is that it is effectively lossless, and the dynamic recipe needs no calibration data.</li>
+    <li>Perplexity is not an acceptance test. Run the labelled set on baseline and candidate, compare items pairwise, and slice by the failures that cost Harbourline money.</li>
+    <li>On two H100s, BF16 70B leaves no KV room, FP8 holds about 64 requests of 3,250 tokens and INT4 about 95, so the cache, not the weights, then sets the batch.</li>
+  </ul>
+  <p>With the weights shrunk, the cache is the next biggest bill. → <a href="04-attention-and-kv-cache-optimisations.html">Attention and KV-Cache Optimisations</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener"><strong>GPTQ</strong></a> — Frantar, Ashkboos, Hoefler and Alistarh, 2022. The one-shot weight-only method and its accuracy at 3 and 4 bits.</li>
+    <li><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener"><strong>AWQ</strong></a> — Lin et al., 2023. Why protecting a small share of channels works and why it generalises across calibration sets.</li>
+    <li><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener"><strong>SmoothQuant</strong></a> — Xiao et al., 2022. The W8A8 INT8 route and the activation-outlier problem it solves.</li>
+    <li><a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener"><strong>FP8 Formats for Deep Learning</strong></a> — Micikevicius et al., 2022. The E4M3 and E5M2 encodings.</li>
+    <li><a href="https://arxiv.org/abs/2411.02355" target="_blank" rel="noopener"><strong>"Give Me BF16 or Give Me Death?"</strong></a> — Kurtic et al., 2024 (revised 2026). Accuracy and performance of FP8, INT8 and INT4 across the Llama 3.1 family.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/quantization/llm_compressor/fp8/" target="_blank" rel="noopener"><strong>vLLM: FP8 W8A8 with LLM Compressor</strong></a> — vLLM project. The recipe, the hardware requirements and the dynamic-scale behaviour.</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md" target="_blank" rel="noopener"><strong>llama.cpp quantize README</strong></a> — llama.cpp project. The GGUF quantization types, bits per weight and the importance matrix.</li>
+  </ul>
 </section>
 
 </main>
