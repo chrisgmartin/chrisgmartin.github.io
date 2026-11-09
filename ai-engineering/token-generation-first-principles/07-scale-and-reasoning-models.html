@@ -37,6 +37,12 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#decoder-only">Why decoder-only</a>
+    <a href="#scaling">Scaling laws</a>
+    <a href="#pipeline">Base to reasoner</a>
+    <a href="#test-time">Thinking tokens</a>
+    <a href="#multimodal">Images and audio</a>
+    <a href="#timeline">2017 to 2026</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -53,12 +59,138 @@
 <header class="hero">
   <span class="eyebrow">Section D · Scale and practice</span>
   <h1>Scale and Reasoning Models</h1>
-  <p class="subtitle">Encoder-decoder to decoder-only, scaling laws, the base, instruct and reasoning pipeline, test-time compute and thinking budgets, multimodal inputs as tokens, and what changed between 2017 and 2026.</p>
+  <p class="subtitle">Chapter 06 ended with the loop that turns a model into a stream of tokens. This chapter asks why the model has this shape, what scaling laws predict, how a base model becomes an assistant or a reasoner, and what thinking tokens and image tokens cost. It closes with a table of what changed between 2017 and 2026.</p>
 </header>
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p>Chapters 01 to 06 followed one token through one model. This chapter asks why the model has the shape it has, and what changes when you spend more arithmetic on a single answer. Three choices decide most of what you see from a model: how large it is and how long it trained, how a raw next-token predictor was turned into an assistant or a reasoner, and how many tokens it writes before it answers.</p>
+  <p>The worked cases are Harbourline's two settings: claims extraction (temperature 0, JSON, 400 tokens) and the help-centre chat (temperature 0.7, top-p 0.9, streaming). Facts about hosted models are as of November 2026.</p>
+</section>
+
+<section id="decoder-only">
+  <h2>Why the encoder went away</h2>
+  <p>The 2017 Transformer was a translation model. Its base configuration had six encoder layers that read the whole source sentence with bidirectional attention, six decoder layers that wrote the target while attending to the encoder's output, a width of 512, eight heads and 65 million parameters, and it trained on about 4.5 million English-German sentence pairs (Vaswani et al., 2017). Llama 3.1 8B has no encoder. It is one stack of 32 layers with a causal mask, and your prompt is simply the first part of a sequence the model continues.</p>
+  <p>Three mechanisms explain why that simpler shape won.</p>
+  <ul>
+    <li><strong>Every position is a training target.</strong> With a causal mask, one forward pass over a 2,048-token window (GPT-3's context) produces 2,047 next-token losses. An encoder-decoder trained on pairs only learns from the target half.</li>
+    <li><strong>One format for every task.</strong> Translation, extraction and chat all become "text, then continuation". GPT-3, a 175-billion-parameter decoder-only model trained on 300 billion tokens, was applied to tasks with no gradient updates, the task and examples specified purely as text in the prompt (Brown et al., 2020).</li>
+    <li><strong>The prefix can be cached.</strong> Under a causal mask the keys and values of earlier tokens do not depend on later tokens, so they are computed once and kept. That is the KV cache of <a href="06-the-generation-loop.html">chapter 06</a>, and it is also why two requests sharing the same 1,200-token Harbourline system prompt can share its cache. A bidirectional encoder over the prompt would have to be recomputed whenever one prompt token changed.</li>
+  </ul>
+  <p>The evidence is narrower than the folklore. Wang et al. (2022) found causal decoder-only models best at zero-shot generalisation after pretraining alone, while encoder-style models won after multitask fine-tuning. Embedding models and rerankers (<a href="../production-rag-deep-dive/03-embeddings.html">Production RAG</a>) still read bidirectionally.</p>
+</section>
+
+<section id="scaling">
+  <h2>What scaling laws predict, and what they leave out</h2>
+  <p>Kaplan et al. (2020) fitted the cross-entropy loss of language models as a power law in non-embedding parameters N, training tokens D and compute C. The exponents were 0.076 for N, 0.095 for D and 0.050 for C. The arithmetic shows why labs keep spending. Doubling N alone multiplies the loss by 2<sup>-0.076</sup> = 0.949, a 5.1% fall. A tenfold increase gives 10<sup>-0.076</sup> = 0.839, a 16% fall. The gains are small and steady, which is a reason to spend on them only when you can predict them.</p>
+  <p>The two papers disagree on how to spend a fixed budget. Kaplan et al. found the optimal model size grows as C<sup>0.73</sup> and the data as C<sup>0.27</sup>, so most extra compute should go into parameters. GPT-3 followed that advice: 175 billion parameters on 300 billion tokens is 1.7 tokens per parameter. Hoffmann et al. (2022) trained more than 400 models from 70 million to over 16 billion parameters and found that model size and tokens should scale in equal proportion, with both exponents near 0.5. They tested it by training Chinchilla, 70 billion parameters on 1.4 trillion tokens, which beat the 280-billion-parameter Gopher trained on 300 billion tokens at the same compute. That is 20 tokens per parameter, the number everyone quotes.</p>
+  <p>Now compare the worked model. Llama 3.1 8B was pretrained on more than 15 trillion tokens, so about 1,870 tokens per parameter, 93 times the Chinchilla ratio. Meta says so directly: its scaling laws suggest the 405B flagship is roughly compute-optimal for the budget, but the smaller models are trained for much longer than compute-optimal, and "perform better than compute-optimal models at the same inference budget" (Dubey et al., 2024). The arithmetic shows the trade. Training compute is about 6ND, so 6 × 8.03 × 10<sup>9</sup> × 15 × 10<sup>12</sup> ≈ 7.2 × 10<sup>23</sup> FLOPs. At 20 tokens per parameter that budget is 120 N², which gives N ≈ 78 billion. A compute-optimal model for the same training bill would have ten times the parameters, and every token Harbourline served from it would cost about ten times the arithmetic and ten times the weight bytes (<a href="04-the-block-and-the-forward-pass.html">chapter 04</a>).</p>
+  <div class="callout insight">
+    <span class="callout-label">Chinchilla optimises the training bill, not the serving bill</span>
+    <p>The 20:1 ratio minimises training compute for a given loss. It says nothing about what you pay each time the model runs. For a surface that serves volume for months, such as the help-centre chat, the cheaper model is the overtrained one. The rule flips when serving is small: a research run, or a model called a few thousand times, should be trained closer to compute-optimal because the training bill dominates.</p>
+  </div>
+  <p>Meta's paper notes that scaling laws "typically predict only next-token prediction loss rather than specific benchmark performance". A bigger model being better at your task is a forecast to test with <a href="../llm-evals-deep-dive/index.html">your own evals</a>.</p>
+</section>
+
+<section id="pipeline">
+  <h2>From base model to assistant to reasoner</h2>
+  <p>A released model family usually ships three kinds of checkpoint, and they behave differently on the same prompt.</p>
+  <p>A <strong>base</strong> model has only been trained to predict the next token. Give it "What is my deductible for windscreen damage on policy HL-UK-4471-220?" and a likely continuation is another question, or a forum reply, because that is what follows such text on the web. An <strong>instruct</strong> model has been post-trained to answer. Meta's Llama 3 recipe is supervised fine-tuning, rejection sampling and direct preference optimisation, applied in rounds, and Llama 3.1 8B ships in both forms: the paper's model table lists "Llama 3.1 8B" and "Llama 3.1 8B Instruct" as separate releases, with tool use only in the second. Which one to start from when you fine-tune is the subject of <a href="../finetuning-and-alignment-deep-dive/02-choosing-a-base-checkpoint.html">choosing a base checkpoint</a>.</p>
+  <p>A <strong>reasoning</strong> model adds a stage that rewards the final answer. DeepSeek-R1-Zero started from the V3 base model and used reinforcement learning with rule-based rewards, one for answer correctness and one for output format, with no supervised fine-tuning first. On AIME 2024 its average pass@1 rose from 15.6% to 77.9% during training, and its responses grew longer as it learned to use more thinking time (DeepSeek-AI, 2025). R1-Zero had poor readability and mixed languages, so the released R1 adds cold-start data, rejection sampling, fine-tuning and a second reinforcement stage. The capability comes from rewarding verifiable outcomes, not from a new architecture.</p>
+  <p>The line has since blurred into a setting. The Qwen3.8-27B card describes one checkpoint with thinking on by default, switchable per request, and recommends different sampling per mode: temperature 1.0, top-p 0.95 for thinking and 0.7, 0.80 otherwise. Treat the sampling settings of <a href="05-from-logits-to-a-token.html">chapter 05</a> as per-mode, not per-model.</p>
+</section>
+
+<section id="test-time">
+  <h2>Thinking tokens are decode steps you pay for</h2>
+  <p>Test-time compute has no new machinery. A reasoning model runs the loop of <a href="06-the-generation-loop.html">chapter 06</a> for n thinking tokens before the answer, and each one is a full forward pass that reads every weight and the growing KV cache. It helps because a forward pass has a fixed number of layers, so the serial computation it can do per token is bounded, and writing intermediate steps as tokens lets later tokens read earlier work. </p>
+  <p>The costs follow from the mechanism. The tokens are billed as output tokens even when the thinking text is not returned to you, they count toward <code>max_tokens</code>, and the thinking blocks arrive before the text, so the user waits through them. Snell et al. (2024) add the economics: the benefit of extra test-time compute varies with prompt difficulty, so allocating it adaptively per prompt improved efficiency by more than 4 times over a best-of-N baseline, and on problems where a smaller model already had non-trivial success, spending test-time compute beat a model 14 times larger at matched FLOPs. </p>
+  <p>Here is the arithmetic for one Harbourline chat turn. The prompt is the 1,200-token system prompt, about 700 tokens of retrieved passages and the question: about 1,900 tokens. The answer is 300 tokens. Rates are Claude Sonnet 5.5's list prices, $2 per million input and $10 per million output tokens. The 3,000 thinking tokens and 50 tokens a second are illustrative; <a href="06-the-generation-loop.html">chapter 06</a> derives real decode speeds.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Harbourline chat turn</th><th>Input tokens</th><th>Output tokens billed</th><th>Cost per request</th><th>Answer text starts after</th></tr></thead>
+    <tbody>
+      <tr><td>No thinking</td><td>1,900</td><td>300</td><td>$0.0068</td><td>prefill only</td></tr>
+      <tr><td>3,000 thinking tokens</td><td>1,900</td><td>3,300</td><td>$0.0368</td><td>prefill + 60 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>That is 5.4 times the cost and a minute of silence in a streaming chat, to answer a question whose answer is a number in a retrieved passage. For the help-centre chat the right default is little or no up-front thinking. The recommendation flips for tasks with real multi-step work, such as reconciling a claim against three policy clauses, and when the cost of a wrong answer exceeds the extra cents and seconds. Find the point with an effort sweep on your own eval set, and treat a setting change as a change to evaluate, as in <a href="../llm-evals-deep-dive/08-model-and-prompt-changes.html#silent">what changes silently</a>.</p>
+  <h3>The controls, as of November 2026</h3>
+  <p>The older <code>budget_tokens</code> control is legacy: Claude 4.7 and later models reject it with a 400 error. The current control is adaptive thinking, where the model decides whether and how much to think, steered by an <code>effort</code> setting of low, medium, high, xhigh or max. Effort is "a behavioral signal, not a strict token budget" and applies to all output tokens, thinking or not. Defaults are high, except medium for Opus 5.5 and Haiku 5.5. Claude Fable 5.2 (<code>claude-fable-5-2</code>) is the top model as of November 2026, recommended on Anthropic's <a href="https://platform.claude.com/docs/en/models/overview" target="_blank" rel="noopener">models overview</a> for demanding reasoning and long-horizon agentic work, and it always thinks adaptively. Sonnet 5.5 thinks by default and rejects <code>thinking: disabled</code>; its lowest setting is <code>between_tools</code>.</p>
+  <div class="callout warn">
+    <span class="callout-label">A 400-token cap with thinking on is a truncation bug</span>
+    <p>Claims extraction caps output at 400 tokens. Thinking tokens count against that cap, so a model that thinks for 350 tokens leaves 50 for the JSON, and the document fails to parse. Turn up-front thinking off or to its lowest setting for extraction, raise <code>max_tokens</code> to cover both, and use structured output so a truncated reply fails loudly. Also note that on these hosted models a non-default <code>temperature</code>, <code>top_p</code> or <code>top_k</code> returns a 400 error, so "temperature 0" is a self-hosted setting there, and consistency comes from the schema.</p>
+  </div>
+</section>
+
+<section id="multimodal">
+  <h2>Images and audio are tokens too</h2>
+  <p>A multimodal model does not have a second brain for pictures. An encoder cuts the image into fixed-size patches, each patch becomes one vector projected to the model's width, and from the first layer on the decoder treats those vectors like any other positions. The idea dates to the Vision Transformer, "an image is worth 16x16 words" (Dosovitskiy et al., 2020). The consequence for an engineer is that images are priced and limited like text, by position count.</p>
+  <p>Anthropic's vision documentation gives the rule for Claude: 28 by 28 pixel patches, so an image costs ⌈width / 28⌉ × ⌈height / 28⌉ tokens, capped by the model's limits. A 1000 × 1000 image is 36 × 36 = 1,296 tokens, and a 200 × 200 image is 8 × 8 = 64. Models from Claude 4.7 on take up to 2,576 pixels on the long edge and 4,784 tokens; older ones cap at 1,568 pixels and 1,568 tokens. A customer's photo of a cracked windscreen at 1000 × 1000 therefore costs more input than Harbourline's entire 1,200-token system prompt. At $4 per million input tokens, the docs' figure for Opus 5.5, the same image is about $5.18 per thousand.</p>
+  <p>Open-weight models do the same sum with other constants: the Qwen3.8-27B config implies about one token per 32 × 32 pixels, roughly 977 for a 1000 × 1000 image (arithmetic; the processor was not run for this chapter). Whisper leaves one encoder position per 20 ms, so a 30-second window is 1,500 positions (Radford et al., 2022). Decide resolution before upload and downsample when the task does not need the pixels. That flips when small print decides the answer.</p>
+</section>
+
+<section id="timeline">
+  <h2>What changed from 2017 to 2026</h2>
+  <p>Each column is read from its own paper or card. The block is recognisable throughout; Llama 3.1 8B shares each KV pair across four query heads (<a href="03-attention-one-head-at-a-time.html">chapter 03</a>), and Qwen3.8-27B replaces three of every four attention layers with fixed-state linear attention (<a href="08-reading-a-model-card.html">chapter 08</a>).</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th></th><th>Transformer base (2017)</th><th>GPT-3 175B (2020)</th><th>Llama 3.1 8B (2024)</th><th>Qwen3.8-27B (2026)</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Shape</td><td>Encoder-decoder, 6 + 6 layers</td><td>Decoder-only, 96 layers</td><td>Decoder-only, 32 layers</td><td>Decoder-only, 64 layers, hybrid</td></tr>
+      <tr><td class="term">Width</td><td>512</td><td>12,288</td><td>4,096</td><td>5,120</td></tr>
+      <tr><td class="term">Parameters</td><td>65 million</td><td>175 billion</td><td>8.03 billion</td><td>27.8 billion (with vision encoder)</td></tr>
+      <tr><td class="term">Training data</td><td>4.5 million sentence pairs</td><td>300 billion tokens</td><td>15 trillion+ tokens</td><td>not stated on the card</td></tr>
+      <tr><td class="term">Context</td><td>not a headline figure</td><td>2,048</td><td>131,072</td><td>262,144, to 1,000,000 with YaRN</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague proposes an encoder-decoder model for the help-centre chat, arguing that the system prompt "only needs to be encoded once". What do you say about training signal and about prefix reuse?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A causal decoder gets a loss at every position, so a sequence of T tokens gives T − 1 training signals from one pass, and it can cache keys and values for any shared prefix because they never depend on later tokens. A bidirectional encoder over the prompt must be recomputed if any prompt token changes. See <a href="#decoder-only">why decoder-only</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Team A trains a 7B model on 140B tokens. Team B trains a 7B model on 2T tokens. Which is closer to compute-optimal, how much more training compute did the other spend, and when is that spend still rational?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Team A, at 20 tokens per parameter. Team B used 2T / 140B ≈ 14 times the training compute (compute scales as 6ND with N fixed) for the same serving cost per token. It is rational when serving volume is high enough that the lower loss saves more than the extra training cost. See <a href="#scaling">scaling laws</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Claims extraction (max 400 tokens, JSON) starts returning truncated JSON on a small share of requests after a team enables adaptive thinking on a hosted model. Explain the failure and give two fixes.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Thinking tokens count toward <code>max_tokens</code>, so a long think leaves too few tokens for the JSON. Fixes: set the model's lowest thinking setting for extraction and raise <code>max_tokens</code> to cover both thinking and answer; use structured output and treat a truncated stop reason as an error. See <a href="#test-time">thinking tokens</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Customers upload 4000 × 3000 phone photos of windscreen damage. Roughly how many visual tokens does a standard-tier Claude model charge, what is the high-resolution ceiling, and what would you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The image is downscaled to fit, so a standard-tier model charges at most 1,568 tokens (the docs show a 2000 × 1500 image costing 1,564) and a high-resolution model at most 4,784, about three times more. Resize on the client to the smallest size that keeps the damage legible. See <a href="#multimodal">images and audio</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Decoder-only won as the default because every position is a training target, every task becomes text plus continuation, and the causal mask makes the prefix cacheable. It is a default, not a proof that encoders lose everywhere.</li>
+    <li>Scaling laws predict held-out loss, not task accuracy. Doubling parameters alone cuts loss by about 5%.</li>
+    <li>Chinchilla's 20 tokens per parameter minimises training compute. Llama 3.1 8B was trained at about 1,870 because inference volume, not training cost, dominates once a model serves real traffic.</li>
+    <li>Base, instruct and reasoning checkpoints are different products: next-token prediction, then supervised and preference post-training, then reinforcement learning on verifiable outcomes. Current open models expose reasoning as a per-request setting with its own recommended sampling.</li>
+    <li>Thinking tokens are ordinary decode steps. They are billed as output, count toward <code>max_tokens</code> and delay the answer, so a 3,000-token think on a 300-token chat answer cost 5.4 times as much in the worked example.</li>
+  </ul>
+  <p>You now have the shape of the model and what its settings cost. → <a href="08-reading-a-model-card.html">Reading a Model Card</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener"><strong>Training Compute-Optimal Large Language Models</strong></a> — Hoffmann et al., 2022. The Chinchilla result, the three fitting approaches and the 70B on 1.4T-token test.</li>
+    <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener"><strong>The Llama 3 Herd of Models</strong></a> — Dubey et al., 2024. A full recipe: overtrained small models, staged context extension, and the SFT, rejection-sampling and DPO post-training loop.</li>
+    <li><a href="https://arxiv.org/abs/2408.03314" target="_blank" rel="noopener"><strong>Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters</strong></a> — Snell et al., 2024. How the value of thinking varies with prompt difficulty.</li>
+    <li><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener"><strong>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</strong></a> — DeepSeek-AI, 2025. The base-to-reasoner recipe with rule-based rewards.</li>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/thinking" target="_blank" rel="noopener"><strong>Thinking</strong></a> — Anthropic documentation, read November 2026. Per-model thinking support, billing, and the effort parameter; check it before relying on any setting named here.</li>
+  </ul>
 </section>
 
 </main>
