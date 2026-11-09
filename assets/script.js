@@ -30,7 +30,8 @@
         { name: 'Evals for LLM Systems', folder: 'llm-evals-deep-dive' },
         { name: 'Fine-Tuning and Preference Alignment', folder: 'finetuning-and-alignment-deep-dive' },
         { name: 'Serving Open-Weight Models', folder: 'serving-open-weight-models' },
-        { name: 'Securing LLM Applications', folder: 'securing-llm-applications' }
+        { name: 'Securing LLM Applications', folder: 'securing-llm-applications' },
+        { name: 'Token Generation from First Principles', folder: 'token-generation-first-principles' }
       ]
     },
     {
