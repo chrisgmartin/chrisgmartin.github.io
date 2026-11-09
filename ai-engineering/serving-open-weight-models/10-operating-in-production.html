@@ -36,7 +36,12 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#signals">What to record on every request</a>
+    <a href="#upgrades">Upgrading the model, the tokenizer and the engine</a>
+    <a href="#adapters">Serving fine-tuned adapters</a>
+    <a href="#guardrails">Where guardrails sit</a>
+    <a href="#incidents">The incidents this stack produces</a>
+    <a href="#runbook">A runbook</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -55,9 +60,120 @@
   <p class="subtitle">Per-request observability, KV-cache and queue metrics, canary model upgrades, serving fine-tuned adapters, placing guardrails, and the incidents open-weight serving produces.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="signals">
+  <h2>What to record on every request</h2>
+  <p>A self-hosted model gives you the signals a vendor API hides, and you pay for that with the duty to look at them. Start with one structured log line per request, written by the <a href="../build-inference-gateway-rust/05-observability.html">gateway</a> so that it covers the queue before the engine as well as the engine: a request id, the model and adapter name, the engine image, prompt tokens, completion tokens, time in queue, TTFT, mean inter-token latency, the finish reason and a flag for whether the request was preempted. The finish reason matters most. A rise in <code>length</code> means truncated answers or runaway generations, and nothing else surfaces it.</p>
+  <p>Beside the logs sit the engine's own gauges and histograms. vLLM serves them at <code>/metrics</code>, and these are the ones to chart for Harbourline's help-centre assistant:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Metric</th><th>Reads as</th><th>Alert when</th></tr></thead>
+    <tbody>
+      <tr><td class="term"><code>vllm:num_requests_waiting</code></td><td>Queue depth</td><td>Above 2 per replica for a minute: capacity is short</td></tr>
+      <tr><td class="term"><code>vllm:kv_cache_usage_perc</code></td><td>Cache pressure</td><td>Sustained above 90%: preemption is near</td></tr>
+      <tr><td class="term"><code>vllm:num_preemptions</code></td><td>Requests evicted and recomputed</td><td>Any sustained increase</td></tr>
+      <tr><td class="term"><code>vllm:time_to_first_token_seconds</code></td><td>TTFT, engine side</td><td>p95 above 0.8 s less your gateway time</td></tr>
+      <tr><td class="term"><code>vllm:inter_token_latency_seconds</code></td><td>Per-token speed</td><td>p95 above 33 ms: below 30 tok/s</td></tr>
+      <tr><td class="term"><code>vllm:prefix_cache_hits</code> and <code>_queries</code></td><td>Hit rate = hits ÷ queries, in tokens</td><td>Falls against its own baseline</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The thresholds are starting points from the arithmetic in <a href="08-capacity-cost-and-slos.html">chapter 08</a>, not vendor guidance. The 33 ms is 1/30 s. Track the output rate of the whole fleet through <code>vllm:generation_tokens</code> and <code>vllm:prompt_tokens</code> as well, so cost per million tokens is a dashboard line and not a quarterly surprise. GPU-level health such as memory errors and temperature comes from your platform's exporter, not the engine, so confirm the host has one before you rely on it.</p>
+</section>
+
+<section id="upgrades">
+  <h2>Upgrading the model, the tokenizer and the engine</h2>
+  <p>There are three things that change under a live service, and each can fail silently. A new model version changes the answers. A new tokenizer changes what a token is. A new engine release changes the scheduler, the kernels and sometimes the default flags. The upgrade path is the same for all three: stand up a second deployment next to the first, send it a copy of real traffic, compare, shift a small share, and keep the old one until the new one has carried a full peak. Because each model is its own pod set (<a href="07-deployment-topologies.html#kubernetes">chapter 07</a>), rollback is moving the gateway's weights back and costs no deployment. The decision rules for judging the new model on the eval set are in <a href="../llm-evals-deep-dive/08-model-and-prompt-changes.html">model and prompt changes</a>. What is specific to serving is the list of things that move with it.</p>
+  <p>The tokenizer deserves its own check, because it changes numbers that your plan treats as constants. Say a new model tokenises Harbourline's help-centre text into 10% more tokens, an illustrative figure. A 3,000-token prompt becomes 3,300 and the 250-token answer 275, and the KV cache per request grows from 1.065 GB to 1.16 GB. The per-replica batch that the 30 tokens-per-second floor allows was 39 in chapter 08, from 20.8 GB per GPU of cache reads at 0.5325 GB per request on each GPU. At 0.58 GB per GPU it is 35. A 30 token-per-second floor also buys fewer words. Prefill takes 10% longer, and every per-token price, prompt budget and <code>max-model-len</code> in your configuration changes meaning. Also re-check the things tied to the vocabulary: the chat template and stop tokens, the tool-call parser, and the compiled grammars of <a href="09-structured-output-and-constrained-decoding.html#tools">chapter 09</a>.</p>
+  <p>For the canary, compare per version, from the logs above: finish-reason mix, tokens per answer, TTFT and inter-token latency percentiles, preemptions, schema validity rate and the eval score on the labelled set. Run the chapter 08 load test on the new image before it takes traffic, since a release that is correct but 20% slower consumes a replica's worth of headroom. Pin the engine image by digest, so that "the same version" cannot change under you.</p>
+</section>
+
+<section id="adapters">
+  <h2>Serving fine-tuned adapters</h2>
+  <p>If Harbourline fine-tunes with low-rank adapters, one base model can serve several of them. In vLLM, <code>--enable-lora</code> turns it on, <code>--lora-modules name=path</code> registers adapters at startup, and a client picks one by putting its name in the <code>model</code> field. Requests for different adapters and for the base model run side by side in the same batch. Set <code>--max-lora-rank</code> to the largest rank you will serve, because the documentation warns that setting it much higher wastes memory, and that memory comes out of the KV budget you sized in chapter 08.</p>
+  <p>The same page describes loading and unloading adapters at runtime through <code>/v1/load_lora_adapter</code> and <code>/v1/unload_lora_adapter</code>, gated by <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code>, and says plainly that the feature is insecure and belongs only in an isolated, fully trusted environment, not production. For a production fleet, ship an adapter as a new deployment, with the canary above, so that every adapter version has an owner and a rollback. How adapters are trained, merged and retired is the job of <a href="../finetuning-and-alignment-deep-dive/08-serving-and-retraining.html">the fine-tuning guide's serving chapter</a>.</p>
+</section>
+
+<section id="guardrails">
+  <h2>Where guardrails sit</h2>
+  <p>A guardrail is a check on what goes into or comes out of the model, and the serving stack offers three places for one. The gateway can check the input before the engine is reached: length, a banned pattern, a classifier for prompt injection. It can check the output after the engine returns. And the engine itself can constrain the output, which is the structured-output machinery of chapter 09. Each costs something different. An input check adds to TTFT directly, so a guard model of 8B parameters in front of a 70B adds its own prefill to the 800 ms budget. An output check on a streamed answer faces a choice: hold the answer until it passes, which breaks the 30 tokens-per-second experience, or stream and be unable to retract what the user has already read.</p>
+  <p>Put cheap deterministic checks at the gateway, put the classifier on the path only where a miss is expensive, and keep guard models on their own GPUs so a guard spike cannot starve the main model's batch. What to check, and why prompt injection cannot be filtered away, is the subject of the <a href="../securing-llm-applications/index.html">security guide</a>.</p>
+</section>
+
+<section id="incidents">
+  <h2>The incidents this stack produces</h2>
+  <p><strong>The long prompt.</strong> Harbourline's uploader accepts policies of up to 300 pages. At an assumed 500 tokens a page, that is 150,000 tokens, past the 128k context in the model card, so the engine rejects it. A request at the 128,000 limit would hold 128,000 × 327,680 bytes = 42 GB of cache, 62% of the 68 GB budget, and even a 32,000-token request holds 10.5 GB, enough to push a busy replica into preemption. Set <code>--max-model-len</code> to a value your budget can carry, reject larger requests at the gateway with a clear error, and route long documents to a batch path with its own capacity.</p>
+  <p><strong>Cache thrash.</strong> When the cache fills, vLLM pauses some requests and, in its default V1 mode, recomputes them later. The recomputation is work that produces no new tokens, so preemptions push throughput down at the moment load is highest, and TTFT with it. The documented levers are to raise <code>gpu_memory_utilization</code>, lower <code>max_num_seqs</code> or <code>max_num_batched_tokens</code>, or raise the tensor-parallel size. The prefix cache can thrash too: if the prompts' shared prefix is evicted by varied traffic, the hit rate falls and prefill cost returns. Watch the hit rate against its baseline.</p>
+  <p><strong>The stuck request.</strong> A generation that never reaches a stop token, a repetition loop, or a client that disconnected still holds a batch slot and its cache. With no cap on <code>max_tokens</code>, a runaway can hold a slot for as long as the context allows; at 30 tokens per second, 100,000 tokens is nearly an hour. Cap <code>max_tokens</code> at the gateway, set timeouts, and test that your engine releases a request when the client goes away rather than assuming it.</p>
+  <p><strong>The node.</strong> A GPU or host fails and takes a tensor-parallel pair with it. That is what the second replica is for, and the readiness check must exercise a real generation, not only a port.</p>
+</section>
+
+<section id="runbook">
+  <h2>A runbook</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Symptom</th><th>Look at</th><th>Likely cause</th><th>First action</th></tr></thead>
+    <tbody>
+      <tr><td class="term">TTFT p95 rising</td><td>Waiting requests; prefix hit rate</td><td>Queue building, or prefix cache lost</td><td>Add a replica; check recent prompt changes</td></tr>
+      <tr><td class="term">Inter-token latency above 33 ms</td><td>Running requests; KV usage</td><td>Batch beyond the SLO ceiling of 39</td><td>Shed load to the API route; lower <code>max_num_seqs</code></td></tr>
+      <tr><td class="term">Throughput falls under load</td><td>Preemptions</td><td>Cache full, recomputing</td><td>Cap context length; raise memory fraction</td></tr>
+      <tr><td class="term">Answers cut off</td><td>Finish reason mix</td><td>Token limit or runaway loops</td><td>Check <code>max_tokens</code>; inspect the longest outputs</td></tr>
+      <tr><td class="term">Parse errors jump</td><td>Image digest; tool parser</td><td>Model or parser changed</td><td>Roll back via gateway weights</td></tr>
+      <tr><td class="term">One replica silent</td><td>Readiness; node events</td><td>GPU or host failure</td><td>Shift weight to the survivor; replace the node</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Keep the runbook next to the dashboard, and rehearse the rollback row with a real canary before an incident needs it. Page on the SLO and on user-visible errors, and leave the causal metrics to the dashboard. Review the post-incident record against <a href="../llm-evals-deep-dive/09-online-signals-and-drift.html">online signals and drift</a>, which covers the quality signals no engine metric shows.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Throughput on a replica falls 30% during the morning peak while CPU and GPU look busy and no request errors. Which metric do you check, and what mechanism explains the fall?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The preemption counter, with KV cache usage. A full cache makes the engine pause requests and recompute them later, so GPU time goes on repeated work and fewer new tokens come out. See <a href="#incidents">the incidents</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A model upgrade passes the eval set, yet two days after rollout the replicas queue at traffic they handled before. What changed that the eval set could not show, and how would you have caught it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The new tokenizer produces more tokens for the same text, so prefill and KV cache per request grow and the SLO batch ceiling falls. A canary that compared tokens per request and ran the load test would show it. See <a href="#upgrades">upgrading</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why is it a mistake to alert on mean TTFT from the engine's histogram alone?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The SLO is a p95 as the user sees it, which includes gateway queue time that the engine histogram starts after, and a mean hides the tail. Alert on the gateway's p95. See <a href="#signals">what to record</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A team proposes loading adapters at runtime so data scientists can ship without a deployment. What does the vLLM documentation say about that, and what do you offer instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It calls the runtime update endpoints insecure and for isolated, fully trusted environments only. Offer a deployment per adapter version through the normal canary, so each has an owner and a rollback. See <a href="#adapters">adapters</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You must add a safety classifier to the help-centre assistant without breaking an 800 ms TTFT budget that currently sits near 560 ms. Where do you place it and what do you check?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Run it on its own GPU, on the paths where a miss is expensive, and measure its added latency at p95 against the 240 ms of spare budget. If it does not fit, run it in parallel with the model. For streamed output you must choose between holding the answer and being unable to retract it. See <a href="#guardrails">guardrails</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Log one line per request at the gateway, including queue time, TTFT and finish reason, and chart the engine's queue, KV usage, preemption and latency metrics next to it.</li>
+    <li>A tokenizer change alters token counts, KV size and the batch the SLO allows, so a model upgrade needs a load test and a canary, not only an eval score.</li>
+    <li>Serve adapters as versioned deployments; the runtime load endpoints are documented as unsafe for production.</li>
+    <li>Guardrails cost TTFT, so keep cheap checks at the gateway, put classifiers where a miss is expensive and keep guard models off the main model's GPUs.</li>
+    <li>Long prompts, a full cache and unbounded generations are the usual causes of an incident, and each has a cap or a limit you can set before it happens.</li>
+    <li>A runbook that maps symptom to metric to first action is what turns the dashboard into a response.</li>
+  </ul>
+  <p>The serving layer is now sized, measured and watched; what remains is defending it from the people who send it text. → <a href="../securing-llm-applications/index.html">Securing LLM Applications</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.vllm.ai/en/latest/usage/metrics.html" target="_blank" rel="noopener"><strong>vLLM: production metrics</strong></a> — vLLM documentation. Good for the Prometheus metric names and the endpoint.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/design/metrics.html" target="_blank" rel="noopener"><strong>vLLM: metrics design</strong></a> — vLLM documentation. Good for latency histograms and what each measures.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener"><strong>vLLM: optimization and tuning</strong></a> — vLLM documentation. Good for preemption behaviour and the settings that relieve it.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/lora.html" target="_blank" rel="noopener"><strong>vLLM: LoRA adapters</strong></a> — vLLM documentation. Good for the serving flags and the warning on runtime updates.</li>
+    <li><a href="https://github.com/llm-d/llm-d" target="_blank" rel="noopener"><strong>llm-d</strong></a> — llm-d project. Good for a Kubernetes-native stack with cache-aware routing on top of vLLM.</li>
+  </ul>
 </section>
 
 </main>
