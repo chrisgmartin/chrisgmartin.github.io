@@ -126,6 +126,24 @@
     d.text(200,f[2].y+f[2].h+22,'one set measures every layer · recall@k per slice',{size:9.5});
     d.note(14,272,'wrong answer, right document in the index?\nforce the gold passage into the prompt:\nif the answer flips, the breach is upstream',{size:10});
   };
+  B['ai-engineering/token-generation-first-principles']=function(d){
+    d.title('One token at a time');
+    var t=d.box(14,58,76,38,'text →\ntoken ids',{size:9.5});
+    var e=d.box(104,58,76,38,'embed +\nposition',{size:9.5});
+    var blk=d.box(194,52,110,50,'32 × [attention\n+ feed-forward]',{wash:1,size:9.5});
+    var lg=d.box(318,58,70,38,'logits\n128,256',{size:9.5});
+    d.connect(t,e);d.connect(e,blk);d.connect(blk,lg);
+    var smp=d.round(300,136,88,34,'sample one',{red:1,size:10});
+    d.arrow(lg.cx,lg.y+lg.h+2,smp.cx,smp.y-2,{});
+    d.note(300,186,'temperature · top-p',{size:9.5});
+    d.line(smp.x-2,smp.cy,52,smp.cy,{});d.arrow(52,smp.cy,52,t.y+t.h+2,{});
+    d.note(60,160,'append and go again',{size:9.5});
+    var kv=d.box(150,200,120,36,'KV cache\nremembers the past',{size:9.5});
+    d.line(blk.cx,blk.y+blk.h+2,blk.cx,kv.y-2,{dash:1});
+    d.note(14,214,'128 KB per token\nfor the worked model',{size:9.5});
+    d.note(14,258,'quadratic without the cache,\nlinear with it',{size:9.5});
+    d.note(200,296,'a wrong answer is a probable continuation that was false',{size:9.5});
+  };
   B['ai-engineering/llm-evals-deep-dive']=function(d){
     d.title('A number you can defend');
     var set=d.box(14,70,92,44,'eval set\nby slice',{size:10.5}),sys=d.box(150,70,90,44,'the system',{wash:1,size:10.5}),gr=d.box(284,70,100,44,'graders\nrules · judge · human',{size:9.5});
