@@ -126,6 +126,22 @@
     d.text(200,f[2].y+f[2].h+22,'one set measures every layer · recall@k per slice',{size:9.5});
     d.note(14,272,'wrong answer, right document in the index?\nforce the gold passage into the prompt:\nif the answer flips, the breach is upstream',{size:10});
   };
+  B['ai-engineering/securing-llm-applications']=function(d){
+    d.title('The model cannot tell data from orders');
+    var sp=d.box(14,56,88,40,'system prompt\n(yours)',{size:9.5});
+    var um=d.box(112,56,80,40,'user\nmessage',{size:9.5});
+    var doc=d.box(202,56,88,40,'retrieved doc\n/ uploaded PDF',{red:1,size:9.5});
+    var tr=d.box(300,56,86,40,'tool results\nweb · email',{red:1,size:9.5});
+    var m=d.round(140,136,120,40,'one token stream',{wash:1,size:10.5});
+    d.connect(sp,m);d.connect(um,m);d.connect(doc,m);d.connect(tr,m);
+    d.note(296,104,'untrusted',{size:9.5});
+    var act=d.box(120,212,160,40,'actions: writes · URLs · output',{size:9.5});
+    d.connect(m,act);
+    d.ring(110,206,180,52);
+    d.note(296,224,'defend here:\nleast privilege\nconfirm writes\nno exfil channel',{size:9.5});
+    d.note(14,224,'filters catch\nstrings, not\nintent',{size:9.5});
+    d.note(14,296,'99% holds × 40k sessions a day = hundreds of failures');
+  };
   B['ai-engineering/llm-evals-deep-dive']=function(d){
     d.title('A number you can defend');
     var set=d.box(14,70,92,44,'eval set\nby slice',{size:10.5}),sys=d.box(150,70,90,44,'the system',{wash:1,size:10.5}),gr=d.box(284,70,100,44,'graders\nrules · judge · human',{size:9.5});
