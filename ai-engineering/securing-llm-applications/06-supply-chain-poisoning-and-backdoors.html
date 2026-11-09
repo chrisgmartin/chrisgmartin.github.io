@@ -36,7 +36,12 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#formats">Loading a model file can run the file's code</a>
+    <a href="#provenance">Provenance: knowing the bytes are the ones you reviewed</a>
+    <a href="#poisoning">Poisoned data: the count matters, not the share</a>
+    <a href="#sleepers">Backdoors that safety training does not remove</a>
+    <a href="#packages">Dependencies and MCP packages</a>
+    <a href="#pipeline">Controls on Harbourline's fine-tuning pipeline</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -56,9 +61,144 @@
   <p class="subtitle">Weights, formats and provenance, poisoned fine-tuning data and how little it takes, sleeper behaviours, dependency and MCP package risk, and the controls on Harbourline's fine-tuning pipeline.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="formats">
+  <h2>Loading a model file can run the file's code</h2>
+  <p>Treat a downloaded weights file as an executable until proven otherwise. PyTorch checkpoints have traditionally been serialised with Python's <code>pickle</code>, and Hugging Face's own documentation says deserialising one can execute arbitrary code: the format is a stack of instructions that can import functions such as <code>exec</code> and call them as the file is read. The remedy the docs recommend is to load models only from users and organisations you trust, and to prefer safer formats. The <code>safetensors</code> format stores tensors with no code path, and the Transformers loader prefers it when a repository offers one. PyTorch's <code>torch.load</code> documentation, in the current release, defaults <code>weights_only</code> to true and still warns never to load data from an untrusted source.</p>
+  <p>This happens in practice. In February 2024 JFrog reported around 100 malicious model instances on the Hugging Face Hub, found by scanning new uploads, with payloads injected through the pickle <code>__reduce__</code> method; one opened a reverse shell to a remote host. The Hub flags pickle models as unsafe but, in JFrog's account, does not block their download. Scanners help and they are best-effort: Hugging Face's own page says its pickle scan is not foolproof and that the user remains responsible. Other routes exist. A repository can ship custom modelling code that runs when you set <code>trust_remote_code=True</code>, and the Transformers docs advise loading such models from a pinned commit hash so the code cannot change under you.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>load_model.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM
+
+# Sketch: pin an exact commit, refuse pickle weights, refuse repo code.
+model = AutoModelForCausalLM.from_pretrained(
+    "org/model-name",
+    revision="&lt;full 40-character commit hash&gt;",
+    use_safetensors=True,
+    trust_remote_code=False,
+)</code></pre>
+</div>
+  <p>The rule has a flip. If a model exists only as a pickle checkpoint and you need it, convert it once inside an isolated, credential-free environment, then store the safetensors output in your own registry. Do the risky load once, away from anything valuable, rather than on every developer laptop and every CI runner.</p>
+</section>
+
+<section id="provenance">
+  <h2>Provenance: knowing the bytes are the ones you reviewed</h2>
+  <p>A pinned commit tells you which bytes you got. It does not tell you who produced them. Signing closes the second gap. The OpenSSF model-signing project, released as version 1.0 in April 2025, signs and verifies ML models of any format, with Sigstore as the recommended mechanism: a short-lived certificate tied to an identity, with the signing event written to a public transparency log. That gives you integrity and signer identity. The announcement itself is clear on what it does not give: a signature does not say the model is safe, and trusted provenance for how it was built is described as a future step.</p>
+  <div class="flow">  hub or vendor ──► quarantine ──► format check ──► convert if needed
+                    (no network,   (safetensors?    (isolated, no creds)
+                     no creds)      repo code?)             │
+                                                            ▼
+  deploy ◄── hash + signature ◄── internal registry ◄── review + sign
+  (fail closed on mismatch)       (pinned commit,        (record source,
+                                   per-file SHA-256)      owner, date)</div>
+  <p>So the practice for Harbourline is a layered one. Mirror approved models into an internal registry. Record the source, the commit hash and the hash of each file at admission. Verify a signature where the publisher provides one, and re-check the hashes on deploy so a swapped file fails closed. Review adapters, such as LoRA weights from a community hub, as you would a base model, because they alter behaviour. The deploy-time check is a few lines:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>verify_manifest.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import hashlib, json, sys
+from pathlib import Path
+
+def sha256(path: Path) -&gt; str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 &lt;&lt; 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+# usage: python verify_manifest.py model_dir manifest.json
+# manifest.json maps relative file names to the SHA-256 recorded at admission
+model_dir, manifest = Path(sys.argv[1]), json.loads(Path(sys.argv[2]).read_text())
+bad = [name for name, want in manifest.items() if sha256(model_dir / name) != want]
+extra = {p.name for p in model_dir.iterdir() if p.is_file()} - set(manifest)
+if bad or extra:
+    sys.exit(f"refusing to load: changed={bad} unexpected={sorted(extra)}")
+print("manifest ok")</code></pre>
+</div>
+  <p> This has a cost: a slower path to try a new model. Keep a fast lane that runs in a sandbox with no production credentials and no customer data, and promote from it only after review. The exception is a model from your own training run, where the provenance question moves to the data and the pipeline that made it.</p>
+</section>
+
+<section id="poisoning">
+  <h2>Poisoned data: the count matters, not the share</h2>
+  <p>Data poisoning plants examples that teach the model a behaviour the owner did not intend. The natural intuition is that an attacker needs to control a meaningful fraction of the training set, so a larger corpus is safer. Recent measurement points the other way. Souly and colleagues trained models from 600 million to 13 billion parameters on datasets from 6 to 260 billion tokens and found that 250 poisoned documents compromised models across all sizes. Poisoning needs a near-constant number of samples, not a fixed percentage. Anthropic's summary puts the 250 documents at about 420,000 tokens, or 0.00016% of the 13B model's training tokens. The authors also report similar dynamics when poisoning during fine-tuning.</p>
+  <p>Read the limits as carefully as the headline. The backdoor tested was narrow: a trigger phrase that made the model emit gibberish. The authors say it is unlikely to be a significant risk in frontier models, that it is unclear whether the pattern holds at larger scale or for harmful behaviours such as insecure code, and that an attacker must still get the documents into the data and survive later training. Take the finding as a reason to stop relying on dilution, not as a demonstrated attack on any production model. The access question is separate and practical. Carlini and colleagues showed in 2023 that two attacks on web-scale datasets were feasible, and that they could poison 0.01% of the LAION-400M or COYO-700M datasets for about $60. If you buy or scrape data, someone else controls what it contains.</p>
+</section>
+
+<section id="sleepers">
+  <h2>Backdoors that safety training does not remove</h2>
+  <p>A backdoor is a behaviour that appears only on a trigger. Hubinger and colleagues built proof-of-concept models in 2024 that wrote secure code when the prompt said the year was 2023 and inserted exploitable code when it said 2024. The finding that matters for defenders is that the behaviour persisted through standard safety training, including supervised fine-tuning, reinforcement learning and adversarial training. Adversarial training taught the models to recognise their triggers better, which hid the behaviour instead of removing it. Persistence was greatest in the largest models. These were deliberately trained backdoors in a research setting, and the paper does not claim that deployed models contain one.</p>
+  <p>The practical consequence is about evidence. A test suite finds triggers you think to try. A clean result from it is not proof that no trigger exists, and fine-tuning the model again to be safe may not remove one. That moves effort to the inputs: who made this model, who touched the data, and can you show it. It also argues for architecture that limits what a backdoored model can do, which is where the privilege controls of <a href="04-agents-tools-and-excessive-agency.html">the agents chapter</a> and the layered defences in <a href="07-defences-in-depth.html">chapter 07</a> carry the load. A model that cannot change a payout without a separate check is a safer place to be wrong.</p>
+</section>
+
+<section id="packages">
+  <h2>Dependencies and MCP packages</h2>
+  <p>An LLM application imports the same package ecosystems as any service, and adds a kind that run with the agent's authority. In September 2025 an npm package called <code>postmark-mcp</code>, which impersonated Postmark's MCP server, published fifteen versions and then added one line in version 1.0.16 that blind-copied outgoing email to an external address. Koi Security found it and Postmark said it had no involvement; the Register's report puts weekly downloads near 1,500. For an agent that sends mail on a customer's behalf, a poisoned server needs no prompt injection at all, since it sits on the path the data already takes.</p>
+  <p>The controls are the old ones, applied without exceptions for AI tooling. Lock dependency versions with hashes and install from an internal mirror. Treat a name that looks like an official vendor's server as unverified until you have matched it to the vendor's own documentation. Review diffs of tool servers on update, since a trusted server can change after you adopted it. Give every server the least access it needs, as described in <a href="../ai-engineer-compliance/04-mcp-deep-dive.html">the MCP deep dive</a> and the tool-trust section of the previous chapter. The case where you relax this is a throwaway prototype on a laptop with no credentials, and prototypes have a habit of becoming production.</p>
+</section>
+
+<section id="pipeline">
+  <h2>Controls on Harbourline's fine-tuning pipeline</h2>
+  <p>The companion guide's pipeline, described in <a href="../finetuning-and-alignment-deep-dive/03-post-training-data.html">the post-training data chapter</a>, ingests adjuster-edited summaries to improve the model that writes claim summaries. That makes the adjusters, and anyone who can act as one, a source of training data. Suppose, illustratively, a training set of 60,000 summaries built from about ten days of intake at 6,000 claims a day. Using the 250-document figure from the paper as a scale marker, an insider needs 250 edits, which is 0.4% of that set. Spread over a quarter, that is under three edits a day, below the noise of normal editing. The paper's numbers do not transfer to this model, so treat the sum as a sense of scale, not a prediction.</p>
+  <table>
+    <thead><tr><th>Stage</th><th>What can go wrong</th><th>Control</th></tr></thead>
+    <tbody>
+      <tr><td>Base model and adapters</td><td>Swapped file, pickle payload, unsigned fork</td><td>Internal mirror, pinned commit, safetensors only, signature check where available, hash check on deploy</td></tr>
+      <tr><td>Adjuster-edited summaries</td><td>A few accounts plant a trigger-and-response pattern</td><td>Record editor, time and source per edit; cap one editor's share of any batch; scan for phrases that recur across many records from few editors</td></tr>
+      <tr><td>Training job</td><td>Code or dependency compromise on the trainer</td><td>Locked dependencies, no outbound network, credentials limited to the data bucket</td></tr>
+      <tr><td>Tuned model</td><td>A behaviour the evals never probed</td><td>Held-out clean set; probes with varied dates, tenants and rare phrases; staged rollout with output monitoring</td></tr>
+    </tbody>
+  </table>
+  <p>None of these controls proves a model clean, and the sleeper-agent result says to expect that. They raise the cost of an attack, leave a trail for the incident process in <a href="09-governance-and-incident-response.html">chapter 09</a>, and keep the damage bounded by what the model is allowed to do. The price is reviewer time on training data. If the pipeline only trains on machine-generated drafts that a second system has already checked, that price can be much lower, and the risk moves to the checker.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A data scientist downloads a community fine-tune distributed as a <code>.bin</code> checkpoint and loads it on a shared GPU box that has read access to the training bucket. Walk through what can happen and what you would change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Loading a pickle can run attacker code with the box's permissions, so it can reach the bucket. Prefer safetensors, load from a pinned commit, and do any unavoidable conversion in an isolated environment with no credentials. See <a href="#formats">formats</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone argues that a training set of ten million records is safe from poisoning because an attacker would need to control a large share of it. What does the 2025 evidence say, and what limits apply to that evidence?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The study found a near-constant count, 250 documents across sizes tested, matters rather than a share. The limits: models up to 13B, a narrow gibberish backdoor, and unknown results at larger scale or for harmful behaviours. See <a href="#poisoning">poisoning</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your red team runs a thousand probes on a tuned model and finds nothing. A colleague says that proves there is no backdoor. How do you respond?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Tests find triggers someone thought of. The sleeper-agent work shows backdoors can survive safety training and that adversarial training can teach a model to hide its trigger. A pass lowers risk without proving absence, so keep provenance controls and limit the model's privileges. See <a href="#sleepers">sleepers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A signed model passes verification in your deploy pipeline. What has been established, and what has not?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Integrity and the identity of the signer. Not that the model is safe, nor how it was built. You still need a review of the source and behavioural testing. See <a href="#provenance">provenance</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Choose between two ways to guard the adjuster-summary pipeline: manual review of every edit, or per-editor caps and phrase scans. Which would you pick for Harbourline and when would you pick the other?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Caps and scans scale with volume and catch the low-and-slow pattern, so they suit thousands of edits a quarter. Manual review fits a small, high-stakes set, or the final gate before a model reaches a write-capable surface. Many teams use both. See <a href="#pipeline">the pipeline section</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A model file in pickle format can execute code on load, so prefer safetensors, load from a pinned commit and refuse repository code you have not reviewed.</li>
+    <li>Signing proves integrity and signer identity, not safety, so pair it with an internal registry, hash checks and review.</li>
+    <li>Poisoning scales with the number of poisoned samples, not their share of the data, so a bigger training set is not protection by itself.</li>
+    <li>Backdoors can survive safety training, so a clean test result lowers risk without proving absence.</li>
+    <li>MCP and package dependencies run with the agent's authority, so they need version locks, review of updates and least privilege.</li>
+    <li>Harbourline's adjuster-edit pipeline needs provenance per edit, caps per editor and bounded model privileges, because no test can promise a clean model.</li>
+  </ul>
+  <p>With the inputs and the assets covered, the next chapter turns to the controls that hold when one of them fails. → <a href="07-defences-in-depth.html">Defences in Depth</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://huggingface.co/docs/hub/security-pickle" target="_blank" rel="noopener"><strong>Pickle Scanning</strong></a> — Hugging Face Hub documentation. Good for why pickle executes code and what the Hub scan does and does not cover.</li>
+    <li><a href="https://jfrog.com/blog/data-scientists-targeted-by-malicious-hugging-face-ml-models-with-silent-backdoor/" target="_blank" rel="noopener"><strong>Data Scientists Targeted by Malicious Hugging Face ML Models with Silent Backdoor</strong></a> — JFrog, February 2024. Good for a worked case of malicious pickle models on a public hub.</li>
+    <li><a href="https://blog.sigstore.dev/model-transparency-v1.0" target="_blank" rel="noopener"><strong>Taming the Wild West of ML: Practical Model Signing with Sigstore</strong></a> — Google Open Source Security Team, April 2025. Good for what model signing attests and what it leaves open.</li>
+    <li><a href="https://arxiv.org/abs/2510.07192" target="_blank" rel="noopener"><strong>Poisoning Attacks on LLMs Require a Near-constant Number of Poison Samples</strong></a> — Souly et al., 2025. Good for the 250-document result and its experimental limits.</li>
+    <li><a href="https://arxiv.org/abs/2401.05566" target="_blank" rel="noopener"><strong>Sleeper Agents</strong></a> — Hubinger et al., 2024. Good for backdoors that persist through safety training.</li>
+    <li><a href="https://arxiv.org/abs/2302.10149" target="_blank" rel="noopener"><strong>Poisoning Web-Scale Training Datasets is Practical</strong></a> — Carlini et al., 2023. Good for how cheaply public data sources can be tampered with.</li>
+    <li><a href="https://www.theregister.com/2025/09/29/postmark_mcp_server_code_hijacked/" target="_blank" rel="noopener"><strong>Postmark MCP server code hijacked</strong></a> — The Register, 29 September 2025. Good for the postmark-mcp incident, reported from Koi Security's finding.</li>
+  </ul>
 </section>
 
 </main>

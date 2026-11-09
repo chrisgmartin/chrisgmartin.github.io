@@ -36,7 +36,13 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#prompt">The system prompt is public; plan as if it is</a>
+    <a href="#memorisation">What the weights remember</a>
+    <a href="#traces">Your observability stack is a second copy of the data</a>
+    <a href="#tenancy">Tenancy leaks in retrieval</a>
+    <a href="#caches">Shared caches that answer faster for what they have seen</a>
+    <a href="#markdown">The output channel: rendered images and links</a>
+    <a href="#dlp">Output-side checks that know the session</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -56,9 +62,109 @@
   <p class="subtitle">System prompt extraction, memorisation and training-data extraction, PII in traces and logs, tenancy and cache leaks, exfiltration through rendered output, and output-side controls.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="prompt">
+  <h2>The system prompt is public; plan as if it is</h2>
+  <p>Treat anything in the system prompt as something a determined user will read. OWASP's 2025 entry on system prompt leakage (LLM07) is direct about this: secrets do not belong in system prompts, and a prompt should not be a security control, because prompt injection can change its behaviour. What matters is what the prompt reveals, such as credentials, internal rules or permission structure, and the underlying fault is sensitive data stored where it should not be, or authorisation delegated to the model. Extraction itself needs no cleverness. A model asked to repeat, translate or summarise its instructions will often comply, and the chapter on <a href="02-prompt-injection.html">prompt injection</a> shows why the model cannot keep a boundary it cannot see.</p>
+  <p>For Harbourline the audit is a grep. Does the customer-service prompt contain an API key, a database name, a staff escalation phone number, the fraud-score threshold that triggers a manual review? Move credentials into the tool gateway, where the model never sees them. Move thresholds into code that the model calls. What stays is instruction text whose exposure costs you competitive polish and nothing more. The test is the same as for any client-side code: assume it is published, and ask what an attacker gains. The exception is a prompt you keep private for product reasons. That is a legitimate preference, but defend it as friction, not as security.</p>
+</section>
+
+<section id="memorisation">
+  <h2>What the weights remember</h2>
+  <p>A model trained on text can emit some of that text verbatim. Carlini and colleagues showed this in 2020 against GPT-2: with queries alone they extracted hundreds of verbatim sequences from the training data, including names, phone numbers, email addresses, code and UUIDs, and each extracted sequence appeared in only one training document. Larger models were more vulnerable than smaller ones. In 2023 Nasr and colleagues extended the attack to production systems. They built a divergence attack against ChatGPT that made it stop acting as a chatbot and emit training data at a rate 150 times higher than normal behaviour, and concluded that alignment as practised does not remove memorisation.</p>
+  <p>Two consequences for a team using a hosted model. First, the base model's memorised data is not your leak and not your control; you choose a vendor and read its data-handling terms. Second, and this one is yours, anything you fine-tune on can come back out. Harbourline's pipeline from the <a href="../finetuning-and-alignment-deep-dive/03-post-training-data.html">post-training data chapter</a> ingests adjuster-edited summaries. Those summaries name claimants, addresses and injuries. A model tuned on them, served to the help-centre assistant, can reproduce one claimant's details to another customer who happens to prompt near it. Deduplicate before training, scrub identifiers from the training set rather than the output, and test with canaries: plant a few unique synthetic records in the training data and check whether the tuned model can be prompted into emitting them. The flip case is a model trained only on synthetic or fully de-identified records, which carries little regurgitation risk but also teaches less about real claim language.</p>
+</section>
+
+<section id="traces">
+  <h2>Your observability stack is a second copy of the data</h2>
+  <p>The most common leak in a working LLM system is not an attack. A tracing tool such as Langfuse records the exact prompt, the model's reply, token usage, latency and every tool or retrieval step in between. That is what makes it useful for debugging and what makes it a copy of everything the customer typed and everything the agent read. Do the arithmetic for Harbourline's customer-service agent, with illustrative figures: 40,000 sessions a day, 8 model calls per session, about 4 KB of prompt text per call. That is 40,000 × 8 × 4 KB, or about 1.3 GB of customer text a day, and 115 GB over a 90-day retention window. Claim PDFs run through the intake agent add their full extracted text. A trace store holding that is a regulated data store whether or not anyone designated it one.</p>
+  <p>Controls come in three layers. Redact before export: Langfuse documents masking as a function that runs inside your application before data leaves it, applied to the input, output and metadata of each observation. Note the limit it states: masking only affects data sent to Langfuse, so any other exporter receives its own unmodified copy of the spans. If you fan traces out to several backends, mask at the point where the span is created, or in a collector in front of all of them. Restrict access: engineers debugging a prompt rarely need claimant names, so use project-level separation and role-based access, and keep the intake agent's traces in their own project with a shorter retention period. And set retention by purpose. Debugging value decays within days, while forensic value, covered in <a href="09-governance-and-incident-response.html">chapter 09</a>, needs a tamper-evident subset, not the whole firehose. The related audit-log design is in <a href="../ai-engineer-compliance/09-audit-trails.html">the audit trails chapter</a>.</p>
+  <div class="callout warn">
+    <span class="callout-label">A redaction regex catches formats, not meaning</span>
+    <p>Patterns find policy numbers and card numbers. They do not find "my neighbour at number 14 was driving" or a diagnosis in free text. Redaction reduces the exposure but does not remove it, so keep access controls and retention limits even when masking is on.</p>
+  </div>
+</section>
+
+<section id="tenancy">
+  <h2>Tenancy leaks in retrieval</h2>
+  <p>The help-centre assistant retrieves from US and UK policy documents and from broker tenants. A leak here means one tenant's passage lands in another tenant's context, after which the model will quote it faithfully. The mechanism and the fixes belong to <a href="../production-rag-deep-dive/08-freshness-tenancy-and-access.html#tenancy">the tenancy section of the RAG guide</a>, so this chapter does not repeat them. The security point is where the control lives. The tenant filter must be applied by your retrieval service from the authenticated session, as part of the query, and never passed as text the model composes. An agent that builds its own filter is a confused deputy, as <a href="04-agents-tools-and-excessive-agency.html#deputy">the previous chapter</a> describes. Check two side paths that people forget: a reranker or cache that sees candidates from the unfiltered pool, and an evaluation or debugging tool that replays production queries against a shared index.</p>
+</section>
+
+<section id="caches">
+  <h2>Shared caches that answer faster for what they have seen</h2>
+  <p>Caching a prompt prefix is a large saving, and it creates a timing channel when the cache is shared. A request whose prefix is already cached returns faster than one that is not, so an observer who can send requests to the same cache can test guesses about what others have sent. Gu and colleagues audited prompt caching in real LLM APIs in 2025. They built statistical tests for cache hits and detected global cache sharing across users in seven API providers, which they note could leak information about other users' prompts. Song and colleagues (2024) studied the key-value cache and the semantic cache in serving systems and showed an adversary could infer confidential system prompts and other users' prompts, using a token-by-token search over the cached prefix. These are research results against real services; neither paper shows an attack on Harbourline.</p>
+  <p>What you control depends on where you run. On a hosted API, read the isolation guarantee and design to it. Anthropic's documentation states that caches are isolated between organisations, and on the Claude API also by workspace, so a design that mixes tenants in one workspace relies on your own tenancy checks rather than the cache boundary; Claude on Bedrock and on Google Cloud uses organisation-level isolation only. As of November 2026, that is a boundary you should check against the vendor page each time you change platform. On a stack you run yourself, check whether your server can partition the prefix cache by tenant, and if it cannot, put tenant-specific text after the shared prefix and keep per-tenant secrets out of the cached prefix. The remaining option is to accept the risk when every user is trusted staff, which for Harbourline's public-facing agents is not the case.</p>
+</section>
+
+<section id="markdown">
+  <h2>The output channel: rendered images and links</h2>
+  <p>A chat client that renders Markdown turns model text into network requests. An image tag with a URL on a domain the attacker controls makes the user's browser fetch it, and anything the model placed in that URL goes with the request. This is the third leg of the trifecta from <a href="04-agents-tools-and-excessive-agency.html#trifecta">the agents chapter</a>, and it needs no click. Johann Rehberger reported the technique against ChatGPT in early April 2023. OpenAI added a client-side check on 20 December 2023 that calls a validation API before displaying an image. Rehberger's account says the fix was partial: it covered the web app only, and some images from arbitrary domains still rendered.</p>
+  <p>The 2025 Microsoft 365 Copilot case, tracked as CVE-2025-32711 and called EchoLeak in a paper by Reddy and Gujral, shows the attack at production scale. A single crafted email, no user action, led to exfiltration. According to the paper's abstract the chain bypassed Microsoft's cross-prompt-injection classifier, evaded link redaction by using reference-style Markdown, got around protections on auto-fetched images, and used a Teams proxy that the content security policy allowed. The lesson is the chain: each filter held on its own, and the allowed paths carried the data out anyway. Aim Security disclosed it; their page refused my automated fetch, so this chapter relies on the paper.</p>
+  <p>The controls sit in the renderer, not the model. Do not auto-render model-authored images at all unless you need them. If you do, serve them through your own proxy and allow only your domains in the CSP <code>img-src</code>. Strip or neutralise links whose host is not on an allowlist and show the real destination on hover. EchoLeak shows the limit: the data left through a proxy that the policy allowed, so an allowlist is only as safe as the services on it that carry attacker-chosen paths.</p>
+</section>
+
+<section id="dlp">
+  <h2>Output-side checks that know the session</h2>
+  <p>Data loss prevention on a model's output works best when it knows what this session was entitled to see. A generic pattern scan flags every card number, including the customer's own. A session-aware check keeps the set of identifiers the tools returned for this authenticated customer, then compares any policy number, account fragment or claim reference in the reply against it. An identifier that was never returned in this session is a signal that something went wrong, whether a tenancy bug, a memorised string or an injection. Block or redact the reply and log the event for review.</p>
+  <p>Add three cheaper checks. Scan for fragments of the system prompt, which catches simple extraction. Plant canary strings in documents and prompts that no legitimate reply should contain, and alert when one appears (more in <a href="07-defences-in-depth.html">chapter 07</a>). And treat outbound URLs in replies as in the section above. All of this has a price. Session-aware matching misses data that is paraphrased, and regex scans miss anything they were not written for, so output DLP is a net under the other controls, not a replacement. It earns its place on the surfaces with a write tool or a wide retrieval pool, and costs more than it saves on a nightly batch whose output goes only to adjusters.</p>
+  <div class="flow">  tool results ──► session allowlist of identifiers ──┐
+                                                      ▼
+  model reply ──► strip images/links ──► identifier check ──► canary check ──► user
+                   (allowlisted hosts)    (not in set? hold)   (hit? alert)
+                                                      │
+                                         held replies ──► review queue</div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate proposes keeping the CRM API key in the system prompt, because "the prompt is never shown to users". What is the flaw, and where should the key live?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The model can be induced to repeat its instructions, and the prompt is not a security boundary, so the key is one request from exposure. Keep it in the tool gateway so the model never sees it. See <a href="#prompt">the system prompt section</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Adjuster summaries naming claimants are used to fine-tune the help-centre model. A reviewer says "we filter outputs for PII, so it is safe". What does the memorisation research suggest, and what would you do before training?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Models can emit training text verbatim, and alignment does not remove that. Output filtering catches formats, not paraphrase or context. Deduplicate, de-identify the training set, and plant canary records to test regurgitation. See <a href="#memorisation">memorisation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You mask PII in the Langfuse client, yet an audit finds claimant names in your second tracing backend. How did that happen, and how do you fix it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The masking applies only to data sent to Langfuse; other exporters receive unmodified spans. Mask at span creation or in a collector in front of all exporters, and set retention and access per project. See <a href="#traces">traces</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two Harbourline brokers share one hosted-API workspace and the same long system prompt prefix. Which risks does the vendor's cache isolation address, and which remain yours?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Isolation by organisation or workspace stops other customers of the vendor reading your cache timing. It does not separate the two brokers inside your workspace, so tenancy has to be enforced by your retrieval filters, and tenant-specific content kept out of shared prefixes. See <a href="#caches">caches</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your chat client blocks all images except those from your own domain, but the model can still write links. A reviewer says the leak path is closed. Argue whether it is, and say what you would check next.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Not closed: a link the user clicks, or any allowed path that accepts attacker-chosen parameters, can still carry data, as EchoLeak chained allowed paths. Check link handling, redirectors on your own domain and anything the CSP lets through. See <a href="#markdown">the output channel</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A system prompt is extractable, so keep secrets and authorisation out of it and treat its text as published.</li>
+    <li>Fine-tuned models can regurgitate training text, so de-identify and deduplicate training data and test with planted canaries.</li>
+    <li>Trace stores copy every prompt, reply and tool step, so give them masking, access control and a retention period set by purpose.</li>
+    <li>Tenant filters must be applied by your service from the session, never composed by the model, and shared caches need their isolation boundary checked.</li>
+    <li>Rendered Markdown images and links are a zero-click exfiltration channel, and the control belongs in the renderer and its content security policy.</li>
+    <li>Output checks that compare identifiers against what the session was entitled to see catch more than generic pattern scans, and still need layers beneath them.</li>
+  </ul>
+  <p>Next, the leak you cannot see in the application: data and code that enter the system through the model files, the training set and the packages. → <a href="06-supply-chain-poisoning-and-backdoors.html">Supply Chain, Poisoning and Backdoors</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2012.07805" target="_blank" rel="noopener"><strong>Extracting Training Data from Large Language Models</strong></a> — Carlini et al., 2020. Good for the original extraction attack on GPT-2.</li>
+    <li><a href="https://arxiv.org/abs/2311.17035" target="_blank" rel="noopener"><strong>Scalable Extraction of Training Data from (Production) Language Models</strong></a> — Nasr et al., 2023. Good for the divergence attack and why alignment does not remove memorisation.</li>
+    <li><a href="https://arxiv.org/abs/2502.07776" target="_blank" rel="noopener"><strong>Auditing Prompt Caching in Language Model APIs</strong></a> — Gu et al., 2025. Good for how to test a provider's cache for sharing across users.</li>
+    <li><a href="https://arxiv.org/abs/2409.20002" target="_blank" rel="noopener"><strong>The Early Bird Catches the Leak</strong></a> — Song et al., 2024. Good for timing side channels in KV and semantic caches.</li>
+    <li><a href="https://arxiv.org/abs/2509.10540" target="_blank" rel="noopener"><strong>EchoLeak</strong></a> — Reddy and Gujral, 2025. Good for the chain of bypasses in a zero-click Copilot exfiltration.</li>
+    <li><a href="https://embracethered.com/blog/posts/2023/openai-data-exfiltration-first-mitigations-implemented" target="_blank" rel="noopener"><strong>OpenAI Begins Tackling ChatGPT Data Leak Vulnerability</strong></a> — Johann Rehberger, 2023. Good for the image-rendering technique and a partial fix.</li>
+    <li><a href="https://genai.owasp.org/llmrisk/llm072025-system-prompt-leakage/" target="_blank" rel="noopener"><strong>LLM07:2025 System Prompt Leakage</strong></a> — OWASP GenAI Security Project. Good for what not to put in a prompt.</li>
+  </ul>
 </section>
 
 </main>
