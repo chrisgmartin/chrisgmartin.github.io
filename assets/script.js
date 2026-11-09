@@ -28,7 +28,8 @@
         { name: 'AI Engineer Interview Prep', folder: 'ai-engineer-interview-prep' },
         { name: 'Production RAG from the Retrieval Up', folder: 'production-rag-deep-dive' },
         { name: 'Evals for LLM Systems', folder: 'llm-evals-deep-dive' },
-        { name: 'Fine-Tuning and Preference Alignment', folder: 'finetuning-and-alignment-deep-dive' }
+        { name: 'Fine-Tuning and Preference Alignment', folder: 'finetuning-and-alignment-deep-dive' },
+        { name: 'Serving Open-Weight Models', folder: 'serving-open-weight-models' }
       ]
     },
     {
