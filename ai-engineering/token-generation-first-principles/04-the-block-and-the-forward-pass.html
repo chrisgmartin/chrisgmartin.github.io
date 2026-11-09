@@ -36,7 +36,12 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#block">One block, in the order the data flows</a>
+    <a href="#ffn">The feed-forward network, where the capacity sits</a>
+    <a href="#count">Counting the 8.03 billion parameters</a>
+    <a href="#flops">FLOPs per token: 2N, plus attention over context</a>
+    <a href="#h100">What a forward pass costs on an H100, in time</a>
+    <a href="#moe">Mixture of experts: active against total parameters</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -53,12 +58,191 @@
 <header class="hero">
   <span class="eyebrow">Section B · Inside the model</span>
   <h1>The Block and the Forward Pass</h1>
-  <p class="subtitle">The feed-forward network, normalisation and residuals, stacking layers, where eight billion parameters come from, FLOPs per token, and mixture-of-experts.</p>
+  <p class="subtitle">Chapter 03 built attention for one layer. This chapter adds the rest of the block, counts Llama 3.1 8B's parameters term by term, converts them into FLOPs and H100 milliseconds, and shows what mixture-of-experts changes.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="block">
+  <h2>One block, in the order the data flows</h2>
+  <p>Chapter 03 built attention for one layer. A layer is more than attention. Llama 3.1 8B repeats one block 32 times, and the block has two sub-layers, each wrapped in the same pattern: normalise, transform, add the result back onto the input.</p>
+  <div class="flow">  x  (4,096 numbers per token: the residual stream)
+  │
+  ├──────────────┐
+  │         RMSNorm
+  │         attention (GQA, RoPE)      chapter 03
+  │              │
+  └──────(+)─────┘   x = x + attention(norm(x))
+  │
+  ├──────────────┐
+  │         RMSNorm
+  │         SwiGLU feed-forward        this chapter
+  │              │
+  └──────(+)─────┘   x = x + ffn(norm(x))
+  │
+  next block (32 in total), then final RMSNorm, then the output head</div>
+  <p>Two choices here are easy to get wrong when reading the code. First, the norm sits <em>inside</em> each residual branch, before the transform, not after the addition. This is pre-norm. Xiong et al. showed that with the norm inside the branch, gradients at initialisation are well behaved, which lets you drop the learning-rate warm-up that post-norm Transformers need. The side effect is that the residual path itself is never normalised, so it carries the raw sum of every layer's contribution. That is the "residual stream" of <a href="02-embeddings-and-position.html">chapter 02</a>: each sub-layer reads a normalised copy and writes a delta onto the stream.</p>
+  <p>Second, <strong>RMSNorm</strong> is LayerNorm without the mean subtraction. For a vector <code>x</code> of length <em>d</em> it computes <code>x / sqrt(mean(x²) + ε) × g</code>, where <code>g</code> is a learned scale per dimension and ε is 10<sup>-5</sup> in this model's config. Zhang and Sennrich proposed it on the argument that re-centring is dispensable and re-scaling is what matters, and reported running-time savings of 7% to 64% against LayerNorm in their experiments. It has one weight vector of 4,096 numbers per norm and no bias.</p>
+</section>
+
+<section id="ffn">
+  <h2>The feed-forward network, where the capacity sits</h2>
+  <p>Attention moves information between positions. The feed-forward network (FFN) works on each position alone: it takes the 4,096-number vector, expands it into a wider space, applies a non-linearity, and projects back. No token sees another token here. They are also the largest block of weights in the model.</p>
+  <p>The original Transformer FFN had two matrices and a ReLU. Llama uses SwiGLU, from Shazeer's 2020 note on gated variants. It has three matrices, and the output of one path gates the other:</p>
+  <div class="flow">  ffn(x) = W_down ( SiLU(W_gate x)  ⊙  (W_up x) )
+
+  W_gate : 4,096 → 14,336      SiLU(z) = z · sigmoid(z)
+  W_up   : 4,096 → 14,336      ⊙ is element-wise multiplication
+  W_down : 14,336 → 4,096</div>
+  <p>Shazeer reduced the hidden width by a factor of two thirds when swapping in a gated variant, so that three matrices cost the same as two. Matching a 16,384-wide two-matrix FFN would give 10,923. Llama 3.1 8B uses 14,336, which is 3.5 times the model width and about 31% more FFN parameters than parity. Meta's paper lists 14,336 in its hyperparameter table without giving the reason, so treat the choice as deliberate but unexplained.</p>
+</section>
+
+<section id="count">
+  <h2>Counting the 8.03 billion parameters</h2>
+  <p>The hyperparameters in the table below are Table 3 of the Llama 3 paper and match the <code>config.json</code> fields of the 8B checkpoint. Everything else follows from them. The shapes: queries project to 32 heads of 128 dimensions, keys and values to only 8 heads of 128 (the grouped-query attention of chapter 03), and the output projection maps the 4,096 concatenated head outputs back to 4,096.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>params.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python"># Llama 3.1 8B: hidden 4096, ffn 14336, 32 layers, 32 heads, 8 KV heads, vocab 128256
+d, f, L, H, Hkv, V = 4096, 14336, 32, 32, 8, 128256
+hd = d // H                                  # head dimension, 128
+
+attn = d*(H*hd) + 2*d*(Hkv*hd) + (H*hd)*d    # W_q + (W_k + W_v) + W_o
+ffn  = 3 * d * f                             # gate, up, down
+norm = 2 * d                                 # two RMSNorm scale vectors
+block = attn + ffn + norm
+
+embed, head, final_norm = V*d, V*d, d        # untied: separate input and output matrices
+total = embed + L*block + final_norm + head
+print(f"{attn:,} {ffn:,} {block:,} {total:,}")</code></pre>
+  </div>
+  <p>Running it prints the figures in the table.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Term</th><th>Shape or formula</th><th>Parameters</th></tr></thead>
+    <tbody>
+      <tr><td class="term">W<sub>q</sub></td><td>4,096 × 4,096</td><td>16,777,216</td></tr>
+      <tr><td class="term">W<sub>k</sub> and W<sub>v</sub></td><td>2 × 4,096 × 1,024</td><td>8,388,608</td></tr>
+      <tr><td class="term">W<sub>o</sub></td><td>4,096 × 4,096</td><td>16,777,216</td></tr>
+      <tr><td class="term">Attention per layer</td><td></td><td>41,943,040</td></tr>
+      <tr><td class="term">FFN per layer</td><td>3 × 4,096 × 14,336</td><td>176,160,768</td></tr>
+      <tr><td class="term">Two norms per layer</td><td>2 × 4,096</td><td>8,192</td></tr>
+      <tr><td class="term">One block</td><td></td><td>218,112,000</td></tr>
+      <tr><td class="term">32 blocks</td><td>32 × 218,112,000</td><td>6,979,584,000</td></tr>
+      <tr><td class="term">Input embedding</td><td>128,256 × 4,096</td><td>525,336,576</td></tr>
+      <tr><td class="term">Output head</td><td>128,256 × 4,096</td><td>525,336,576</td></tr>
+      <tr><td class="term">Final norm</td><td></td><td>4,096</td></tr>
+      <tr><td class="term"><strong>Total</strong></td><td></td><td><strong>8,030,261,248</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The total is 8.03 billion, which the name "8B" rounds down. Three things follow from the table. The FFN holds 70% of all parameters (32 × 176.2 million = 5.64 billion), attention holds 17%, and the two vocabulary matrices hold 13%. A model's size is mostly its feed-forward layers. Second, grouped-query attention saves little in parameters: full multi-head attention would raise W<sub>k</sub> and W<sub>v</sub> from 8.4 million to 33.6 million per layer, a 25 million difference across 32 layers of a 8,030 million total. Its saving is in the KV cache, which chapter 06 sizes. Third, the output head is a separate matrix because this model does not tie input and output embeddings (<code>tie_word_embeddings</code> is false). Some models tie them and save the second 525 million.</p>
+  <p>At two bytes per parameter in BF16, the weights occupy 16.06 GB, or 14.96 GiB. Every decode step in chapter 06 starts from that number. <a href="../serving-open-weight-models/03-quantization.html">Quantisation</a> attacks it directly: 4-bit weights bring the floor down by roughly a factor of four, at a cost in accuracy that the serving guide measures.</p>
+</section>
+
+<section id="flops">
+  <h2>FLOPs per token: 2N, plus attention over context</h2>
+  <p>Every weight in a matrix multiplication takes part in one multiply and one add per token. So the forward pass costs about two floating-point operations per parameter per token. Kaplan et al. write this as C<sub>forward</sub> ≈ 2N + 2·n<sub>layer</sub>·n<sub>ctx</sub>·d<sub>model</sub>, where N excludes the embedding lookup (a table read, not a matrix product) and the second term is attention over the context.</p>
+  <p>For this model that is 2 × 7.5 billion matmul parameters = 15.0 GFLOPs per token, or 16.06 GFLOPs if you simply double the headline count. The two numbers differ by 7% and the second is the one people quote. The attention term depends on how much context there is:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Context length</th><th>Attention term, per token</th><th>Relative to 15.0 GFLOPs</th></tr></thead>
+    <tbody>
+      <tr><td class="term">2,000 (Harbourline prompt)</td><td>2 × 32 × 2,000 × 4,096 = 0.52 GFLOPs</td><td>3%</td></tr>
+      <tr><td class="term">8,192</td><td>2.15 GFLOPs</td><td>14%</td></tr>
+      <tr><td class="term">131,072</td><td>34.4 GFLOPs</td><td>229%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>At a few thousand tokens the 2N rule is accurate to a few per cent. At 131,072 tokens attention costs more than twice everything else combined, because it grows with context while the matrices do not. The formula is an upper bound for causal attention, since a token only attends to earlier positions and the average is about half. Setting the attention term equal to 15.0 GFLOPs gives a crossover near 57,000 tokens of context. Quadratic cost across a whole sequence is the subject of <a href="03-attention-one-head-at-a-time.html">chapter 03</a>; the point here is the per-token view, where the weights set a fixed floor and the context adds a variable amount on top.</p>
+</section>
+
+<section id="h100">
+  <h2>What a forward pass costs on an H100, in time</h2>
+  <p>FLOPs are not time. A GPU has two limits, and a forward pass runs into whichever it reaches first. NVIDIA lists the H100 SXM at 3.35 TB/s of memory bandwidth and 1,979 TFLOPS of BF16 tensor throughput, with a footnote that this figure is with sparsity. The dense figure is half, about 989 TFLOPS, and that is the one to use for ordinary weights. Divide one by the other and you get 295 FLOPs per byte moved, the ridge point. Work with fewer FLOPs per byte than that waits on memory; work with more waits on compute.</p>
+  <p>A BF16 weight is two bytes and costs two FLOPs per token it serves. With one token in flight, each byte read buys one FLOP, 295 times below the ridge. With <em>B</em> tokens sharing one read of the weights, it buys <em>B</em>. So the arithmetic is simple enough to do by hand:</p>
+  <div class="flow">  decode, one token (batch 1)   memory-bound
+    time ≈ weights / bandwidth = 16.06 GB / 3.35 TB/s = 4.8 ms
+    ceiling: about 205 tokens/s
+    compute used: 15.0 GFLOPs / 4.8 ms = 3 TFLOPS of 989 (0.3%)
+
+  prefill, 2,000 tokens in one pass   compute-bound
+    FLOPs = 2,000 × 15.0 GFLOPs = 30 TFLOPs
+    time at peak = 30 TFLOPs / 989 TFLOPS = 30 ms
+    time at an assumed 50% of peak = 61 ms</div>
+  <p>The 50% figure is an assumption for illustration; real kernels land somewhere below peak, and chapter 06 uses the same figure. The 4.8 ms is a floor: it ignores the KV cache read, kernel launch overhead and communication. The shape of the result is the durable part. Processing the prompt is cheap per token because 2,000 tokens share one read of the weights, and generating is expensive per token because one token pays for the whole read. A 2,000-token prefill takes about 13 decode steps' worth of time while doing 2,000 times the work.</p>
+  <div class="callout insight">
+    <span class="callout-label">Batch 1 decode uses well under 1% of the chip</span>
+    <p>This is why serving engines batch requests together. Adding sequences to a decode step costs almost no extra weight traffic, so throughput rises almost linearly at first, until the batch nears 295 tokens or the KV cache fills memory. The flip side: if you serve one user at a time on an H100, you pay for a 989 TFLOPS machine and use 3.</p>
+  </div>
+</section>
+
+<section id="moe">
+  <h2>Mixture of experts: active against total parameters</h2>
+  <p>A dense model sends every token through every FFN weight. A mixture-of-experts (MoE) model replaces the single FFN in each block with many smaller FFNs, the experts, and a small router that picks a few of them per token. Attention stays dense. The consequence for the arithmetic above is that two numbers now describe the model. <strong>Total parameters</strong> set the memory the weights occupy. <strong>Active parameters</strong> set the FLOPs per token, so the 2N rule becomes 2 × active.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Model</th><th>Total</th><th>Active per token</th><th>Experts</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Mixtral 8x7B</td><td>47B</td><td>13B</td><td>8, top 2</td><td>Jiang et al., 2024</td></tr>
+      <tr><td class="term">DeepSeek-V3</td><td>671B</td><td>37B</td><td>shared plus routed</td><td>DeepSeek-AI, 2024</td></tr>
+      <tr><td class="term">Qwen3-235B-A22B</td><td>235B</td><td>22B</td><td>128, top 8</td><td>Yang et al., 2025</td></tr>
+      <tr><td class="term">GLM-5.3</td><td>about 753B (parameter count in the checkpoint metadata)</td><td>not stated on the model card</td><td>256 routed plus 1 shared, 8 routed per token</td><td>Hugging Face repository, as of November 2026</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Take Qwen3-235B-A22B. Its FLOPs per token are about 2 × 22 billion = 44 GFLOPs, roughly three times Llama 3.1 8B and a fraction of what a dense 235-billion model would need (470 GFLOPs). Its weights still need 470 GB in BF16, so it does not fit on one 80 GB GPU even at 4 bits per weight, which would still take about 118 GB. You buy compute efficiency and pay in memory.</p>
+  <p>The decode floor behaves differently from the dense case, and this is where the intuition breaks. At batch 1 the router picks 8 of 128 experts in each layer, so only a small share of the FFN weights is read and the step is fast. But different tokens pick different experts. If routing were uniform, a batch of 64 tokens would touch 1 − (1 − 8/128)<sup>64</sup> = 98% of the experts in each layer, which means the step reads nearly all the weights. A real router is not uniform, so this overstates the effect, but the direction holds: MoE gives its speed advantage at small batch, and as batches grow the memory traffic approaches that of the full model. Whether a given MoE model is cheaper to serve than a dense one of similar quality depends on your batch size, which is a serving question taken up in <a href="../serving-open-weight-models/08-capacity-cost-and-slos.html">capacity, cost and SLOs</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Without looking at the table, derive the FFN parameters in one Llama 3.1 8B layer. Then say what fraction of the total they make up and why that fraction is not the same as the fraction of FLOPs spent on FFN at a 131,072-token context.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Three matrices of 4,096 × 14,336 give 176,160,768 per layer, and 32 layers give 5.64 billion of 8.03 billion, or 70%. At long context the attention term grows with context length while the FFN FLOPs do not, so FFN's share of FLOPs falls well below 70%. See <a href="#count">Counting the 8.03 billion parameters</a> and <a href="#flops">FLOPs per token</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague says the model has 8 billion parameters, so a forward pass is 16 GFLOPs. Where is that right, and where is it wrong?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It is right to within 7% at short contexts: 2N with N including the embedding is 16.06 GFLOPs, and 15.0 without the lookup. It is wrong at long context, where attention adds 2 × layers × context × width per token, 34 GFLOPs at 131,072 tokens. See <a href="#flops">FLOPs per token</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does a 2,000-token prompt take about 60 ms to prefill while each generated token takes about 5 ms, when the model does 2,000 times more arithmetic in the first case?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Prefill shares one read of the weights across 2,000 tokens, so it is limited by compute. A decode step at batch 1 reads all 16 GB for one token and is limited by memory bandwidth, about 4.8 ms. See <a href="#h100">What a forward pass costs on an H100</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Grouped-query attention cuts keys and values from 32 heads to 8. How many parameters does that save in this model, and why do people care about it anyway?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Full multi-head K and V would be 33.6 million per layer instead of 8.4 million, a saving of 25 million per layer, 805 million in total, about 10% of the model. The larger effect is a four times smaller KV cache, which is what limits batch size at decode. See <a href="#count">Counting the 8.03 billion parameters</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Qwen3-235B-A22B decodes one token at batch 1 much faster than a dense 235B model would. Why does that advantage shrink when you serve 64 concurrent requests?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Different tokens activate different experts. With 8 of 128 experts per token and uniform routing, 64 tokens touch about 98% of them, so the step reads nearly all 470 GB of weights. Memory traffic, not active FLOPs, sets the step time. See <a href="#moe">Mixture of experts</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A block is pre-norm RMSNorm, attention, add, pre-norm RMSNorm, SwiGLU feed-forward, add. The residual stream is never normalised and every sub-layer writes a delta onto it.</li>
+    <li>The feed-forward network holds 70% of Llama 3.1 8B's 8,030,261,248 parameters, attention 17% and the two vocabulary matrices 13%.</li>
+    <li>A forward pass costs about 2 FLOPs per parameter per token, plus an attention term that grows with context and, on Kaplan's upper-bound formula, passes the weights' cost near 57,000 tokens.</li>
+    <li>At batch 1 an H100 decodes this model at about 4.8 ms per token, set by reading 16 GB of weights, using under 1% of its compute.</li>
+    <li>Prefill is compute-bound and decode is memory-bound, which is why batching raises throughput almost for free until the batch nears 295 tokens.</li>
+    <li>For a mixture-of-experts model, active parameters set FLOPs and total parameters set memory. The speed advantage fades as batch size grows and more experts are touched.</li>
+  </ul>
+  <p>The forward pass ends with 128,256 numbers, one per vocabulary entry, and the next chapter turns them into a single token. → <a href="05-from-logits-to-a-token.html">From Logits to a Token</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener"><strong>The Llama 3 Herd of Models</strong></a> — Llama Team, Meta, 2024. Table 3 gives the hyperparameters used in the count above.</li>
+    <li><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener"><strong>Scaling Laws for Neural Language Models</strong></a> — Kaplan et al., 2020. The parameter and forward-pass FLOP formulas in its Table 1.</li>
+    <li><a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener"><strong>GLU Variants Improve Transformer</strong></a> — Shazeer, 2020. Where SwiGLU and the two-thirds width adjustment come from.</li>
+    <li><a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener"><strong>Root Mean Square Layer Normalization</strong></a> — Zhang and Sennrich, 2019. The RMSNorm definition and its cost argument.</li>
+    <li><a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener"><strong>On Layer Normalization in the Transformer Architecture</strong></a> — Xiong et al., 2020. Why pre-norm trains without warm-up.</li>
+    <li><a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener"><strong>Mixtral of Experts</strong></a> — Jiang et al., 2024. Total against active parameters in a sparse mixture of experts.</li>
+    <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener"><strong>NVIDIA H100 Tensor Core GPU</strong></a> — NVIDIA. Memory bandwidth and tensor throughput figures, with the sparsity footnote.</li>
+  </ul>
 </section>
 
 </main>
