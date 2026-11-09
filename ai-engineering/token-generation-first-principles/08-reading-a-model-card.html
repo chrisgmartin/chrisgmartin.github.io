@@ -37,6 +37,12 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#fields">The fields</a>
+    <a href="#side-by-side">Side by side</a>
+    <a href="#memory">Weights and KV cache</a>
+    <a href="#script">The script, run</a>
+    <a href="#context">Claimed against effective</a>
+    <a href="#terms">Licence and data</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -53,12 +59,221 @@
 <header class="hero">
   <span class="eyebrow">Section D · Scale and practice</span>
   <h1>Reading a Model Card</h1>
-  <p class="subtitle">The configuration fields that matter, computing memory and KV cache from them, context windows claimed and effective, licences, and a worked read of a current open-weight model.</p>
+  <p class="subtitle">Chapter 07 covered why models have their shape and what thinking and image tokens cost. This chapter turns that into a practical skill: reading a config.json and model card, computing weight memory and KV cache from them, separating claimed from effective context, and checking the licence. It reads Llama 3.1 8B and Qwen3.8-27B side by side.</p>
 </header>
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p>A model card tells you what the vendor wants you to believe. The <code>config.json</code> beside it tells you what the weights are, and from a dozen of its fields you can compute the memory a model needs before you download a byte. This chapter reads two configs side by side: Llama 3.1 8B, the worked model of this guide, and Qwen3.8-27B, a current open-weight model released in 2026 (as of November 2026). It then separates claimed from effective context and covers the licence and data statements.</p>
+</section>
+
+<section id="fields">
+  <h2>The fields that matter</h2>
+  <p>Most of a config is plumbing. Eight groups of fields carry the numbers you need, and each has a way to mislead you.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Field</th><th>What you compute from it</th><th>The trap</th></tr></thead>
+    <tbody>
+      <tr><td class="term">hidden_size, num_hidden_layers</td><td>Width and depth; with the two below, the parameter count</td><td>Multimodal configs nest these inside <code>text_config</code></td></tr>
+      <tr><td class="term">intermediate_size, vocab_size</td><td>Feed-forward and embedding parameters</td><td>Check <code>tie_word_embeddings</code>: tied halves the embedding cost, untied doubles it</td></tr>
+      <tr><td class="term">num_attention_heads, num_key_value_heads, head_dim</td><td>KV cache bytes per token (below)</td><td>A missing KV-heads field means one per head. <code>head_dim</code> need not equal hidden size divided by heads</td></tr>
+      <tr><td class="term">layer_types and any <code>linear_*</code> keys</td><td>How many layers keep a per-token cache</td><td>A hybrid model caches only its full-attention layers</td></tr>
+      <tr><td class="term">rope_theta or rope_parameters, rope_scaling</td><td>How position is encoded and whether it was stretched</td><td>Llama has <code>rope_theta</code>; Qwen nests it in <code>rope_parameters</code></td></tr>
+      <tr><td class="term">max_position_embeddings</td><td>The context the vendor claims</td><td>A claim, not a measurement</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Qwen3.8-27B shows most of these traps. Its <code>head_dim</code> is 256, but dividing the hidden size 5,120 by its 24 heads gives 213.3, so a script that assumes the usual relation computes the wrong attention shape. Its rotary base lives under <code>rope_parameters</code>, its dtype key is <code>dtype</code>, and 48 of its 64 layers are not softmax attention at all.</p>
+</section>
+
+<section id="side-by-side">
+  <h2>Two models side by side</h2>
+  <p>The Llama values come from its <code>config.json</code> and agree with Table 3 of the Llama 3 paper. The Qwen values come from its config and from its README, which describes the layout as 16 repeats of three Gated DeltaNet layers followed by one Gated Attention layer. Derived rows come from <a href="#script">the script below</a>.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th></th><th>Llama 3.1 8B</th><th>Qwen3.8-27B</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Hidden size, layers</td><td>4,096, 32</td><td>5,120, 64</td></tr>
+      <tr><td class="term">Query heads / KV heads / head dim</td><td>32 / 8 / 128</td><td>24 / 4 / 256 (16 full-attention layers)</td></tr>
+      <tr><td class="term">Vocabulary</td><td>128,256</td><td>248,320</td></tr>
+      <tr><td class="term">RoPE base</td><td>500,000</td><td>10,000,000, applied to a quarter of each head</td></tr>
+      <tr><td class="term">Claimed context</td><td>131,072</td><td>262,144, extensible to about 1 million</td></tr>
+      <tr><td class="term">Parameters</td><td>8,030,261,248</td><td>27,781,427,952 (includes the vision encoder)</td></tr>
+      <tr><td class="term">Weights in BF16</td><td>16.06 GB</td><td>55.56 GB</td></tr>
+      <tr><td class="term">KV cache per token</td><td>131,072 bytes</td><td>65,536 bytes</td></tr>
+      <tr><td class="term">Licence</td><td>Llama 3.1 Community License</td><td>Apache 2.0</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The parameter count for Llama is not an estimate. Adding up the embeddings, the attention and feed-forward matrices and the norms for the config's shape gives 8,030,261,248, the exact total in the published safetensors header, and <a href="04-the-block-and-the-forward-pass.html">chapter 04</a> derives it term by term. The Qwen total comes from that header, because a hybrid layer cannot be priced with the dense formula.</p>
+</section>
+
+<section id="memory">
+  <h2>Weight memory and KV cache from the config</h2>
+  <p>Weight memory is parameters times bytes per parameter. Llama 3.1 8B at two bytes is 16.06 GB, which leaves 63.9 GB on an 80 GB H100 SXM (NVIDIA lists 80 GB and 3.35 TB/s). Qwen3.8-27B at two bytes is 55.56 GB, leaving 24.4 GB. <a href="../serving-open-weight-models/03-quantization.html">Quantisation</a> shrinks that; the config gives only the shipped precision.</p>
+  <p>The KV cache per token is the formula from <a href="03-attention-one-head-at-a-time.html">chapter 03</a>, with one correction for hybrids. For each layer that keeps a per-token cache, store K and V for every KV head:</p>
+  <div class="flow">bytes per token = cached layers × 2 (K, V) × KV heads × head_dim × bytes per value
+
+Llama 3.1 8B : 32 × 2 × 8 × 128 × 2 = 131,072 bytes   (128 KiB)
+Qwen3.8-27B  : 16 × 2 × 4 × 256 × 2 =  65,536 bytes   ( 64 KiB)
+Qwen, naive  : 64 × 2 × 4 × 256 × 2 = 262,144 bytes   (wrong: 4 times too high)</div>
+  <p>Qwen's 48 Gated DeltaNet layers keep a recurrent state of fixed size per sequence instead of a growing cache. That state is not in the formula, and it was not measured for this chapter, so treat the Qwen figures as the growing part only.</p>
+  <p>Multiply by sequence length. A Harbourline chat turn of about 1,900 tokens needs 249 MB of cache on Llama and 125 MB on Qwen. A full-length sequence needs 131,072 × 131,072 bytes = 16 GiB on Llama, and 262,144 × 65,536 bytes = 16 GiB on Qwen, which is a coincidence of the two designs. Dividing the memory left after the weights by those figures gives the planning numbers below, ignoring activations and runtime overhead, which will cut them.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>One H100 80 GB, BF16</th><th>Llama 3.1 8B</th><th>Qwen3.8-27B</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Memory left after weights</td><td>63.9 GB</td><td>24.4 GB</td></tr>
+      <tr><td class="term">Sequences of 1,900 tokens</td><td>about 257</td><td>about 196</td></tr>
+      <tr><td class="term">Sequences at full context</td><td>about 3.7</td><td>about 1.4</td></tr>
+      <tr><td class="term">Batch-1 decode floor, weights ÷ bandwidth</td><td>4.8 ms per token</td><td>16.6 ms per token</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The last row reads every weight once per token at 3.35 TB/s, a batch-1 bound that ignores cache reads. The paging that makes these cache numbers achievable is the subject of <a href="../paged-attention-deep-dive/index.html#kvcache">the PagedAttention guide</a>. For Harbourline the arithmetic says the 27B model fits one card with about three quarters of the concurrency of the 8B, at roughly 3.5 times the time per token. Whether the 27B's quality justifies that is an eval question; <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html#table">the neocloud pricing table</a> has H100 hourly rates.</p>
+</section>
+
+<section id="script">
+  <h2>A script that prints these numbers</h2>
+  <p>This script reads any dense or hybrid decoder config of the kinds above. It unwraps <code>text_config</code>, handles the renamed keys, counts only full-attention layers when <code>layer_types</code> exists, and derives the parameter count for dense models. It raises a <code>KeyError</code> on a config it does not understand instead of printing a plausible wrong number.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>config_numbers.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">"""Print the memory numbers a model's config.json implies. Usage: config_numbers.py config.json [total_params]"""
+import json
+import sys
+
+DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
+H100_BYTES = 80e9          # H100 SXM memory, 80 GB
+H100_BW = 3.35e12          # H100 SXM memory bandwidth, bytes per second
+
+
+def read(path, total_params=None):
+    cfg = json.load(open(path))
+    cfg = cfg.get("text_config", cfg)            # multimodal configs nest the language model
+    h, L = cfg["hidden_size"], cfg["num_hidden_layers"]
+    heads = cfg["num_attention_heads"]
+    kv_heads = cfg.get("num_key_value_heads", heads)
+    head_dim = cfg.get("head_dim", h // heads)
+    width = DTYPE_BYTES[cfg.get("torch_dtype") or cfg["dtype"]]
+    types = cfg.get("layer_types")               # hybrid models mix attention kinds
+    full = sum(t == "full_attention" for t in types) if types else L
+    rope = cfg.get("rope_theta") or cfg["rope_parameters"]["rope_theta"]
+    ctx = cfg["max_position_embeddings"]
+
+    if total_params is None:                     # dense Llama-style count, term by term
+        ff, v = cfg["intermediate_size"], cfg["vocab_size"]
+        attn = h * heads * head_dim * 2 + h * kv_heads * head_dim * 2     # Q, O, K, V
+        per_layer = attn + 3 * h * ff + 2 * h                             # SwiGLU MLP, 2 norms
+        embed = v * h * (1 if cfg.get("tie_word_embeddings") else 2)      # input + output
+        total_params = L * per_layer + embed + h                          # + final norm
+
+    kv_tok = full * 2 * kv_heads * head_dim * width    # K and V, per token, whole model
+    weights = total_params * width
+    print(f"layers {L} ({full} with a per-token KV cache), hidden {h}, heads {heads}, "
+          f"kv heads {kv_heads}, head dim {head_dim}, rope theta {rope:,.0f}")
+    print(f"params {total_params:,}  dtype bytes {width}  weights {weights / 1e9:.2f} GB")
+    print(f"KV cache per token {kv_tok:,} bytes ({kv_tok / 1024:.0f} KiB)")
+    print(f"KV cache at {ctx:,} tokens {kv_tok * ctx / 2**30:.1f} GiB")
+    print(f"KV cache at 1,900 tokens {kv_tok * 1900 / 1e6:.0f} MB")
+    free = H100_BYTES - weights
+    print(f"H100 80 GB: {free / 1e9:.1f} GB left after weights = "
+          f"{free / (kv_tok * ctx):.1f} sequences at full context, "
+          f"{free / (kv_tok * 1900):.0f} at 1,900 tokens")
+    print(f"batch-1 decode floor (weights / bandwidth) {weights / H100_BW * 1e3:.1f} ms per token")
+    if types:
+        print(f"naive count (every layer cached) would say {L * 2 * kv_heads * head_dim * width:,} bytes per token")
+
+
+if __name__ == "__main__":
+    read(sys.argv[1], int(sys.argv[2]) if len(sys.argv) &gt; 2 else None)</code></pre>
+  </div>
+  <p>Meta's repository for Llama 3.1 8B is gated, so the run below uses the config of a public mirror (NousResearch/Meta-Llama-3.1-8B, which agrees with Table 3 of the paper) and on the Qwen file straight from its Hugging Face repository. For Qwen the second argument is the safetensors total, 27,781,427,952, read from the repository's metadata.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">$ python3 -I config_numbers.py llama-3.1-8b.json
+layers 32 (32 with a per-token KV cache), hidden 4096, heads 32, kv heads 8, head dim 128, rope theta 500,000
+params 8,030,261,248  dtype bytes 2  weights 16.06 GB
+KV cache per token 131,072 bytes (128 KiB)
+KV cache at 131,072 tokens 16.0 GiB
+KV cache at 1,900 tokens 249 MB
+H100 80 GB: 63.9 GB left after weights = 3.7 sequences at full context, 257 at 1,900 tokens
+batch-1 decode floor (weights / bandwidth) 4.8 ms per token
+
+$ python3 -I config_numbers.py qwen3.8-27b.json 27781427952
+layers 64 (16 with a per-token KV cache), hidden 5120, heads 24, kv heads 4, head dim 256, rope theta 10,000,000
+params 27,781,427,952  dtype bytes 2  weights 55.56 GB
+KV cache per token 65,536 bytes (64 KiB)
+KV cache at 262,144 tokens 16.0 GiB
+KV cache at 1,900 tokens 125 MB
+H100 80 GB: 24.4 GB left after weights = 1.4 sequences at full context, 196 at 1,900 tokens
+batch-1 decode floor (weights / bandwidth) 16.6 ms per token
+naive count (every layer cached) would say 262,144 bytes per token</code></pre></div>
+</section>
+
+<section id="context">
+  <h2>Claimed context against effective context</h2>
+  <p><code>max_position_embeddings</code> is the longest position the model was trained or extended to handle. It is not a quality guarantee. Meta's paper describes how Llama's number came about: pretraining ran at an 8K window, and the final stage extended it to 128K in six increments using about 800 billion tokens, because attention cost grows quadratically with length. Each increment was accepted when short-context scores had fully recovered and the model solved needle-in-a-haystack retrieval perfectly at that length.</p>
+  <p>RULER (Hsieh et al., 2024) asks for more. It adds multiple needles, multi-hop variable tracking and aggregation, and defines the effective length as the longest length where a model's score stays above a fixed threshold, the score of Llama 2 7B at 4K, which was 85.6. Llama 3.1 8B Instruct claimed 128K and scored as follows.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Context length</th><th>4K</th><th>8K</th><th>16K</th><th>32K</th><th>64K</th><th>128K</th></tr></thead>
+    <tbody><tr><td class="term">RULER score, Llama 3.1 8B</td><td>95.5</td><td>93.8</td><td>91.6</td><td>87.4</td><td>84.7</td><td>77.0</td></tr></tbody>
+  </table>
+  </div>
+  <p>The score passes the threshold at 32K and fails at 64K, so RULER reports an effective length of 32K against a claimed 128K. The paper's wider finding is that almost all models fell below the threshold before their claimed length, and that only about half of the 17 models tested kept satisfactory performance at 32K.</p>
+  <p>Qwen3.8-27B claims 262,144 natively. Its README says that going further needs YaRN scaling, which the notable open-source engines implement as static scaling, and warns that it is "potentially impacting performance on shorter texts", so it advises changing the config only when you need the length. The card gives no long-context benchmark.</p>
+  <p>The practical rule has two parts. For capacity planning use the claimed length, because the cache must hold what you let users send. For quality use the length you actually send, measured on your task. Harbourline's chat turn is about 1,900 tokens, far inside any limit, so the claimed length matters for the cap you set on pasted documents, not for the quality of the usual turn. It flips for a claims agent that stuffs 60,000 tokens of policy history into one prompt: there, run your own needle and multi-hop tests at that length before trusting the headline. <a href="02-embeddings-and-position.html">Chapter 02</a> explains why length degrades quality.</p>
+</section>
+
+<section id="terms">
+  <h2>Licence, usage terms and training data</h2>
+  <p>A model you cannot legally ship is not a candidate. Read three things on the card, in this order.</p>
+  <p><strong>The licence.</strong> Llama 3.1 uses a custom licence. It grants a royalty-free licence to use, modify and redistribute, with conditions. If you distribute the models or a product containing them you must pass on the agreement and prominently display "Built with Llama". If you use the materials or their outputs to create, train, fine-tune or improve a model that you distribute or make available, its name must begin with "Llama". If, on the 23 July 2024 release date, your products had more than 700 million monthly active users, you need a separate licence from Meta. The Acceptable Use Policy is incorporated by reference, and the licence ends if you sue Meta over the materials. Qwen3.8-27B is Apache 2.0, a standard permissive licence with no display, naming or user-count conditions. This is a reading aid, not legal advice.</p>
+  <p><strong>The training-data statement.</strong> The Llama 3.1 card says "a new mix of publicly available online data", more than 15 trillion tokens, and a knowledge cutoff of December 2023, and calls the model static. The Qwen3.8-27B README as read for this chapter states no training-data description, token count or knowledge cutoff. Without one you cannot rule out that it has seen your benchmark.</p>
+  <p>A December 2023 cutoff means the model knows nothing about terms Harbourline changed since, or about policy HL-UK-4471-220. The facts must arrive in the prompt, which is the job of retrieval and the reason <a href="../production-rag-deep-dive/03-embeddings.html">the embeddings chapter</a> exists.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A teammate sizes Qwen3.8-27B's cache as 64 layers × 2 × 4 × 256 × 2 bytes. What did they miss?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Only the 16 full-attention layers keep a per-token cache: 65,536 bytes, a quarter of theirs. See <a href="#memory">weight memory and KV cache</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A config lists 40 layers, 40 attention heads, no <code>num_key_value_heads</code> field, hidden size 5,120 and BF16 weights. Compute the KV cache per token, and say what changes if the field is present with value 8.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>With no KV-heads field every head has its own K and V, so the head dimension is 5,120 / 40 = 128 and the cache is 40 × 2 × 40 × 128 × 2 bytes = 819,200 bytes per token. With 8 KV heads it is 40 × 2 × 8 × 128 × 2 = 163,840 bytes, a fifth. See <a href="#memory">weight memory and KV cache</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vendor's card says "128K context" and shows a perfect needle-in-a-haystack chart. Your task is to answer questions that combine facts from three places in a 100,000-token claims file. What do you do before you trust it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Treat the chart as evidence of single-fact retrieval only. Build a test at 100,000 tokens with your own multi-hop questions, as RULER does with variable tracking and aggregation, and compare against a shorter-context baseline. RULER measured Llama 3.1 8B at 77.0 at 128K against 95.5 at 4K. See <a href="#context">claimed against effective context</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You are choosing between Llama 3.1 8B and Qwen3.8-27B to self-host the help-centre chat on one H100. Memory alone does not decide it. What does the arithmetic rule in, what does it rule out, and what must you still measure?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Both fit: 16.06 GB and 55.56 GB leave room for roughly 257 and 196 concurrent 1,900-token sequences. Neither is practical for several full-length sequences on one card. The batch-1 decode floor is about 4.8 ms against 16.6 ms per token, so latency favours the 8B. Whether the 27B's answers are good enough to justify roughly 3.5 times the time per token is an eval question. See <a href="#memory">weight memory and KV cache</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A handful of config fields give you weight memory and KV cache per token before you download the model. The arithmetic for Llama 3.1 8B gives 16.06 GB of weights and 131,072 bytes of cache per token.</li>
+    <li>Configs mislead in predictable ways: nested <code>text_config</code>, renamed keys, a missing KV-heads field that means full multi-head attention, and a <code>head_dim</code> that is not hidden size divided by heads.</li>
+    <li>On a hybrid model only the full-attention layers keep a per-token cache. Qwen3.8-27B needs 65,536 bytes per token, not the 262,144 a naive count gives.</li>
+    <li>A claimed context length is a configuration value, not a measurement. RULER put Llama 3.1 8B's effective length at 32K against 128K claimed, and a perfect needle test shows only that a single fact can be retrieved.</li>
+    <li>Licence terms and training-data statements are part of the model choice. Llama 3.1's licence adds display, naming and user-count conditions that Apache 2.0 does not, and a missing data statement means you cannot rule out benchmark contamination.</li>
+  </ul>
+  <p>You can now read what a model is and what it costs to hold. → <a href="09-why-models-fail.html">Why Models Fail</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md" target="_blank" rel="noopener"><strong>Llama 3.1 model card</strong></a> — Meta. The architecture table, GQA statement, token count, knowledge cutoff and supported languages used above.</li>
+    <li><a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/LICENSE" target="_blank" rel="noopener"><strong>Llama 3.1 Community License Agreement</strong></a> — Meta, 23 July 2024. The attribution, naming, 700 million user and termination clauses.</li>
+    <li><a href="https://arxiv.org/abs/2404.06654" target="_blank" rel="noopener"><strong>RULER: What's the Real Context Size of Your Long-Context Language Models?</strong></a> — Hsieh et al., 2024. The effective-length method and the per-length scores for Llama 3.1.</li>
+    <li><a href="https://huggingface.co/Qwen/Qwen3.8-27B" target="_blank" rel="noopener"><strong>Qwen3.8-27B model card</strong></a> — Qwen team, read November 2026. The hybrid layout, context length, YaRN guidance and licence for the second worked model.</li>
+  </ul>
 </section>
 
 </main>
