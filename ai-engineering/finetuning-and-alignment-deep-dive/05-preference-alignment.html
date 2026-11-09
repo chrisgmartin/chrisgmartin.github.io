@@ -19,14 +19,14 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
-<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
-<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
 <!-- /HEAD:seo -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
 <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="../../assets/style.css?v=20">
-<script defer src="../../assets/script.js?v=20"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
 </head>
 <body>
 
@@ -37,6 +37,14 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#plateau">Why SFT alone plateaus</a>
+    <a href="#rlhf">The reward-model pipeline and why teams moved off it</a>
+    <a href="#dpo">DPO: the preference loss without a reward model</a>
+    <a href="#variants">ORPO, KTO and SimPO: what each one changes</a>
+    <a href="#rl">GRPO, verifiable rewards and rejection sampling</a>
+    <a href="#collecting">Collecting preferences from adjusters</a>
+    <a href="#hacking">Reward hacking and length bias</a>
+    <a href="#wasted">When SFT is enough</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -58,7 +66,183 @@
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p><a href="04-supervised-fine-tuning.html">Chapter 04</a> trains the model to imitate adjusters' summaries. Harbourline's adjusters also did something imitation cannot use: over eight weeks they picked the better of two summaries about 6,000 times. This chapter decides whether that signal is worth a second training stage, and if so how to use it.</p>
+</section>
+
+<section id="plateau">
+  <h2>Why SFT alone plateaus</h2>
+  <p>SFT maximises the likelihood of one reference summary, token by token. Two summaries can both be acceptable and still score very differently against that reference. The objective also only ever sees good outputs, so it has no way to say "this wording is worse than that one".</p>
+  <p>Preference data supplies the missing signal. Stiennon et al. (2020) tested it on summarisation: their 1.3B model trained with human feedback was preferred to the reference summaries 61% of the time, while a supervised model ten times its size reached 43%. Tajwar et al. (2024) analysed why. Methods that sample from the model's own outputs, or push down the likelihood of bad responses (a "negative gradient"), beat plain maximum-likelihood training.</p>
+</section>
+
+<section id="rlhf">
+  <h2>The reward-model pipeline and why teams moved off it</h2>
+  <p>Ouyang et al. (2022) set the template behind InstructGPT. First fine-tune on demonstrations. Then collect rankings of model outputs and train a reward model to predict which output a human prefers. Then optimise the SFT model against it with PPO, with a KL penalty to keep it near the start.</p>
+  <p>The cost is the machinery: PPO keeps a policy, a frozen reference, a reward model and a value model, and samples from the policy during training. The Llama 3 authors state their choice plainly: they used SFT, rejection sampling and DPO rather than more complex reinforcement learning algorithms that tend to be less stable and harder to scale. For an 8B model on one rented GPU that argument is stronger, so the rest of this chapter starts from DPO.</p>
+</section>
+
+<section id="dpo">
+  <h2>DPO: the preference loss without a reward model</h2>
+  <p>Rafailov et al. (2023) show that the RLHF objective has a closed-form optimal policy, so the reward model can be written in terms of the policy itself. The result is a classification loss on pairs. For a prompt <em>x</em>, a chosen summary <em>y<sub>w</sub></em> and a rejected one <em>y<sub>l</sub></em>:</p>
+  <div class="flow">loss = -log sigmoid( beta * [ log pi(yw|x) - log pi_ref(yw|x) ]
+                    - beta * [ log pi(yl|x) - log pi_ref(yl|x) ] )</div>
+  <p>Each bracket measures how much more likely the tuned model makes a summary than the reference does. The loss falls when the chosen summary gains likelihood relative to the rejected one. There is no sampling and no reward model. The "implicit reward" TRL logs is <em>β</em> times that log ratio.</p>
+  <p><strong>The reference must be the SFT model.</strong> DPO pulls the policy back toward the reference, so a base model as reference would drag the tuned model away from everything chapter 04 taught. With LoRA, merge the SFT adapter into the weights, save, and train a fresh adapter on top. TRL's error message for an adapter model plus a new adapter config says to merge and unload the adapter first. When <code>ref_model</code> is <code>None</code>, TRL uses the model's state before DPO started.</p>
+  <p><strong>Beta.</strong> <em>β</em> sets how hard the pull back is. In TRL, a higher value means less deviation from the reference, and the default is 0.1. The DPO paper used 0.1 for most tasks and 0.5 for TL;DR summarisation, which is Harbourline's task, so sweep both.</p>
+  <p><strong>What to watch.</strong> At step zero the policy equals the reference, both brackets are equal, and the loss is the log of 2, 0.693. In a one-step smoke test the logged loss was 0.6931. TRL also logs <code>rewards/accuracies</code>, the share of pairs where the chosen summary has the higher implicit reward, and <code>rewards/margins</code>. Held-out accuracy climbing is the sign that training generalises; a margin that grows while it stalls is memorisation.</p>
+  <p>The two scripts below run the Harbourline recipe. Both were smoke-tested on CPU with a 135-million-parameter model for one to three steps, and have not been run at 9B scale. Run <code>merge_sft.py</code> first.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>merge_sft.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># merge_sft.py: fold the SFT adapter into the base weights so DPO can start from the SFT model.
+import os, torch
+from peft import AutoPeftModelForCausalLM
+from transformers import AutoTokenizer
+
+adapter, out = "out/harbourline-sft-lora", "out/harbourline-sft-merged"
+model = AutoPeftModelForCausalLM.from_pretrained(adapter, dtype=torch.bfloat16)
+model.merge_and_unload().save_pretrained(out)
+AutoTokenizer.from_pretrained(adapter).save_pretrained(out)</code></pre>
+</div>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>train_dpo.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># train_dpo.py: LoRA DPO on adjuster preference pairs, starting from the merged SFT model.
+# Tested with trl 1.17.1, peft 0.21.2, transformers 5.22.2, torch 2.15.0.
+import os
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from trl import DPOConfig, DPOTrainer
+
+START = os.environ.get("START", "out/harbourline-sft-merged")
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "-1"))
+cuda = torch.cuda.is_available()
+
+# {"prompt": [user message], "chosen": [assistant message], "rejected": [assistant message]}
+data = load_dataset("json", data_files={"train": "pairs_train.jsonl", "validation": "pairs_val.jsonl"})
+
+args = DPOConfig(
+    output_dir="out/harbourline-dpo-lora",
+    beta=0.1,                            # pull back to the SFT model; the DPO paper used 0.5 for summarisation
+    learning_rate=5e-6,                  # TRL's default for full DPO is 1e-6; LoRA needs more. Sweep 5e-6 to 5e-5
+    num_train_epochs=1,
+    max_steps=MAX_STEPS,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=16,      # 2 pairs x 16 = 32 pairs per update
+    max_length=4096,
+    bf16=cuda,
+    model_init_kwargs={"dtype": torch.bfloat16 if cuda else torch.float32},
+    eval_strategy="no" if MAX_STEPS &gt;= 0 else "steps",
+    eval_steps=50,
+    logging_steps=10,
+    save_strategy="no" if MAX_STEPS &gt;= 0 else "epoch",
+    report_to="none",
+    seed=7,
+)
+trainer = DPOTrainer(model=START, args=args, train_dataset=data["train"], eval_dataset=data["validation"],
+                     peft_config=LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                            target_modules="all-linear", task_type="CAUSAL_LM"))
+trainer.train()
+trainer.save_model()</code></pre>
+</div>
+  <p>Each row of the pairs file holds a <code>prompt</code> and two one-message lists, <code>chosen</code> and <code>rejected</code>. A pair is two sequences, so micro-batch 2 means four per forward pass, plus a no-gradient reference pass. Hold out 600 of the 6,000 pairs and let TRL report accuracy on them.</p>
+</section>
+
+<section id="variants">
+  <h2>ORPO, KTO and SimPO: what each one changes</h2>
+  <p>Each variant removes one thing DPO needs. Which removal helps depends on what you are short of: a stage, a reference model's memory, or pairs.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Method</th><th>What it changes from DPO</th><th>Data needed</th><th>Status in TRL 1.17.1</th></tr></thead>
+    <tbody>
+      <tr><td class="term">DPO</td><td>Baseline: log-ratio against a reference model</td><td>Pairs</td><td>Stable trainer</td></tr>
+      <tr><td class="term">ORPO</td><td>Adds an odds-ratio penalty to the SFT loss, in one stage, with no reference model (Hong et al., 2024)</td><td>Pairs</td><td>Under <code>trl.experimental</code></td></tr>
+      <tr><td class="term">KTO</td><td>Replaces pairs with a per-output good-or-bad label, using a prospect-theory utility (Ethayarajh et al., 2024)</td><td>Binary labels</td><td>Stable trainer</td></tr>
+      <tr><td class="term">SimPO</td><td>Reward is the length-normalised average log-probability, so no reference model; adds a target margin (Meng et al., 2024)</td><td>Pairs</td><td>Via the experimental CPO trainer, <code>loss_type="simpo"</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>ORPO</strong> folds SFT and preference learning into one run from the base model, giving the chosen response a strong adaptation signal and the rejected one a weak penalty. That saves a stage but merges two experiments into one, so a bad result is harder to attribute, and it sits in TRL's experimental module, which can change without deprecation.</p>
+  <p><strong>KTO</strong> needs only a label that an output was good or bad. Harbourline's review tool probably holds many more of those than pairs, such as an adjuster accepting a summary unedited. The KTO authors report matching or exceeding preference-based methods from 1B to 30B parameters using this weaker signal.</p>
+  <p><strong>SimPO</strong> uses the average log-probability of a response as the reward, which is close to the quantity used to generate, and subtracts a target margin. Dropping the reference model saves its forward pass, and length normalisation targets the bias in <a href="#hacking">the hacking section</a>. The SimPO authors report that without the normalisation the model drifts toward longer, lower-quality sequences.</p>
+</section>
+
+<section id="rl">
+  <h2>GRPO, verifiable rewards and rejection sampling</h2>
+  <p>When the right answer can be checked by a program, you can skip human preferences. DeepSeek-AI (2025) trained R1-Zero with GRPO, a method from the DeepSeekMath paper. For each question it samples a group of outputs (16 in R1-Zero), scores each, and computes the advantage as the reward minus the group mean, divided by the group's standard deviation. The group baseline replaces PPO's value model, which cuts memory. The rewards were rules: accuracy, checked by matching a boxed answer or running a compiler, and format. The authors avoided neural reward models because they were susceptible to reward hacking.</p>
+  <p>Harbourline has a checkable half. The classification fields, such as claim type, loss date and amount, can be compared with structured data. The prose quality of a summary cannot. GRPO fits the first and not the second. TRL's <code>GRPOTrainer</code> samples 8 generations per prompt by default, so generation, not the weight update, dominates the cost. Do not start here. It earns a place if SFT and DPO still leave field errors that a program can score.</p>
+  <p><strong>Rejection sampling</strong> is the cheapest way to get an on-policy signal. Sample K candidates per prompt from the SFT model, score them, keep the best, and run SFT on the winners. Llama 2 did this with a reward model, and Llama 3 paired it with DPO. At Harbourline the scorer could be the judge you calibrated in <a href="../llm-evals-deep-dive/04-llm-as-judge.html#calibration">the evals guide</a>. It reuses chapter 04's script. The risk is the scorer: Gao et al. (2022) found best-of-n sampling overoptimises a proxy reward too, so whatever the judge prefers, such as length, is what the winners will have.</p>
+</section>
+
+<section id="collecting">
+  <h2>Collecting preferences from adjusters</h2>
+  <p>Treat the preference interface as an instrument. Show the claim, then the two summaries in random order, with options for "tie" and "both wrong" and a one-tap reason such as "invented a fact" or "missing amount". Randomise order, since position bias is not only a judge problem.</p>
+  <p>Measure agreement before you trust the labels. Have two adjusters label an overlap of about 10% of pairs, roughly 600. For scale, Ouyang et al. report labelers agreeing with each other 72.6 ± 1.5% of the time, 77.3% for held-out labelers, and cite 73% researcher agreement from Stiennon et al. If Harbourline lands near 73%, then with balanced choices chance agreement is 50% and kappa is (0.73 − 0.50) / (1 − 0.50) = 0.46, moderate. A model cannot be expected to agree with one adjuster much more often than adjusters agree with each other. Drop the contested pairs from training. Training on pairs adjusters would split on adds noise, and TRL's <code>label_smoothing</code> option for flipped labels documents a range of 0 to 0.5 and recommends 0.1, so it is a patch for light noise, not for 27%.</p>
+  <p>How many pairs? Llama 2's reward models used over a million comparisons, for general chat. A single narrow task needs far fewer, and no source tells you how many. Find out with a learning curve: train on 1,500, 3,000 and 5,400 pairs, and plot held-out pair accuracy. If it still climbs at 5,400, collect more. If it has flattened, the limit is label noise or the signal, not quantity.</p>
+  <p>Last, check where the pairs came from. Tajwar et al. found on-policy data works better. If the candidates in the review tool came from the current Sonnet pipeline rather than your SFT model, the pairs are off-policy. They teach the tuned model to prefer one API-model summary over another, not to fix its own mistakes. Once chapter 04's model exists, have it generate the pairs for the next batch.</p>
+</section>
+
+<section id="hacking">
+  <h2>Reward hacking and length bias</h2>
+  <p>Any learned preference signal can be gamed, and the cheapest game is length. Singhal et al. (2023) found that a purely length-based reward reproduced most of the downstream improvement RLHF showed over SFT, and traced the dominant source to reward models and the length bias in preference data. Park et al. (2024) showed DPO exploits length too, without a reward model at all. Gao et al. (2022) fit the general curve: for best-of-n the gold reward follows <em>d</em>(<em>α</em> − <em>β</em><em>d</em>), where <em>d</em> is the square root of the KL distance from the starting policy. It rises, peaks, then falls.</p>
+  <div class="callout warn">
+    <span class="callout-label">At Harbourline, a longer summary is a riskier summary</span>
+    <p>Adjusters will often pick the fuller summary, since it feels complete. A DPO model learns that and drifts long. Each added sentence is another chance to state a policy term the claim file does not contain, which is the failure <a href="07-evaluating-a-tuned-model.html">chapter 07</a> must rule out. Log mean summary length at every checkpoint, compare tuned and untuned models inside length buckets, and apply the controls in <a href="../llm-evals-deep-dive/04-llm-as-judge.html#biases">the judge-bias section</a>.</p>
+  </div>
+  <p>Controls: compare at matched length, use a higher <em>β</em> or an earlier checkpoint, try SimPO's length normalisation, and stop on held-out pair accuracy and length trend together, not on the training margin.</p>
+</section>
+
+<section id="wasted">
+  <h2>When SFT is enough</h2>
+  <p>Preference tuning adds a stage, a hyperparameter, a reference model's memory and a new regression to test. It pays only when SFT's remaining errors are choices between acceptable outputs. It does nothing for missing knowledge or a wrong field, which are data and capability problems.</p>
+  <p>Test before you build. After SFT, have adjusters compare the SFT model's summary with the approved summary on the 400 held-out claims, blind. If failures cluster in missing fields or wrong amounts, fix the training data. If they are in style or emphasis, DPO is aimed at the right target.</p>
+  <p>Then account for the noise in your own measurement. With 400 paired comparisons the standard error on a 50% win rate is the square root of 0.25 / 400, which is 0.025, so the 95% interval is ±4.9 points. A DPO model must beat the SFT model by more than that, a win rate above about 55%, before the held-out set can tell the difference. <a href="../llm-evals-deep-dive/05-the-ship-decision.html#interval">The ship decision</a> covers intervals properly. If the realistic gain is smaller than the interval, you cannot detect it, and the stage is not worth its risk.</p>
+  <p>One exception favours doing it anyway. Chapter 04's SFT cannot teach a model what not to say. Harbourline needs the tuned model to refuse to invent policy terms, and a preference pair where the rejected answer invents a term is exactly the negative signal SFT lacks. A few hundred such pairs, deliberately constructed, may do more than six thousand style pairs. That is a hypothesis for chapter 07 to test, not a result. Candidate B, the intake agent's tone, needs no training of either kind.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Two summaries of the same claim are both factually right, and adjusters consistently prefer the shorter one. Explain why SFT on the approved summaries cannot reliably learn that preference, and what a DPO pair adds.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>SFT only sees one good output per claim and scores it against that reference, so it never learns that another acceptable wording is worse. A pair gives an explicit contrast: the loss pushes the chosen summary's likelihood up relative to the rejected one's. See <a href="#plateau">why SFT plateaus</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your held-out pair accuracy is 71%, and two adjusters agreed on 73% of the overlap pairs. Is the model underperforming?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. Adjusters disagree with each other on 27% of pairs, so that agreement rate is a rough ceiling for agreement with any one adjuster. A model at 71% is close to it. See <a href="#collecting">collecting preferences</a>.</p></div></details>
+    </li>
+    <li>
+      <p>After DPO the adjuster win rate over the SFT model is 60%, but mean summary length rose from 180 to 260 tokens. What do you do before reporting the win?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Compare the two models within length buckets, so a longer summary is only compared with a summary of similar length, and check for invented policy terms in the longer outputs. If the win shrinks inside buckets, it was length. See <a href="#hacking">reward hacking and length bias</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You have 400 held-out claims and DPO improves the adjuster win rate over SFT to 53%. Can you ship the DPO model on that evidence? Show the arithmetic.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No. The standard error at 50% is the square root of 0.25 / 400, which is 0.025, so the 95% interval is ±4.9 points and 53% is inside the noise around 50%. The gain is not distinguishable from no gain, and the stage added risk. See <a href="#wasted">when SFT is enough</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>SFT imitates one reference summary and never sees a worse one, so it cannot learn preferences among acceptable outputs, which pairs can teach.</li>
+    <li>DPO turns pairs into a classification loss against a reference model, with no reward model and no sampling, which makes it the practical default for a 9B model on one GPU.</li>
+    <li>The reference model must be the merged SFT model, and beta sets how far the tuned model may move from it; sweep 0.1 and 0.5 for summarisation.</li>
+    <li>Preference data is bounded by adjuster agreement, and length is the cheapest way to game it, so measure both before and after training.</li>
+    <li>Preference tuning is wasted when SFT's errors are missing data or wrong fields, or when the expected gain is smaller than the evaluation interval.</li>
+  </ul>
+  <p>Both stages need GPU hours, and the cost of the full and LoRA routes is worth working out before you rent anything. → <a href="06-compute-and-distributed-training.html">Compute and Distributed Training</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener"><strong>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</strong></a> — Rafailov et al., 2023. The derivation, the loss, and the beta used for summarisation.</li>
+    <li><a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener"><strong>Training language models to follow instructions with human feedback</strong></a> — Ouyang et al., 2022. The SFT, reward model and PPO pipeline, with labeler agreement figures.</li>
+    <li><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener"><strong>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</strong></a> — DeepSeek-AI, 2025. GRPO with rule-based rewards, and why neural reward models were avoided.</li>
+    <li><a href="https://arxiv.org/abs/2310.03716" target="_blank" rel="noopener"><strong>A Long Way to Go: Investigating Length Correlations in RLHF</strong></a> — Singhal et al., 2023. How much of RLHF's gain is length.</li>
+    <li><a href="https://huggingface.co/docs/trl/dpo_trainer" target="_blank" rel="noopener"><strong>TRL DPO Trainer</strong></a> — Hugging Face docs. Dataset formats, logged metrics and loss variants.</li>
+  </ul>
 </section>
 
 </main>

@@ -19,14 +19,14 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
-<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
-<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
 <!-- /HEAD:seo -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
 <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="../../assets/style.css?v=20">
-<script defer src="../../assets/script.js?v=20"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
 </head>
 <body>
 
@@ -37,6 +37,13 @@
   <nav>
     <h2>Sections</h2>
     <a href="#overview">Overview</a>
+    <a href="#memory">Where the bytes go</a>
+    <a href="#lora">What LoRA changes, and the four settings that matter</a>
+    <a href="#qlora">QLoRA: use it when the BF16 base will not fit</a>
+    <a href="#hyperparameters">Learning rate, batch, epochs, length and packing</a>
+    <a href="#frameworks">Frameworks as of November 2026</a>
+    <a href="#script">A minimal run</a>
+    <a href="#curves">Reading the loss curve</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -58,7 +65,221 @@
 
 <section id="overview">
   <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+  <p><a href="03-post-training-data.html">Chapter 03</a> left Harbourline with about 22,000 claim-to-summary pairs. This chapter turns them into weights on one rented H100: which parameters to train, what that costs in bytes, which settings matter, and how to read the loss curve.</p>
+  <p>The worked model is Qwen3-8B, which lists Apache-2.0 on its model card and has 8,190,735,360 parameters according to the Hugging Face API in November 2026. <a href="02-choosing-a-base-checkpoint.html">Chapter 02</a> owns the pick. Harbourline volumes are illustrative.</p>
+</section>
+
+<section id="memory">
+  <h2>Where the bytes go</h2>
+  <p>Training memory has four parts: weights, gradients, optimiser state and activations. The middle two scale with the number of <em>trainable</em> parameters, which is the whole case for LoRA. The ZeRO paper (Rajbhandari et al., 2019) gives the accounting for mixed-precision Adam: 2 bytes per parameter for BF16 weights, 2 for BF16 gradients, and 12 for the optimiser's FP32 master copy, momentum and variance. That is 16 bytes per parameter, or 131 GB for Qwen3-8B before one activation is stored. An H100 has 80 GB, so a full fine-tune does not fit on one card.</p>
+  <p>LoRA freezes the base. A frozen weight needs no gradient and no optimiser state, so only its 2 bytes remain, and the adapter is small. QLoRA stores the frozen base in 4 bits.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Method (8.19 B parameters)</th><th>Weights</th><th>Gradients and optimiser</th><th>Static total</th></tr></thead>
+    <tbody>
+      <tr><td>Full fine-tune, mixed precision</td><td>16.4 GB</td><td>14 B per parameter: 114.7 GB</td><td>131.1 GB</td></tr>
+      <tr><td>Full fine-tune, pure BF16</td><td>16.4 GB</td><td>6 B per parameter: 49.1 GB</td><td>65.5 GB</td></tr>
+      <tr><td>LoRA, r=16, all linear layers</td><td>16.4 GB frozen</td><td>43.6 M adapter parameters at 16 B: 0.7 GB</td><td>17.1 GB</td></tr>
+      <tr><td>QLoRA, r=16</td><td>6.1 GB</td><td>0.7 GB</td><td>6.8 GB</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Activations come on top. With gradient checkpointing, which TRL enables by default, each layer keeps only its input. A micro-batch of 4 sequences at 4,096 tokens is 16,384 tokens, so layer inputs cost 36 × 16,384 × 4,096 × 2 bytes, or 4.8 GB. The logits are the surprise: 16,384 × 151,936 vocabulary entries × 2 bytes is 5.0 GB, and 10.0 GB if the loss upcasts to FP32. The LoRA run therefore needs roughly 17 + 5 + 5 to 10 GB plus one layer's working set. It fits in 80 GB. These are estimates, so read the real peak from <code>torch.cuda.max_memory_allocated()</code>.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>memory_budget.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># memory_budget.py: static training memory for Qwen3-8B from its config.json shapes. Standard library only.
+L, H, FF, V, Q, KV = 36, 4096, 12288, 151936, 4096, 1024
+linears = [(H, Q), (H, KV), (H, KV), (Q, H), (H, FF), (H, FF), (FF, H)]   # (in, out) per block
+blk = sum(i * o for i, o in linears)
+N = L * (blk + 2 * H + 256) + 2 * V * H + H
+print(f"N = {N:,} parameters")
+for name, b in [("full, mixed precision (2+2+4+4+4)", 16), ("full, pure BF16 (2+2+2+2)", 8)]:
+    print(f"{name:34s} {N * b / 1e9:6.1f} GB")
+for r in (16, 64):
+    t = L * r * sum(i + o for i, o in linears)
+    print(f"LoRA r={r}: {t:,} trainable; base {2 * N / 1e9:.1f} GB + adapter {16 * t / 1e9:.1f} GB")
+print(f"QLoRA base: {(L * blk * 4.127 / 8 + (N - L * blk) * 2) / 1e9:.1f} GB (NF4 + double quant on blocks, BF16 rest)")
+tok = 4 * 4096                                  # micro-batch 4 x 4,096 tokens
+print(f"activations, {tok:,} tokens: layer inputs {L * tok * H * 2 / 1e9:.1f} GB; "
+      f"logits {tok * V * 2 / 1e9:.1f} GB BF16, {tok * V * 4 / 1e9:.1f} GB FP32")</code></pre>
+</div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">N = 8,190,735,360 parameters
+full, mixed precision (2+2+4+4+4)   131.1 GB
+full, pure BF16 (2+2+2+2)            65.5 GB
+LoRA r=16: 43,646,976 trainable; base 16.4 GB + adapter 0.7 GB
+LoRA r=64: 174,587,904 trainable; base 16.4 GB + adapter 2.8 GB
+QLoRA base: 6.1 GB (NF4 + double quant on blocks, BF16 rest)
+activations, 16,384 tokens: layer inputs 4.8 GB; logits 5.0 GB BF16, 10.0 GB FP32</code></pre></div>
+  <div class="callout warn">
+    <span class="callout-label">A pure-BF16 full fine-tune fits on paper and still fails</span>
+    <p>Dropping the FP32 master copy gives 65.5 GB, which looks feasible. The trouble is rounding. BF16 keeps 7 explicit mantissa bits, so a weight near 0.02 moves in steps of about 0.000122, and an Adam update of 0.00005 is rounded away. Check it: <code>torch.tensor([0.02], dtype=torch.bfloat16) + 5e-5</code> equals 0.02. The FP32 master copy exists to catch these small updates, and at full fine-tuning rates of 1e-5 to 2e-5 most of them are small.</p>
+  </div>
+</section>
+
+<section id="lora">
+  <h2>What LoRA changes, and the four settings that matter</h2>
+  <p>Hu et al. (2021) freeze a weight <em>W</em> and learn <em>ΔW = BA</em>, where <em>A</em> is <em>r × d_in</em> with random Gaussian values and <em>B</em> is <em>d_out × r</em> and starts at zero. The model therefore begins where the base left off, and the update is scaled by <em>α/r</em>. For a 4,096 × 4,096 projection at <em>r</em> = 16 the adapter holds 131,072 values against 16.8 million, 0.78%. After training, <em>ΔW</em> folds into <em>W</em> at no inference cost, which <a href="08-serving-and-retraining.html">chapter 08</a> uses.</p>
+  <p><strong>Target modules.</strong> The original paper adapted only the attention query and value projections. Dettmers et al. (2023) found LoRA on all linear layers is required to match full fine-tuning. On Qwen3-8B the three MLP projections hold 78% of each block's linear weights, so attention-only LoRA leaves most of the model without an adapter. Use <code>target_modules="all-linear"</code>.</p>
+  <p><strong>Rank.</strong> In the QLoRA ablations, rank made no measurable difference once every linear layer carried an adapter. Biderman et al. (2024) qualify that: on hard targets such as continued pre-training for code and maths, LoRA underperforms full fine-tuning substantially, and full fine-tuning learns a weight change of rank 10 to 100 times higher than typical LoRA settings. On instruction data, higher ranks closed most of the gap. Harbourline's task is a narrow format over knowledge the base already has, so start at <em>r</em> = 16 and run <em>r</em> = 64 once. That adapter is 174.6 M parameters and 2.8 GB of state. If 64 does not beat 16 on the validation slices, keep 16. If neither meets the bar from <a href="01-when-to-fine-tune.html">chapter 01</a>, the task may need capability LoRA cannot add, and a full fine-tune is the next experiment.</p>
+  <p><strong>Alpha and dropout.</strong> With Adam, changing <em>α</em> is roughly the same as changing the learning rate, and Hu et al. set it to the first rank they tried without tuning it. Fix <em>α</em> = 2<em>r</em>, the ratio Biderman et al. used, and sweep the learning rate. QLoRA used dropout 0.1 up to 13B parameters and 0.05 above. Use 0.05, and remove it first if the run underfits.</p>
+</section>
+
+<section id="qlora">
+  <h2>QLoRA: use it when the BF16 base will not fit</h2>
+  <p>QLoRA stores the frozen base in 4-bit NormalFloat and dequantises each block to BF16 for the matrix multiply. One FP32 scale per 64 weights costs 0.5 bits per parameter, and double quantisation brings that to 0.127. Paged optimisers absorb the memory spikes checkpointing causes on long sequences. With these, Dettmers et al. fine-tuned a 65B model on one 48 GB GPU and matched 16-bit fine-tuning on their tasks.</p>
+  <p>On Qwen3-8B the saving is 16.4 GB down to 6.1 GB, assuming the embedding table and output head stay in BF16, and Harbourline has 80 GB. QLoRA would trade step time, since every layer dequantises on the fly, for memory it does not need. The slowdown was not benchmarked on this model, so measure it before you decide. QLoRA earns its place on a small card such as a 24 GB workstation, or for a large model: a 70B base in BF16 is 140 GB.</p>
+</section>
+
+<section id="hyperparameters">
+  <h2>Learning rate, batch, epochs, length and packing</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Setting</th><th>First run</th><th>Why, and when it flips</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Learning rate</td><td>2e-4 (LoRA)</td><td>QLoRA used 2e-4 for 7B and 13B. Full fine-tuning uses 1e-5 to 2e-5; the TRL default is 2e-5. Sweep three values, since Biderman et al. found LoRA sensitive to it.</td></tr>
+      <tr><td class="term">Effective batch</td><td>32 = 4 × 8</td><td>Micro-batch 4 fits memory and 8 accumulation steps reach 32. Smaller batches give more steps and a noisier loss. See <a href="06-compute-and-distributed-training.html">chapter 06</a>.</td></tr>
+      <tr><td class="term">Epochs</td><td>2</td><td>Enough to learn the format, few enough to limit memorising. Decide by validation loss.</td></tr>
+      <tr><td class="term">Max length</td><td>4,096</td><td>Set from the token-length distribution of your data.</td></tr>
+      <tr><td class="term">Loss mask</td><td>Completion only</td><td>QLoRA's ablation found training on the response alone gave better MMLU than training on the prompt too.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The step arithmetic: 500 of the 22,000 rows go to validation, leaving 21,500. At 32 sequences per step that is 672 steps per epoch and 1,344 for two. Split by claim, not by pair, and keep validation apart from the 400-claim set in <a href="../llm-evals-deep-dive/02-building-the-eval-set.html#held-out">building the eval set</a>. Validation loss steers training, and the held-out set decides shipping.</p>
+  <p><strong>Truncation hurts quietly.</strong> TRL keeps the start of anything over <code>max_length</code>. A summary cut short loses its end-of-turn token, so the model sees examples that never finish. If the prompt alone exceeds the limit, the whole completion is masked and the row is dropped. Both effects fall on your longest, hardest claims. Measure the 99th percentile of token length, then set the limit above it or filter long rows deliberately and record how many.</p>
+  <p><strong>Packing.</strong> Without packing, each batch pads to its longest sequence. If claims average 2,000 tokens and a batch pads to 3,500, 43% of positions are padding. <code>packing=True</code> concatenates sequences into fixed blocks, and the default <code>bfd</code> strategy needs FlashAttention 2 or 3. Leave it off for the first run and turn it on when step time is the problem.</p>
+</section>
+
+<section id="frameworks">
+  <h2>Frameworks as of November 2026</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Tool</th><th>Version and date</th><th>Shape</th><th>Pick it when</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Hugging Face TRL</td><td>1.17.1, 30 Oct 2026, Apache-2.0</td><td>Python trainers: SFT, DPO, GRPO, KTO</td><td>You want the least indirection and one API through chapter 05. This guide uses it.</td></tr>
+      <tr><td class="term">Axolotl</td><td>0.21.1, 27 Oct 2026</td><td>One YAML file drives preprocessing, training, evaluation and inference</td><td>You run many experiments and want them as reviewable config files.</td></tr>
+      <tr><td class="term">Unsloth</td><td>2026.11.3, 6 Nov 2026, Apache-2.0</td><td>Custom kernels; one GPU or several</td><td>Memory or speed on a small card binds. Its README claims 2× faster and 70% less VRAM; that was not verified for this chapter.</td></tr>
+      <tr><td class="term">torchtune</td><td>0.6.1, 7 Apr 2025</td><td>Hackable PyTorch recipes</td><td>Not for new work: its README says development wound down in 2025.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Use TRL, because chapter 05's DPO and GRPO trainers share its dataset conventions. Pin the version either way. Running the script below against current releases found two changes that break a script copied from 2025: Transformers 5 removed <code>warmup_ratio</code> in favour of a float <code>warmup_steps</code>, and TRL loads a model given as a string in FP32 unless you pass <code>dtype</code>, which doubles the memory of the base weights.</p>
+</section>
+
+<section id="script">
+  <h2>A minimal run</h2>
+  <p>The script applies the choices above to a prompt-completion JSONL file. It was smoke-tested end to end for three steps on CPU with a 135-million-parameter model, using <code>MODEL=HuggingFaceTB/SmolLM2-135M-Instruct MAX_STEPS=3</code>. It was not run on an H100 or at 8B scale, so treat this chapter's memory and time figures as arithmetic to confirm. With a prompt and a completion per row, TRL masks the prompt out of the loss. Only the adapter is saved: 43.6 M parameters in FP32 is about 175 MB, against 16.4 GB for a full BF16 checkpoint.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>train_sft.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python"># train_sft.py: LoRA SFT on claim-to-summary pairs. Tested with trl 1.17.1, peft 0.21.2,
+# transformers 5.22.2, torch 2.15.0. Set MODEL and MAX_STEPS to smoke-test on a small model.
+import os
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from trl import SFTConfig, SFTTrainer
+
+MODEL = os.environ.get("MODEL", "Qwen/Qwen3-8B")
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "-1"))
+cuda = torch.cuda.is_available()
+
+# One JSON object per line: {"prompt": [{"role": "user", ...}], "completion": [{"role": "assistant", ...}]}
+# With this layout TRL puts the loss on the completion only, so the claim text is not trained on.
+data = load_dataset("json", data_files={"train": "claims_train.jsonl", "validation": "claims_val.jsonl"})
+
+lora = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules="all-linear",          # every linear layer except the output head
+    task_type="CAUSAL_LM",
+)
+
+args = SFTConfig(
+    output_dir="out/harbourline-sft-lora",
+    num_train_epochs=2,
+    max_steps=MAX_STEPS,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,       # effective batch 4 x 8 = 32 sequences
+    learning_rate=2e-4,                  # LoRA tolerates about 10x the full fine-tune rate
+    lr_scheduler_type="cosine",
+    warmup_steps=0.03,                # a float below 1 is a share of total steps (Transformers 5)
+    max_length=4096,
+    bf16=cuda,
+    model_init_kwargs={"dtype": torch.bfloat16 if cuda else torch.float32},
+    eval_strategy="epoch" if MAX_STEPS &lt; 0 else "no",
+    save_strategy="epoch" if MAX_STEPS &lt; 0 else "no",
+    logging_steps=10,
+    report_to="none",
+    seed=7,
+)
+
+trainer = SFTTrainer(model=MODEL, args=args, train_dataset=data["train"],
+                     eval_dataset=data["validation"], peft_config=lora)
+trainer.model.print_trainable_parameters()
+trainer.train()
+trainer.save_model()                      # writes the adapter only</code></pre>
+</div>
+</section>
+
+<section id="curves">
+  <h2>Reading the loss curve</h2>
+  <p>Log training loss every 10 steps and validation loss every epoch. Four shapes cover most runs.</p>
+  <ul>
+    <li><strong>Both fall, then flatten together.</strong> The run is healthy. Part of the floor cannot be lowered, because two adjusters write different valid summaries of one claim.</li>
+    <li><strong>Training falls, validation turns up.</strong> The model is memorising. Illustratively, validation at 0.91, 0.88, 0.93 across three epochs says to keep the epoch-2 checkpoint, then use fewer epochs or more data.</li>
+    <li><strong>Loss spikes or goes to NaN.</strong> The learning rate is too high for the batch, or a malformed row produced an empty target.</li>
+    <li><strong>Validation improves but the slices regress.</strong> Loss averages over tokens, and the few tokens that decide whether a summary is correct barely move it.</li>
+  </ul>
+  <p>The last case includes forgetting. Biderman et al. found that LoRA learns less than full fine-tuning but also forgets less of the base model's behaviour outside the target domain, and does so better than weight decay or dropout. That makes LoRA the safer default for Harbourline's constraint that the tuned model still refuse to invent policy terms. Safer is not safe: loss will not show a lost refusal, so <a href="07-evaluating-a-tuned-model.html">chapter 07</a> tests it directly. The ship decision is a paired comparison with an interval, as in <a href="../llm-evals-deep-dive/05-the-ship-decision.html#paired">the ship decision</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague plans a full fine-tune of the 8.19 B model on one 80 GB H100 with mixed-precision AdamW. What is the static memory, and what is the smallest change that makes it fit?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>16 bytes × 8.19 B is 131 GB, so it does not fit. LoRA keeps the BF16 base at 16.4 GB and adds 0.7 GB of adapter state, 17.1 GB in all. Pure BF16 gives 65.5 GB but rounds small updates away. See <a href="#memory">where the bytes go</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Rank 16 and rank 64 reach the same validation loss and per-slice scores. Which do you carry forward, and what would change your mind?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Rank 16: 43.6 M parameters against 174.6 M, and the extra capacity bought nothing. Choose higher rank if it wins on a slice that matters, or if the target looks like new knowledge, where Biderman et al. found LoRA underperforms. See <a href="#lora">what LoRA changes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Over three epochs training loss falls from 0.80 to 0.55 while validation loss is 0.91, 0.88 and 0.93. What happened, which checkpoint do you keep, and what do you check before shipping it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The model began memorising in epoch 3, so keep epoch 2. Then run the held-out evaluation by slice and the refusal check, which validation loss does not measure. See <a href="#curves">reading the loss curve</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You set <code>max_length=1024</code> and claims average 1,500 tokens. Name two things that go wrong, and the first thing you measure.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Rows whose prompt alone exceeds the limit have the whole completion masked and are dropped, so the longest claims vanish. Rows cut mid-summary lose the end-of-turn token, so the model learns summaries that do not end. Measure the token-length percentiles. See <a href="#hyperparameters">the settings table</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Peak memory is well above your estimate, and you passed the model to the trainer as a string. What do you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The load dtype. TRL 1.17.1 loads a model given by name in FP32 unless <code>model_init_kwargs</code> sets <code>dtype</code>, so the base takes 32.8 GB instead of 16.4 GB. See <a href="#frameworks">frameworks</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Full fine-tuning in mixed precision costs 16 bytes per parameter, 131 GB for an 8B model, because gradients and Adam state are 14 of those bytes.</li>
+    <li>LoRA keeps the BF16 base frozen and trains about 0.5% of the parameters, so static memory drops to about 17 GB and one H100 has headroom.</li>
+    <li>Put LoRA on all linear layers, fix alpha at twice the rank, start at rank 16, and spend the sweep on the learning rate.</li>
+    <li>QLoRA trades step time for memory, so use it when the BF16 base does not fit.</li>
+    <li>Truncation and dtype defaults fail silently, so measure token lengths and pass the dtype explicitly.</li>
+    <li>Validation loss says when to stop, not whether the model is good; the held-out evaluation decides that.</li>
+  </ul>
+  <p>SFT teaches the model to imitate adjusters' summaries, but the adjusters also ranked pairs of them, and imitation cannot use that signal. → <a href="05-preference-alignment.html">Preference Alignment</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener"><strong>LoRA: Low-Rank Adaptation of Large Language Models</strong></a> — Hu et al., 2021. The method, zero initialisation and α/r scaling.</li>
+    <li><a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener"><strong>QLoRA: Efficient Finetuning of Quantized LLMs</strong></a> — Dettmers et al., 2023. NF4, double quantisation, paged optimisers and the all-linear-layers finding.</li>
+    <li><a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener"><strong>LoRA Learns Less and Forgets Less</strong></a> — Biderman et al., 2024. Where LoRA falls short of full fine-tuning, and how it limits forgetting.</li>
+    <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener"><strong>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</strong></a> — Rajbhandari et al., 2019. The 16-bytes-per-parameter accounting.</li>
+    <li><a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener"><strong>TRL SFT Trainer</strong></a> — Hugging Face docs. Dataset formats, packing and loss-masking options.</li>
+  </ul>
 </section>
 
 </main>

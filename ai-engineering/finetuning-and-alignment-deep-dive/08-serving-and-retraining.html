@@ -7,26 +7,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Serving and Retraining — Fine-Tuning and Preference Alignment</title>
 <!-- HEAD:seo -->
-<meta name="description" content="Merged weights against served adapters, multi-adapter serving, provider fine-tuning APIs, versioning and rollback, drift in the data the model was tuned on…">
+<meta name="description" content="A tuned model is a file until it is versioned, served and replaced. This chapter decides between merged weights and adapters, surveys provider fine-tuning APIs…">
 <link rel="canonical" href="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/08-serving-and-retraining">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Field Guides">
 <meta property="og:title" content="Serving and Retraining — Fine-Tuning and Preference Alignment">
-<meta property="og:description" content="Merged weights against served adapters, multi-adapter serving, provider fine-tuning APIs, versioning and rollback, drift in the data the model was tuned on…">
+<meta property="og:description" content="A tuned model is a file until it is versioned, served and replaced. This chapter decides between merged weights and adapters, surveys provider fine-tuning APIs…">
 <meta property="og:url" content="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/08-serving-and-retraining">
 <meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
-<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
-<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
 <!-- /HEAD:seo -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
 <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="../../assets/style.css?v=20">
-<script defer src="../../assets/script.js?v=20"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
 </head>
 <body>
 
@@ -36,7 +36,12 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#artefact">Merged weights or adapters</a>
+    <a href="#multi-adapter">Serving many adapters from one base</a>
+    <a href="#providers">Provider fine-tuning APIs, as of November 2026</a>
+    <a href="#release">Versioning, canary and rollback</a>
+    <a href="#drift">Drift and retraining triggers</a>
+    <a href="#base-update">When the base model changes</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -53,12 +58,139 @@
 <header class="hero">
   <span class="eyebrow">Section D · Shipping</span>
   <h1>Serving and Retraining</h1>
-  <p class="subtitle">Merged weights against served adapters, multi-adapter serving, provider fine-tuning APIs, versioning and rollback, drift in the data the model was tuned on, and the retraining cadence.</p>
+  <p class="subtitle">A tuned model is a file until it is versioned, served and replaced. This chapter decides between merged weights and adapters, surveys provider fine-tuning APIs as of November 2026, and sets how Harbourline releases, watches and retrains the model, including when the base model changes.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="artefact">
+  <h2>Merged weights or adapters</h2>
+  <p>The training run ends with an adapter, and the first serving decision is whether to keep it separate. Both forms are the same model. A LoRA adapter stores, for each targeted weight matrix W, two thin matrices A and B whose product is the update, so the tuned layer computes W·x + B·(A·x). Merging adds B·A into W once and discards the adapter. The merged model has the base architecture and no extra cost at inference. The unmerged one runs two extra small matrix products per adapted layer.</p>
+  <p>The sizes make the trade concrete. Take Qwen3-8B, whose Hugging Face config gives 36 layers, hidden size 4,096, 32 attention heads and 8 key-value heads of 128 dimensions (so key and value projections are 1,024 wide), and a 12,288-wide feed-forward layer. A rank-16 adapter on all seven projections has 16 × (4,096 + 4,096) × 2 for the query and output projections, 16 × (4,096 + 1,024) × 2 for key and value, and 16 × (4,096 + 12,288) × 3 for the feed-forward ones. That is about 1.21 million parameters per layer and 43.6 million over 36 layers, which is about 87 MB in BF16. The base is about 16 GB in BF16 (roughly 8 billion parameters × 2 bytes). So an adapter is about 0.5% of the model.</p>
+  <p>That 0.5% is the reason to keep adapters when you have many of them and the reason to merge when you have one. Candidate A has one task and one adapter, so merge it: the served artefact is an ordinary checkpoint, every engine in <a href="../serving-open-weight-models/06-engines-and-formats.html">the serving guide's engines chapter</a> can load it, and there is no adapter machinery to operate. Merge into BF16 weights, quantise afterwards if you quantise (see <a href="../serving-open-weight-models/03-quantization.html">its quantisation chapter</a>), and run the <a href="07-evaluating-a-tuned-model.html">evaluation from chapter 07</a> on the artefact you will serve, not on the one you trained. Merging and quantising both change the numbers a little, and the eval has to see the final file.</p>
+  <p>Keep the adapters separate when one base serves several behaviours. If Harbourline later tuned a second adapter for another line of business, or one per region, two adapters of 87 MB cost almost nothing next to a second 16 GB model, and they share the base weights and the KV-cache memory of a single deployment.</p>
+</section>
+
+<section id="multi-adapter">
+  <h2>Serving many adapters from one base</h2>
+  <p>Batching is the idea behind multi-adapter serving. A GPU is efficient when it processes many requests at once, and requests for different adapters cannot normally share a batch, because each has a different W. S-LoRA (Sheng et al., 2023) keeps the base computation shared and applies each request's small adapter product separately, so one batch can mix adapters. Its abstract claims serving thousands of adapters on a single GPU or across several, and up to 4 times the throughput of Hugging Face PEFT and of vLLM with naive LoRA support. Those are its numbers on its benchmarks, and a reason to try the design, not a forecast for yours.</p>
+  <p>vLLM supports this directly, as of its current documentation. The server flag <code>--enable-lora</code> turns it on, <code>--lora-modules name=path</code> registers adapters at start-up, and <code>--max-lora-rank</code> must be set to the highest rank among your adapters, since a much higher value wastes memory. A client picks an adapter by putting its name in the <code>model</code> field of the request. Requests with adapters run alongside base-model requests on the same server.</p>
+  <div class="code-wrap">
+    <div class="code-header"><span class="filename"><span class="dot"></span>serve-adapters.sh (sketch)</span><button class="copy-btn">Copy</button></div>
+    <pre><code class="language-bash"># Sketch: flag names from the vLLM LoRA documentation; paths and names are illustrative.
+vllm serve BASE_MODEL_ID \
+  --enable-lora \
+  --max-lora-rank 16 \
+  --lora-modules claims-summary=/models/adapters/claims-summary-v3
+
+# A client then asks for the adapter by name:
+#   {"model": "claims-summary", "messages": [ ... ]}</code></pre>
+  </div>
+  <p>vLLM can also load and unload adapters at run time, through the <code>/v1/load_lora_adapter</code> and <code>/v1/unload_lora_adapter</code> endpoints, but only if you set <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING=True</code>, and its documentation warns that this is a security risk to use only in isolated, fully trusted environments. Treat that endpoint as an admin interface, not as a deployment mechanism. A rollout that anyone on the network can trigger is not a rollout.</p>
+  <p>The flip is cost. Multi-adapter serving is a cost and operations saving when you have many adapters with uneven traffic. For one adapter on a nightly batch it adds a flag and a failure mode for no gain, so it stays off.</p>
+</section>
+
+<section id="providers">
+  <h2>Provider fine-tuning APIs, as of November 2026</h2>
+  <p>The alternative to owning weights is to rent a tuned model from a vendor. The market has narrowed, and what a provider offers decides whether this route is open at all. Each line below is from the vendor's own documentation, read in November 2026.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Provider</th><th>What exists</th><th>Constraint to know</th></tr></thead>
+    <tbody>
+      <tr><td class="term">OpenAI</td><td>Supervised and preference (DPO) fine-tuning of the GPT-4.1 family: gpt-4.1, gpt-4.1-mini, gpt-4.1-nano. Vision fine-tuning on gpt-4o-2024-08-06.</td><td>The platform is being wound down. New organisations lost access on 7 May 2026, and existing ones can create jobs until 6 January 2027. gpt-4.1-nano and its fine-tunes shut down on 23 October 2026; gpt-4.1 and gpt-4.1-mini on 14 January 2027.</td></tr>
+      <tr><td class="term">Google</td><td>Supervised tuning of Gemini 3.5 Flash-Lite, 3.5 Flash, 3.1 Flash-Lite, 2.5 Pro, 2.5 Flash-Lite and 2.5 Flash. Preference tuning of 2.5 Flash-Lite and 2.5 Flash.</td><td>Google's page now names the platform Gemini Enterprise Agent Platform rather than Vertex AI. Check the region and the data-residency terms before you commit.</td></tr>
+      <tr><td class="term">Amazon Bedrock</td><td>Supervised fine-tuning, reinforcement fine-tuning and distillation. Fine-tunable models include Amazon Nova, Meta Llama 3.1, 3.2 and 3.3, and Claude 3 Haiku in us-west-2.</td><td>Once a model enters Legacy, you cannot create new fine-tuning jobs on it. Claude 3 Haiku entered Legacy on 10 March 2026, with end of life on 10 September 2026 in the regions listed, so its fine-tuning is closed in practice. Bedrock's fine-tuning table still lists it.</td></tr>
+      <tr><td class="term">Anthropic</td><td>Anthropic's <a href="https://platform.claude.com/docs/en/about-claude/models/overview" target="_blank" rel="noopener">models overview</a> lists no fine-tuning for any current model (Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5).</td><td>The one earlier route was Claude 3 Haiku on Bedrock, above. Treat "no fine-tuning of current Claude models" as the state of the documentation in November 2026, and ask Anthropic if the answer matters to a contract.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Three consequences follow. First, a provider-tuned model carries the provider's lifecycle. OpenAI's fine-tunes die with their base models, and the base is dated. Open weights you hold do not deprecate, which weighs in favour of the route in this guide. Second, a provider API gives you a tuned model but not the inference-time control you get from owning the stack: you cannot choose the quantisation, the batch policy or the region beyond what the vendor offers. Third, for Candidate A the residency goal decides it. The constraint is UK data residency, and a vendor's tuning service is a processor for your training data, so the question for legal is where the data and the tuned model live. If a provider region satisfies that, a provider fine-tune is a legitimate shortcut, and the cost model is the one in <a href="01-when-to-fine-tune.html">chapter 01</a>, with a per-token surcharge in place of GPU hours.</p>
+</section>
+
+<section id="release">
+  <h2>Versioning, canary and rollback</h2>
+  <p>A tuned model is the product of five inputs: the base checkpoint, the training data, the training code and settings, the merge or quantisation step, and the eval that passed it. If any is unrecorded you cannot reproduce the model or explain a regression. Store one manifest per release: the base model's revision hash, the data snapshot identifier, the adapter hash, the eval report with its gates, and the serving configuration. The model's name in production is a version of that manifest, never "latest".</p>
+  <div class="flow">[train] → [eval gates: ch07] → [manifest + artefact]
+                              ↓
+   [shadow: run on nightly batch, not shown to adjusters]
+                              ↓
+   [canary: ~5% of claims to the new model, edit rate watched]
+                              ↓
+   [full rollout]      [rollback: re-point to previous manifest]</div>
+  <p>Harbourline's nightly batch is a gift for staging because nothing is interactive. Run the new version in shadow on a full night's 6,000 claims alongside the current one, compare the outputs by the paired method of <a href="../llm-evals-deep-dive/05-the-ship-decision.html#paired">the evals guide</a>, and only then give it a slice of the real queue. A 5% canary is 300 claims a night. The signal that matters is the one adjusters already produce: how much they edit the summary. An edit rate that rises against the incumbent's, within a night or two, is the rollback trigger, and it should be written before the canary starts. <a href="../llm-evals-deep-dive/08-model-and-prompt-changes.html#rollback">The evals guide's rollback section</a> covers the mechanics, and the serving guide's <a href="../serving-open-weight-models/10-operating-in-production.html">operations chapter</a> covers the serving side.</p>
+  <p>Rollback needs the previous artefact to be warm and the routing to be a configuration change. Keep the last two released versions loaded or one command from loaded, and make the switch a flag. If rolling back means rebuilding a container, the canary was theatre.</p>
+</section>
+
+<section id="drift">
+  <h2>Drift and retraining triggers</h2>
+  <p>A tuned model is frozen against the world at the moment of training. The data it learned from, 18 months of adjuster-edited summaries, stops being the data it sees. Claim wording shifts, a new claim type appears, the policy wordings change, adjusters change their house style. None of that shows in the held-out set, because that set is also frozen. You find out in production, and <a href="../llm-evals-deep-dive/09-online-signals-and-drift.html#drift">the evals guide's drift chapter</a> lays out the signals. For a tuned model the useful ones are three.</p>
+  <ul>
+    <li><strong>Adjuster edit rate</strong> on summaries, by slice. A slow rise is the drift signal, and a step change usually means an upstream format change or a bad release.</li>
+    <li><strong>Input shift.</strong> The share of claims of each type and region against the training mix, and the share containing wording the training data never had. A claim type with 2% of the training data and 15% of tonight's queue is a trigger by itself.</li>
+    <li><strong>Refusal-set and held-out re-runs.</strong> Re-run the chapter 07 gates monthly against a fresh sample, because the production log, not the frozen set, is where the answer lives.</li>
+  </ul>
+  <p>Retraining is not free, so set the triggers instead of a calendar alone. A reasonable pair: retrain when an edit-rate or input-shift trigger fires, and otherwise review quarterly. The data supply sets the practical floor. Harbourline's 40,000 pairs over 18 months is about 2,200 a month, about 1,200 a month after the filtering of <a href="03-post-training-data.html">chapter 03</a>. At a quarter, that is about 3,700 new filtered pairs, 17% on top of the 22,000 you hold. That may not move the model much, which is an argument for a longer cadence unless a trigger fires. The cost of a run comes from <a href="06-compute-and-distributed-training.html">chapter 06</a>. The cadence flips when claims change faster than your data: a regulatory change to a form, or a new product line, makes the old data wrong rather than merely old, and the answer is to retrain on new data with the stale pairs removed.</p>
+</section>
+
+<section id="base-update">
+  <h2>When the base model changes</h2>
+  <p>An adapter is a difference from one specific set of base weights. It was fitted so that W plus the update behaves well, and on a different W the same update means something else. A new release of the base, even from the same family and the same shapes, makes the old adapter at best untested and at worst wrong, so the adapter does not move. The data does. You rerun training on the new base with the same filtered pairs, which is why the data and its manifest are the real asset, and you rerun every gate in chapter 07.</p>
+  <p>That decision comes in two kinds. A security or licence fix, or a base your engine no longer supports, is forced. A better base is optional, and the question is the one in <a href="02-choosing-a-base-checkpoint.html">chapter 02</a>: does it beat your current tuned model on the held-out set after you tune it? Do not upgrade because a release is new. A tuned 8B model that passes its gates is a working system, and a base change restarts the cost.</p>
+  <p>Candidate B in this guide, the claims-intake agent, never had this problem, since a prompt and retrieval carry across a base change with only a re-run of the evals. That portability is a real, recurring benefit of not fine-tuning, and it belongs in the cost of Candidate A.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Harbourline has one adapter, for the nightly batch, and a colleague wants multi-adapter serving "for flexibility". What do you ask, and what would change your answer?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask what the second adapter is. With one adapter, merging gives a plain checkpoint that every engine loads and no adapter code to operate. Several adapters with uneven traffic on one base would flip it, since each costs about 87 MB against 16 GB for a second model. See <a href="#artefact">merged weights or adapters</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why can requests for different adapters not simply share a batch the way requests for one model do, and what do S-LoRA-style systems do instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each adapter implies a different effective W, so a plain batch cannot mix them. The shared base computation is done once for the whole batch and the small per-adapter products are applied separately, so mixed adapters share a batch. See <a href="#multi-adapter">serving many adapters</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your legal team prefers a managed fine-tuning API. Which facts about November 2026 do you check first for each of OpenAI, Google and Anthropic?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether the route is open. OpenAI has closed it to new organisations and shuts GPT-4.1 fine-tunes on 14 January 2027. Google lists Gemini models for tuning, so check region and residency terms. Anthropic's documentation lists no fine-tuning for current Claude models. See <a href="#providers">the provider table</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The new version scores well on the gates but you are unsure about a full rollout. What does a shadow run on the nightly batch tell you that the held-out set cannot?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It tests the current queue, not the frozen sample, so it shows input shift and real format changes, and it can be compared claim by claim with the live version. The canary then adds the adjuster edit rate. See <a href="#release">versioning, canary and rollback</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Edit rate has risen slowly for three months with no release. Name two causes you would test and the data you need for each.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Input shift, tested by comparing today's claim-type and wording mix against the training mix, and changed adjuster style or policy wording, tested by sampling recent edits. Edit rate by slice separates the two. See <a href="#drift">drift and retraining triggers</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A new release of the base family appears, with the same shapes. Someone proposes loading the existing adapter onto it. Why is that wrong, and what carries over?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The adapter is a difference fitted to the old weights, so on new weights it means something else even if it loads. The data, manifest and gates carry over, so you retrain on the same pairs and rerun the evaluation. See <a href="#base-update">when the base changes</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>An adapter is about 0.5% of the size of its base. Merge a single adapter into a plain checkpoint and keep adapters separate only when several share one base.</li>
+    <li>Evaluate the exact artefact you serve, after merging and any quantisation, not the one you trained.</li>
+    <li>vLLM serves many adapters from one base and selects them by model name, and its runtime-loading endpoint is for trusted environments only.</li>
+    <li>As of November 2026, OpenAI has closed fine-tuning to new organisations and is shutting GPT-4.1 fine-tunes, Google tunes Gemini models, Bedrock tunes Nova and Llama models, and Anthropic documents no fine-tuning of current Claude models.</li>
+    <li>Version every release as a manifest of base, data, adapter, eval report and serving configuration, canary it on the nightly batch, and make rollback a configuration change.</li>
+    <li>Retrain on triggers, edit-rate rise and input shift, with a review cadence behind them. A new base means retraining on the same data, not moving the adapter.</li>
+  </ul>
+  <p>Two techniques remain for when a single tuned model is not the right shape. → <a href="09-distillation-and-merging.html">Distillation and Merging</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.vllm.ai/en/latest/features/lora.html" target="_blank" rel="noopener"><strong>LoRA Adapters, vLLM documentation</strong></a> — vLLM project. Good for the current flags, per-request adapter selection and the run-time loading warning.</li>
+    <li><a href="https://arxiv.org/abs/2311.03285" target="_blank" rel="noopener"><strong>S-LoRA: Serving Thousands of Concurrent LoRA Adapters</strong></a> — Sheng et al., 2023. Good for the design of multi-adapter batching.</li>
+    <li><a href="https://developers.openai.com/api/docs/deprecations" target="_blank" rel="noopener"><strong>OpenAI deprecations</strong></a> — OpenAI. Good for the fine-tuning wind-down dates.</li>
+    <li><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/custom-model-fine-tuning.html" target="_blank" rel="noopener"><strong>Customize a model with fine-tuning in Amazon Bedrock</strong></a> — AWS. Good for the list of fine-tunable models.</li>
+    <li><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle-legacy.html" target="_blank" rel="noopener"><strong>Bedrock model lifecycle (legacy)</strong></a> — AWS. Good for how Legacy status closes new fine-tuning jobs.</li>
+    <li><a href="https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/tune-models" target="_blank" rel="noopener"><strong>Tune Gemini models</strong></a> — Google Cloud. Good for the models and methods open to tuning.</li>
+  </ul>
 </section>
 
 </main>
