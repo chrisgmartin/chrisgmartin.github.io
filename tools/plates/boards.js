@@ -126,6 +126,38 @@
     d.text(200,f[2].y+f[2].h+22,'one set measures every layer · recall@k per slice',{size:9.5});
     d.note(14,272,'wrong answer, right document in the index?\nforce the gold passage into the prompt:\nif the answer flips, the breach is upstream',{size:10});
   };
+  B['ai-engineering/serving-open-weight-models']=function(d){
+    d.title('Memory-bound, so budget the bytes');
+    d.text(200,50,'one 80 GB GPU',{size:10.5});
+    var w=d.box(30,60,340,52,'weights · 2 bytes/param BF16 · 1 FP8 · ½ INT4',{wash:1,size:10});
+    var kv=d.box(30,118,340,62,'KV cache · bytes per token × tokens in flight\n= how many requests fit',{size:10});
+    var hd=d.box(30,186,340,26,'activations · engine working space',{size:9.5});
+    d.ring(24,54,352,166);
+    d.arrow(386,86,386,66,{});d.note(300,236,'quantise ↓ weights',{size:9.5});
+    d.arrow(386,150,386,130,{});d.note(300,250,'shrink · share the cache',{size:9.5});
+    var pf=d.round(30,232,110,30,'prefill → TTFT',{size:9.5});var dc=d.round(150,232,120,30,'decode → TPOT',{size:9.5,red:1});
+    d.connect(pf,dc);
+    d.note(30,276,'decode reads every weight per token:\nbatch more requests into one pass',{size:9.5});
+    d.note(230,296,'goodput = tokens inside the SLO',{size:10});
+  };
+  B['ai-engineering/finetuning-and-alignment-deep-dive']=function(d){
+    d.title('Teach the model, then prove it');
+    var base=d.box(14,62,96,44,'base checkpoint\nsomeone else trained',{size:9.5});
+    var sft=d.box(150,62,100,44,'SFT on 22k pairs\nLoRA, 1% of weights',{wash:1,size:9.5});
+    var pref=d.box(290,62,96,44,'preferences\n6k pairs · DPO',{size:9.5});
+    d.connect(base,sft);d.connect(sft,pref);
+    var tuned=d.round(150,150,100,36,'tuned 8B model',{size:10.5});
+    d.arrow(pref.cx,pref.y+pref.h+2,tuned.cx+30,tuned.y-2,{});
+    var evals=d.box(14,150,100,40,'held-out set\n400 claims · sliced',{size:9.5});
+    d.arrow(evals.x+evals.w+2,evals.cy,tuned.x-2,tuned.cy,{});
+    var dec=d.box(290,150,96,36,'ship? vs prompt\nvs API model',{red:1,size:9.5});
+    d.arrow(tuned.x+tuned.w+2,tuned.cy,dec.x-2,dec.cy,{});
+    d.note(150,208,'paired · per slice · safety too',{size:9.5});
+    d.line(dec.cx,dec.y+dec.h+2,dec.cx,250,{dash:1});d.line(dec.cx,250,sft.cx,250,{dash:1});d.arrow(sft.cx,250,sft.cx,sft.y+sft.h+2,{dash:1});
+    d.note(160,264,'failures become new pairs',{size:9.5});
+    d.note(14,224,'eval set first,\nthen weights',{size:10});
+    d.note(14,296,'prompt → retrieve → fine-tune: cheapest tool that passes the eval');
+  };
   B['ai-engineering/llm-evals-deep-dive']=function(d){
     d.title('A number you can defend');
     var set=d.box(14,70,92,44,'eval set\nby slice',{size:10.5}),sys=d.box(150,70,90,44,'the system',{wash:1,size:10.5}),gr=d.box(284,70,100,44,'graders\nrules · judge · human',{size:9.5});

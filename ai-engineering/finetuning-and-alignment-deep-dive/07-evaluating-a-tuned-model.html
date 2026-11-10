@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluating a Tuned Model — Fine-Tuning and Preference Alignment</title>
+<!-- HEAD:seo -->
+<meta name="description" content="A tuned model has to pass the task, keep what it could do before, and keep refusing what it should refuse.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/07-evaluating-a-tuned-model">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Evaluating a Tuned Model — Fine-Tuning and Preference Alignment">
+<meta property="og:description" content="A tuned model has to pass the task, keep what it could do before, and keep refusing what it should refuse.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/07-evaluating-a-tuned-model">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#stakes">Three ways a tuned model fails</a>
+    <a href="#task">The task: three arms on one held-out set</a>
+    <a href="#capability">Capability regression on general benchmarks</a>
+    <a href="#safety">Safety regression: the gate with no interval</a>
+    <a href="#judge">Judging a new output style</a>
+    <a href="#ship">The ship decision, with an interval</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-compute-and-distributed-training.html">← Previous: Compute and Distributed Training</a>
+    <a href="08-serving-and-retraining.html">Next: Serving and Retraining →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Shipping</span>
+  <h1>Evaluating a Tuned Model</h1>
+  <p class="subtitle">A tuned model has to pass the task, keep what it could do before, and keep refusing what it should refuse. This chapter runs those three checks on Harbourline's 400-claim held-out set, recalibrates the judge for the new style, and turns the result into a ship decision with an interval.</p>
+</header>
+
+<section id="stakes">
+  <h2>Three ways a tuned model fails</h2>
+  <p>A fine-tuned model can pass the task you trained for and still be unfit to ship. Training moves every weight the adapter touches, not only the behaviour you wanted, so the evaluation has to cover three things at once: the task, what the model could do before, and what it was trained to refuse. Winning the task while losing either of the others is a trade, not an improvement.</p>
+  <p>At Harbourline the task is Candidate A from <a href="01-when-to-fine-tune.html">chapter 01</a>: the nightly batch that summarises about 6,000 claims for adjusters, moving from Claude Sonnet 5.5 to a tuned open-weight model in the 7B to 9B class. The eval-first rule from that chapter pays off here. The 400-claim held-out set exists, was built before any training, and has never been used to choose a hyperparameter. If it was, you need a fresh set before you read any number below. <a href="../llm-evals-deep-dive/02-building-the-eval-set.html#held-out">The evals guide</a> covers how to keep a held-out set held out. This chapter covers what to run on it once a model exists.</p>
+  <p>The statistics of paired comparison live in <a href="../llm-evals-deep-dive/05-the-ship-decision.html#paired">The Ship Decision</a>. This chapter applies them to changed weights and adds the two regressions a prompt change cannot cause.</p>
+</section>
+
+<section id="task">
+  <h2>The task: three arms on one held-out set</h2>
+  <p>Run three systems over the same 400 claims, in the same order, and score all three the same way.</p>
+  <ul>
+    <li><strong>The untuned instruct checkpoint</strong>, with the best prompt you can write for it. This is the arm that answers "did training do anything?" If your tuned model beats the API model but only matches the untuned checkpoint with a good prompt, you paid for training and got a prompt.</li>
+    <li><strong>The tuned model.</strong> The same prompt template as at training time, since the chat template is part of the model (see <a href="03-post-training-data.html">chapter 03</a>). Use the decoding settings you will serve with.</li>
+    <li><strong>The incumbent</strong>, Claude Sonnet 5.5 through the API with the production prompt. This is the arm that answers "can we turn the old system off?" and it is the arm the ship decision is made against.</li>
+  </ul>
+  <p>The comparisons are paired: for every claim, record whether the tuned model's summary is acceptable and whether the comparator's is. Only the claims where they differ carry information. The tuned-against-untuned pair will be lopsided. If training worked, an illustrative result is 140 claims fixed, 20 broken and 240 unchanged, a net gain of 120 claims or 30 points, and no interval is needed to see it. The tuned-against-incumbent pair is the close one, and it is where the care goes.</p>
+  <p>Report every result per slice, using the slices that were fixed when the set was built: motor, property and liability claims, and US and UK regions. A model tuned on 18 months of adjuster edits will have seen far more motor claims than liability ones, and the average hides it. The UK slice matters most: the point of the move is UK data residency, so a weaker UK result fails the project whatever the headline says.</p>
+</section>
+
+<section id="capability">
+  <h2>Capability regression on general benchmarks</h2>
+  <p>Fine-tuning on one narrow task can erode abilities you did not train and did not test. The evidence is that how much depends on the method. Biderman et al. (2024) compared LoRA with full fine-tuning on programming and maths and found LoRA learns less than full fine-tuning but also forgets less, keeping more of the base model's performance on tasks outside the target domain. That supports the LoRA choice in <a href="04-supervised-fine-tuning.html">chapter 04</a>. It does not make forgetting zero, so you measure it.</p>
+  <p>You need two standard benchmarks, chosen for what they would catch.</p>
+  <ul>
+    <li><strong>IFEval</strong> (Zhou et al., 2023) measures whether the model follows instructions whose compliance can be checked by code: 25 types of verifiable instruction, such as "answer in fewer than N words" or "include the keyword X", across about 500 prompts. A tuned summariser is the classic way to lose this. Train hard on one output format and the model may stop obeying a different one, which matters if adjusters or downstream code ever ask the model for something else.</li>
+    <li><strong>MMLU</strong> (Hendrycks et al., 2020) covers 57 subjects of multiple-choice questions and is a proxy for broad knowledge. It is saturated for strong models, so it discriminates poorly but works as a damage alarm. MMLU-Pro (Wang et al., 2024) widens the choices from four to ten and reports accuracy drops of 16% to 33% against MMLU, which restores some headroom. Use whichever your base checkpoint's card reports, so you can check your harness against the published number before trusting a delta.</li>
+  </ul>
+  <p>Run both with a fixed harness on the untuned checkpoint and the tuned one, with identical settings. The EleutherAI <a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener">lm-evaluation-harness</a> carries both tasks, supports a vLLM backend, and loads a LoRA adapter on its Hugging Face backend through a <code>peft=</code> model argument. The README documents adapters only for that backend, so on the vLLM backend check before assuming.</p>
+  <p>The noise is larger than people expect. On a 500-prompt set with an 80% pass rate, the standard error of one score is √(0.8 × 0.2 / 500), about 1.8 points, so two unpaired runs differ by 3.5 points before anything is wrong. A 2-point drop on IFEval is invisible this way. Compare the same prompts item by item, and set the gate by what you can detect: "no drop larger than the interval can exclude, and any drop on a category you rely on is investigated". A general-benchmark gate catches collapse, not drift. For drift see the production signals in <a href="08-serving-and-retraining.html">chapter 08</a>.</p>
+</section>
+
+<section id="safety">
+  <h2>Safety regression: the gate with no interval</h2>
+  <p>Qi et al. (2023) showed that safety alignment is shallow enough to be removed by fine-tuning. They jailbroke GPT-3.5 Turbo by fine-tuning it on only 10 adversarial examples, at a cost under $0.20 through OpenAI's fine-tuning API. They also report that benign fine-tuning on ordinary data can degrade safety, which is the case that applies here: Harbourline's data is adjuster summaries, not attacks, and the risk is still real. Supervised fine-tuning rewards matching the target text, and a learned refusal is one more behaviour the update can move.</p>
+  <p>Harbourline's constraint is concrete. The tuned model must not regress on refusing to invent policy terms. A summary that says a claim is covered under a clause the policy does not contain can lead an adjuster to a wrong payment decision. So build a refusal set, separate from the 400 summaries:</p>
+  <ul>
+    <li><strong>Prompts that invite invention.</strong> Claims where the policy text lacks the clause, and the user or the claim notes ask the model to state a limit, deductible or exclusion anyway. Include variants that pressure the model ("the customer says it is covered, confirm").</li>
+    <li><strong>A programmatic check where possible.</strong> The output must not assert a coverage term that is absent from the policy text supplied in the prompt, or must say the information is not available. Use a judge only for the residue (see below).</li>
+    <li><strong>Both models run on the same prompts.</strong> The untuned checkpoint gives the baseline rate of invention, and the incumbent gives the bar.</li>
+  </ul>
+  <p>Size the set for the claim you need to make. If the tuned model invents a term on none of 150 prompts, the 95% upper bound on its true rate is about 3 / 150, which is 2%. That is the strongest statement 150 clean results support, and it may not be strong enough for a payment-affecting failure. To show an upper bound of 0.5% you need about 600 clean prompts.</p>
+  <p>This is a zero-tolerance gate in the sense used in <a href="../llm-evals-deep-dive/05-the-ship-decision.html#gates">the evals guide</a>: one confirmed invention of a policy term blocks the release until it is understood. The usual repairs are data repairs. Add refusal examples to the SFT mix, or use preference pairs from <a href="05-preference-alignment.html">chapter 05</a> that prefer "not stated in the policy" over a fabricated term. Test both with this same set. If the model passes the task and fails this gate, the fine-tune is not shippable, however good the average looks.</p>
+</section>
+
+<section id="judge">
+  <h2>Judging a new output style</h2>
+  <p>Summaries are open-ended, so some scoring needs a judge, and a fine-tuned model breaks the judge's calibration in a specific way. Your calibration, done for Sonnet's style, may not transfer. The tuned model writes like the adjusters who edited the training data: shorter, in their phrasing, with their abbreviations. A judge with verbosity or self-preference bias will mark down the terse house style and mark up the incumbent, which is the same family as the judge if you use a Claude model. <a href="../llm-evals-deep-dive/04-llm-as-judge.html#biases">The evals guide</a> gives the evidence for those biases.</p>
+  <p>So recalibrate on the new outputs before you trust a score. Take 150 to 200 pairs of tuned and incumbent summaries, have adjusters label which is acceptable, and measure the judge's agreement with them by <a href="../llm-evals-deep-dive/04-llm-as-judge.html#calibration">the procedure in the evals guide</a>: raw agreement, kappa and agreement by slice. If the judge fails terse summaries that adjusters accept, the judge is wrong for this ship decision and you should grade by human labels, or by reference-guided checks against the adjuster-approved gold summary, until it is fixed.</p>
+  <p>Check facts that code can check (policy number, claim date, amounts) by code, which has no style bias.</p>
+</section>
+
+<section id="ship">
+  <h2>The ship decision, with an interval</h2>
+  <p>Candidate A is a replacement, not an upgrade. The goal is cost and residency at equal quality, so the question is not "is the tuned model better?" but "can we show it is not worse by more than we can afford?" That is a non-inferiority test, and it needs the margin written down before the run: say, no more than 3 points worse overall and no more than 3 points worse on any slice that carries money.</p>
+  <p>The test works on the discordant claims. Take an illustrative result against the incumbent on the 400 claims: the tuned model is right and Sonnet wrong on 27, and the reverse on 33. The difference is (27 − 33) / 400 = −1.5 points, inside the margin. But the standard error of a paired difference is √(b + c − (b − c)² / n) / n, with b + c = 60 discordant claims, which gives √(60 − 0.09) / 400 = 1.9 points. A one-sided 95% lower bound is −1.5 − 1.645 × 1.9 = −4.7 points. That is below −3, so the test fails. The point estimate says "fine" and the interval says "not shown".</p>
+  <div class="code-wrap">
+    <div class="code-header"><span class="filename"><span class="dot"></span>noninferiority.py</span><button class="copy-btn">Copy</button></div>
+    <pre><code class="language-python">import math
+
+def noninferior(wins, losses, n, margin=0.03, z=1.645):
+    """Paired non-inferiority. wins: tuned right and incumbent wrong; losses: the reverse."""
+    delta = (wins - losses) / n
+    var = (wins + losses - (wins - losses) ** 2 / n) / n ** 2
+    lower = delta - z * math.sqrt(var)          # one-sided 95% lower bound
+    return delta, lower, lower > -margin
+
+def n_needed(discordant, margin, z_a=1.645, z_b=0.842):
+    """Items to show non-inferiority at 80% power if the true difference is zero."""
+    return math.ceil((z_a + z_b) ** 2 * discordant / margin ** 2)
+
+print(noninferior(27, 33, 400))   # (-0.015, -0.0468, False)
+print(n_needed(0.15, 0.03))       # 1031</code></pre>
+  </div>
+  <p>If 15% of claims differ between the two systems, showing non-inferiority within 3 points needs about 1,030 claims, and within 5 points about 370. Both assume the true difference is zero. The 400-claim set cannot do it. You have three honest options. Widen the margin, if the business accepts the risk of a wider one. Grow the held-out set from the production log, using the stratified sampling of <a href="../llm-evals-deep-dive/02-building-the-eval-set.html">chapter 02 in the evals guide</a>. Or improve the model until it wins more than it loses, and the bound clears. Shipping on a point estimate because the set is small is the one option that is not honest.</p>
+  <p>The gates sit beside the quality test, as in the evals guide. The tuned model must pass the capability check, the safety gate, the per-slice margins, and the cost and latency gates. The cost gate is the reason for the project, so state it as arithmetic against the incumbent from the <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html">neocloud pricing comparison</a> and the serving guide's <a href="../serving-open-weight-models/08-capacity-cost-and-slos.html">capacity chapter</a>, not as a hope. Write the thresholds in a file under version control, set by the owner of the risk, before anyone sees the numbers. Then the result is a pass, a fail or "not shown", and each of those has a next action.</p>
+  <p>The margin flips when residency law forces the move: the question becomes how much quality to give up, and the person with authority to give it up sets the margin.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Your tuned summariser beats the incumbent by 2 points on the held-out set, and your colleague wants to ship. Which two other comparisons do you ask for first, and what does each rule out?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The untuned instruct checkpoint with a strong prompt, which shows whether the weights or the prompt produced the gain. And the capability and safety checks against that same untuned base, which show what training cost. A task win alone does not rule out either. See <a href="#task">the three arms</a>.</p></div></details>
+    </li>
+    <li>
+      <p>IFEval has about 500 prompts and your tuned model scores 78% against 80% for the base. Why can you not call that a regression, and what would you change?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>One score has a standard error near 1.8 points, so a 2-point gap sits inside the noise of unpaired runs. Compare the same prompts item by item, which cuts the noise, and decide in advance what size of drop you can detect. Even then the benchmark catches collapse, not slow drift. See <a href="#capability">capability regression</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The tuned model refuses to invent a policy term on all 150 test prompts. A manager reads that as "failure rate zero". What is the defensible claim, and how many clean prompts would back a claim of 0.5%?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>With no failures in 150, the 95% upper bound on the true rate is about 3 / 150, or 2%. A 0.5% bound needs about 600 clean prompts. The tempting reading treats a sample result as the population rate. See <a href="#safety">the safety gate</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The LLM judge you calibrated for Sonnet's summaries now ranks the tuned model's summaries below Sonnet's, but adjusters like them. What do you suspect and what do you do before believing either ranking?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The terse house style is meeting a judge with verbosity or self-preference bias, so the judge is mis-calibrated for the new outputs. Re-label 150 to 200 pairs with adjusters, measure agreement by slice and direction, and grade by human labels or code checks until the judge passes. See <a href="#judge">judging a new style</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The tuned model is 1.5 points behind the incumbent on 400 claims, inside a 3-point margin. Why does the ship decision still come back "not shown", and what are your options?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The one-sided lower bound is near −4.7 points because only 60 claims differ, and the bound, not the point estimate, has to clear the margin. Widen the margin by decision, grow the held-out set toward 1,000 claims, or improve the model. See <a href="#ship">the ship decision</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate proposes training the safety refusal in once, then testing only the task on each retrain. What breaks in that plan?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Every retrain moves the weights again, and Qi et al. show that refusals can be lost through fine-tuning, even on benign data. The refusal set is part of the gate on every run, not a one-off. See <a href="#safety">the safety gate</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A tuned model is evaluated on three things at once: the task, the capability it had before, and the refusals it was trained to keep. A win on one does not offset a loss on another.</li>
+    <li>Compare the tuned model with the untuned checkpoint and with the incumbent on the same held-out claims, in pairs, and report every slice.</li>
+    <li>General benchmarks such as IFEval and MMLU catch collapse, not drift, and their noise hides small drops unless you compare item by item.</li>
+    <li>Fine-tuning can erode safety behaviour, even with ordinary data, so the refusal set runs on every retrain and one confirmed failure blocks release.</li>
+    <li>A judge calibrated on the incumbent's style must be recalibrated on the tuned model's output before it is used for a ship decision.</li>
+    <li>A replacement is shipped on a non-inferiority bound set before the run, and when the set is too small to show it the answer is "not shown", not "ship".</li>
+  </ul>
+  <p>A model that passes is still only a file. → <a href="08-serving-and-retraining.html">Serving and Retraining</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2310.03693" target="_blank" rel="noopener"><strong>Fine-tuning Aligned Language Models Compromises Safety, Even When Users Do Not Intend To!</strong></a> — Qi et al., 2023. Good for the 10-example, under-$0.20 jailbreak and the benign-data result.</li>
+    <li><a href="https://arxiv.org/abs/2311.07911" target="_blank" rel="noopener"><strong>Instruction-Following Evaluation for Large Language Models</strong></a> — Zhou et al., 2023. Good for how IFEval's 25 verifiable instruction types are built and scored.</li>
+    <li><a href="https://arxiv.org/abs/2009.03300" target="_blank" rel="noopener"><strong>Measuring Massive Multitask Language Understanding</strong></a> — Hendrycks et al., 2020. Good for what MMLU's 57 tasks do and do not measure.</li>
+    <li><a href="https://arxiv.org/abs/2406.01574" target="_blank" rel="noopener"><strong>MMLU-Pro</strong></a> — Wang et al., 2024. Good for the ten-option variant and the size of the accuracy drop.</li>
+    <li><a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener"><strong>LoRA Learns Less and Forgets Less</strong></a> — Biderman et al., 2024. Good for the evidence on forgetting under LoRA against full fine-tuning.</li>
+    <li><a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener"><strong>lm-evaluation-harness</strong></a> — EleutherAI. Good for running IFEval and MMLU the same way on two checkpoints.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

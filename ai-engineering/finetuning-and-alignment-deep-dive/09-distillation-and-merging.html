@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Distillation and Merging — Fine-Tuning and Preference Alignment</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Three techniques sit past a working fine-tune: distilling into a smaller model, merging models without training, and spending test-time compute on reasoning.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/09-distillation-and-merging">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Distillation and Merging — Fine-Tuning and Preference Alignment">
+<meta property="og:description" content="Three techniques sit past a working fine-tune: distilling into a smaller model, merging models without training, and spending test-time compute on reasoning.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/09-distillation-and-merging">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#need">Three techniques, and the question before them</a>
+    <a href="#distillation">Distillation into a smaller model</a>
+    <a href="#merging">Merging models without training</a>
+    <a href="#reasoning">Reasoning models and test-time compute</a>
+    <a href="#honest">When a product team needs any of it</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-serving-and-retraining.html">← Previous: Serving and Retraining</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Shipping</span>
+  <h1>Distillation and Merging</h1>
+  <p class="subtitle">Three techniques sit past a working fine-tune: distilling into a smaller model, merging models without training, and spending test-time compute on reasoning. This chapter says what each buys, what the teacher's terms and the merge's limits allow, and whether Harbourline needs any of them.</p>
+</header>
+
+<section id="need">
+  <h2>Three techniques, and the question before them</h2>
+  <p>Distillation, merging and reasoning-style training are the techniques most often named in a post-training plan and least often needed by a product team. Each answers a real problem. The first makes a model smaller than your best one. The second combines models without training. The third makes a model spend more compute on a hard answer. Before any of them, ask whether the tuned model from <a href="07-evaluating-a-tuned-model.html">chapter 07</a> already meets its gates at an acceptable cost. If it does, you are done, and this chapter is a map of what you did not need.</p>
+  <p>Harbourline's Candidate A is the test case. Take an illustrative size for the nightly job: 6,000 claims, about 1,500 input tokens and 250 output tokens each. On Claude Sonnet 5.5 at $2 per million input tokens and $10 per million output tokens (Anthropic's <a href="https://platform.claude.com/docs/en/about-claude/models/overview" target="_blank" rel="noopener">models overview</a>, November 2026) the night costs 9M × $2 / 1M + 1.5M × $10 / 1M = $18 + $15 = $33, about $1,000 for a 30-night month. If the tuned 8B model clears the batch in one rented hour at $3.99 (the <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html">neocloud pricing comparison</a> carries that rate), the night costs about $4, or $120 a month. The one-hour figure is an assumption to measure, not a result, and an always-on H100 would cost 24 × 30 × $3.99, about $2,900 a month, which is more than the API bill, so rent by the hour. The saving that justifies the project already exists. A smaller student would shave dollars off a $120 line.</p>
+</section>
+
+<section id="distillation">
+  <h2>Distillation into a smaller model</h2>
+  <p>Distillation trains a small student to reproduce a larger teacher. Hinton et al. (2015) describe the original form: compress the knowledge of a large model, or an ensemble, into a single model that is simpler to deploy. The student is trained against the teacher's full output distribution over tokens, which carries more information per example than a single correct label, since it records which wrong answers the teacher found plausible. That needs the teacher's logits, so it works when you hold the teacher's weights.</p>
+  <p>With an API teacher you receive text only, and the usable form is sequence-level. Kim and Rush (2016) introduced sequence-level knowledge distillation for neural machine translation: generate the teacher's output sequences for your inputs and train the student on them as ordinary supervised data. In their translation experiments the best student ran about 10 times faster than its teacher with little loss, and a version with weight pruning had 13 times fewer parameters for a cost of 0.4 BLEU. Those are translation results from 2016, so read them as the shape of the effect, not a promise for summarising claims.</p>
+  <p>In practice this is the synthetic-data pipeline of <a href="03-post-training-data.html">chapter 03</a> followed by the SFT of <a href="04-supervised-fine-tuning.html">chapter 04</a>, with one added requirement: the teacher must be better than your human data on the thing you care about, or the student inherits its mistakes with confidence. For Harbourline, the teacher outputs are Sonnet's summaries and the reference is the adjusters' edits. Where they differ, the adjusters win, which is why the primary training data in this guide is the 22,000 adjuster-edited pairs and not teacher text.</p>
+  <p>Distillation has two real uses for a product team. One is a smaller student, for latency or memory: a 3B model in BF16 is about 6 GB of weights against 16 GB for 8B. The other is extra training data for slices where the human data is thin, such as liability claims in the UK. Both need an eval that proves the student holds on every slice, since small models lose the long tail first.</p>
+  <div class="callout danger">
+    <span class="callout-label">The teacher's terms may forbid the student</span>
+    <p>Anthropic's Commercial Terms (section D.4, use restrictions) say the customer may not "access the Services to build a competing product or service, including to train competing AI models or resell the Services except as expressly approved by Anthropic". Whether an internal claims summariser is a competing model is a question for counsel, not for the ML team. Other vendors have their own clauses, and OpenAI's terms were not checked for this chapter, so read each teacher's current terms before you generate training data from it. Open-weight teachers carry their licence terms in the model card.</p>
+  </div>
+  <p>Amazon Bedrock offers distillation as a managed service: you pick a teacher and a student, supply prompts, and Bedrock generates the teacher responses and fine-tunes the student (AWS documentation, November 2026). That sits inside the vendor's own terms, which is the cleaner route when it supports both models you want. The route flips if your goal is open weights you serve yourself: check whether the managed student can leave the platform before you plan around it.</p>
+</section>
+
+<section id="merging">
+  <h2>Merging models without training</h2>
+  <p>Merging combines the weights of several fine-tuned models that share an ancestor into one model, without further training. The common methods differ in how they treat the disagreement between models.</p>
+  <ul>
+    <li><strong>Linear and SLERP.</strong> Weighted averaging of the weights. SLERP interpolates along the arc between two models rather than the straight line, which keeps the norm of the weights from shrinking in the middle. It takes exactly two models.</li>
+    <li><strong>Task arithmetic.</strong> Work with the task vector, the fine-tuned weights minus the base weights, and add scaled vectors to the base. This needs the common base.</li>
+    <li><strong>TIES-Merging</strong> (Yadav et al., 2023). Averaging loses performance because parameters interfere: many are redundant, and models disagree on the sign of the same one. TIES trims parameters that barely changed, elects one sign per parameter, and merges only the values that agree with it.</li>
+    <li><strong>DARE</strong> (Yu et al., 2023). Randomly sets a fraction p of the task-vector entries to zero and rescales the rest by 1 / (1 − p). The paper reports that 90% or even 99% of the delta can be dropped for supervised fine-tuned models without hurting their abilities. It is used before a TIES-style merge, as <code>dare_ties</code>.</li>
+  </ul>
+  <p>All of these are implemented in the open-source <a href="https://github.com/arcee-ai/mergekit" target="_blank" rel="noopener">mergekit</a> library (Goddard et al., 2024), which takes a YAML file. Its README says ties, DARE and task arithmetic require a base model, SLERP requires exactly two inputs plus a base, and that all non-vocabulary tensor shapes must match.</p>
+  <div class="code-wrap">
+    <div class="code-header"><span class="filename"><span class="dot"></span>merge.yaml (sketch)</span><button class="copy-btn">Copy</button></div>
+    <pre><code class="language-yaml"># Sketch: field names follow the mergekit README; model paths are illustrative.
+merge_method: dare_ties
+base_model: ./base-8b-instruct
+models:
+  - model: ./tuned-motor-claims
+    parameters: {density: 0.5, weight: 0.5}
+  - model: ./tuned-property-claims
+    parameters: {density: 0.5, weight: 0.5}
+dtype: bfloat16</code></pre>
+  </div>
+  <p>The limits matter more than the methods. Merging needs the same architecture and shapes, and for the delta-based methods the same base, because a task vector is meaningless against a different starting point. It does not create a skill that neither parent had, and it cannot stop one parent's behaviour from corrupting the other's, which is what the sign election and the dropping try to reduce. Every merged model is a new model and needs the full gates of chapter 07, including the refusal set, since a safety-tuned parent can lose its behaviour in the blend.</p>
+  <p>When would Harbourline merge? Usually it should not. If you have the data for two slices, one SFT run on both beats a merge, since training sees the examples together. Merging is for when you cannot pool the data, for instance a US-trained and a UK-trained adapter whose data must stay in their regions. The merge moves weights, not records, but whether merged weights count as personal data is a legal question to ask before relying on it.</p>
+</section>
+
+<section id="reasoning">
+  <h2>Reasoning models and test-time compute</h2>
+  <p>The frontier of post-training has moved from "make the model say the right thing" to "make the model think longer when it needs to". Snell et al. (2024) show that for problems where a smaller model already has a reasonable success rate, spending extra compute at inference can beat a model 14 times larger under a matched compute budget, and that allocating that compute per prompt, instead of uniformly, improves efficiency more than 4 times over best-of-N sampling. DeepSeek-R1 (DeepSeek-AI, 2025) reports that reasoning behaviour, including self-reflection and verification, can emerge from reinforcement learning without human-labelled reasoning examples, and that the reasoning patterns of large models can be used to improve smaller ones. The RL method with verifiable rewards is the one in <a href="05-preference-alignment.html">chapter 05</a>.</p>
+  <p>For a product team the question is whether to buy this or build it. Buying is a request parameter: Anthropic's current models use adaptive thinking, where the model decides how much to think, steered by an effort setting (models overview, November 2026). Building is a research project: you need a task with a checkable answer to reward, a large base, and a lot of rollouts. Harbourline's summaries have no verifiable reward, and a reasoning trace does not make a summary more faithful to the claim file.</p>
+  <p>Test-time compute is also not free. If thinking added 2,000 output tokens per claim to the nightly batch, that is 12M extra output tokens a night, or $120 at Sonnet 5.5's $10 per million, nearly four times the whole $33 night above. It earns that cost on hard, multi-step problems such as reconciling conflicting claim records, and not on summarising a clean file. The rule flips for a task with a checkable answer and a hard tail, where a reasoning model with a cheap verifier can beat a larger model on cost.</p>
+</section>
+
+<section id="honest">
+  <h2>When a product team needs any of it</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Technique</th><th>What it buys</th><th>You need it when</th><th>Harbourline Candidate A</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Distillation</td><td>A smaller, faster student, or more data for thin slices</td><td>Latency or memory limits rule out the tuned model, or a slice lacks data and the teacher's terms allow it</td><td>No. The batch is not latency-bound and the human data is the better source.</td></tr>
+      <tr><td class="term">Merging</td><td>Several tunes in one model, with no extra training</td><td>You cannot pool training data, or want to blend a tune with its base to recover lost behaviour</td><td>No. One slice set, one SFT run.</td></tr>
+      <tr><td class="term">Reasoning / test-time compute</td><td>Better answers on hard problems, paid in tokens</td><td>The task has multi-step structure and a checkable answer</td><td>No. Buy it by API if a later task needs it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The honest view is that the most valuable work in this guide is the least glamorous: the held-out set, the clean data and the gates. These three techniques are optimisations you reach for after those exist, when a measured limit points to one. A team that merges or distils because the technique is current has a model it cannot evaluate and a licence question it has not asked. The decision to fine-tune at all was <a href="01-when-to-fine-tune.html">chapter 01's</a>, and it should stay revisitable: if a hosted model's price falls far enough, the right answer for Candidate A could be to stop. The tuned model is served by an engine, and choosing and running one is a subject of its own.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>You can only reach a teacher through an API that returns text. Why can you not train the student on the teacher's output distribution, and what do you train on instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Distribution matching needs the teacher's logits, which a text API does not give. You generate the teacher's output sequences for your inputs and train on them as ordinary supervised pairs, which is sequence-level distillation. See <a href="#distillation">distillation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The teacher's summaries and the adjusters' edits disagree on 12% of claims. Which do you train on, and what does the disagreement tell you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Train on the adjusters' version. A student cannot exceed its teacher, so teacher text is useful only where it is better than the human reference. The disagreement is also a ready list of slices to inspect before training. See <a href="#distillation">distillation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two LoRA-tuned models were trained from different base releases of the same family. Can you merge them with TIES, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No, not meaningfully. TIES works on task vectors, the difference from a common base, and a vector from one base means nothing against another. Shapes may match and the merge may run, but the result is untested weights. See <a href="#merging">merging</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A merged model passes your task eval. What else must pass before it ships, and which parent's behaviour is most at risk?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The capability checks and the refusal set from chapter 07, because a merge is a new model. A parent tuned for refusals can lose them when blended with a parent that was not. See <a href="#merging">merging</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague proposes a reasoning model for the nightly summaries, citing results on maths benchmarks. What do you ask, and how do you cost it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask whether the task has a checkable answer and a hard tail, since the gains were shown where it does. Cost the extra output tokens: 2,000 more per claim over 6,000 claims is 12M tokens a night, about $120 at $10 per million. See <a href="#reasoning">reasoning models</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team wants to distil Sonnet 5.5 into the tuned 8B model for extra liability-claim data. Which two checks come before generating a single example?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The teacher's terms, since Anthropic's clause bars using its Services to train competing models and counsel must say whether this is one, and a measured gap on the liability slice that the human data cannot close. Without both, you take a legal risk for nothing. See <a href="#distillation">distillation</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Distillation, merging and reasoning-style training answer measured limits, and Harbourline's batch has none of them once the tuned 8B model passes its gates.</li>
+    <li>With an API teacher, distillation is sequence-level: the student trains on the teacher's text, so it can be no better than that text, and the human reference wins where they differ.</li>
+    <li>A teacher's terms can forbid training on its output, as Anthropic's Commercial Terms do for competing models, so read them before generating data.</li>
+    <li>Merging with TIES, DARE or SLERP needs a common architecture and, for the delta methods, a common base, and every merged model needs the full evaluation including the refusal set.</li>
+    <li>Pooled data and one training run beat a merge when you can pool the data. Merge when you cannot.</li>
+    <li>Test-time compute pays on multi-step tasks with checkable answers, and costs tokens on every call, so buy it by API before building it.</li>
+  </ul>
+  <p>The tuned model is a file, and the next guide is about running it well. → <a href="../serving-open-weight-models/index.html">Serving Open-Weight Models</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener"><strong>Distilling the Knowledge in a Neural Network</strong></a> — Hinton, Vinyals and Dean, 2015. Good for the original idea of compressing a large model into a small one.</li>
+    <li><a href="https://arxiv.org/abs/1606.07947" target="_blank" rel="noopener"><strong>Sequence-Level Knowledge Distillation</strong></a> — Kim and Rush, 2016. Good for training a student on teacher outputs and the reported speedups.</li>
+    <li><a href="https://arxiv.org/abs/2306.01708" target="_blank" rel="noopener"><strong>TIES-Merging: Resolving Interference When Merging Models</strong></a> — Yadav et al., 2023. Good for the trim, elect-sign and merge steps.</li>
+    <li><a href="https://arxiv.org/abs/2311.03099" target="_blank" rel="noopener"><strong>Language Models are Super Mario</strong></a> — Yu et al., 2023. Good for DARE's drop-and-rescale of delta parameters.</li>
+    <li><a href="https://arxiv.org/abs/2403.13257" target="_blank" rel="noopener"><strong>Arcee's MergeKit</strong></a> — Goddard et al., 2024. Good for what the toolkit implements and why merging became popular.</li>
+    <li><a href="https://arxiv.org/abs/2408.03314" target="_blank" rel="noopener"><strong>Scaling LLM Test-Time Compute Optimally Can Be More Effective than Scaling Model Parameters</strong></a> — Snell et al., 2024. Good for when extra inference compute beats a larger model.</li>
+    <li><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener"><strong>DeepSeek-R1</strong></a> — DeepSeek-AI, 2025. Good for reasoning from reinforcement learning and distilling it into smaller models.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

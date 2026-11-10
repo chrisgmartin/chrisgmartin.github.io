@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Structured Output and Constrained Decoding — Serving Open-Weight Models</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Grammar-constrained decoding, JSON schema enforcement, tool-call formats, what it costs in latency and quality, and the libraries that do it as of November…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/serving-open-weight-models/09-structured-output-and-constrained-decoding">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Structured Output and Constrained Decoding — Serving Open-Weight Models">
+<meta property="og:description" content="Grammar-constrained decoding, JSON schema enforcement, tool-call formats, what it costs in latency and quality, and the libraries that do it as of November…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/serving-open-weight-models/09-structured-output-and-constrained-decoding">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">When the output feeds a machine</a>
+    <a href="#mask">How constrained decoding masks logits</a>
+    <a href="#schema">Enforcing a JSON schema</a>
+    <a href="#tools">Tool calls</a>
+    <a href="#libraries">Libraries and engine support, November 2026</a>
+    <a href="#costs">What constraining costs</a>
+    <a href="#decide">Constrain, validate, or both</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="08-capacity-cost-and-slos.html">← Previous: Capacity, Cost and SLOs</a>
+    <a href="10-operating-in-production.html">Next: Operating in Production →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Running it</span>
+  <h1>Structured Output and Constrained Decoding</h1>
+  <p class="subtitle">Grammar-constrained decoding, JSON schema enforcement, tool-call formats, what it costs in latency and quality, and the libraries that do it as of November 2026.</p>
+</header>
+
+<section id="why">
+  <h2>When the output feeds a machine</h2>
+  <p>Harbourline's nightly batch reads about 6,000 first notices of loss and writes, for each, a record the adjuster queue can load: a loss type from a fixed list, an urgency from one to four, a list of missing documents. A person can forgive a stray sentence before the JSON. A loader cannot. There are three ways to get valid records from a model. You can ask in the prompt and validate after, you can constrain generation so invalid tokens cannot be produced, or you can fine-tune until the model rarely strays. The first two are this chapter. The third is in the <a href="../finetuning-and-alignment-deep-dive/index.html">fine-tuning guide</a>.</p>
+  <p>Take the arithmetic of validating alone. If 2% of outputs fail to parse, an illustrative rate, that is 120 records a night. Re-asking costs one more call of about 1,800 tokens each, 216,000 tokens a night, which is trivial for a batch with a four-hour window. A retry loop is a fine answer there. It is a poor answer for the interactive path, where a failed parse adds a whole generation to the user's wait, and for agents, where a malformed tool call stalls a multi-step run. Constraining costs per token on every request, so it pays where a failure costs more than that.</p>
+</section>
+
+<section id="mask">
+  <h2>How constrained decoding masks logits</h2>
+  <p>At each step the model produces one logit for every token in its vocabulary, 128,000 for Llama 3. Sampling turns them into probabilities. Constrained decoding inserts a step before that: compute which tokens may legally come next, set the logits of all others to negative infinity, and sample from what remains. The model is unchanged. Only the choice among its outputs is restricted. How the sampler picks a token is the subject of <a href="../token-generation-first-principles/05-from-logits-to-a-token.html">the token-generation guide</a>.</p>
+  <div class="flow">  logits (128k) ---> mask ---> softmax ---> sample ---> token
+                       ^                                    |
+                       |       grammar state (automaton)    |
+                       +---- advance state with the token <-+
+
+  state after  {"loss_type":"   allows:  "fire"  "water"  "theft" ...
+  every other token's logit = -inf</div>
+  <p>The hard part is that grammars speak in characters and models speak in tokens. A token can span several characters, and a single JSON string value can be tokenised many ways, so the engine must test each of the 128,000 tokens against the automaton's current state. Done naively that is a scan of the vocabulary per step. The libraries differ in how they avoid it. XGrammar's paper splits the vocabulary into tokens whose validity does not depend on the parser's stack, which are checked ahead of time, and context-dependent tokens, checked at runtime, and reports up to a 100× speedup over earlier grammar engines. llguidance's README claims about 50 µs of single-core CPU time per token for a 128k tokenizer, and 1.5 ms for the full mask of a typical JSON schema. Those are the authors' figures, to be reproduced on your own schemas.</p>
+  <p>Put them against the decode step from <a href="08-capacity-cost-and-slos.html#decode">chapter 08</a>. A step with 39 streams takes 33 ms. If masks were computed one after another at 50 µs each, 39 streams cost 39 × 50 µs ≈ 2 ms, about 6% of the step. Engines overlap this CPU work with GPU compute, which is the point of co-designing grammar and engine that the XGrammar abstract describes, so the observed cost is often smaller. The cost that does show up is the first request with a new schema, when the grammar is compiled. vLLM's tool-calling documentation says that, for a named function, compiling the grammar adds several seconds the first time before it is cached. A schema that changes per request defeats that cache.</p>
+</section>
+
+<section id="schema">
+  <h2>Enforcing a JSON schema</h2>
+  <p>In vLLM a client asks for a schema through the OpenAI-compatible <code>response_format</code> with type <code>json_schema</code>, or through <code>structured_outputs</code> in <code>extra_body</code>, which also accepts <code>choice</code>, <code>regex</code>, <code>grammar</code> and <code>structural_tag</code>. The server's backend defaults to <code>auto</code>, which picks one for the request; the documentation names xgrammar and guidance. Older <code>guided_*</code> fields were removed in v0.12.0. This is a sketch against Harbourline's claim record, not a tested pipeline:</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>triage.py (sketch)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from typing import Literal
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+class Triage(BaseModel):
+    loss_type: Literal["fire", "water", "theft", "collision", "other"]
+    urgency: int = Field(ge=1, le=4)
+    missing_documents: list[str]
+
+client = OpenAI(base_url="http://gateway.internal/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="harbourline-70b",
+    messages=[{"role": "user", "content": notice_text}],
+    max_tokens=600,
+    response_format={"type": "json_schema", "json_schema": {
+        "name": "triage", "schema": Triage.model_json_schema()}},
+)
+choice = resp.choices[0]
+if choice.finish_reason == "length":      # cut off mid-JSON: not valid
+    raise RuntimeError("raise max_tokens or shorten the schema")
+record = Triage.model_validate_json(choice.message.content)</code></pre>
+  </div>
+  <p>Three details matter. First, <code>finish_reason</code> must be checked: a constraint guarantees that every prefix is valid, not that the output is complete, so a response that hits <code>max_tokens</code> stops mid-object and will not parse. Second, schema coverage is partial. llguidance says it supports "a large subset" of JSON Schema, and the JSONSchemaBench paper was written because little had been done on systematically comparing the behaviours of Guidance, Outlines, llama.cpp, XGrammar, OpenAI and Gemini across 10,000 real-world schemas. Run your schemas against your engine and keep the validator after it, for any keyword the backend ignores. Third, the guarantee is syntactic. The mask cannot stop the model from choosing <code>"theft"</code> for a flood. The <code>Literal</code> list makes a wrong answer look right, so the accuracy check from the <a href="../llm-evals-deep-dive/index.html">evals guide</a> still applies.</p>
+</section>
+
+<section id="tools">
+  <h2>Tool calls</h2>
+  <p>A tool call is structured output with a convention on top: a function name and arguments, in a format the model was trained on. Open-weight models differ in that format, so vLLM needs <code>--enable-auto-tool-choice</code> and a <code>--tool-call-parser</code> matched to the model, such as <code>hermes</code> or <code>llama3_json</code>, and it takes a chat template that renders tool messages. Pick the parser for the weights you serve and re-check it when the model changes (<a href="10-operating-in-production.html#upgrades">chapter 10</a>).</p>
+  <p>What <code>tool_choice</code> does about validity is easy to miss. With <code>auto</code>, the model writes its call as free text and the parser extracts it, so a malformed call is possible. With <code>required</code>, or a named function, vLLM uses the structured-output machinery, so the arguments match the schema, at the cost of the grammar compile on first use. For a state-changing tool such as a Harbourline address update, use the constrained modes and still validate the arguments against business rules before executing. Whether the call should happen at all belongs to <a href="../securing-llm-applications/04-agents-tools-and-excessive-agency.html">the agents and tools chapter of the security guide</a>.</p>
+</section>
+
+<section id="libraries">
+  <h2>Libraries and engine support, November 2026</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Option</th><th>What it constrains to</th><th>Where it runs</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Outlines</td><td>JSON Schema, regex, context-free grammar</td><td>vLLM, Transformers, llama.cpp, Ollama, MLX-LM, SGLang, TGI and hosted APIs</td><td>A library you call; the vLLM structured-outputs page does not list it as a selectable backend</td></tr>
+      <tr><td class="term">XGrammar</td><td>Context-free grammars, including JSON Schema</td><td>vLLM backend</td><td>Precomputes the context-independent part of the mask</td></tr>
+      <tr><td class="term">llguidance</td><td>Large subset of JSON Schema, regex, Lark-style grammars</td><td>vLLM, SGLang, llama.cpp, mistral.rs and others</td><td>Claims about 50 µs of CPU per token</td></tr>
+      <tr><td class="term">Engine-native</td><td>vLLM: choice, regex, JSON, grammar, structural tag. Ollama: JSON schema in <code>format</code>. WebLLM: JSON mode</td><td>The engine itself</td><td>One request field, no extra service</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Use the engine-native path first. It is the one your engine's maintainers test with its scheduler, and it keeps the request shape portable across <a href="06-engines-and-formats.html">engines</a>. Reach for a library when your engine lacks a feature you need, a grammar format in particular, or when you run outside a server, for instance a batch job calling a model through Transformers. The libraries are changing quickly, so pin versions and re-run your schema suite on each upgrade. The vLLM page also notes that lm-format-enforcer is deprecated, which is an example of a backend disappearing under a deployment.</p>
+</section>
+
+<section id="costs">
+  <h2>What constraining costs</h2>
+  <p><strong>Latency.</strong> The per-token mask is small if it is overlapped, the first-use compile is seconds, and a schema that varies per request pays it every time. Reuse a fixed schema, or enumerate a few. <strong>Quality.</strong> Setting disallowed logits to negative infinity renormalises the probability over what remains, so a token the model rated very unlikely can become the likeliest legal choice, and the model has no way to say it disagrees. Tam et al. report a significant decline in reasoning ability under format restrictions, larger as the restrictions tighten. Note that this finding comes from their tasks and models, and engines have changed since.</p>
+  <p>The practical remedy is order. Fields generate in the order the schema lists them, so put a free-text <code>reasoning</code> field before the answer fields, and the model thinks before it commits to a loss type. Costing the extra tokens at 100 or so a record on 6,000 records is 600,000 tokens a night, still small. When the reasoning must be long, split into two calls: a free-text analysis, then a constrained extraction of its conclusion.</p>
+  <div class="callout warn">
+    <span class="callout-label">A valid record is not a correct record</span>
+    <p>Constrained output removes parse errors and leaves wrong answers in place, and it makes the wrong ones harder to spot because they look right. Keep the eval on the Harbourline set, and track the validity rate and the accuracy separately, so an improvement in one cannot hide a drop in the other.</p>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>Constrain, validate, or both</h2>
+  <p>Constrain when the caller is a machine with no retry path: a tool call that mutates state, an interactive path with a latency budget, or a model small enough that its raw format failures are common. Validate after the fact when the failure rate is low and retries are cheap, as in the nightly batch, when the schema uses features your backend lacks, or when the task needs long reasoning that a grammar would cut off. In practice do both: constrain the shape, then validate the semantics with code, such as an urgency consistent with the loss type, and retry or route to a person on failure. The flip is a model fine-tuned on the exact schema, which may reach a failure rate where the mask is no longer worth its overhead. Measure that rate on the eval set rather than assuming it.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Describe what happens to the logits and the probabilities at one decode step when a JSON grammar is active and the output so far is <code>{"urgency":</code>.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The engine finds the tokens that can legally follow, here digits or whitespace, sets every other logit to negative infinity, and renormalises over the rest. Sampling then picks among the survivors, and the automaton advances by the chosen token. See <a href="#mask">the mask</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A response with a schema returns HTTP 200 and fails to parse. What do you check first, and why can it happen when the constraint is on?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Check the finish reason. A constraint guarantees valid prefixes, so a generation cut off by the token limit stops mid-object. Raise the limit or shorten the schema. See <a href="#schema">enforcing a schema</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A team enables constrained decoding and the accuracy of the loss-type field drops, while parse errors go to zero. Offer two explanations and one change for each.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The mask forces a legal but unlikely token the model would not have chosen, and tighter formats lower reasoning quality, so add a reasoning field before the answer or split into two calls. Or the zero parse errors reveal errors that used to be retried away, so compare accuracy on the same records with retries counted. See <a href="#costs">what constraining costs</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does <code>tool_choice</code> set to <code>auto</code> not give the same guarantee as <code>required</code> on the same server?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>With <code>auto</code> the model writes the call as free text and a parser extracts it, so it can be malformed. <code>required</code> and named choices use structured outputs, so the arguments match the schema. See <a href="#tools">tool calls</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The nightly batch has a 2% parse-failure rate and four hours to spare. A colleague wants constrained decoding on it. Make the case against, and name what would change your mind.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Retrying 120 records costs about 216,000 tokens, which the window absorbs, while the mask adds compile and per-token overhead and may lower reasoning quality. That judgement flips if the failure rate rises, retries began to fail repeatedly, or a downstream step could not tolerate a retry delay. See <a href="#decide">constrain or validate</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Constrained decoding masks the logits of tokens the grammar forbids, so the model's weights are untouched and only its choices are restricted.</li>
+    <li>The mask guarantees syntax, not truth: check the finish reason for truncation, and keep evals for accuracy separate from the validity rate.</li>
+    <li>The cost is a per-token mask that engines overlap with GPU work, plus a first-use compile that a per-request schema pays every time.</li>
+    <li>Tool calls with <code>auto</code> choice can be malformed, while required and named choices go through the structured-output machinery.</li>
+    <li>Prefer the engine-native path, add a library only for a capability the engine lacks, and pin versions because this area moves fast.</li>
+    <li>Constrain where a failure is expensive, validate where a retry is cheap, and do both for anything that changes state.</li>
+  </ul>
+  <p>Last, run all of this in production and know what breaks. → <a href="10-operating-in-production.html">Operating in Production</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.vllm.ai/en/latest/features/structured_outputs.html" target="_blank" rel="noopener"><strong>vLLM: structured outputs</strong></a> — vLLM documentation. Good for the request fields, the backends and the removed guided options.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/tool_calling.html" target="_blank" rel="noopener"><strong>vLLM: tool calling</strong></a> — vLLM documentation. Good for the parser flags and what each tool choice guarantees.</li>
+    <li><a href="https://arxiv.org/abs/2411.15100" target="_blank" rel="noopener"><strong>XGrammar</strong></a> — Dong et al., 2024. Good for the split between context-independent and context-dependent tokens.</li>
+    <li><a href="https://github.com/guidance-ai/llguidance" target="_blank" rel="noopener"><strong>llguidance</strong></a> — Guidance project README. Good for the grammar formats, integrations and the per-token cost claim.</li>
+    <li><a href="https://dottxt-ai.github.io/outlines/latest/" target="_blank" rel="noopener"><strong>Outlines</strong></a> — dottxt documentation. Good for the supported constraints and the list of integrations.</li>
+    <li><a href="https://arxiv.org/abs/2408.02442" target="_blank" rel="noopener"><strong>Let Me Speak Freely?</strong></a> — Tam et al., 2024. Good for the evidence on format restrictions and reasoning.</li>
+    <li><a href="https://arxiv.org/abs/2501.10868" target="_blank" rel="noopener"><strong>JSONSchemaBench</strong></a> — Geng et al., 2025. Good for comparing frameworks on real schemas.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

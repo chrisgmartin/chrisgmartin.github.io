@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Post-Training Data — Fine-Tuning and Preference Alignment</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chat templates and dataset formats, mining production for examples, synthetic data from a frontier model and the terms that govern it, filtering and…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/03-post-training-data">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Post-Training Data — Fine-Tuning and Preference Alignment">
+<meta property="og:description" content="Chat templates and dataset formats, mining production for examples, synthetic data from a frontier model and the terms that govern it, filtering and…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/finetuning-and-alignment-deep-dive/03-post-training-data">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=22" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=22" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=22">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=22">
+<script defer src="../../assets/script.js?v=22"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#template">The chat template is part of the model</a>
+    <a href="#formats">Dataset formats</a>
+    <a href="#sources">Where the examples come from</a>
+    <a href="#terms">Synthetic data and the terms that govern it</a>
+    <a href="#filter">Filtering and deduplication</a>
+    <a href="#funnel">How many examples, and the Harbourline funnel</a>
+    <a href="#review">Personal data, review and agreement</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-choosing-a-base-checkpoint.html">← Previous: Choosing a Base Checkpoint</a>
+    <a href="04-supervised-fine-tuning.html">Next: Supervised Fine-Tuning →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Deciding and preparing</span>
+  <h1>Post-Training Data</h1>
+  <p class="subtitle">Chat templates and dataset formats, mining production for examples, synthetic data from a frontier model and the terms that govern it, filtering and deduplication, how many examples you need, and the review that makes the set defensible.</p>
+</header>
+
+<section id="template">
+  <h2>The chat template is part of the model</h2>
+  <p>A causal language model continues a token sequence, and a chat model is one that was post-trained on sequences laid out in a particular way. The Hugging Face documentation puts it plainly: the list of roles and contents you pass in is converted to a token sequence "often with control tokens", and models fine-tuned from the same base can use different formats. With the wrong control tokens, it warns, models "would have drastically worse performance". Qwen's card for the Qwen3.5-9B base says the same from the other side: its control tokens, such as <code>&lt;|im_start|&gt;</code> and <code>&lt;|im_end|&gt;</code>, were trained so that LoRA tuning with the official chat template works well.</p>
+  <p>The failure is silent. Training runs, loss falls, samples look fine, and the model is a little worse than it should be, or fails to stop. Render the template yourself and read it before you train. This is the output for the working checkpoint, with a short sample claim summary:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">&gt;&gt;&gt; tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+&gt;&gt;&gt; tok.apply_chat_template(msgs, tokenize=False)
+&lt;|im_start|&gt;system
+Summarise the claim for an adjuster.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+FNOL: rear-end collision, A406.&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+&lt;think&gt;
+
+&lt;/think&gt;
+
+Motor claim. Rear-end collision on the A406.&lt;|im_end|&gt;</code></pre></div>
+  <p>Three details matter. The assistant turn carries an empty <code>&lt;think&gt;</code> block, which this template adds when it renders a finished conversation. If you hand-build training strings without it, the model learns a format that the serving template will not match. The turn ends with <code>&lt;|im_end|&gt;</code>, the token that teaches the model to stop, and a missing end token produces a model that rambles past its summary. And the loss should fall on the assistant tokens only: the system and user text are fixed input, and training on them wastes capacity on reproducing the claim. TRL's SFT trainer has an option for this, <code>assistant_only_loss</code>, and it needs the template to mark the assistant span, which TRL patches in for known families such as Qwen3. The repository <code>google/gemma-4-E4B</code> ships no chat template at all, so for a base checkpoint like that you must supply one.</p>
+  <div class="callout warn">
+    <span class="callout-label">Use the template once, and tokenise once</span>
+    <p>Chat templates already include the special tokens. The Hugging Face guide warns that adding more, for example by tokenising the rendered string with the default settings, duplicates them and hurts performance. Use <code>apply_chat_template</code> with <code>tokenize=True</code>, or pass <code>add_special_tokens=False</code> when you tokenise later. Serve with the same template you trained with; <a href="08-serving-and-retraining.html">chapter 08</a> returns to this.</p>
+  </div>
+</section>
+
+<section id="formats">
+  <h2>Dataset formats</h2>
+  <p>Data arrives in three shapes, and the trainer expects one of them. The <strong>messages</strong> shape is a list of <code>{"role", "content"}</code> turns, and it is what TRL calls the conversational language-modelling format. The <strong>prompt-completion</strong> shape separates the input turns from the target turns, and TRL then computes loss on the completion only by default. The older <strong>Alpaca</strong> shape has <code>instruction</code>, an optional <code>input</code> and an <code>output</code>, from the Stanford Alpaca release of 52,000 examples. <strong>ShareGPT</strong> stores turns as a <code>conversations</code> list with <code>from</code> and <code>value</code> keys, which Axolotl documents as a deprecated type in favour of the messages shape. Preference data has its own shapes, with <code>chosen</code> and <code>rejected</code> fields, for <a href="05-preference-alignment.html">chapter 05</a>.</p>
+  <p>Store the claim data in messages shape, with the source claim as the user turn and the adjuster-approved summary as the assistant turn. Convert once, before the chat template, because TRL recommends doing conversions on the conversational form. Keep each example's metadata beside it, not inside it: claim ID, claim type, region, source, and edit distance. You will need those to split, to slice and to explain a result.</p>
+</section>
+
+<section id="sources">
+  <h2>Where the examples come from</h2>
+  <p>Harbourline has 18 months of claims whose summaries adjusters edited, which is the best kind of data: real inputs, with a human-approved target. Three choices decide its quality.</p>
+  <p><strong>Take the final edited summary as the target, not the model's draft.</strong> The draft is what the old process produced, and the edit is the correction. Edit distance is a useful signal in both directions. An untouched draft means the adjuster accepted it, which is weak evidence of quality, because tired reviewers click through. A heavy rewrite means the draft was poor, or that this adjuster writes unlike the others. Bucket by edit size and review samples from each bucket before deciding what to keep.</p>
+  <p><strong>Split by claim, not by row.</strong> A claim edited twice yields two rows. If one lands in training and one in the held-out set, the held-out score is inflated by a near-copy. Pull the 400 held-out claims, and every row for those claim IDs, out of the pool first, and then check the training pool against the held-out set for near-duplicates. This is the same leak that <a href="../llm-evals-deep-dive/02-building-the-eval-set.html#held-out">the eval-set chapter</a> guards against from the other side.</p>
+  <p><strong>Decide where synthetic data helps.</strong> When real examples are scarce for a slice, a stronger model can draft more. Llama 3 leaned on this: the paper says that because most of its post-training data was model-generated, it needed careful cleaning and quality control. The risk for Harbourline is not quality but terms, which come next.</p>
+</section>
+
+<section id="terms">
+  <h2>Synthetic data and the terms that govern it</h2>
+  <p>Using one model's outputs to train another is governed by the contract or licence of the model that wrote them. Two sources could be checked directly.</p>
+  <ul>
+    <li><strong>Anthropic.</strong> The Commercial Terms, in the version dated 17 June 2025 that the page showed in November 2026, say in section D.4(a) that a customer may not "access the Services to build a competing product or service, including to train competing AI models".</li>
+    <li><strong>Llama.</strong> The Llama 3.1 model card says a model built or improved using Llama materials or outputs must carry "Llama" at the start of its name.</li>
+  </ul>
+  <p>OpenAI's current terms could not be read, as the page refused automated requests, so they are not quoted. Read the generator's current terms yourself on the day you generate. The cautionary example in public is Stanford Alpaca: its 52,000 outputs were generated by <code>text-davinci-003</code>, and the project licensed the data for non-commercial use only and says the model is for research.</p>
+  <p>Whether an internal claims summariser "competes" with Claude is a legal question, and the sentence is broad enough that counsel should answer it, not an engineer. Harbourline's position is sharper than most, since candidate A exists to replace a Sonnet 5.5 call. The safe design needs no ruling. Use the adjusters' own edited summaries as targets, which are Harbourline's data. If you need synthetic augmentation, generate it with a teacher whose licence you have read and that permits it, such as an Apache-2.0 open-weight model, whose terms cover the weights and not the outputs. Record the generator and its version on every synthetic row, so a later change in terms means a filter and not an archaeology project.</p>
+</section>
+
+<section id="filter">
+  <h2>Filtering and deduplication</h2>
+  <p>Duplicates do damage in three ways. A string repeated many times is memorised, so it comes back verbatim. Repeats push the weighting of what the model learns toward the repeated cases. And duplicates between training and held-out sets inflate the evaluation. Lee et al. (2021) found that over 1% of unprompted output from models trained on standard corpora reproduced training text verbatim, that deduplication cut how often models emitted memorised text by a factor of ten, and that train-test overlap affected over 4% of the validation sets of standard datasets.</p>
+  <p>Exact duplicates fall to a hash. Near-duplicates need MinHash, a technique from Broder (1997): break each text into word shingles, hash every shingle with many different hash functions, and keep the minimum per function. The chance that two texts share a minimum equals the Jaccard similarity of their shingle sets, so a signature of 64 numbers estimates similarity without comparing full texts. Banding makes it fast: cut the signature into 16 bands of 4 rows, and mark two texts as a candidate pair if any band matches exactly. A pair with Jaccard similarity <em>s</em> becomes a candidate with probability 1 &minus; (1 &minus; <em>s</em><sup>4</sup>)<sup>16</sup>, which is about 12% at <em>s</em> = 0.3, about 64% at 0.5, and above 99.9% at 0.8. The threshold is steep, which is the point. This sketch runs on the standard library alone.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>dedup.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import hashlib, re
+from collections import defaultdict
+
+NUM_PERM, BANDS = 64, 16            # 16 bands of 4 rows
+ROWS = NUM_PERM // BANDS
+
+def shingles(text, k=3):
+    w = re.findall(r"\w+", text.lower())
+    return {" ".join(w[i:i + k]) for i in range(max(1, len(w) - k + 1))}
+
+def h(s, seed):
+    salt = seed.to_bytes(8, "little")
+    return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8, salt=salt).digest(), "big")
+
+def signature(sh):
+    return [min(h(s, p) for s in sh) for p in range(NUM_PERM)]
+
+def candidate_pairs(sigs):
+    buckets = defaultdict(list)
+    for i, sig in enumerate(sigs):
+        for b in range(BANDS):
+            buckets[(b, tuple(sig[b * ROWS:(b + 1) * ROWS]))].append(i)
+    return {(x, y) for ids in buckets.values() for x in ids for y in ids if x &lt; y}</code></pre>
+  </div>
+  <p>On three variants of one motor-claim summary plus an unrelated property summary, it flagged the three variants against one another, at exact Jaccard similarities of 0.90, 0.84 and 0.75, and did not flag the property summary, whose similarity to the first was 0.00. Real summaries share more boilerplate than invented ones, so tune the threshold on a sample you have inspected. Embedding near-duplicates catch paraphrases that share few words. Llama 3 clustered whole dialogues, sorted each cluster by quality times difficulty, and kept an example only if its cosine similarity to those already kept stayed under a threshold.</p>
+  <p>Quality scoring comes after. The same paper scored samples two ways, with a reward model and with a Llama prompt that rated accuracy, instruction following and tone on a three-point scale, and found the two disagreed often, so it kept examples either one marked high quality. Use that lesson: a model-based score is one signal, to be checked against humans before it removes anything. Calibrate it as <a href="../llm-evals-deep-dive/04-llm-as-judge.html#calibration">the judge chapter</a> describes. Add rules for the cheap failures: empty or truncated summaries, summaries that copy the whole claim, wrong language, and text that mentions a policy term absent from the source claim.</p>
+</section>
+
+<section id="funnel">
+  <h2>How many examples, and the Harbourline funnel</h2>
+  <p>LIMA fine-tuned a 65B model on 1,000 curated examples and matched or beat GPT-4 in 43% of a human study. That figure is an upper bound on how little a style needs, and it tells you that quality dominates the count. It does not mean 1,000 will do for your task. LIMA's examples were chosen for diversity across assistant behaviours, and a narrow task has the opposite problem: you need coverage of the variation inside the task. Harbourline's variation is claim type, region, claim length and the odd case, and a slice with a few dozen examples will be learned unevenly.</p>
+  <p>Do not guess the count. Measure a learning curve: train on 25%, 50% and 100% of the cleaned set with a cheap LoRA run each, and score the held-out set. If the score is flat between 50% and 100%, more data of the same kind will not help, and the next move is data for the weakest slice. If it is still rising, collect more. The exception is the very early stage, before you have a model and an eval pipeline, when a few hundred hand-checked examples are worth more than any filter.</p>
+  <p>Harbourline's funnel, with the stage counts illustrative:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Stage</th><th>Removed</th><th>Left</th></tr></thead>
+    <tbody>
+      <tr><td>Claim and edited-summary pairs, 18 months</td><td></td><td>40,000</td></tr>
+      <tr><td>Exact duplicates</td><td>3,100</td><td>36,900</td></tr>
+      <tr><td>Near-duplicates (MinHash and embeddings)</td><td>5,900</td><td>31,000</td></tr>
+      <tr><td>Redaction failed or personal data left</td><td>1,200</td><td>29,800</td></tr>
+      <tr><td>Adjuster barely edited or fully rewrote the draft</td><td>4,300</td><td>25,500</td></tr>
+      <tr><td>Scored low on quality, or failed rules</td><td>3,500</td><td>22,000</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The 400 held-out claims were removed before the first row, and the 22,000 are checked against them. Report the funnel alongside the model. If a slice shrinks far more than the rest, for instance UK liability, you have learned where the tuned model will be weakest before training starts.</p>
+</section>
+
+<section id="review">
+  <h2>Personal data, review and agreement</h2>
+  <p>Claims text holds names, addresses, phone numbers, policy and registration numbers, and health details. Carlini et al. (2021) showed that a trained model can leak training examples: against GPT-2 they extracted hundreds of verbatim sequences, including names, phone numbers and email addresses, some from a single training document. A tuned model that saw a claimant's details once can emit them. So remove personal data from the targets that the model is meant to learn, or replace it with consistent placeholders, and keep the originals out of the training store. Whether Harbourline may use claims for training, and in which region, is a legal and data-protection decision to settle first. UK data residency, the reason for candidate A, means the tuning data and the training run stay in the UK too.</p>
+  <p>Review is how you find out whether the targets are consistent. Have two adjusters independently mark a sample of 200 edited summaries as acceptable or not. Suppose both accept 150, both reject 20, and they split on 30, 18 one way and 12 the other. Raw agreement is 170 of 200, or 85%. But accept rates of 84% and 81% give a chance agreement of 0.84 × 0.81 + 0.16 × 0.19, which is 0.71, and Cohen's kappa is (0.85 &minus; 0.71) / (1 &minus; 0.71), about 0.48. That is moderate agreement. The chapter on <a href="../llm-evals-deep-dive/04-llm-as-judge.html#calibration">calibration</a> explains the statistic. Moderate means the adjusters disagree about what a good summary is, and a model trained on both will average their habits. Settle a style guide, relabel the disagreements, and only then scale up. If kappa stays low on one slice, that slice's examples cannot teach a stable behaviour whatever their number.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>You fine-tune with a prompt format you wrote by hand, and serve the model through its tokenizer's chat template. Training loss looked fine. What do you expect, and how would you find out?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The model saw one layout in training and meets another at inference, so quality drops without any error. Render the template for a sample and compare training strings against serving strings token by token, including the end-of-turn token. See <a href="#template">the chat template</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The same claim was edited by two adjusters, producing two rows. Where could they end up, and why does it matter?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>If rows are split independently, one can land in training and one in the held-out set, so the held-out score rewards recalling a near-copy. Split by claim ID, and remove all rows for the held-out claims before filtering. See <a href="#sources">where the examples come from</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague wants Sonnet 5.5 to generate 30,000 extra summaries to train the open-weight replacement. What do you ask before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Whether the generator's terms permit it. Anthropic's Commercial Terms bar using the Services to train competing AI models, and whether this model competes is a question for counsel. Prefer adjuster-written targets, or a teacher whose licence you have read, and log the generator on every row. See <a href="#terms">the terms</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two summaries differ by one changed vehicle make. A hash of the text sees them as unrelated. What finds them, and what does a band of four rows do to a pair with Jaccard similarity 0.5?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>MinHash signatures with banding. Each band matches with probability 0.5 to the power 4, about 6%, and across 16 bands the pair becomes a candidate about 64% of the time, while pairs at 0.8 are almost always found. See <a href="#filter">filtering</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your cleaned set has 22,000 examples and the team debates collecting another 20,000. How do you decide without opinion?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Run learning curves at 25%, 50% and 100% of the set and score the held-out set. A flat curve between 50% and 100% says more of the same will not help, so target the weakest slice. A rising curve says collect more. See <a href="#funnel">how many examples</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Two adjusters agree on 85% of accept or reject calls. A manager calls that good. What do you compute, and what could it show?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Chance-corrected agreement, because most summaries are accepted and chance alone gives high agreement. With accept rates near 84% and 81%, kappa is about 0.48, so the targets are inconsistent. Fix the style guide before scaling. See <a href="#review">review and agreement</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The chat template is part of the model: render it, read it, train and serve with the same one, and compute loss on the assistant tokens only.</li>
+    <li>Store data in messages shape with metadata beside it, and split by claim so no near-copy of a held-out claim reaches training.</li>
+    <li>Whether you may train on a model's outputs is set by that model's terms, so prefer your own human targets, log every generator, and send the "competing" question to counsel.</li>
+    <li>Deduplicate exactly and then by similarity, because repeated text is memorised and train-test overlap inflates scores.</li>
+    <li>Model-based quality scores are signals to calibrate against humans, not verdicts.</li>
+    <li>Pick the data volume with a learning curve, not a rule, and report the funnel, because a slice that shrinks most will be weakest.</li>
+    <li>Remove personal data from targets, and check agreement with a chance-corrected statistic before scaling a labelling effort.</li>
+  </ul>
+  <p>With a clean, defensible set in hand, the next chapter trains on it. → <a href="04-supervised-fine-tuning.html">Supervised Fine-Tuning</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://huggingface.co/docs/transformers/chat_templating" target="_blank" rel="noopener"><strong>Chat templates</strong></a> — Hugging Face Transformers documentation. Good for how templates work, the duplicated special token trap and training with a template.</li>
+    <li><a href="https://huggingface.co/docs/trl/dataset_formats" target="_blank" rel="noopener"><strong>Dataset formats and types</strong></a> — Hugging Face TRL documentation. Good for the exact shapes each trainer expects.</li>
+    <li><a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener"><strong>SFT Trainer</strong></a> — Hugging Face TRL documentation. Good for assistant-only and completion-only loss.</li>
+    <li><a href="https://arxiv.org/abs/2305.11206" target="_blank" rel="noopener"><strong>LIMA: Less Is More for Alignment</strong></a> — Zhou et al., 2023. Good for the case that a thousand curated examples can teach a style.</li>
+    <li><a href="https://arxiv.org/abs/2107.06499" target="_blank" rel="noopener"><strong>Deduplicating Training Data Makes Language Models Better</strong></a> — Lee et al., 2021. Good for the measured effects of duplicates on memorisation and evaluation.</li>
+    <li><a href="https://arxiv.org/abs/2012.07805" target="_blank" rel="noopener"><strong>Extracting Training Data from Large Language Models</strong></a> — Carlini et al., 2021. Good for why personal data in training text can come back out.</li>
+    <li><a href="https://www.anthropic.com/legal/commercial-terms" target="_blank" rel="noopener"><strong>Commercial Terms of Service</strong></a> — Anthropic, read November 2026. Good for the clause on building competing products and training competing models.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
