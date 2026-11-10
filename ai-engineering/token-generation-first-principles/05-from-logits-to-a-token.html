@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>From Logits to a Token — Token Generation from First Principles</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapter 04 ended with a vector of 128,256 numbers. This chapter turns it into one token: softmax and temperature with a worked distribution, top-k, top-p and…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/token-generation-first-principles/05-from-logits-to-a-token">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="From Logits to a Token — Token Generation from First Principles">
+<meta property="og:description" content="Chapter 04 ended with a vector of 128,256 numbers. This chapter turns it into one token: softmax and temperature with a worked distribution, top-k, top-p and…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/token-generation-first-principles/05-from-logits-to-a-token">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#logits">What the forward pass hands over</a>
+    <a href="#softmax">Softmax and temperature</a>
+    <a href="#truncation">Cutting the tail: top-k, top-p, min-p</a>
+    <a href="#penalties">Penalties, and why Harbourline avoids them</a>
+    <a href="#search">Greedy, sampling and beam search</a>
+    <a href="#logprobs">Logprobs: what they tell you and what they cannot</a>
+    <a href="#determinism">Why temperature 0 still varies</a>
+    <a href="#masking">Structured decoding is logit masking</a>
+    <a href="#settings">The Harbourline settings and why</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-the-block-and-the-forward-pass.html">← Previous: The Block and the Forward Pass</a>
+    <a href="06-the-generation-loop.html">Next: The Generation Loop →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Generation</span>
+  <h1>From Logits to a Token</h1>
+  <p class="subtitle">Chapter 04 ended with a vector of 128,256 numbers. This chapter turns it into one token: softmax and temperature with a worked distribution, top-k, top-p and min-p, penalties, greedy against beam search, logprobs, why temperature 0 still varies, and logit masking for structured output.</p>
+</header>
+
+<section id="logits">
+  <h2>What the forward pass hands over</h2>
+  <p>The last block's output goes through a final RMSNorm and then the output head, the 4,096 × 128,256 matrix that <a href="04-the-block-and-the-forward-pass.html#count">chapter 04</a> counted at 525 million parameters. The result for the newest position is a vector of 128,256 <strong>logits</strong>, one real number per vocabulary entry. In float32 that is 513,024 bytes, about half a megabyte per generated token. A logit is an unnormalised score: bigger means more likely.</p>
+  <p>Everything in this chapter happens between that vector and the integer id of the next token. It is a small program that runs after every forward pass, and its settings are the generation controls most applications touch. Harbourline runs two configurations side by side: claims extraction, with temperature 0, JSON output and at most 400 new tokens, and the help-centre chat, with temperature 0.7, top-p 0.9 and streaming. The rest of the chapter explains why those two differ.</p>
+</section>
+
+<section id="softmax">
+  <h2>Softmax and temperature</h2>
+  <p>Softmax turns logits <em>z</em> into probabilities. Temperature <em>T</em> divides the logits first:</p>
+  <div class="flow">  p_i = exp(z_i / T) / Σ_j exp(z_j / T)
+
+  T = 1    the model's own distribution
+  T → 0    all mass on the largest logit (greedy)
+  T → ∞    uniform over the vocabulary</div>
+  <p>Dividing by <em>T</em> scales the gaps between logits. A gap of 1.4 between two tokens becomes 2.0 at T = 0.7 and 0.93 at T = 1.5, so the winner pulls further ahead when you cool the distribution and closer when you heat it. Here is a worked case. Suppose the model has read the Harbourline prompt and is about to write the first word of its answer to "What is my deductible for windscreen damage on policy HL-UK-4471-220?". The logits below are illustrative, not read from a real model, and the example keeps five candidates and treats the other 128,251 as negligible.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>sampling.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">import math
+
+tokens = [" £", " $", " 100", " nil", " the"]
+logits = [6.0, 4.6, 4.0, 3.2, 2.0]            # illustrative
+
+def softmax(z, T=1.0):
+    m = max(z)                                 # subtract the max for numerical stability
+    e = [math.exp((x - m) / T) for x in z]
+    s = sum(e)
+    return [x / s for x in e]
+
+def top_p(p, thr):
+    keep, c = set(), 0.0
+    for i in sorted(range(len(p)), key=lambda i: -p[i]):
+        keep.add(i); c += p[i]
+        if c &gt;= thr: break
+    q = [x if i in keep else 0.0 for i, x in enumerate(p)]
+    return [x / sum(q) for x in q]
+
+def min_p(p, base):
+    th = base * max(p)
+    q = [x if x >= th else 0.0 for x in p]
+    return [x / sum(q) for x in q]
+
+for T in (0.2, 0.7, 1.0, 1.5):
+    print(T, [round(x, 3) for x in softmax(logits, T)])
+p = softmax(logits, 0.7)
+print("top-p 0.9", [round(x, 3) for x in top_p(p, 0.9)])
+print("min-p 0.1", [round(x, 3) for x in min_p(p, 0.1)])</code></pre>
+  </div>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Token</th><th>logit</th><th>T = 0.2</th><th>T = 0.7</th><th>T = 1.0</th><th>T = 1.5</th></tr></thead>
+    <tbody>
+      <tr><td class="term">" £"</td><td>6.0</td><td>0.999</td><td>0.823</td><td>0.684</td><td>0.532</td></tr>
+      <tr><td class="term">" $"</td><td>4.6</td><td>0.001</td><td>0.111</td><td>0.169</td><td>0.209</td></tr>
+      <tr><td class="term">" 100"</td><td>4.0</td><td>0.000</td><td>0.047</td><td>0.093</td><td>0.140</td></tr>
+      <tr><td class="term">" nil"</td><td>3.2</td><td>0.000</td><td>0.015</td><td>0.042</td><td>0.082</td></tr>
+      <tr><td class="term">" the"</td><td>2.0</td><td>0.000</td><td>0.003</td><td>0.013</td><td>0.037</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>At T = 1 the model puts 68% on " £" and sends one answer in three down a different path. At 0.7 the leader holds 82%, and at 0.2 the choice is effectively fixed. Temperature reshapes the whole distribution, tail included. A real 128,256-way distribution has thousands of tail tokens with tiny shares, and heating it lifts their sum. That is why high temperature produces the occasional nonsense token, and why the next section exists.</p>
+</section>
+
+<section id="truncation">
+  <h2>Cutting the tail: top-k, top-p, min-p</h2>
+  <p>Truncation sets the probability of unlikely tokens to zero and renormalises what remains. Three rules differ in how they decide what is unlikely.</p>
+  <ul>
+    <li><strong>Top-k</strong> keeps the <em>k</em> highest-probability tokens. Fan et al. used <em>k</em> = 10 for story generation. It is blind to the shape of the distribution: the cut falls after the third token whether the model is sure or has a hundred equally good options.</li>
+    <li><strong>Top-p</strong>, or nucleus sampling, keeps the smallest set whose probabilities sum to at least <em>p</em>. Holtzman et al. introduced it because the right number of candidates changes from step to step. With <em>p</em> = 0.9 and T = 0.7, " £" alone covers 0.823, so the loop adds " $" to reach 0.935 and stops. Two tokens survive and renormalise to 0.881 and 0.119.</li>
+    <li><strong>Min-p</strong> keeps tokens whose probability is at least <em>p</em><sub>base</sub> times the top token's probability. Nguyen et al. proposed it in 2024. With <em>p</em><sub>base</sub> = 0.1 the threshold is 0.1 × 0.823 = 0.082 and the survivors are the same two tokens. The threshold follows the model's confidence. If the top token has 95%, the threshold is 9.5% and nearly everything else goes. If the top token has 12%, the threshold is 1.2% and many candidates stay.</li>
+  </ul>
+  <p>Order matters and is an engine choice. The numbers above apply temperature first, then truncate, then renormalise. Another stack may truncate on the raw distribution and apply temperature afterwards, which gives different survivors at the same settings, so check what your serving engine does before you copy settings from a paper or another provider. The model vendors' own advice is a reasonable starting point: the GLM-5.3 model card states temperature 1.0 and top-p 0.95 for one of its evaluations, and the Llama 3.1 8B Instruct generation config ships temperature 0.6 and top-p 0.9.</p>
+</section>
+
+<section id="penalties">
+  <h2>Penalties, and why Harbourline avoids them</h2>
+  <p>Repetition penalties edit the logits of tokens already seen. The CTRL paper (Keskar et al.) multiplies the temperature applied to every already generated token by a factor θ, and reports θ ≈ 1.2 as a good balance with greedy decoding. OpenAI's API instead subtracts: <code>mu[j] = mu[j] - c[j] × alpha_frequency - (c[j] &gt; 0 ? alpha_presence : 0)</code>, where <code>c[j]</code> is how many times token <em>j</em> has been sampled so far. The frequency penalty grows with each repeat. The presence penalty is a one-off charge. The frequency penalty takes values from -2.0 to 2.0 in the API.</p>
+  <p>The failure mode is easy to see with Harbourline's data. The answer must repeat <code>HL-UK-4471-220</code> exactly, and that identifier is several tokens long, with pieces such as the dash and the digits reappearing within a single sentence. A frequency penalty of 0.5 on a token that has already appeared three times lowers its logit by 1.5. In the table above that moves " 100" from 4.0 to 2.5 and its probability at T = 0.7 from 0.047 to 0.006. The same pressure acts on policy numbers, repeated amounts and JSON keys. Penalties exist to stop loops in open-ended prose, and they work against any output where repetition is correct. The flip case is a model that does loop at low temperature; then a mild penalty, or a switch to sampling, is the lesser evil. For both Harbourline surfaces, leave them at zero.</p>
+</section>
+
+<section id="search">
+  <h2>Greedy, sampling and beam search</h2>
+  <p><strong>Greedy</strong> decoding takes the highest-probability token at each step, which is temperature 0. <strong>Sampling</strong> draws from the (possibly truncated) distribution. <strong>Beam search</strong> keeps the <em>b</em> highest-scoring partial sequences, extends each, and keeps the best <em>b</em> again, returning the sequence with the highest total log-probability. It searches for the single most probable sequence, which is not the same as a good one. Holtzman et al. found that maximisation-based decoding such as beam search leads to text that is bland, incoherent or stuck in repetitive loops, and that human text does not sit at the high-probability peak. Beam search still suits tasks with one short correct output, such as translation. For chat it multiplies the decode work and cache by roughly <em>b</em> and, on Holtzman's evidence, buys blander text.</p>
+</section>
+
+<section id="logprobs">
+  <h2>Logprobs: what they tell you and what they cannot</h2>
+  <p>Some APIs return the log-probability of each generated token and, on request, the top alternatives at each position. OpenAI's chat completions take <code>top_logprobs</code> between 0 and 20. The Messages API for Claude, in the reference as of November 2026, has no logprobs parameter, so a design that depends on them rules out those models. Where available they support two useful things.</p>
+  <ul>
+    <li><strong>Classification with a score.</strong> Ask the model to answer with one label and read the probability of the first token, which gives a ranking you can threshold. This is how <a href="../llm-evals-deep-dive/04-llm-as-judge.html">an LLM judge</a> can return a graded confidence instead of a verdict.</li>
+    <li><strong>Flagging low-confidence spans.</strong> A drop in the probability of a number or identifier is a cheap signal to route an answer to review, and it shows where two runs forked.</li>
+  </ul>
+  <p>They cannot tell you whether a statement is true. A logprob measures how surprising a token is given the preceding text, and a fluent wrong deductible can be a high-probability continuation. Calibration is also uneven. The GPT-4 technical report found the pre-trained model highly calibrated on a subset of MMLU and noted that post-training reduced the calibration. Kadavath et al. found that larger models are well calibrated on multiple-choice questions when the question is in the right format. Neither result transfers to a free-text answer. Treat logprobs as a ranking signal you validate on a labelled set, as <a href="../llm-evals-deep-dive/index.html">the evals guide</a> does for judges, not as the probability that an answer is correct.</p>
+</section>
+
+<section id="determinism">
+  <h2>Why temperature 0 still varies</h2>
+  <p>Greedy decoding looks deterministic: same prompt, same weights, same argmax. In practice hosted and self-hosted endpoints often return different text on repeated calls. The usual explanation, that GPUs add floating-point numbers in a random order, is not the main cause. Horace He and colleagues at Thinking Machines showed that the kernels in a typical inference stack are run-to-run deterministic for a fixed input. What they lack is <strong>batch invariance</strong>: the numeric result for your request depends on how many other requests share the batch, because the reduction order inside matrix multiplications, attention and RMSNorm changes with the batch shape. The server's load is not under your control, so the batch size your request sees varies, the low-order bits of the logits shift, and floating-point addition is not associative, so occasionally two near-equal logits swap places.</p>
+  <p>Their measurement makes the size of the effect concrete. They sampled 1,000 completions of 1,000 tokens at temperature 0 from Qwen3-235B-A22B-Instruct-2507 and got 80 unique completions. All 1,000 matched for the first 102 tokens and first diverged at token 103, where 992 wrote "Queens, New York" and 8 wrote "New York City". With their batch-invariant kernels enabled, all 1,000 were identical. The price was speed: on a separate test with Qwen3-8B, 1,000 requests took 26 seconds on default vLLM, 55 seconds on their unoptimised deterministic build and 42 seconds with an improved attention kernel.</p>
+  <p>For Harbourline's claims extraction this means "temperature 0" is a request for the most likely path, not a guarantee of identical bytes. Design for it: validate against a schema and compare extractions on field values, not raw text. OpenAI documents its <code>seed</code> parameter as a best effort whose determinism is not guaranteed, and now marks it deprecated. If you need reproducibility on your own hardware, a batch-invariant mode in your engine is the lever, and it costs speed. On Claude models since version 4.7 you cannot set temperature at all: the API documentation says <code>temperature</code>, <code>top_p</code> and <code>top_k</code> are not supported on those models and a non-default value returns a 400 error, and from API version 2026-10-21 any value does. Without them a request samples at temperature 1.0, and Anthropic's advice is to steer behaviour with prompting.</p>
+</section>
+
+<section id="masking">
+  <h2>Structured decoding is logit masking</h2>
+  <p>Constrained decoding adds one step before softmax. A grammar or JSON schema defines which tokens may legally come next given what has been written. The engine sets the logits of all other tokens to negative infinity, so their probability after softmax is exactly zero, and then samples as usual. At every step the output stays a valid prefix of the grammar. The model's own preferences still choose among the legal tokens, so the quality of the content is the model's, and only the syntax is guaranteed. A masked decode can still produce a well-formed JSON object with a wrong deductible in it. The mechanics and the engines that support them are in <a href="../serving-open-weight-models/09-structured-output-and-constrained-decoding.html">structured output and constrained decoding</a>.</p>
+</section>
+
+<section id="settings">
+  <h2>The Harbourline settings and why</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Setting</th><th>Claims extraction</th><th>Help-centre chat</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Temperature</td><td>0</td><td>0.7</td><td>Extraction wants the most likely reading of the form. Chat wants wording that does not repeat verbatim across customers.</td></tr>
+      <tr><td class="term">Top-p</td><td>not needed</td><td>0.9</td><td>At 0.7 the tail is already small. Top-p trims what remains.</td></tr>
+      <tr><td class="term">Penalties</td><td>0</td><td>0</td><td>Identifiers, amounts and JSON keys must repeat.</td></tr>
+      <tr><td class="term">Max new tokens</td><td>400</td><td>set by the longest acceptable answer</td><td>A cap that fits the schema turns a runaway into a visible truncation. Chapter 06 covers stop conditions.</td></tr>
+      <tr><td class="term">Structure</td><td>JSON schema mask</td><td>none</td><td>Downstream code parses extraction output. Chat is read by people.</td></tr>
+      <tr><td class="term">Streaming</td><td>off</td><td>on</td><td>A parser needs the whole object. A reader benefits from the first words early.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Treat these as starting points to test. If the chat's answers are too uniform, raise temperature or try min-p before touching penalties. If extraction drifts between runs, look at the schema and the prompt before the sampler, since at temperature 0 the sampler has done all it can. If the model behind either surface is a recent Claude model, these knobs do not exist: the configuration moves into the prompt, a schema and an evaluation set that catches drift.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Two logits differ by 1.4. By what factor does the ratio of their probabilities change when you move from T = 1 to T = 0.5, and in which direction?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The ratio of probabilities is exp(gap / T). At T = 1 it is exp(1.4) = 4.06. At T = 0.5 the gap acts as 2.8 and the ratio is exp(2.8) = 16.4. The leader pulls ahead by a factor of 4. See <a href="#softmax">Softmax and temperature</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Compare top-p at 0.9 and min-p with base 0.1 on a flat distribution (top token 12%, fifty tokens near 10%) and on a peaked one (top token 95%). What does each keep?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Top-p at 0.9 keeps dozens on the flat distribution and only the leader on the peaked one. Min-p thresholds are 1.2% and 9.5%, so it also keeps the near-ties in the flat case and cuts nearly everything in the peaked case. Top-k keeps <em>k</em> in both. See <a href="#truncation">Cutting the tail</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why would a frequency penalty damage claims extraction even though it helps chat avoid loops?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It lowers the logit of every token in proportion to how often it has already appeared. The output legitimately repeats policy numbers, amounts and JSON keys, so the penalty pushes the model away from the correct token. See <a href="#penalties">Penalties</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A teammate saw two different extractions from the same document at temperature 0 and concluded the sampler is random. What actually changed, and what do you check first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Likely the batch the request ran in, because kernels are deterministic run to run but not invariant to batch size, so near-tied logits can swap. First compare the logprobs of the two paths at the point they diverge: a small gap confirms a near tie. See <a href="#determinism">Why temperature 0 still varies</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A JSON-schema mask guarantees valid output. Name one thing it does not guarantee, and one thing that could make you distrust a high logprob on a deductible figure.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It does not guarantee the values are correct; the model still picks among legal tokens. A high logprob measures fluency in context, not truth, and calibration after post-training can be poor. See <a href="#masking">Structured decoding is logit masking</a> and <a href="#logprobs">Logprobs</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>The forward pass yields 128,256 logits per step, and a small sampling program turns them into one token id without changing the model.</li>
+    <li>Temperature divides the logits before softmax, so the probability ratio of two tokens becomes exp(gap / T). It reshapes the tail as well as the head.</li>
+    <li>Top-p and min-p adapt the candidate set to the shape of the distribution, and top-k does not. The order in which an engine applies temperature and truncation changes the result.</li>
+    <li>Repetition and frequency penalties help prose and hurt any output that must repeat identifiers, amounts or keys, so Harbourline sets them to zero.</li>
+    <li>Temperature 0 does not guarantee identical output on a shared server, because kernels are not batch-invariant. Design for tolerant comparison.</li>
+    <li>Structured decoding masks illegal tokens to negative infinity before sampling. It guarantees syntax and nothing about truth.</li>
+    <li>Logprobs rank tokens by the model's own surprise and need validating on labelled data. Recent Claude models expose neither logprobs nor sampling parameters.</li>
+  </ul>
+  <p>Sampling runs once per token, and generation is that loop repeated until something tells it to stop. → <a href="06-the-generation-loop.html">The Generation Loop</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener"><strong>The Curious Case of Neural Text Degeneration</strong></a> — Holtzman et al., 2020. Nucleus sampling and the case against maximisation-based decoding.</li>
+    <li><a href="https://arxiv.org/abs/1805.04833" target="_blank" rel="noopener"><strong>Hierarchical Neural Story Generation</strong></a> — Fan, Lewis and Dauphin, 2018. The top-k sampling scheme.</li>
+    <li><a href="https://arxiv.org/abs/2407.01082" target="_blank" rel="noopener"><strong>Turning Up the Heat: Min-p Sampling</strong></a> — Nguyen et al., 2025. The min-p rule and its comparison with top-p at high temperature.</li>
+    <li><a href="https://arxiv.org/abs/1909.05858" target="_blank" rel="noopener"><strong>CTRL</strong></a> — Keskar et al., 2019. The repetition penalty with θ ≈ 1.2.</li>
+    <li><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/" target="_blank" rel="noopener"><strong>Defeating Nondeterminism in LLM Inference</strong></a> — He and Thinking Machines, 2025. Batch invariance and the 1,000-completion experiment.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/advanced-usage" target="_blank" rel="noopener"><strong>OpenAI advanced usage</strong></a> — OpenAI. The additive form of the frequency and presence penalties.</li>
+    <li><a href="https://platform.claude.com/docs/en/api/migration-2026-10-21" target="_blank" rel="noopener"><strong>Migrating to API version 2026-10-21</strong></a> — Anthropic. Removal of temperature, top-p and top-k.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

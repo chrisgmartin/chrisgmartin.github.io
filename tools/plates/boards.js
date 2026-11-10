@@ -126,6 +126,40 @@
     d.text(200,f[2].y+f[2].h+22,'one set measures every layer · recall@k per slice',{size:9.5});
     d.note(14,272,'wrong answer, right document in the index?\nforce the gold passage into the prompt:\nif the answer flips, the breach is upstream',{size:10});
   };
+  B['ai-engineering/token-generation-first-principles']=function(d){
+    d.title('One token at a time');
+    var t=d.box(14,58,76,38,'text →\ntoken ids',{size:9.5});
+    var e=d.box(104,58,76,38,'embed +\nposition',{size:9.5});
+    var blk=d.box(194,52,110,50,'32 × [attention\n+ feed-forward]',{wash:1,size:9.5});
+    var lg=d.box(318,58,70,38,'logits\n128,256',{size:9.5});
+    d.connect(t,e);d.connect(e,blk);d.connect(blk,lg);
+    var smp=d.round(300,136,88,34,'sample one',{red:1,size:10});
+    d.arrow(lg.cx,lg.y+lg.h+2,smp.cx,smp.y-2,{});
+    d.note(300,186,'temperature · top-p',{size:9.5});
+    d.line(smp.x-2,smp.cy,52,smp.cy,{});d.arrow(52,smp.cy,52,t.y+t.h+2,{});
+    d.note(60,160,'append and go again',{size:9.5});
+    var kv=d.box(150,200,120,36,'KV cache\nremembers the past',{size:9.5});
+    d.line(blk.cx,blk.y+blk.h+2,blk.cx,kv.y-2,{dash:1});
+    d.note(14,214,'128 KB per token\nfor the worked model',{size:9.5});
+    d.note(14,258,'quadratic without the cache,\nlinear with it',{size:9.5});
+    d.note(200,296,'a wrong answer is a probable continuation that was false',{size:9.5});
+  };
+  B['ai-engineering/securing-llm-applications']=function(d){
+    d.title('The model cannot tell data from orders');
+    var sp=d.box(14,56,88,40,'system prompt\n(yours)',{size:9.5});
+    var um=d.box(112,56,80,40,'user\nmessage',{size:9.5});
+    var doc=d.box(202,56,88,40,'retrieved doc\n/ uploaded PDF',{red:1,size:9.5});
+    var tr=d.box(300,56,86,40,'tool results\nweb · email',{red:1,size:9.5});
+    var m=d.round(140,136,120,40,'one token stream',{wash:1,size:10.5});
+    d.connect(sp,m);d.connect(um,m);d.connect(doc,m);d.connect(tr,m);
+    d.note(296,104,'untrusted',{size:9.5});
+    var act=d.box(120,212,160,40,'actions: writes · URLs · output',{size:9.5});
+    d.connect(m,act);
+    d.ring(110,206,180,52);
+    d.note(296,224,'defend here:\nleast privilege\nconfirm writes\nno exfil channel',{size:9.5});
+    d.note(14,224,'filters catch\nstrings, not\nintent',{size:9.5});
+    d.note(14,296,'99% holds × 40k sessions a day = hundreds of failures');
+  };
   B['ai-engineering/serving-open-weight-models']=function(d){
     d.title('Memory-bound, so budget the bytes');
     d.text(200,50,'one 80 GB GPU',{size:10.5});

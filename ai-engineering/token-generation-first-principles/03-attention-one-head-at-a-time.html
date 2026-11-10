@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Attention, One Head at a Time — Token Generation from First Principles</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapter 02 gave every position a vector and a sense of where it sits. This chapter takes attention one head at a time: queries, keys and values, a worked…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/token-generation-first-principles/03-attention-one-head-at-a-time">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Attention, One Head at a Time — Token Generation from First Principles">
+<meta property="og:description" content="Chapter 02 gave every position a vector and a sense of where it sits. This chapter takes attention one head at a time: queries, keys and values, a worked…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/token-generation-first-principles/03-attention-one-head-at-a-time">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#idea">What one head computes</a>
+    <a href="#qkv">The three projections, with Llama 3.1's shapes</a>
+    <a href="#worked">A worked example with three tokens</a>
+    <a href="#mask">The causal mask and the softmax</a>
+    <a href="#heads">Many heads, and the output projection</a>
+    <a href="#gqa">MQA and GQA: sharing keys and values</a>
+    <a href="#quadratic">The quadratic cost</a>
+    <a href="#circuits">What heads turn out to do</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="02-embeddings-and-position.html">← Previous: Embeddings and Position</a>
+    <a href="04-the-block-and-the-forward-pass.html">Next: The Block and the Forward Pass →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Inside the model</span>
+  <h1>Attention, One Head at a Time</h1>
+  <p class="subtitle">Chapter 02 gave every position a vector and a sense of where it sits. This chapter takes attention one head at a time: queries, keys and values, a worked three-token example with the numbers shown, the causal mask, multi-head and grouped-query attention with the KV-cache arithmetic, the quadratic cost, and what heads turn out to do.</p>
+</header>
+
+<section id="idea">
+  <h2>What one head computes</h2>
+  <p>When the model reaches <em>windscreen</em> in Harbourline's question, the vector at that position knows little beyond the word. To produce the right next token it needs the policy number thirty tokens later, the deductible in a retrieved passage a thousand tokens earlier, and the instruction in the system prompt. Attention is the only mechanism that moves information between positions. Each position issues a <strong>query</strong>, every earlier position offers a <strong>key</strong> to be matched against, and a position whose key matches well contributes its <strong>value</strong> to the result. The output at each position is a weighted average of value vectors, with weights set by how well queries and keys match. Everything else in a transformer works on one position at a time.</p>
+  <p>Query, key and value are three linear views of the same <a href="02-embeddings-and-position.html#residual">residual-stream</a> vector, so what a token asks for can differ from what it advertises and from what it hands over.</p>
+</section>
+
+<section id="qkv">
+  <h2>The three projections, with Llama 3.1's shapes</h2>
+  <p>Each projection is a learned matrix. With <code>x</code> the residual-stream vector of one position, <code>q = x·W_Q</code>, <code>k = x·W_K</code> and <code>v = x·W_V</code>. For Llama 3.1 8B (hidden size 4,096, 32 query heads, 8 key-value heads, head dimension 128) the shapes are:</p>
+  <table>
+    <thead><tr><th>Matrix</th><th>Shape</th><th>Parameters</th></tr></thead>
+    <tbody>
+      <tr><td class="term">W_Q</td><td>4,096 × (32 × 128)</td><td>16,777,216</td></tr>
+      <tr><td class="term">W_K</td><td>4,096 × (8 × 128)</td><td>4,194,304</td></tr>
+      <tr><td class="term">W_V</td><td>4,096 × (8 × 128)</td><td>4,194,304</td></tr>
+      <tr><td class="term">W_O (output projection)</td><td>(32 × 128) × 4,096</td><td>16,777,216</td></tr>
+      <tr><td class="term">Per layer</td><td></td><td>41,943,040</td></tr>
+      <tr><td class="term">32 layers</td><td></td><td>1,342,177,280</td></tr>
+    </tbody>
+  </table>
+  <p>Attention holds about 1.34 billion of the 8.03 billion parameters, roughly a sixth. <a href="04-the-block-and-the-forward-pass.html">Chapter 04</a> derives the rest. The unequal shapes of W_Q against W_K and W_V are grouped-query attention, covered below.</p>
+</section>
+
+<section id="worked">
+  <h2>A worked example with three tokens</h2>
+  <p>Take three tokens, <em>windscreen</em>, <em>damage</em>, <em>excess</em>, a model width of 4 and a head dimension d_k of 2. The matrices are made-up integers; a real model learns them.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>attn_demo.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import numpy as np
+np.set_printoptions(precision=3, suppress=True)
+
+tokens = ["windscreen", "damage", "excess"]
+X = np.array([[1, 0, 1, 0],        # one row per token: d_model = 4
+              [0, 2, 0, 1],
+              [1, 1, 1, 1]], dtype=float)
+Wq = np.array([[1, 0], [0, 1], [1, 0], [0, 1]], dtype=float)   # d_model x d_k, d_k = 2
+Wk = np.array([[1, 0], [0, 1], [0, 1], [1, 0]], dtype=float)
+Wv = np.array([[1, 0], [0, 1], [1, 1], [0, 0]], dtype=float)
+
+Q, K, V = X @ Wq, X @ Wk, X @ Wv
+scores = Q @ K.T / np.sqrt(Q.shape[1])                 # 3 x 3, scaled by sqrt(d_k)
+mask = np.triu(np.ones_like(scores), k=1).astype(bool)  # True above the diagonal = future
+masked = np.where(mask, -np.inf, scores)
+weights = np.exp(masked - masked.max(axis=1, keepdims=True))
+weights /= weights.sum(axis=1, keepdims=True)
+out = weights @ V
+
+for name, m in [("Q", Q), ("K", K), ("V", V), ("scores", scores), ("weights", weights), ("output", out)]:
+    print(name); print(m)</code></pre>
+</div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">Q          K          V          scores (QK^T / sqrt 2)       weights (after mask, softmax)    output
+[2 0]      [1 1]      [2 1]      [1.414 1.414 2.828]          [1.000 0.000 0.000]              [2.000 1.000]
+[0 3]      [1 2]      [0 2]      [2.121 4.243 4.243]          [0.107 0.893 0.000]              [0.214 1.893]
+[2 2]      [2 2]      [2 2]      [2.828 4.243 5.657]          [0.045 0.187 0.768]              [1.627 1.955]</code></pre></div>
+  <p>The script prints the six matrices one under another, and the block above lays them side by side with the same values, one row per token. Walk through the second row, <em>damage</em>. Its query is [0, 3]. Dotted with the three keys [1, 1], [1, 2] and [2, 2] it gives 3, 6 and 6, and dividing by √2 gives 2.121, 4.243 and 4.243. The causal mask then removes the third score, since <em>excess</em> comes later. What remains is a softmax over [2.121, 4.243]: e<sup>2.121</sup> = 8.34 and e<sup>4.243</sup> = 69.6, so the weights are 8.34 / 77.9 = 0.107 and 69.6 / 77.9 = 0.893. The output is 0.107 × [2, 1] + 0.893 × [0, 2] = [0.214, 1.893], mostly the value of <em>damage</em> itself with a little of <em>windscreen</em> mixed in.</p>
+  <p>The division by √d_k is there for a reason Vaswani et al. give: for large d_k the dot products grow large in magnitude and push the softmax into regions with extremely small gradients. A quick check shows the size of the effect. For random vectors with unit-variance entries, the standard deviation of a dot product is 1.41 at d_k = 2 and 11.3 at d_k = 128, Llama's head dimension. Divided by √d_k it is 1.0 in both cases. Without it, score gaps of ten or more make the softmax nearly one-hot from the first step of training.</p>
+</section>
+
+<section id="mask">
+  <h2>The causal mask and the softmax</h2>
+  <p>Two operations shape the weights. The <strong>causal mask</strong> sets every score above the diagonal to minus infinity before the softmax, so position t can attend to positions 0 through t and never to later ones. Exponentiating minus infinity gives zero, which is how the third column of <em>damage</em>'s row vanished. The mask is what makes next-token training possible in one pass: all positions are computed at once, and each is still predicting the token after it using only what came before. <a href="06-the-generation-loop.html">Chapter 06</a> shows what the mask lets the server cache.</p>
+  <p>The <strong>softmax</strong> turns each row of scores into weights that are positive and sum to 1, so the output is always a convex combination of values. Softmax is sharp: a gap of two in the scores already gives 0.89 against 0.11. And weights must sum to 1, so a head with nothing relevant to read still has to put its weight somewhere. Xiao et al. (2023) observed that models put strong attention on the initial tokens even when those tokens carry no meaning, calling them attention sinks, and showed that a sliding window which drops the first tokens' keys and values fails once the text outgrows the cache. Keeping them largely restores quality.</p>
+</section>
+
+<section id="heads">
+  <h2>Many heads, and the output projection</h2>
+  <p>A single head makes one weighted average per position. Vaswani et al. run several in parallel, each with its own W_Q, W_K and W_V, so the model can track several relations at once. Llama 3.1 8B runs 32 query heads of dimension 128 per layer. Their outputs are concatenated into a 4,096-number vector and multiplied by W_O, shape 4,096 × 4,096, which mixes the heads and writes the result back into the residual stream as an additive update. Elhage et al. note that this concatenate-and-multiply form is mathematically equivalent to treating each head as an independent operation whose result is added to the stream.</p>
+  <div class="flow">  residual stream x  (4,096)
+        |
+        +--> head 0  : q,k,v (128 each) --> weighted values (128) --+
+        +--> head 1  : ...                                           |
+        +--> ...                                                     +--> concat (4,096)
+        +--> head 31 : ...                                           |       |
+        |                                                            +-------+
+        |                                                                    v
+        |                                                      x W_O (4,096 x 4,096)
+        v                                                                    |
+   x  +  update   <----------------------------------------------------------+</div>
+  <p>Heads in a layer cannot see each other's output until the next layer, so depth is how a later head uses what an earlier one found.</p>
+</section>
+
+<section id="gqa">
+  <h2>MQA and GQA: sharing keys and values</h2>
+  <p>During generation, the keys and values of every earlier token are kept and reloaded at each step, and that traffic limits decoding. Shazeer (2019) proposed <strong>multi-query attention</strong>: all query heads share a single key head and a single value head, which shrinks those tensors and the memory bandwidth to read them, at the price of minor quality degradation. Ainslie et al. (2023) introduced <strong>grouped-query attention</strong>, which uses an intermediate number of key-value heads, more than one and fewer than the query heads, and report quality close to multi-head attention at speed comparable to multi-query. Llama 3.1 8B is a GQA model: 32 query heads in 8 groups of 4, each group sharing one key head and one value head. The saving is direct, because the cache stores keys and values, not queries.</p>
+  <table>
+    <thead><tr><th>Variant</th><th>KV heads</th><th>Bytes per token (BF16)</th><th>1,421 tokens</th><th>131,072 tokens</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Multi-head</td><td>32</td><td>524,288</td><td>745 MB</td><td>64 GiB</td></tr>
+      <tr><td class="term">Grouped-query (Llama 3.1 8B)</td><td>8</td><td>131,072</td><td>186 MB</td><td>16 GiB</td></tr>
+      <tr><td class="term">Multi-query</td><td>1</td><td>16,384</td><td>23 MB</td><td>2 GiB</td></tr>
+    </tbody>
+  </table>
+  <p>The formula is 2 (K and V) × 32 layers × KV heads × 128 × 2 bytes, as in chapter 02. With 32 KV heads the Llama 3.1 cache would be four times larger: 64 GiB per full-window sequence, which would not fit on an 80 GB H100 beside the 16.1 GB of weights. That is the reason the architecture exists. Eight groups sit between the extremes: Shazeer reports a quality cost for a single shared head, and Ainslie et al. report that an intermediate count stays close to full multi-head quality. See <a href="../serving-open-weight-models/04-attention-and-kv-cache-optimisations.html">Attention and KV-Cache Optimisations</a> for the serving side. The trade flips for a small model at short context, where the cache is negligible and only the quality cost remains.</p>
+</section>
+
+<section id="quadratic">
+  <h2>The quadratic cost</h2>
+  <p>Every query is scored against every earlier key, so a sequence of n tokens produces n² scores per head per layer. Counting multiply-adds as 2 FLOPs, the scores (QK<sup>T</sup>) and the weighted sum of values together cost about 4 × n² × 4,096 FLOPs per layer, with 4,096 being heads times head dimension, and the model has 32 layers. The rest of the forward pass, the weight matrices, costs about 2 × 8.03 billion FLOPs per token, a figure <a href="04-the-block-and-the-forward-pass.html">chapter 04</a> derives. Put the two side by side for the Harbourline prompt and for a full window:</p>
+  <table>
+    <thead><tr><th>Tokens n</th><th>Attention FLOPs</th><th>Weight FLOPs (2N × n)</th><th>Attention divided by weights</th></tr></thead>
+    <tbody>
+      <tr><td class="term">1,421</td><td>1.06 × 10<sup>12</sup></td><td>2.28 × 10<sup>13</sup></td><td>0.05</td></tr>
+      <tr><td class="term">131,072</td><td>9.0 × 10<sup>15</sup></td><td>2.1 × 10<sup>15</sup></td><td>4.3</td></tr>
+    </tbody>
+  </table>
+  <p>The two terms cross at n = 2N / (4 × 4,096 × 32) ≈ 30,600 tokens. A causal mask means only about half the scores are needed, so a kernel that skips the masked half crosses near 61,000. Harbourline's chat prompt is far below that and dominated by the weights. Above it the quadratic term takes over, which is why the Llama 3 paper trains on long sequences only in the final stages. The table counts compute only; memory is the other quadratic. At n = 131,072 one head's score matrix has 17.2 billion entries, about 34 GB in BF16 if stored, far more than a card holds. FlashAttention (Dao et al., 2022) computes exact attention by tiling, reducing reads and writes between GPU high-bandwidth memory and on-chip memory, so the full matrix is never written out. These are estimates of order of magnitude, not a benchmark.</p>
+</section>
+
+<section id="circuits">
+  <h2>What heads turn out to do</h2>
+  <p>Most heads are not cleanly interpretable. Two kinds have been studied closely. A <strong>previous-token head</strong> attends mostly to the position just before the current one and copies information from it. An <strong>induction head</strong> uses what previous-token heads wrote. Olsson et al. (2022) define the circuit as a rule: given a sequence that contained <code>[A][B]</code> earlier and now reaches <code>[A]</code>, predict <code>[B]</code>. The mechanism has two heads. The first, in an earlier layer, copies each token's identity onto the token after it. The second looks for positions whose recorded predecessor matches the current token, attends there, and copies what follows. That composition across layers is why the paper notes that induction heads do not occur in one-layer models.</p>
+  <p>The practical relevance is in-context behaviour. If a Harbourline prompt contains a policy number, and the model must reproduce it in its answer, a circuit that finds the earlier occurrence and copies what comes next is plausibly the machinery, though no study shows it for this case. Olsson et al. find that induction heads form in an abrupt phase change early in training, when in-context learning improves. Read the strength of that claim carefully: the paper rates its evidence as stronger for small attention-only models, and for large models with feed-forward layers it states that it must rely mainly on correlational evidence which could be confounded. Heads are a lens for reading a model, not a spec. Do not assume a given head in a given checkpoint plays a named role. <a href="09-why-models-fail.html">Chapter 09</a> returns to what interpretability can and cannot offer.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory first.</p>
+  <ol>
+    <li>
+      <p>In the worked example, the query for <em>damage</em> scores equally (4.243) against itself and against <em>excess</em> before masking, yet the weight on <em>excess</em> is 0. Where did the difference come from, and what would break if you removed it during training?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The causal mask set the score for <em>excess</em> to minus infinity before the softmax, so its weight is exactly zero. Without it, each position would read the tokens that follow it, and since training predicts the next token at every position at once, the model could copy the answer from the future and learn nothing useful. See <a href="#mask">The causal mask and the softmax</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague removes the 1/√d_k factor from a 128-dimensional head "to save a division". Describe what the attention weights look like at the start of training and why learning suffers.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Dot products of unit-variance vectors have a standard deviation near 11 at d_k = 128, so score gaps are large and the softmax is close to one-hot. A saturated softmax has tiny gradients away from its peak, so the head learns slowly and cannot easily redistribute its attention. See <a href="#worked">A worked example</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You are sizing a deployment of a model with 32 query heads, 32 layers and head dimension 128 in BF16. Compare the KV cache per token with 32 KV heads against 4 KV heads, and say what the second buys at 100,000 tokens.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Per token it is 2 × 32 × heads × 128 × 2 bytes, so 524,288 bytes against 65,536, an eightfold cut. At 100,000 tokens that is about 52 GB against 6.6 GB per sequence, which decides whether one card can hold several long sequences or one. The cost is some quality, as the GQA paper reports. See <a href="#gqa">MQA and GQA</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A prompt grows from 2,000 to 20,000 tokens. Does attention compute grow tenfold or a hundredfold, and does the total cost of the forward pass grow by the same factor?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Attention compute grows a hundredfold because it scales with n². The total grows by less than that, between tenfold and a hundredfold, since the weight matrices cost per token and scale only tenfold. Below about 30,600 tokens for Llama 3.1 8B they are the larger share. See <a href="#quadratic">The quadratic cost</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Someone explains the model's habit of repeating a policy number from the prompt by pointing at "the induction head in layer 12". What do you say?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Induction heads are a documented circuit, a previous-token head composed with a later head, and plausible machinery for copying. But the original evidence is correlational for large models, and naming a specific head in a specific checkpoint requires an experiment on that checkpoint, such as ablating it and measuring the copy rate. Without that it is a hypothesis. See <a href="#circuits">What heads turn out to do</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Attention is the only mechanism that moves information between positions: each position's output is a weighted average of earlier positions' values, weighted by how well its query matches their keys.</li>
+    <li>Scores are scaled by 1/√d_k so that dot products stay near unit size and the softmax does not saturate.</li>
+    <li>The causal mask zeroes the weights on later positions, which lets training compute every position's next-token prediction in one pass.</li>
+    <li>Heads run in parallel on different slices of the projections, and a final output matrix mixes them and adds the result to the residual stream.</li>
+    <li>Grouped-query attention shares keys and values across groups of query heads: Llama 3.1 8B keeps 8 KV heads instead of 32, which cuts its cache from 524,288 to 131,072 bytes per token.</li>
+    <li>Attention compute grows with the square of sequence length and overtakes the weight matrices near 30,600 tokens for this model, so long prompts are limited by it in both compute and cache memory.</li>
+    <li>Previous-token and induction heads are real, documented circuits, but treat any claim about a named head in a named checkpoint as a hypothesis until it is tested.</li>
+  </ul>
+  <p>Most parameters sit in the feed-forward layers that process each position alone, which the next chapter builds into a full block and forward pass. → <a href="04-the-block-and-the-forward-pass.html">The Block and the Forward Pass</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener"><strong>Attention Is All You Need</strong></a> — Vaswani et al., 2017. Scaled dot-product attention, multi-head attention and the reason for the scaling factor.</li>
+    <li><a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener"><strong>Fast Transformer Decoding: One Write-Head is All You Need</strong></a> — Shazeer, 2019. Multi-query attention and why decoding is bound by memory bandwidth.</li>
+    <li><a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener"><strong>GQA</strong></a> — Ainslie et al., 2023. Grouped-query attention and the recipe for converting multi-head checkpoints.</li>
+    <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener"><strong>FlashAttention</strong></a> — Dao et al., 2022. Exact attention by tiling, and the memory-traffic argument behind it.</li>
+    <li><a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank" rel="noopener"><strong>A Mathematical Framework for Transformer Circuits</strong></a> — Elhage et al., Anthropic, 2021. Heads as independent additive operations, and previous-token heads in small models.</li>
+    <li><a href="https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html" target="_blank" rel="noopener"><strong>In-context Learning and Induction Heads</strong></a> — Olsson et al., Anthropic, 2022. The induction circuit, its phase change, and a frank account of how strong the evidence is.</li>
+    <li><a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener"><strong>Efficient Streaming Language Models with Attention Sinks</strong></a> — Xiao et al., 2023. Why the first tokens attract attention and what that means for cache eviction.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
