@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment Topologies — Serving Open-Weight Models</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Laptop, demo, server and edge: tensor and pipeline parallelism, disaggregated prefill and decode, Kubernetes and autoscaling on queue depth, GPU selection, and…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/serving-open-weight-models/07-deployment-topologies">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Deployment Topologies — Serving Open-Weight Models">
+<meta property="og:description" content="Laptop, demo, server and edge: tensor and pipeline parallelism, disaggregated prefill and decode, Kubernetes and autoscaling on queue depth, GPU selection, and…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/serving-open-weight-models/07-deployment-topologies">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#ladder">Four places a model can run</a>
+    <a href="#desk">Laptop and demo</a>
+    <a href="#fit">The server rung starts with arithmetic</a>
+    <a href="#parallel">Tensor and pipeline parallelism</a>
+    <a href="#disagg">Disaggregated prefill and decode</a>
+    <a href="#kubernetes">Kubernetes: one model per pod, scale on queue depth</a>
+    <a href="#gpus">Choosing the GPU</a>
+    <a href="#edge">Edge and browser</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="06-engines-and-formats.html">← Previous: Engines and Formats</a>
+    <a href="08-capacity-cost-and-slos.html">Next: Capacity, Cost and SLOs →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Running it</span>
+  <h1>Deployment Topologies</h1>
+  <p class="subtitle">Laptop, demo, server and edge: tensor and pipeline parallelism, disaggregated prefill and decode, Kubernetes and autoscaling on queue depth, GPU selection, and on-device inference.</p>
+</header>
+
+<section id="ladder">
+  <h2>Four places a model can run</h2>
+  <p>The same weights run on a laptop, in a demo container, on a rack of GPUs and inside a browser tab. What changes between them is the budget for memory bandwidth, the number of concurrent users and who owns the machine. <a href="06-engines-and-formats.html">Chapter 06</a> chose an engine. This chapter decides what it runs on and how it is wired, with Harbourline's help-centre assistant as the load: about 13,000 sessions a day, a time to first token (TTFT) at or under 800 ms at p95, and at least 30 output tokens per second per stream, in a UK region.</p>
+  <div class="flow">  laptop / desk      demo box          server (Kubernetes)      edge / browser
+  1 user, 1 request  5-20 users        100s of streams          1 user, own device
+  Ollama, LM Studio  Gradio, Streamlit vLLM, SGLang + HPA       WebLLM, MLC
+  goal: iterate      goal: show it     goal: SLO + cost         goal: no server, no egress</div>
+  <p>Only the third rung has an SLO, so only the third needs the rest of this guide. The other three exist to make the third cheaper to get right. A prompt, a schema and an eval case should be proven on a laptop before they cost GPU-hours, and the same OpenAI-compatible request should work against every rung so that nothing changes when the model moves.</p>
+</section>
+
+<section id="desk">
+  <h2>Laptop and demo</h2>
+  <p>On a laptop the limit is memory bandwidth, the same limit as on a data-centre GPU, only lower. Decode reads every weight once per token, so the ceiling on tokens per second is bandwidth divided by weight bytes. Take an 8B model in 4-bit, about 4.5 GB with overhead, on a machine with 100 GB/s of memory bandwidth. The ceiling is 100 / 4.5, about 22 tokens per second for one user, and real engines land below it. Those figures are illustrative, but the division is the thing to do before promising a laptop demo to anyone.</p>
+  <p>Ollama, which exposes an HTTP API and accepts a JSON schema in the <code>format</code> field of a request for structured output, is the fast path for development. LM Studio fills the same role with a desktop interface. Both run quantised GGUF weights, which <a href="03-quantization.html">chapter 03</a> covers. A demo built with Gradio or Streamlit puts a page in front of the same endpoint so that a claims manager can try it. Treat a demo as a different thing from a pilot. It has no admission control, no authentication worth the name and one process, so ten testers each pasting a policy PDF will queue behind each other. Never point a demo at claim data to make it feel real. Use the synthetic Harbourline set.</p>
+  <div class="callout tip">
+    <span class="callout-label">Keep one request shape across every rung</span>
+    <p>Develop against the OpenAI-compatible endpoint that vLLM, SGLang, llama.cpp and Ollama all expose, and keep the base URL and model name in configuration. The move from laptop to cluster is then a deployment change, and the evals you ran on the laptop still describe the code that ships. The quantisation differs between rungs, so re-run the eval set on the production build.</p>
+  </div>
+</section>
+
+<section id="fit">
+  <h2>The server rung starts with arithmetic</h2>
+  <p>Harbourline's target is a 70B-class dense model. This guide uses Llama 3.3 70B, whose model card lists 70B parameters and grouped-query attention, and whose architecture table in the Llama 3 paper gives 80 layers, 64 attention heads and 8 key/value heads at a model dimension of 8,192. The head dimension is 8,192 / 64 = 128. The KV cache per token is then 2 (K and V) × 80 layers × 8 heads × 128 × 2 bytes (BF16) = 327,680 bytes, about 0.33 MB. A 3,250-token request (3,000 in, 250 out) holds about 1.07 GB of cache.</p>
+  <p>Now the weights. At FP8, 70B parameters take 70 GB. An H100 SXM has 80 GB. Engines reserve a fraction of device memory for themselves; with vLLM's <code>gpu_memory_utilization</code> at 0.90, the budget is 72 GB, and after 70 GB of weights about 2 GB remains for activations and cache, which is room for a handful of tokens. One GPU cannot serve this model at FP8. The options are two GPUs sharing the weights, or 4-bit weights of about 35 GB on one. With two H100s the budget is 2 × 72 = 144 GB, less 70 GB of weights, which leaves roughly 68 GB after allowing about 6 GB for activations and CUDA graphs. That 68 GB holds 68e9 / 327,680 ≈ 207,000 tokens of BF16 cache, or about 63 requests of 3,250 tokens. The 6 GB is an assumption to replace with a measurement.</p>
+  <p>The single-GPU INT4 option reads the same 35 GB per step per GPU as the FP8 two-GPU option does, so decode speed is similar, and it needs no inter-GPU communication. Two independent INT4 replicas on two GPUs give twice the replicas of one tensor-parallel FP8 pair, which helps both capacity and failure isolation. Choose FP8 on two GPUs when the Harbourline eval set shows INT4 losing accuracy on limits and deductibles. Choose two INT4 replicas when it does not.</p>
+</section>
+
+<section id="parallel">
+  <h2>Tensor and pipeline parallelism</h2>
+  <p><strong>Tensor parallelism</strong> splits each layer's matrices across GPUs, so every GPU works on every token. The cost is communication. In the Megatron-style split, the paper states that each transformer layer uses two all-reduces in the forward pass. At 80 layers that is 160 all-reduces per decode step. Each carries one hidden vector per token in the batch, 8,192 × 2 bytes = 16 KB per token, so a batch of 40 moves about 650 KB per all-reduce. That is small enough that fixed latency dominates the transfer time, which is why tensor parallelism wants the fast link between GPUs: NVIDIA lists 900 GB/s of NVLink on the H100 SXM.</p>
+  <p><strong>Pipeline parallelism</strong> cuts the model by layers, giving each GPU a contiguous slice. Only the activations at the cut cross the link, once per step, but a token must pass through each stage in turn. A single stream gains no speed, and the stages idle unless several micro-batches keep them fed. vLLM's guidance fits this split: if the model fits on one GPU, skip distributed inference; if it fits on one node, use tensor parallelism; and on GPUs without NVLink, such as the L40S, use pipeline parallelism, which it says gives higher throughput and lower communication overhead there. Across nodes, use tensor parallelism inside each node and pipeline parallelism between them.</p>
+  <p>For Harbourline that settles the topology: tensor parallel size 2 on one node with NVLink, no pipeline stage, no multi-node. Keep a tensor-parallel group inside one node. A group that spans nodes pays network latency 160 times per token, and that will break the 30 tokens-per-second floor before it breaks anything else.</p>
+</section>
+
+<section id="disagg">
+  <h2>Disaggregated prefill and decode</h2>
+  <p>Prefill is compute-bound and decode is memory-bound, and when one engine runs both, a long prefill stalls the decode steps of every other stream in the batch. That shows up as spikes in inter-token latency. Disaggregation puts prefill and decode in separate instances, with the KV cache moved between them. The DistServe paper, from OSDI 2024, argues that this removes the interference and lets each phase use its own parallelism, and reports serving up to 7.4× more requests or meeting up to 12.6× tighter SLOs than the systems it compared against, with over 90% of requests inside both latency limits.</p>
+  <p>Read the claim with its limits. vLLM's documentation marks disaggregated prefill as experimental and states plainly that it does not improve throughput; its use is to tune TTFT and inter-token latency separately and to control the tail of the latter. It also adds a transfer step whose cost grows with the cache size. At 3,000 tokens, Harbourline's cache per request is 3,000 × 0.33 MB, about 1 GB, which needs a fast fabric to move inside the TTFT budget. llm-d, a Kubernetes inference stack that runs on vLLM and SGLang, packages prefill/decode disaggregation with prefix-cache-aware routing.</p>
+  <p>At about one request per second at peak, Harbourline should not disaggregate. A prefill of a 3,000-token prompt takes roughly a quarter of a second (the arithmetic is in <a href="08-capacity-cost-and-slos.html">chapter 08</a>), so interference is rare, and <a href="05-speculative-decoding-and-batching.html">chunked prefill and the scheduler</a> already bound it. The case flips with long prompts at high concurrency: a 100-page policy summarised in the same fleet as chat, or a rate high enough that every decode step shares the GPU with a prefill.</p>
+</section>
+
+<section id="kubernetes">
+  <h2>Kubernetes: one model per pod, scale on queue depth</h2>
+  <p>On Kubernetes a GPU is a whole-number resource. The device plugin exposes it as <code>nvidia.com/gpu</code>, you set it under <code>limits</code>, and the request must equal the limit. A tensor-parallel pair is one pod asking for two. One model per pod keeps failure, upgrade and capacity decisions separate: a bad weight file takes down one deployment, and the canary in <a href="10-operating-in-production.html">chapter 10</a> is a second deployment rather than a flag.</p>
+  <p>Autoscaling needs a metric that tells you about saturation. GPU utilisation does not: a decode loop keeps the GPU busy at a batch of 2 and at a batch of 60. Queue depth does. vLLM exports <code>vllm:num_requests_waiting</code> and <code>vllm:kv_cache_usage_perc</code> on its <code>/metrics</code> endpoint. Feed them to the Horizontal Pod Autoscaler through the custom or external metrics API. The controller computes desired replicas as ceil[current replicas × current value / target value], scales up with no stabilisation window by default, and scales down only after 300 seconds.</p>
+  <p>Those defaults need two changes for a large model. Scale-up is limited by pod start, not by the controller. Pulling 70 GB of weights, loading them and capturing CUDA graphs takes minutes (<a href="08-capacity-cost-and-slos.html#cold">chapter 08</a>), so a spike has finished before the new replica serves. Set the target low, around a waiting queue of one or two requests per replica, keep a warm spare, and lengthen the scale-down window so the fleet does not thrash through the same load times each hour. The gateway should absorb what the fleet cannot, with the <a href="../build-inference-gateway-rust/04-circuit-breakers-hedging.html">circuit breakers and hedging</a> from the gateway guide.</p>
+</section>
+
+<section id="gpus">
+  <h2>Choosing the GPU</h2>
+  <p>Memory size decides what fits and memory bandwidth decides how fast decode runs, because each step reads the weights and the cache. Compute decides prefill. The figures below come from NVIDIA's pages as of November 2026.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>GPU</th><th>Memory</th><th>Bandwidth</th><th>Link</th><th>70B at FP8 (70 GB)</th></tr></thead>
+    <tbody>
+      <tr><td class="term">L40S</td><td>48 GB GDDR6</td><td>864 GB/s</td><td>PCIe Gen4 only</td><td>Two cards leave 26 GB for cache; slow decode</td></tr>
+      <tr><td class="term">H100 SXM</td><td>80 GB</td><td>3.35 TB/s</td><td>NVLink 900 GB/s</td><td>Two GPUs, 68 GB of cache (above)</td></tr>
+      <tr><td class="term">H100 NVL</td><td>94 GB</td><td>3.9 TB/s</td><td>NVLink 600 GB/s</td><td>Fits on one with 24 GB left, before overhead</td></tr>
+      <tr><td class="term">H200</td><td>141 GB</td><td>4.8 TB/s</td><td>NVLink 900 GB/s</td><td>One GPU, about 70 GB of cache</td></tr>
+      <tr><td class="term">B200 (in DGX B200)</td><td>about 180 GB</td><td>about 8 TB/s</td><td>NVLink, fifth generation</td><td>One GPU, ample cache</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The B200 row is derived: NVIDIA's DGX B200 page lists 1,440 GB and 64 TB/s for eight GPUs, and the per-GPU figures here divide those by eight. A consumer card is the odd one out. The RTX 5090 has 32 GB of GDDR7 and no NVLink, so it suits a 4-bit model of 30B parameters or fewer for development and not a 70B fleet. The H200 changes the Harbourline answer: on one GPU, a 4.8 TB/s read of 70 GB takes 70 / 4800 = 14.6 ms per step against 3.35 TB/s over 35 GB per GPU, 10.4 ms, so a single H200 decodes more slowly per step than two H100s, yet it needs one pod, no collective and half the GPU-hours. Compare the hourly price, not the spec. The <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html">neocloud pricing comparison</a> carries the H100 rates, and its <a href="../../neocloud/neocloud-comparison/04-hardware-infrastructure.html#geography">geography section</a> is where the UK-region question gets answered. For the infrastructure side of the same decision, see <a href="../ai-compute-infrastructure/index.html">the AI compute infrastructure guide</a>.</p>
+</section>
+
+<section id="edge">
+  <h2>Edge and browser</h2>
+  <p>The edge inverts the server's economics. There is no GPU-hour to amortise, the user's device pays, and the data never leaves it. WebLLM, from the MLC project, runs inference inside the browser with WebGPU acceleration and exposes an OpenAI-compatible API, with a JSON mode for structured output. The constraint is the arithmetic from the laptop section, applied to a phone or a thin laptop: a few gigabytes of weights, tens of GB/s of bandwidth, and a first download that is a large fraction of the page weight. That limits the edge to small models doing narrow jobs.</p>
+  <p>For Harbourline, that rules out the 70B assistant and leaves one plausible use: a small on-device model that redacts a policy number or classifies a photo before upload, so that the raw data never reaches the server. It would not replace the server rung. It would move one step of the pipeline in front of it, and the flip is a user population with devices that cannot run it, which is most of the public.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A colleague proposes serving the 70B model at FP8 on a single 80 GB H100 "since the weights are 70 GB". What do you compute to show it will not work, and what number do you get?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Budget the device, not the weights. At 0.90 utilisation the engine owns 72 GB, so 70 GB of weights leaves about 2 GB for activations and cache, which at 327,680 bytes per token is about 6,000 tokens: two requests, not a service. See <a href="#fit">the server rung</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does tensor parallelism across two nodes break a 30 tokens-per-second floor even when each node is fast?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each layer needs two all-reduces in the forward pass, so an 80-layer model makes 160 per token step, and each is latency-bound at this message size. Over NVLink that is small; over a network, each of the 160 pays the network round trip. See <a href="#parallel">tensor and pipeline parallelism</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your HPA scales on GPU utilisation and shows 95% at both 4 and 40 concurrent streams. What does that tell you, and what would you scale on instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>It tells you nothing about headroom, because a decode loop saturates the device at any batch. Scale on waiting requests and KV cache usage, which move when the fleet runs out of room. See <a href="#kubernetes">Kubernetes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A team wants disaggregated prefill and decode to "double throughput". What is wrong with the request, and what would justify the work?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>vLLM's documentation says disaggregation does not improve throughput. It decouples TTFT from inter-token latency and cuts the tail. It is justified by long prefills sharing a fleet with latency-sensitive decode at high concurrency, not by a raw tokens-per-second target. See <a href="#disagg">disaggregation</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A single H200 has more memory than two H100s' usable cache budget needs, so it looks like the obvious buy. What would you compare before agreeing?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Step time and price. One H200 reads 70 GB at 4.8 TB/s, 14.6 ms a step, while two H100s read 35 GB each at 3.35 TB/s, 10.4 ms. The H200 is slower per step but removes the collective and halves the GPU count, so compare cost per token at the SLO, and the hourly rate you can get in a UK region. See <a href="#gpus">choosing the GPU</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Only the server rung has an SLO; the laptop and demo rungs exist to prove prompts, schemas and evals cheaply, behind the same OpenAI-compatible request shape.</li>
+    <li>Size the server from device memory: at FP8 the 70B model needs two 80 GB GPUs, leaving about 68 GB, or 207,000 tokens, of KV cache for Harbourline.</li>
+    <li>Keep tensor-parallel groups inside one NVLink node; use pipeline parallelism only where there is no NVLink or the model spans nodes.</li>
+    <li>Disaggregated prefill and decode buys tail latency, not throughput, and is not worth its transfer cost at Harbourline's request rate.</li>
+    <li>Autoscale on queue depth and KV usage, set low, with a warm spare, because new replicas take minutes to load.</li>
+    <li>Edge inference suits small models doing narrow jobs on the user's device and does not replace the server.</li>
+  </ul>
+  <p>Next, turn the topology into replica counts and a cost per million tokens. → <a href="08-capacity-cost-and-slos.html">Capacity, Cost and SLOs</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html" target="_blank" rel="noopener"><strong>vLLM: parallelism and scaling</strong></a> — vLLM documentation. Good for when to use tensor, pipeline or both, and the no-NVLink advice.</li>
+    <li><a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener"><strong>DistServe</strong></a> — Zhong et al., OSDI 2024. Good for the case for disaggregating prefill and decode and the goodput metric.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/disagg_prefill.html" target="_blank" rel="noopener"><strong>vLLM: disaggregated prefilling</strong></a> — vLLM documentation. Good for its stated limits: experimental, and no throughput gain.</li>
+    <li><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/" target="_blank" rel="noopener"><strong>Horizontal Pod Autoscaling</strong></a> — Kubernetes documentation. Good for the replica formula, custom metrics and the default scaling behaviour.</li>
+    <li><a href="https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/" target="_blank" rel="noopener"><strong>Schedule GPUs</strong></a> — Kubernetes documentation. Good for how pods request GPUs and what the device plugin does.</li>
+    <li><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener"><strong>Megatron-LM</strong></a> — Shoeybi et al., 2019. Good for the tensor-parallel split and its communication count.</li>
+    <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener"><strong>NVIDIA H100</strong></a> — NVIDIA, as of November 2026. Good for memory, bandwidth and NVLink figures.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

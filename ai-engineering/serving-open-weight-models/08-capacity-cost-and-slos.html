@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Capacity, Cost and SLOs — Serving Open-Weight Models</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Sizing from tokens per second, goodput under a latency objective, cost per million tokens from a GPU-hour, cold starts, and the Harbourline sizing worksheet.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/serving-open-weight-models/08-capacity-cost-and-slos">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Capacity, Cost and SLOs — Serving Open-Weight Models">
+<meta property="og:description" content="Sizing from tokens per second, goodput under a latency objective, cost per million tokens from a GPU-hour, cold starts, and the Harbourline sizing worksheet.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/serving-open-weight-models/08-capacity-cost-and-slos">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#slo">What the SLO measures</a>
+    <a href="#decode">Decode capacity from bandwidth</a>
+    <a href="#prefill">Prefill and the TTFT budget</a>
+    <a href="#worksheet">The Harbourline sizing worksheet for Workload B</a>
+    <a href="#cost">Cost per million tokens is a utilisation question</a>
+    <a href="#cold">Cold starts and the warm spare</a>
+    <a href="#headroom">Headroom for peaks</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="07-deployment-topologies.html">← Previous: Deployment Topologies</a>
+    <a href="09-structured-output-and-constrained-decoding.html">Next: Structured Output and Constrained Decoding →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section D · Running it</span>
+  <h1>Capacity, Cost and SLOs</h1>
+  <p class="subtitle">Sizing from tokens per second, goodput under a latency objective, cost per million tokens from a GPU-hour, cold starts, and the Harbourline sizing worksheet.</p>
+</header>
+
+<section id="slo">
+  <h2>What the SLO measures</h2>
+  <p>A capacity plan is only as good as the number it protects. Harbourline's help-centre assistant promises a time to first token (TTFT) at or under 800 ms at p95 and at least 30 output tokens per second per stream. Both are measured from the user's side, so TTFT includes the time a request waits in the gateway and in the engine's queue, not only the prefill. The engine's own <code>vllm:time_to_first_token_seconds</code> histogram starts when the engine receives the request, so measure at the gateway too and compare the two.</p>
+  <p>The metric that ties the two limits together is goodput, the highest request rate per GPU at which both are still met, as the DistServe paper defines it. Raw throughput keeps rising as you add streams to a batch, but each stream slows down. Goodput peaks where the slowest stream reaches 30 tokens per second, and past that point the extra throughput is output nobody should count. Every number in this chapter is therefore a rate at the SLO, never the engine's maximum.</p>
+</section>
+
+<section id="decode">
+  <h2>Decode capacity from bandwidth</h2>
+  <p>Decode is memory-bound, so a step's duration is bytes read divided by effective bandwidth. The setup is the one from <a href="07-deployment-topologies.html#fit">chapter 07</a>: Llama 3.3 70B at FP8 on two H100 SXM GPUs with tensor parallelism, 35 GB of weights per GPU, and 327,680 bytes of BF16 KV cache per token. A request holds 3,250 tokens at its end, so its cache is 1.065 GB, 0.53 GB on each GPU. For a batch of B streams, each GPU reads 35 GB + B × 0.5325 GB per step. NVIDIA lists 3.35 TB/s for the H100 SXM; no engine reaches it, so assume 50%, 1.675 TB/s. That efficiency is an assumption standing in for a load test.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Batch B</th><th>Bytes per GPU per step</th><th>Step time</th><th>Per-stream tok/s</th><th>Fleet tok/s</th><th>Meets 30 tok/s?</th></tr></thead>
+    <tbody>
+      <tr><td class="term">10</td><td>40.3 GB</td><td>24.1 ms</td><td>41.5</td><td>415</td><td>Yes</td></tr>
+      <tr><td class="term">20</td><td>45.7 GB</td><td>27.3 ms</td><td>36.7</td><td>733</td><td>Yes</td></tr>
+      <tr><td class="term">39</td><td>55.8 GB</td><td>33.3 ms</td><td>30.0</td><td>1,170</td><td>Just</td></tr>
+      <tr><td class="term">60</td><td>67.0 GB</td><td>40.0 ms</td><td>25.0</td><td>1,501</td><td>No</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The SLO caps the batch at 39 streams: 33.3 ms per step is 1/30 s, which allows 33.3 ms × 1.675 TB/s = 55.8 GB of reads, minus 35 GB of weights, leaving 20.8 GB per GPU for cache, or 39 requests. Memory would allow 63, so the SLO binds before memory does. The last row shows why throughput misleads: 1,501 tok/s is higher than 1,170, and every stream is below the floor. The model also ignores the all-reduces and the compute time of attention, so treat 39 as a ceiling to confirm under load. It also shows where the lever is. The weights are a fixed 35 GB per step, and a smaller KV cache per request, from <a href="04-attention-and-kv-cache-optimisations.html">chapter 04</a>, raises the batch the SLO allows.</p>
+</section>
+
+<section id="prefill">
+  <h2>Prefill and the TTFT budget</h2>
+  <p>Prefill is compute-bound. A 3,000-token prompt costs about 2 × 70e9 × 3,000 = 4.2e14 FLOPs. NVIDIA's H100 page lists 3,958 TFLOPS of FP8 for the SXM part, marked as with sparsity. Half of that, 1,979 TFLOPS per GPU, is taken as the dense figure, the usual convention, and two GPUs give 3,958 TFLOPS. At 40% utilisation that is 1,583 TFLOPS, so one prefill takes 4.2e14 / 1.583e15 = 0.265 s. The 40% is an assumption.</p>
+  <p>That leaves 800 − 265 = 535 ms of the budget for everything else. Treat prefill as a single server with a service time of 0.265 s, a capacity of 3.77 requests per second. At the peak of 1.1 requests per second the utilisation is 0.29, and the mean wait in an M/D/1 queue is ρ / (2μ(1 − ρ)) = 0.29 / (2 × 3.77 × 0.71) = 54 ms. Allow four times that for p95, about 220 ms, as a working assumption. The TTFT estimate is 265 + 220 + 24 (first decode step) + 50 (gateway and network, assumed) ≈ 560 ms, inside the budget with 240 ms to spare. Prefix caching on the shared 1,200-token system prompt removes 40% of the prefill FLOPs, down to about 0.16 s, which <a href="04-attention-and-kv-cache-optimisations.html">chapter 04</a> prices. The utilisation figure matters because queueing delay grows sharply as it approaches 1: at 0.8 the same formula gives 0.8 / (2 × 3.77 × 0.2) = 530 ms of mean wait, and the SLO is gone.</p>
+</section>
+
+<section id="worksheet">
+  <h2>The Harbourline sizing worksheet for Workload B</h2>
+  <p>Every step is below with its unit. Rows marked A are illustrative assumptions for Harbourline, to be replaced by traffic logs. The rest follow from the specifications above.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>#</th><th>Step</th><th>Calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Daily requests (A: one request per session)</td><td>13,000 sessions × 1</td><td>13,000 requests/day</td></tr>
+      <tr><td>2</td><td>Peak-hour share (A)</td><td>15% × 13,000 = 1,950 requests/hour ÷ 3,600 s</td><td>0.54 requests/s</td></tr>
+      <tr><td>3</td><td>Burst factor inside the hour (A)</td><td>0.54 × 2</td><td>1.1 requests/s</td></tr>
+      <tr><td>4</td><td>Stream duration</td><td>0.56 s TTFT + 250 tokens ÷ 30 tok/s</td><td>8.9 s</td></tr>
+      <tr><td>5</td><td>Concurrent streams (Little's law)</td><td>1.1 requests/s × 8.9 s</td><td>9.8 streams</td></tr>
+      <tr><td>6</td><td>Streams the SLO allows per replica</td><td>decode section</td><td>39 streams</td></tr>
+      <tr><td>7</td><td>Streams memory allows per replica</td><td>68 GB ÷ 1.065 GB</td><td>63 streams</td></tr>
+      <tr><td>8</td><td>Replicas for peak</td><td>ceil(9.8 ÷ 39)</td><td>1 replica (2 GPUs)</td></tr>
+      <tr><td>9</td><td>Prefill capacity per replica</td><td>1 ÷ 0.265 s</td><td>3.77 requests/s</td></tr>
+      <tr><td>10</td><td>Prefill utilisation at peak</td><td>1.1 ÷ 3.77</td><td>29%</td></tr>
+      <tr><td>11</td><td>Add one replica for failure and upgrades</td><td>1 + 1</td><td>2 replicas (4 GPUs)</td></tr>
+      <tr><td>12</td><td>Monthly GPU cost</td><td>4 GPUs × 730 h × $3.99</td><td>$11,651</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Step 5 is the surprise. Harbourline's whole peak is about ten concurrent streams, a quarter of what one replica holds at the SLO. The second replica is bought for availability and rolling upgrades, not throughput. Workload A fits in the same fleet: 6,000 claims a night is 9M input and 1.8M output tokens, which is 9e6 × 2 × 70e9 / 1.583e15 = 796 s of prefill and 1.8M / 1,170 tok/s = 1,538 s of decode on one replica, about 39 minutes inside a four-hour window. It adds almost no cost, because the GPUs are already paid for and idle at night.</p>
+</section>
+
+<section id="cost">
+  <h2>Cost per million tokens is a utilisation question</h2>
+  <p>The H100 rate of $3.99 per GPU-hour is Together's on-demand price, shown with the other providers in the <a href="../../neocloud/neocloud-comparison/05-pricing-comparison.html">neocloud pricing comparison</a>, as of November 2026. Whether that rate is available in a UK region needs checking. The fleet costs $11,651 a month whatever it serves. <a href="01-build-or-buy.html">Chapter 01</a> priced a single replica of two H100s at $4.50 per GPU-hour and arrived at $78,840 a year. This worksheet adds the availability replica, so four GPUs, and uses Together's $3.99 list price. The load is the same: 3.6% of the two-replica fleet is about the 7.5% of one replica that chapter 01 reported, with the small gap down to rounding in the capacity estimate. Divide by what it serves.</p>
+  <p>Per request, fleet time is 0.265 s of prefill plus 250 / 1,170 = 0.214 s of decode, 0.48 s, so one replica at the SLO limit serves about 2.1 requests per second and the pair 4.2. In a 730-hour month, 4.2 × 2,628,000 s × 3,250 tokens ≈ 35.7 billion tokens. Cost at full use is $11,651 / 35,700 M = $0.33 per million tokens. That is the floor, and it is unreachable, because queueing delay climbs well before 100%.</p>
+  <p>Harbourline's real volume is 390,000 requests a month, 1,170M input and 97.5M output tokens, 1,267.5M in all. Utilisation is 1,267.5 / 35,700 = 3.6%, so the delivered cost is $11,651 / 1,267.5 M = $9.19 per million tokens. Adding the nightly batch gives 1,591.5M tokens and $7.32. The Sonnet 5.5 bill for Workload B at Anthropic's published $2 in and $10 out per million tokens is 1,170 × $2 + 97.5 × $10 = $3,315, or $2.62 per million. Haiku 5.5 at $0.10 and $0.50 comes to $166, or $0.13. The self-hosted fleet loses to both at this volume, and the reason is utilisation, not price per GPU-hour. Break-even against Sonnet needs 12.5% utilisation ($0.33 / $2.62), about 4.4 billion tokens a month, 3.5 times the current volume. The API figures ignore prompt caching, which cuts them further. <a href="01-build-or-buy.html">Chapter 01</a> owns the build-or-buy decision. This chapter's contribution is that the number to argue about is utilisation.</p>
+  <div class="callout insight">
+    <span class="callout-label">Even the floor does not beat Haiku</span>
+    <p>At 100% utilisation the 70B fleet costs $0.33 per million blended tokens, above Haiku 5.5's $0.13. Self-hosting at this scale is justified by residency, control or fine-tuned weights, and the cost case only holds against larger API models.</p>
+  </div>
+</section>
+
+<section id="cold">
+  <h2>Cold starts and the warm spare</h2>
+  <p>A new replica must read 70 GB of weights before it serves a token. At an assumed 1 GB/s from object storage that is 70 s; from local NVMe at an assumed 5 GB/s it is 14 s. On top come engine initialisation, CUDA graph capture and a warm-up request, plus the time to get a GPU node at all. None of these is a fixed figure, so measure each on your platform, and expect the total to be minutes, not seconds. Autoscaling therefore cannot answer a spike. By the time the pod serves, the burst has gone.</p>
+  <p>The remedy is capacity held in advance. At Harbourline's load, the second replica is the warm spare, and it already exists for availability. Cache the weights on node-local disk so a restart does not repeat the download. Hold scale-down back, so the fleet is not reloading every hour. Scale up on a low queue threshold, as <a href="07-deployment-topologies.html#kubernetes">chapter 07</a> described. Count a deployment as ready only after a real request has completed, because a pod that passes its health check can still be compiling.</p>
+</section>
+
+<section id="headroom">
+  <h2>Headroom for peaks</h2>
+  <p>Headroom has three sources, and the sizing above hides which one each replica provides. First, the SLO margin: the gap between 10 streams and 39 is a factor of 3.9, absorbing a burst nearly four times the planned peak. Second, the second replica, which doubles that and covers a node failure. Third, the gateway: it can queue a few seconds of overflow, spill to an API model when waiting requests pass a threshold, and hedge a slow request to the other replica, as <a href="../build-inference-gateway-rust/04-circuit-breakers-hedging.html">the gateway guide</a> builds. A spill-over route to the API is the cheapest headroom there is, since it costs nothing until used. The residency requirement limits it: if the residency requirement covers every request, the spill route cannot leave the UK, and you must buy real GPUs instead.</p>
+  <p>The sizing flips with the traffic shape. A launch-day spike, a morning login rush or an incident that sends every customer to the help centre at once can move the burst factor from 2 to 5. That is 2.7 requests per second and 24 streams, still inside the decode limit of 39. But prefill utilisation is then 2.7 / 3.77 = 72%, the mean queue wait is 0.72 / (2 × 3.77 × 0.28) = 340 ms, and the p95 TTFT breaks first. Recompute step 3 from your own peak-minute logs, not the hourly average, and check prefill as well as decode. For related capacity reasoning at the query-system level, see the interview-prep chapters on <a href="../ai-engineer-interview-prep/09-batching-system-for-llm-queries.html">batching</a> and <a href="../ai-engineer-interview-prep/10-latency-and-cost-at-scale.html">latency and cost at scale</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A load test shows the fleet delivering 1,500 output tokens per second at a batch of 60, against 1,170 at a batch of 39. A colleague wants to size on the higher figure. What is wrong with that?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>At a batch of 60 each stream gets 25 tokens per second, below the 30 floor. Throughput that violates the SLO is not capacity, so size on goodput at 39. See <a href="#decode">decode capacity</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Prefill utilisation at peak is 29%. Traffic grows until it reaches 80%. What happens to TTFT, and why is the mean wait the wrong number to check against the SLO?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Mean queueing wait rises from 54 ms to about 530 ms, which with the 265 ms prefill already reaches the 800 ms budget at the mean and exceeds it at p95, since the tail is several times the mean. Queueing delay is nonlinear in utilisation. See <a href="#prefill">prefill and the TTFT budget</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The fleet costs $11,651 a month and serves 1,267.5M tokens. Without changing the hardware, what two moves lower the cost per million tokens, and which would you try first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Raise the tokens served, by moving the nightly batch or another workload onto idle GPUs, or cut the GPU count, for instance one replica plus an API spill route. Moving existing batch work is cheaper and reversible, so try it first. Dropping to one replica trades availability. See <a href="#cost">cost per million tokens</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does autoscaling not fix a 10-minute traffic spike for this model, and what do you hold instead?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A new replica spends minutes loading 70 GB and warming up, so the spike ends first. Hold warm capacity, a replica sized for availability, plus a gateway spill route. See <a href="#cold">cold starts</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your product owner says the self-hosted fleet is "cheaper per GPU-hour than the API is per token" and so should win. Which number do you ask for, and under what conditions does the claim hold?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Ask for delivered utilisation. At 3.6% the fleet costs $9.19 per million tokens against $2.62 for Sonnet 5.5, and it reaches parity near 12.5%. It holds with pooled workloads, steady traffic or a residency requirement that removes the API option. See <a href="#cost">the cost section</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Size on goodput at the SLO, not peak throughput: on two H100s, the 30 tokens-per-second floor caps the batch at 39 streams, below the 63 that memory allows.</li>
+    <li>Decode step time is bytes read divided by effective bandwidth, so the weights are a fixed cost per step and a smaller KV cache per request raises the batch the SLO allows.</li>
+    <li>Prefill is compute-bound, and queueing delay grows sharply as its utilisation rises, so keep it under about half at peak.</li>
+    <li>Harbourline's Workload B peaks near ten concurrent streams, so the second replica is bought for availability, and the nightly batch fits into idle hours.</li>
+    <li>Cost per million tokens is the fleet's monthly price divided by the tokens served, so utilisation, not the GPU-hour rate, decides whether self-hosting beats the API.</li>
+    <li>New replicas take minutes to load, so headroom must be held in advance, with a gateway spill route as the cheapest layer.</li>
+  </ul>
+  <p>Next, constrain what the model is allowed to emit so downstream code can trust it. → <a href="09-structured-output-and-constrained-decoding.html">Structured Output and Constrained Decoding</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener"><strong>DistServe</strong></a> — Zhong et al., OSDI 2024. Good for goodput as the capacity metric under a TTFT and per-token latency pair.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/design/metrics.html" target="_blank" rel="noopener"><strong>vLLM metrics design</strong></a> — vLLM documentation. Good for the exact latency histograms and queue gauges to measure these budgets with.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener"><strong>vLLM optimization and tuning</strong></a> — vLLM documentation. Good for how preemption works and which settings trade batch size against KV cache.</li>
+    <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener"><strong>NVIDIA H100</strong></a> — NVIDIA, as of November 2026. Good for the memory bandwidth and FP8 throughput inputs, with the sparsity footnote.</li>
+    <li><a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank" rel="noopener"><strong>Claude API pricing</strong></a> — Anthropic, as of November 2026. Good for the per-million-token comparison prices.</li>
+    <li><a href="https://www.together.ai/pricing" target="_blank" rel="noopener"><strong>Together AI pricing</strong></a> — Together AI, as of November 2026. Good for the on-demand H100 GPU-hour rate.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

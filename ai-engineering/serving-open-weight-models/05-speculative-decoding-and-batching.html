@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Speculative Decoding and Batching — Serving Open-Weight Models</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Draft models, Medusa and EAGLE heads, n-gram lookup, the acceptance-rate arithmetic, continuous batching and its scheduler, and when speculation hurts.">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/serving-open-weight-models/05-speculative-decoding-and-batching">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="Speculative Decoding and Batching — Serving Open-Weight Models">
+<meta property="og:description" content="Draft models, Medusa and EAGLE heads, n-gram lookup, the acceptance-rate arithmetic, continuous batching and its scheduler, and when speculation hurts.">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/serving-open-weight-models/05-speculative-decoding-and-batching">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#overview">Overview</a>
+    <a href="#draft">Draft and verify</a>
+    <a href="#arithmetic">The acceptance arithmetic</a>
+    <a href="#drafters">Who writes the draft</a>
+    <a href="#batching">Continuous batching and the scheduler</a>
+    <a href="#tradeoff">Throughput against latency, and when speculation hurts</a>
+    <a href="#harbourline">What Harbourline does</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="04-attention-and-kv-cache-optimisations.html">← Previous: Attention and KV-Cache Optimisations</a>
+    <a href="06-engines-and-formats.html">Next: Engines and Formats →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Making it fast</span>
+  <h1>Speculative Decoding and Batching</h1>
+  <p class="subtitle">Draft models, Medusa and EAGLE heads, n-gram lookup, the acceptance-rate arithmetic, continuous batching and its scheduler, and when speculation hurts.</p>
+</header>
+
+<section id="overview">
+  <h2>Overview</h2>
+  <p><a href="04-attention-and-kv-cache-optimisations.html">Chapter 04</a> made the cache cheaper to store and fill. This chapter is about what each memory-bound decode step does with the bytes it already pays for. A step reads all the weights to emit one token per sequence, and the GPU's arithmetic units are mostly idle while it waits. Two techniques use that slack. Speculative decoding verifies several guessed tokens per sequence in one step. Continuous batching fills the step with as many sequences as memory allows.</p>
+  <p>They pull in opposite directions at the extremes. Speculation spends spare compute to cut latency for a single stream, and batching spends it on more streams. Both draw on the same budget, which is why speculation helps most when the batch is small and the acceptance rate is high, and does least when the batch is large or the guesses are poor. The numbers use the same model and hardware as chapter 04: Llama 3.3 70B in FP8 on two H100s, 70 GB of weights, 6.7 TB/s of combined bandwidth, and 320 KiB of BF16 cache per token.</p>
+</section>
+
+<section id="draft">
+  <h2>Draft and verify</h2>
+  <p>Leviathan et al. (2022) start from the observation that decoding K tokens takes K serial runs of the model, and that many tokens are easy. A cheap draft proposes γ tokens. The large model then scores all γ positions plus one more in a single forward pass, because a forward pass over several positions costs almost the same as over one when the step is memory-bound. A rejection-sampling rule accepts a prefix of the draft and, at the first rejection, resamples from a corrected distribution. The output distribution is identical to the large model's. On T5-XXL the authors report a 2× to 3× speed-up with identical outputs and no retraining.</p>
+  <p>That guarantee holds for the standard rejection sampler. vLLM's documentation says the same, qualified: sampling is lossless up to the precision limits of hardware numerics, and a method such as its FLy verification that deliberately relaxes the check is not distribution-preserving. It also warns that outputs can vary with batch size, because batch size shifts the numerics. The guarantee is about distributions, not about getting the same bytes from two runs.</p>
+  <p>Every variant below differs in only one respect, which is who proposes the draft and what it costs.</p>
+</section>
+
+<section id="arithmetic">
+  <h2>The acceptance arithmetic</h2>
+  <p>Let α be the probability the large model accepts one drafted token, and γ the number of tokens drafted. Assuming acceptances are independent, the expected number of tokens produced per large-model step is (1 − α<sup>γ+1</sup>) / (1 − α). The extra one is the token the verifier always produces itself. Let c be the cost of one draft step as a fraction of one large-model step. The paper's Theorem 3.8 gives the expected wall-clock improvement as (1 − α<sup>γ+1</sup>) / ((1 − α)(γc + 1)), and it measured c below 0.05 for drafts a couple of orders of magnitude smaller than the target.</p>
+  <p>For α = 0.8, γ = 4 and c = 0.05, the numerator is (1 − 0.8⁵) / 0.2 = 3.36 tokens per step and the denominator is 1.2, an improvement of 2.8×. The table varies the two parameters you control and the one you cannot.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>α</th><th>γ = 2</th><th>γ = 4</th><th>γ = 8</th></tr></thead>
+    <tbody>
+      <tr><td>0.6</td><td>1.78×</td><td>1.92×</td><td>1.77×</td></tr>
+      <tr><td>0.8</td><td>2.22×</td><td>2.80×</td><td>3.09×</td></tr>
+      <tr><td>0.9</td><td>2.46×</td><td>3.41×</td><td>4.38×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Two things follow. Past a point, longer drafts cost more than they return: at α = 0.6, moving from γ = 4 to 8 loses ground, since the chance that all eight survive is under 2%. And α dominates. Going from 0.6 to 0.9 is worth more than any tuning of γ. Corollary 3.9 in the paper says that a gain exists whenever α exceeds c, so the draft only has to be better than free, but the gain at α just above c is close to nothing. The acceptance rate is a property of your traffic, not the method, so measure it on real prompts before you believe any vendor's multiplier.</p>
+</section>
+
+<section id="drafters">
+  <h2>Who writes the draft</h2>
+  <ul>
+    <li><strong>A small model.</strong> The original design: a 1B-class model proposes for a 70B target. It must share the target's tokenizer, which TensorRT-LLM's documentation states as a requirement. It costs memory for its own weights and cache, and a second set of kernels to run.</li>
+    <li><strong>Medusa heads.</strong> Cai et al. (2024) add extra decoding heads to the target itself, so no second model exists. The heads predict several future tokens, and tree attention verifies many candidate continuations at once. Training the heads on a frozen backbone (Medusa-1) gave over 2.2× with no loss in quality. Training them jointly with the backbone (Medusa-2) gave 2.3× to 3.6×, at the cost of a training recipe that must preserve the backbone's abilities. The paper also pairs the heads with a typical-acceptance scheme that raises acceptance "while maintaining generation quality". That is a quality claim, not the exact-distribution guarantee above.</li>
+    <li><strong>EAGLE.</strong> Li et al. (2024) draft at the feature level, using the target's second-to-top-layer features, and feed in the token sequence advanced by one step to resolve the uncertainty that feature prediction leaves. On Llama 2 Chat 70B the authors report 2.7× to 3.5× latency speed-up and doubled throughput with the output distribution maintained.</li>
+    <li><strong>EAGLE-3.</strong> It drops feature prediction for direct token prediction, fuses features from several layers, and trains with a "training-time test". The authors report up to 6.5× on their tasks, and 1.38× throughput at batch size 64 inside SGLang.</li>
+    <li><strong>N-gram or prompt lookup.</strong> No model at all. Find the most recent n-gram in the context that matches the end of the output, and propose the tokens that followed it. The prompt-lookup project reports about 2.4× on average for summarisation and context question answering with a 7B model on one A100, and says it helps less on open-ended generation, where the output copies little of the input.</li>
+  </ul>
+  <p>As of November 2026 the engines support different subsets. vLLM lists EAGLE, multi-token prediction, a draft model, n-gram and suffix decoding. SGLang lists EAGLE-2, EAGLE-3, multi-token prediction, a standalone draft model and n-gram. TensorRT-LLM lists draft-target, EAGLE 3, multi-token prediction and others, with its n-gram method deprecated in favour of a suffix automaton. TGI supports Medusa and n-gram. Model-based drafters need a trained head or small model that matches your exact target, so a checkpoint for your 70B must exist or you train it. <a href="06-engines-and-formats.html">Chapter 06</a> sets these into one table.</p>
+</section>
+
+<section id="batching">
+  <h2>Continuous batching and the scheduler</h2>
+  <p>Static batching groups requests, runs them to completion, and returns together. Output lengths differ, so a slot sits idle after its sequence ends until the longest finishes. If Workload A's answers range from 100 to 800 tokens with a mean of 300 (illustrative), a static batch uses about 300 / 800 = 38% of its slots. Orca (Yu et al., 2022) fixed this with iteration-level scheduling: the scheduler decides the batch again at every step, so finished sequences leave and waiting ones join immediately. Its authors reported 36.9× higher throughput than FasterTransformer at the same latency on a GPT-3 175B model. vLLM, TGI, TensorRT-LLM and llama.cpp's server all document continuous or in-flight batching. The gateway-level cousin, which batches requests before they reach the engine, is in <a href="../build-inference-gateway-rust/03-batching-and-coalescing.html">batching and coalescing</a>, and the interview framing is in <a href="../ai-engineer-interview-prep/09-batching-system-for-llm-queries.html#continuous">a batching system for LLM queries</a>.</p>
+  <p>Each step the scheduler makes three decisions.</p>
+  <ol>
+    <li><strong>Admission.</strong> A waiting request joins if there are free sequence slots, free KV blocks for its prompt, and room in the step's token budget. These are the limits <code>max_num_seqs</code> and <code>max_num_batched_tokens</code> in vLLM.</li>
+    <li><strong>Ordering.</strong> In vLLM V1, running decodes are served first and prefill takes what budget remains, split into chunks if needed, as <a href="04-attention-and-kv-cache-optimisations.html#chunked">chapter 04</a> showed.</li>
+    <li><strong>Preemption.</strong> When the pool runs out of blocks mid-flight, a running request is evicted and, in V1's default recompute mode, rebuilt later from its prompt. Nothing fails, but the victim's latency jumps. The vLLM docs list lower <code>max_num_seqs</code>, higher memory utilisation, and more parallelism as the remedies, and say the preemption count is exposed as a metric.</li>
+  </ol>
+  <p>Preemption counts belong on the dashboard from day one, since a rising count is the early signal that admission limits are too generous for the pool. <a href="../paged-attention-deep-dive/index.html#continuous-batching">The paged attention guide</a> covers the block-level mechanics.</p>
+</section>
+
+<section id="tradeoff">
+  <h2>Throughput against latency, and when speculation hurts</h2>
+  <p>A step reads the weights once and each sequence's cache once, so step time is (70 GB + batch × context × 320 KiB) / 6.7 TB/s, an ideal floor that ignores kernel overhead. For Workload B at 3,250 tokens of context:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Streams</th><th>Cache read per step</th><th>Step time</th><th>Tokens/s per stream</th><th>Tokens/s total</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1.1 GB</td><td>10.6 ms</td><td>94</td><td>94</td></tr>
+      <tr><td>14</td><td>14.9 GB</td><td>12.7 ms</td><td>79</td><td>1,105</td></tr>
+      <tr><td>32</td><td>34.1 GB</td><td>15.5 ms</td><td>64</td><td>2,060</td></tr>
+      <tr><td>64</td><td>68.2 GB</td><td>20.6 ms</td><td>48</td><td>3,104</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Throughput climbs 33× from one stream to 64 while each stream slows by half, which is the trade batching makes. All rows beat the 30 tokens/s SLO on paper, so the real limit at Harbourline is queueing for prefill, not batch size.</p>
+  <p>Speculation changes the step. It processes γ + 1 tokens per sequence, so the step now holds batch × (γ + 1) tokens. Weights alone hide arithmetic for about 150 tokens per step at the assumed prefill rate of 15,000 tokens/s (10.5 ms × 15,000), and for about 300 at the H100's dense FP8 peak of 1,979 TFLOPS against 3.35 TB/s. Past that, extra verification tokens are not free. The script below models it with the arithmetic from the last section. It is a roofline sketch, not a benchmark: it ignores the draft model's own cache and batching overhead.</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>spec_model.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">KV, BW, W = 327_680, 6.7e12, 70e9     # bytes per token, two-GPU bytes/s, weight bytes
+TOK_S = 15_000                         # assumed rate when compute-bound
+C = 0.05                               # draft step cost as a fraction of one weight-read step
+
+def mem_time(batch, ctx):
+    return (W + batch * ctx * KV) / BW
+
+def plain(batch, ctx):
+    return batch / mem_time(batch, ctx)                       # tokens/s
+
+def spec(batch, ctx, alpha, gamma):
+    expected = (1 - alpha ** (gamma + 1)) / (1 - alpha)       # tokens per verified step
+    verify = max(mem_time(batch, ctx), batch * (gamma + 1) / TOK_S)
+    draft = gamma * C * W / BW
+    return batch * expected / (verify + draft)
+
+print(f"{'batch':>5} {'ctx':>6} {'alpha':>5} {'plain tok/s':>12} {'spec tok/s':>11} {'gain':>6}")
+for batch, ctx in ((1, 3250), (14, 3250), (64, 3250), (125, 1650)):
+    for alpha in (0.6, 0.8):
+        p, s = plain(batch, ctx), spec(batch, ctx, alpha, 4)
+        print(f"{batch:>5} {ctx:>6} {alpha:>5} {p:>12,.0f} {s:>11,.0f} {s / p:>5.2f}x")</code></pre>
+  </div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">batch    ctx alpha  plain tok/s  spec tok/s   gain
+    1   3250   0.6           94         182  1.93x
+    1   3250   0.8           94         265  2.81x
+   14   3250   0.6        1,105       2,186  1.98x
+   14   3250   0.8        1,105       3,188  2.89x
+   64   3250   0.6        3,104       6,300  2.03x
+   64   3250   0.8        3,104       9,185  2.96x
+  125   1650   0.6        6,087       6,586  1.08x
+  125   1650   0.8        6,087       9,603  1.58x</code></pre></div>
+  <p>The model says the gain survives to a batch of 64 and collapses toward 1× at a batch of 125 with poor acceptance. Treat it as an upper bound. The EAGLE-3 authors measured 1.38× at batch 64 in SGLang, not the 3× this sketch gives, and the engines say the same in words: vLLM aims speculation at medium-to-low request rates, and TensorRT-LLM notes that speculation stays on once enabled and that speedups appear mainly at low batch sizes. Reasons the sketch misses include draft-model overhead, tree verification cost, and the cost of rejected tokens' cache writes.</p>
+  <div class="callout insight">
+    <span class="callout-label">Speculation is a latency tool that borrows the batch's headroom</span>
+    <p>It converts idle arithmetic into fewer sequential steps. The more sequences share the GPU, the less idle arithmetic exists. So the same setting that gives 2× at one stream gives little at a full batch, and it can make an overloaded server worse. Enable it for interactive paths and benchmark at your real peak concurrency, not at one request.</p>
+  </div>
+</section>
+
+<section id="harbourline">
+  <h2>What Harbourline does</h2>
+  <p>Workload B at 14 streams has an ideal 79 tokens/s per stream against a 30 tokens/s SLO, so speculation is not needed to meet the SLO. What it changes is the felt latency of a 250-token answer: about 3.2 s at 79 tokens/s, and about 1.1 s at the 2.9× the sketch gives for α = 0.8. That is a product choice, and the case to make for it is that help-centre answers quote the retrieved passages, so α should be high for a prompt-lookup or n-gram drafter, which needs no extra model and, per vLLM's documentation, adds little work at peak traffic. Measure α on logged answers before turning it on. If Harbourline later serves per-team LoRA adapters, note that vLLM's feature table lists speculative decoding as incompatible with LoRA.</p>
+  <p>Workload A is the opposite. With about 125 claims in flight and no latency target, throughput is all that matters, so speculation is off, and the large batch with a large token budget does the work. At that batch the model predicts 1.1× to 1.6×, and a measured result will likely be lower. Disable it there and spend the effort on the cost sizing in <a href="08-capacity-cost-and-slos.html">chapter 08</a>.</p>
+  <p>The recommendation flips if the SLO tightens. At 60 tokens/s per stream the ideal table above allows only about 32 streams, where the ideal is 64, and real engines fall short of ideal, so a multi-token step becomes the way to keep the stream rate.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A draft model has α = 0.7 with γ = 5 and costs 4% of a target step. How many tokens does one target step yield on average, and why is the wall-clock gain smaller?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>(1 − 0.7⁶) / 0.3 = 2.94 tokens. The gain is divided by γc + 1 = 1.2, giving about 2.45×, because the draft steps are not free. See <a href="#arithmetic">the acceptance arithmetic</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does verifying γ + 1 tokens in one forward pass cost little more than verifying one, and under what condition does that stop being true?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A decode step is limited by reading the weights, which happens once however many tokens are in the step. It stops being true when batch × (γ + 1) tokens per step exceeds roughly the hundreds of tokens at which compute time matches weight-read time, after which the step grows with the token count. See <a href="#tradeoff">throughput against latency</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your team enables EAGLE-3 on the nightly batch deployment and throughput drops. Give two reasons.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>At large batch the step is no longer memory-bound, so the extra verification tokens cost real time. Rejected tokens are wasted work when α is low, and claim summaries are less copy-heavy than RAG answers. The reported 1.38× at batch 64 is already small. See <a href="#tradeoff">when speculation hurts</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A request arrives while the KV pool is full and a running request is preempted in recompute mode. What does the user of the preempted request see, and which metric should have warned you?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>No error, but a pause while the prompt is prefilled again before decoding resumes, so a stall and a worse tail latency. The preemption count is the warning, and the remedy is lower admission limits or more cache. See <a href="#batching">the scheduler</a>.</p></div></details>
+    </li>
+    <li>
+      <p>You must choose between a 1B draft model and prompt-lookup for the help-centre assistant. What decides it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Measured α on real traffic and the operating cost. Answers that quote retrieved passages suit prompt lookup, which needs no extra model memory or training. A draft model wins if answers are mostly generated rather than copied, and if you can afford its memory and tokenizer match. See <a href="#drafters">who writes the draft</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Speculative decoding verifies several drafted tokens per step and, with rejection sampling, keeps the target model's output distribution.</li>
+    <li>Expected tokens per step are (1 − α<sup>γ+1</sup>) / (1 − α), so the acceptance rate matters more than the draft length and must be measured on your own traffic.</li>
+    <li>Medusa, EAGLE and EAGLE-3 put the drafter inside or beside the target, and n-gram lookup needs no model, so the choice is between training effort and how much of the answer copies the prompt.</li>
+    <li>Continuous batching re-forms the batch at every step, and the scheduler's admission limits and preemption count are the controls and the warning light.</li>
+    <li>Speculation borrows the headroom that batching also wants, so it helps interactive low-batch paths and fades at high load.</li>
+    <li>At Harbourline, Workload B meets its stream-rate SLO without speculation and may add prompt lookup for latency, while Workload A should leave it off.</li>
+  </ul>
+  <p>Which engine implements these features, and in what form, is the next decision. → <a href="06-engines-and-formats.html">Engines and Formats</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener"><strong>Fast Inference from Transformers via Speculative Decoding</strong></a> — Leviathan, Kalman and Matias, 2022. Good for the rejection-sampling proof and the walltime theorem.</li>
+    <li><a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener"><strong>Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</strong></a> — Cai et al., 2024. Good for the Medusa-1 and Medusa-2 training choices.</li>
+    <li><a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener"><strong>EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</strong></a> — Li et al., 2024. Good for feature-level drafting.</li>
+    <li><a href="https://arxiv.org/abs/2503.01840" target="_blank" rel="noopener"><strong>EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</strong></a> — Li et al., 2025. Good for the batch-size-64 throughput figure.</li>
+    <li><a href="https://github.com/apoorvumang/prompt-lookup-decoding" target="_blank" rel="noopener"><strong>Prompt Lookup Decoding</strong></a> — project README. Good for when n-gram drafting suits input-grounded tasks.</li>
+    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener"><strong>Orca: A Distributed Serving System for Transformer-Based Generative Models</strong></a> — Yu et al., OSDI 2022. Good for iteration-level scheduling.</li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/speculative_decoding/" target="_blank" rel="noopener"><strong>vLLM: Speculative Decoding</strong></a> — vLLM documentation. Good for supported methods, the lossless claim and the high-QPS caveats.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
