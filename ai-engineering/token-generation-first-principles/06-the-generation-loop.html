@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Generation Loop — Token Generation from First Principles</title>
+<!-- HEAD:seo -->
+<meta name="description" content="Chapter 05 turned logits into one token. This chapter repeats that: prefill against decode, why the KV cache exists and what it costs for the Harbourline…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/token-generation-first-principles/06-the-generation-loop">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="The Generation Loop — Token Generation from First Principles">
+<meta property="og:description" content="Chapter 05 turned logits into one token. This chapter repeats that: prefill against decode, why the KV cache exists and what it costs for the Harbourline…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/token-generation-first-principles/06-the-generation-loop">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#loop">One token at a time</a>
+    <a href="#cache">Why the KV cache exists</a>
+    <a href="#size">What the cache costs in memory</a>
+    <a href="#stopping">Stop tokens and max tokens</a>
+    <a href="#latency">TTFT, TPOT and the arithmetic of 300 tokens</a>
+    <a href="#serving">What this means for serving</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="05-from-logits-to-a-token.html">← Previous: From Logits to a Token</a>
+    <a href="07-scale-and-reasoning-models.html">Next: Scale and Reasoning Models →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section C · Generation</span>
+  <h1>The Generation Loop</h1>
+  <p class="subtitle">Chapter 05 turned logits into one token. This chapter repeats that: prefill against decode, why the KV cache exists and what it costs for the Harbourline prompt and a 131,072-token context, stop conditions, and the latency arithmetic for a 300-token answer.</p>
+</header>
+
+<section id="loop">
+  <h2>One token at a time</h2>
+  <p>A decoder-only model is trained to predict the next token given all the previous ones, so generating a reply means running it repeatedly on its own output. Each pass takes the sequence so far, runs the <a href="04-the-block-and-the-forward-pass.html">forward pass</a>, turns the last position's logits into a token with the procedure in <a href="05-from-logits-to-a-token.html">chapter 05</a>, appends that token, and goes round again. The probability of a whole answer is the product of the per-step conditional probabilities, which is why a single early token can send the rest somewhere else.</p>
+  <div class="flow">  prompt tokens ──► PREFILL: one forward pass over all P tokens, in parallel
+                          │  builds K and V for every position (the cache)
+                          ▼
+              logits for the last position ──► sample ──► token 1 (first out)
+                          │
+  ┌───────────────────────┘
+  ▼
+  DECODE step t:  forward pass for ONE new token, reading the cache
+                  ──► logits ──► sample ──► token t ──► append K, V to the cache
+  repeat until a stop condition (end token, stop string, max tokens)</div>
+  <p>The two phases have different costs because they have different shapes. Prefill pushes P tokens through the weights at once and is limited by compute. Each decode step pushes one token and is limited by how fast the weights and cache can be read. <a href="04-the-block-and-the-forward-pass.html#h100">Chapter 04</a> worked that out for an H100: about 61 ms to prefill 2,000 tokens at an assumed half of peak, and 4.8 ms for each decode step at batch 1. The rest of this chapter builds on those two numbers.</p>
+</section>
+
+<section id="cache">
+  <h2>Why the KV cache exists</h2>
+  <p>In the causal attention of <a href="03-attention-one-head-at-a-time.html">chapter 03</a>, the key and value vectors at position <em>i</em> depend only on tokens 1 to <em>i</em>. When the next token arrives, the keys and values of every earlier token are unchanged. Recomputing them is waste, so the engine stores them. A decode step then computes the query, key and value for the one new token, appends the key and value to the cache, and attends over everything cached.</p>
+  <p>Count what it saves on the Harbourline request. Take a 2,000-token prompt and a 300-token answer. The prompt is an illustrative round figure: the 1,200-token system prompt, the two retrieved passages and the question. <a href="01-from-text-to-tokens.html">Chapter 01</a> counts a real one. Without a cache, generating token <em>t</em> reruns the whole sequence so far, which is 2,000 + <em>t</em> tokens. Summed over 300 steps:</p>
+  <div class="flow">  without cache, step t reruns 2,000 + t tokens, for t = 0..299:
+      Σ (2,000 + t) = 300 × 2,000 + 300 × 299 / 2 = 644,850 token-forwards
+  with cache: 2,000 (prefill) + 300 (one per step) = 2,300 token-forwards
+  ratio: 644,850 / 2,300 ≈ 280 times less work</div>
+  <p>The first form shows the shape of the cost. Without a cache the work is roughly n × P + n²/2 for n output tokens, and it is quadratic in the output length for a fixed prompt. With a cache it is linear: each step adds one token of weight traffic and one more row of cached keys to read. The cache does not remove attention's quadratic cost over a whole sequence, since each new token still attends to everything before it. It removes the recomputation on top of that.</p>
+</section>
+
+<section id="size">
+  <h2>What the cache costs in memory</h2>
+  <p>Each token adds one key and one value vector in every layer, for each of the 8 KV heads of 128 dimensions. In BF16:</p>
+  <div class="code-wrap">
+  <div class="code-header"><span class="filename"><span class="dot"></span>kv_cache.py</span><button class="copy-btn">Copy</button></div>
+  <pre><code class="language-python">layers, kv_heads, head_dim, bytes_per = 32, 8, 128, 2
+kv_token = 2 * layers * kv_heads * head_dim * bytes_per     # K and V
+print(kv_token)                                              # 131072 bytes = 128 KiB
+
+print(2_000 * kv_token / 2**20)         # 250.0 MiB   Harbourline prompt
+print(2_300 * kv_token / 2**20)         # 287.5 MiB   after a 300-token answer
+print(131_072 * kv_token / 2**30)       # 16.0 GiB    a full 131,072-token context
+
+weights = 8_030_261_248 * 2             # BF16 bytes
+print((80e9 - weights) // (131_072 * kv_token))   # 3.0 full-length sequences beside the weights on 80 GB</code></pre>
+  </div>
+  <p>A Harbourline request holds about 250 MiB of cache after prefill and 288 MiB at the end of the answer. That is small beside the 15 GiB of weights, and it is why chat at a few thousand tokens batches well. A full 131,072-token context holds 16 GiB, slightly more than the weights themselves, and an 80 GB card has room for three such sequences after the weights are loaded, before activations and any overhead. Long context therefore costs twice: attention work grows, and every concurrent long conversation takes a slice of memory that could have served many short ones.</p>
+  <p>Grouped-query attention is what keeps these numbers manageable. With all 32 heads storing keys and values, the figure would be four times larger: 512 KiB per token and 64 GiB for a full context. The Kwon et al. paper that introduced PagedAttention gives the same formula for OPT-13B, 800 KB per token, and builds a memory manager around the observation that this cache, not the weights, limits how many requests fit. The <a href="../paged-attention-deep-dive/index.html#kvcache">PagedAttention guide</a> follows that argument through, and <a href="../paged-attention-deep-dive/index.html#math">its worked example</a> shows the savings.</p>
+</section>
+
+<section id="stopping">
+  <h2>Stop tokens and max tokens</h2>
+  <p>The loop ends for one of three reasons, and an application should know which. The model can emit an <strong>end token</strong>, a special vocabulary entry it learned to produce when a turn is complete. The Llama 3.1 8B Instruct generation config lists three ids that count as an end: 128001, 128008 and 128009, and the engine stops when any is sampled. You can supply <strong>stop strings</strong>, which halt generation when the text matches. Or the budget runs out: <strong>max tokens</strong>, a hard count of new tokens.</p>
+  <p>The last is a safety valve, and it fails quietly. Anthropic's API reports why generation stopped in <code>stop_reason</code>, with <code>end_turn</code> for a natural stop, <code>stop_sequence</code> for one of your strings and <code>max_tokens</code> when the cap was hit. In Harbourline's claims extraction, max tokens is 400. If the model needs 450 tokens of JSON, the output ends mid-object with no error from the sampler, and a parser downstream sees a truncated string. Check the stop reason before parsing, and size the cap from the schema: measure the longest valid output on real claims and add a margin. Where a provider counts reasoning tokens against the same cap, as Anthropic does for extended thinking, the cap must cover the thinking too, or the visible answer is what gets cut.</p>
+  <p>A cap that is too generous has a cost as well. It is the worst-case time for a runaway loop, and the worst-case KV allocation the engine may reserve for the request. The flip case is open-ended chat, where a tight cap truncates good answers; there, set the cap from the longest answer you would accept and treat hits on it as a metric.</p>
+</section>
+
+<section id="latency">
+  <h2>TTFT, TPOT and the arithmetic of 300 tokens</h2>
+  <p>Two numbers describe a streamed response. <strong>Time to first token</strong> (TTFT) is how long the user waits before anything appears. <strong>Time per output token</strong> (TPOT) is the gap between tokens after that. They differ because they measure different phases: TTFT includes queueing, network and the whole prefill, while TPOT is one decode step. Total time follows:</p>
+  <div class="flow">  TTFT  = network + queue + prefill(P tokens) + first decode step
+  total = TTFT + (n - 1) × TPOT</div>
+  <p>For the Harbourline chat on one H100, ignoring network and queueing, with the 2,000-token prompt and a 300-token answer:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Quantity</th><th>Working</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td class="term">Prefill</td><td>2 × 7.5B × 2,000 / (0.5 × 989 TFLOPS)</td><td>61 ms</td></tr>
+      <tr><td class="term">TPOT, batch 1</td><td>(16.06 GB + 0.28 GB of cache) / 3.35 TB/s</td><td>4.9 ms</td></tr>
+      <tr><td class="term">TTFT floor</td><td>61 + 4.9</td><td>66 ms</td></tr>
+      <tr><td class="term">Total for 300 tokens</td><td>61 + 300 × 4.9</td><td>1.52 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The 0.28 GB of cache is the average over the answer: about 2,150 tokens at 128 KiB each. These are floors for the hardware and the 50% prefill assumption, not benchmarks. Real engines add kernel overheads, scheduling and sampling, and a hosted API adds network and queue time, so measure your own. What survives is the structure. Decode dominates: 1.46 s of the 1.52 s is the 300 steps, and prefill is 4% of the total. Doubling the prompt to 4,000 tokens adds about 61 ms. Doubling the answer to 600 tokens adds about 1.5 s. That is the reason a shorter answer is a bigger latency lever than a shorter prompt, and why <a href="../ai-engineer-interview-prep/10-latency-and-cost-at-scale.html#measure">the latency chapter of the interview guide</a> asks you to record both numbers per surface.</p>
+  <p>Streaming changes what the user sees, not how long generation takes. Anthropic's streaming API sends server-sent events, with a <code>content_block_delta</code> event for each increment of text, so the first words appear at about the TTFT and the rest follow at the TPOT. The chat benefits because 66 ms to first word feels instant while 1.5 s of blank screen does not. The claims extraction does not, because a parser needs the complete object and nothing is gained by receiving half of it earlier. There streaming adds overhead and no benefit, so Harbourline leaves it off.</p>
+</section>
+
+<section id="serving">
+  <h2>What this means for serving</h2>
+  <p>Everything above assumed one request on the card. A real server runs many, and the trade-offs follow from the two bottlenecks. Decode is limited by memory reads, and the weight read is shared, so adding requests to a step is cheap. But each added request brings its own cache to read. On the same arithmetic, with every sequence at 2,150 tokens:</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Batch</th><th>Step time</th><th>Per-user speed</th><th>Aggregate</th></tr></thead>
+    <tbody>
+      <tr><td class="term">1</td><td>4.9 ms</td><td>205 tokens/s</td><td>205 tokens/s</td></tr>
+      <tr><td class="term">8</td><td>5.5 ms</td><td>183 tokens/s</td><td>1,463 tokens/s</td></tr>
+      <tr><td class="term">32</td><td>7.5 ms</td><td>134 tokens/s</td><td>4,275 tokens/s</td></tr>
+      <tr><td class="term">64</td><td>10.2 ms</td><td>98 tokens/s</td><td>6,288 tokens/s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Going from 1 to 64 requests multiplies aggregate throughput by 31 while slowing each user by about half. Compute is not the limit at any of these sizes: at batch 64 the arithmetic needs about 1 ms of the 10 ms step. The growth of the step comes from the cache reads, 18 GB at batch 64 against 16 GB of weights. That is the whole case for shrinking and managing the cache: quantising it, sharing prefixes, paging it so no request reserves memory it does not use. The serving guide's <a href="../serving-open-weight-models/02-anatomy-of-a-decode-step.html">anatomy of a decode step</a> takes each of those in turn.</p>
+  <div class="callout warn">
+    <span class="callout-label">Aggregate throughput is not the user's experience</span>
+    <p>A capacity plan that targets the largest batch the memory allows will hit a latency target before it hits a memory limit. Set the per-user TPOT you promise first, then find the batch size that meets it. The flip case is the nightly batch job, where no one is waiting and the largest batch that fits is the right answer.</p>
+  </div>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Compute the KV cache for a 6,000-token conversation on Llama 3.1 8B in BF16, and say which fields of the config you used.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>2 × 32 layers × 8 KV heads × 128 head dimension × 2 bytes = 131,072 bytes per token, so 6,000 tokens take 786 million bytes, about 750 MiB. The fields are <code>num_hidden_layers</code>, <code>num_key_value_heads</code>, head dimension (hidden size over attention heads) and the dtype. See <a href="#size">What the cache costs in memory</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Without a KV cache, how does the work to generate <em>n</em> tokens from a prompt of <em>P</em> grow, and what does the cache change about it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Roughly n × P + n²/2 token-forwards, quadratic in output length. With a cache it is P + n, linear in the tokens processed. For P = 2,000 and n = 300 that is 644,850 against 2,300. Attention over the growing sequence is still quadratic in total; the cache only removes recomputation. See <a href="#cache">Why the KV cache exists</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A user complains the chat feels slow. TTFT is 70 ms and TPOT is 5 ms, and answers average 600 tokens. Which lever helps most, and what does shortening the system prompt by 500 tokens buy?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Total is about 70 ms + 599 × 5 ms = 3.1 s, nearly all decode, so shorter answers help most. Cutting 500 prompt tokens saves roughly 15 ms of prefill at the compute rate used here, and little else. See <a href="#latency">TTFT, TPOT and the arithmetic of 300 tokens</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Claims extraction returns a JSON string that fails to parse about once in a few hundred calls. Name two causes in the generation loop, and the check that separates them.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The cap of 400 tokens was reached and the object was cut off, or the model produced malformed JSON that no mask prevented. Read the stop reason: <code>max_tokens</code> means truncation. See <a href="#stopping">Stop tokens and max tokens</a> and the masking section of <a href="05-from-logits-to-a-token.html#masking">chapter 05</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Why does the per-user speed fall as batch size rises on a memory-bound decode step, even though the weights are read only once per step?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Each sequence adds its own cache to read, about 282 MB at 2,150 tokens, so the bytes per step grow with the batch while the weight read stays fixed. At batch 64 the cache is about 18 GB, more than the weights. See <a href="#serving">What this means for serving</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Generation is a loop of forward pass, sampling and append, which ends on an end token, a stop string or the token cap, and the application should record which.</li>
+    <li>Prefill processes the prompt in parallel and is compute-bound. Decode produces one token per pass and is memory-bound, so the two phases have different costs and different levers.</li>
+    <li>The KV cache stores each token's keys and values so earlier tokens are never recomputed. For a 2,000-token prompt and a 300-token answer it cuts the work by about 280 times.</li>
+    <li>Llama 3.1 8B holds 128 KiB of cache per token, 250 MiB for the Harbourline prompt and 16 GiB for a full 131,072-token context.</li>
+    <li>Time to first token is dominated by prefill and queueing. Total time for a normal answer is dominated by decode steps, so answer length is the bigger latency lever.</li>
+    <li>Batching raises aggregate throughput by sharing the weight read, but each added request brings its own cache, so per-user speed falls and memory eventually caps the batch.</li>
+  </ul>
+  <p>Next the guide steps back from one request to the models themselves: how scale, training and reasoning budgets changed what this loop produces. → <a href="07-scale-and-reasoning-models.html">Scale and Reasoning Models</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener"><strong>Efficient Memory Management for Large Language Model Serving with PagedAttention</strong></a> — Kwon et al., 2023. The KV cache size formula and why it limits batch size.</li>
+    <li><a href="https://arxiv.org/abs/2211.05102" target="_blank" rel="noopener"><strong>Efficiently Scaling Transformer Inference</strong></a> — Pope et al., 2022. Memory traffic of weights and cache as the cost of generative inference.</li>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/streaming" target="_blank" rel="noopener"><strong>Streaming Messages</strong></a> — Anthropic. The server-sent event types for incremental text.</li>
+    <li><a href="https://platform.claude.com/docs/en/api/messages" target="_blank" rel="noopener"><strong>Messages API reference</strong></a> — Anthropic. The <code>stop_reason</code> values and the <code>max_tokens</code> semantics.</li>
+    <li><a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener"><strong>NVIDIA H100 Tensor Core GPU</strong></a> — NVIDIA. The bandwidth and throughput figures behind the latency arithmetic.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>

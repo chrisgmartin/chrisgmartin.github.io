@@ -30,7 +30,8 @@
         { name: 'Evals for LLM Systems', folder: 'llm-evals-deep-dive' },
         { name: 'Fine-Tuning and Preference Alignment', folder: 'finetuning-and-alignment-deep-dive' },
         { name: 'Serving Open-Weight Models', folder: 'serving-open-weight-models' },
-        { name: 'Securing LLM Applications', folder: 'securing-llm-applications' }
+        { name: 'Securing LLM Applications', folder: 'securing-llm-applications' },
+        { name: 'Token Generation from First Principles', folder: 'token-generation-first-principles' }
       ]
     },
     {
@@ -510,11 +511,11 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=23';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=24';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
-      fonts.href = root + 'assets/fonts.css?v=23';   // self-hosted (assets/fonts/); no third-party font origin
+      fonts.href = root + 'assets/fonts.css?v=24';   // self-hosted (assets/fonts/); no third-party font origin
       document.head.appendChild(fonts);
     }
     // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
@@ -524,7 +525,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=23';
+    s.src = root + 'assets/nav.js?v=24';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a

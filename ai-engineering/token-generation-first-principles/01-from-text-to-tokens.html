@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>From Text to Tokens — Token Generation from First Principles</title>
+<!-- HEAD:seo -->
+<meta name="description" content="The first step from text to a sampled token is a lookup in a frozen vocabulary. This chapter covers how byte-level BPE and its relatives cut text into ids…">
+<link rel="canonical" href="https://christopherm.xyz/ai-engineering/token-generation-first-principles/01-from-text-to-tokens">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Field Guides">
+<meta property="og:title" content="From Text to Tokens — Token Generation from First Principles">
+<meta property="og:description" content="The first step from text to a sampled token is a lookup in a frozen vocabulary. This chapter covers how byte-level BPE and its relatives cut text into ids…">
+<meta property="og:url" content="https://christopherm.xyz/ai-engineering/token-generation-first-principles/01-from-text-to-tokens">
+<meta property="og:image" content="https://christopherm.xyz/assets/og.png?v=2">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Field Guides — the craft of building real systems, written down.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../../assets/favicon.svg?v=20" type="image/svg+xml">
+<link rel="alternate icon" href="../../favicon.ico?v=20" sizes="32x32">
+<link rel="apple-touch-icon" href="../../assets/apple-touch-icon.png?v=20">
+<!-- /HEAD:seo -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" integrity="sha384-oaMLBGEzBOJx3UHwac0cVndtX5fxGQIfnAeFZ35RTgqPcYlbprH9o9PUV/F8Le07" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="../../assets/style.css?v=20">
+<script defer src="../../assets/script.js?v=20"></script>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="mobile-toc-toggle">☰ Contents</button>
+  <nav>
+    <h2>Sections</h2>
+    <a href="#why">What the model actually receives</a>
+    <a href="#bpe">Byte-level BPE and how the merges are learned</a>
+    <a href="#sentencepiece">SentencePiece and Unigram</a>
+    <a href="#vocab">Vocabulary sizes, and what a bigger one costs</a>
+    <a href="#quirks">Why numbers, identifiers and whitespace tokenise the way they do</a>
+    <a href="#languages">Tokens per word by language, and the bill</a>
+    <a href="#spelling">The strawberry failures are a tokenisation artefact</a>
+    <a href="#special">Special tokens and chat templates</a>
+    <a href="#count">Counting Harbourline's prompt</a>
+    <a href="#check">✓ Check yourself</a>
+    <a href="#takeaway">Takeaway</a>
+    <a href="#further-reading">Further reading</a>
+
+    <h2>Navigation</h2>
+    <a href="index.html">↺ All chapters</a>
+    <a href="00-START-HERE.html">← Previous: Start Here</a>
+    <a href="02-embeddings-and-position.html">Next: Embeddings and Position →</a>
+  </nav>
+</aside>
+
+<main>
+
+<header class="hero">
+  <span class="eyebrow">Section B · Inside the model</span>
+  <h1>From Text to Tokens</h1>
+  <p class="subtitle">The first step from text to a sampled token is a lookup in a frozen vocabulary. This chapter covers how byte-level BPE and its relatives cut text into ids, what vocabulary size costs, why numbers, identifiers and other languages fragment, how special tokens and chat templates frame a request, and Harbourline's prompt counted with real tokenizers.</p>
+</header>
+
+<section id="why">
+  <h2>What the model actually receives</h2>
+  <p>A customer types <em>What is my deductible for windscreen damage on policy HL-UK-4471-220?</em> and the model never sees a letter. It sees a list of integers, each an index into a fixed vocabulary, and everything downstream is arithmetic on rows of a matrix indexed by those integers. The tokenizer is trained separately from the network and then frozen, so its choices are baked into the model: what counts as one unit, how much text fits in the window, how many units you are billed for, and what information is split apart before the network sees it.</p>
+  <p>The rest of the guide starts from that list of ids: <a href="02-embeddings-and-position.html">chapter 02</a> turns each one into a vector.</p>
+</section>
+
+<section id="bpe">
+  <h2>Byte-level BPE and how the merges are learned</h2>
+  <p>Byte pair encoding was adapted to neural translation by Sennrich et al. in 2015 to handle rare words as sequences of subword units. The training loop is simple. Start with every word as a sequence of single symbols. Count every adjacent pair of symbols across the corpus, weighted by word frequency. Merge the most frequent pair into a new symbol, record the merge, and repeat until the vocabulary reaches the size you chose. The toy below runs on nine Harbourline words.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>bpe_toy.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">from collections import Counter
+
+corpus = "claim claim claim claims claims claimed policy policy policies".split()
+words = Counter(tuple(w) for w in corpus)       # each word as a tuple of symbols
+
+def pair_counts(words):
+    pairs = Counter()
+    for word, n in words.items():
+        for a, b in zip(word, word[1:]):
+            pairs[(a, b)] += n
+    return pairs
+
+def merge(words, pair):
+    out = Counter()
+    for word, n in words.items():
+        new, i = [], 0
+        while i &lt; len(word):
+            if i &lt; len(word) - 1 and (word[i], word[i + 1]) == pair:
+                new.append(word[i] + word[i + 1]); i += 2
+            else:
+                new.append(word[i]); i += 1
+        out[tuple(new)] += n
+    return out
+
+for step in range(1, 6):
+    pair, n = pair_counts(words).most_common(1)[0]
+    words = merge(words, pair)
+    print(f"merge {step}: {pair[0]!r} + {pair[1]!r} -> {pair[0] + pair[1]!r}  (seen {n}x)")
+print(dict(words))</code></pre>
+</div>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">merge 1: 'c' + 'l' -> 'cl'  (seen 6x)
+merge 2: 'cl' + 'a' -> 'cla'  (seen 6x)
+merge 3: 'cla' + 'i' -> 'clai'  (seen 6x)
+merge 4: 'clai' + 'm' -> 'claim'  (seen 6x)
+merge 5: 'p' + 'o' -> 'po'  (seen 3x)
+{('claim',): 3, ('claim', 's'): 2, ('claim', 'e', 'd'): 1, ('po', 'l', 'i', 'c', 'y'): 2, ('po', 'l', 'i', 'c', 'i', 'e', 's'): 1}</code></pre></div>
+  <p>The pair <code>c l</code> ties with <code>l a</code> at six, and this code breaks ties by first appearance. Encoding a new string replays the merges in the order learned, so a frequent word becomes one token and a rare word falls into pieces that were frequent elsewhere.</p>
+  <p>Two changes turn this into what production models use. First, <strong>bytes instead of characters</strong>. The GPT-2 paper observes that a byte-level BPE needs a base vocabulary of only 256 symbols, so any Unicode string can be encoded and nothing is ever unknown. Second, <strong>pre-tokenisation</strong>. Left alone, BPE would learn many variants of common words such as <em>dog.</em> and <em>dog!</em>, so GPT-2 prevents merges across character categories, with an exception for spaces. Modern tokenizers use a regular expression that cuts the text into chunks before any merge applies. Llama 3.1's pattern separates contractions, letter runs, digits in groups of one to three, punctuation runs and whitespace runs, and merges never cross a chunk boundary. That is why digits, spaces and punctuation behave as they do below.</p>
+</section>
+
+<section id="sentencepiece">
+  <h2>SentencePiece and Unigram</h2>
+  <p>SentencePiece is a library, not an algorithm. Kudo and Richardson (2018) describe a tokenizer that trains directly on raw sentences with no word-level pre-splitting, so it suits languages without spaces. It treats whitespace as an ordinary symbol, written <code>▁</code>, which is why Llama 2 and Mistral tokens look like <code>▁policy</code>. Mistral 7B v0.1 ships a SentencePiece model and a 32,000-entry BPE vocabulary.</p>
+  <p>Unigram, proposed by Kudo in 2018, reverses the direction. It starts from a large seed vocabulary of frequent substrings and prunes it. A sentence's probability is the product of its subwords' probabilities, the best segmentation comes from the Viterbi algorithm, and probabilities are fitted with expectation-maximisation. Pruning drops the subwords whose removal costs the least corpus likelihood, never single characters. Because it is probabilistic, Unigram can sample several segmentations of one sentence, which Kudo used as training-time noise. BPE gives one per string.</p>
+</section>
+
+<section id="vocab">
+  <h2>Vocabulary sizes, and what a bigger one costs</h2>
+  <p>A larger vocabulary packs more characters into each token, so sequences are shorter, attention is cheaper and more text fits in the window. It also enlarges two matrices, the input embedding table and the output projection, each vocabulary by hidden size. For Llama 3.1 8B that is 128,256 × 4,096 = 525,336,576 parameters each, about 0.53 billion, and the model does not tie them. Together they are about 1.05 billion of the 8.03 billion parameters, about 13% (<a href="02-embeddings-and-position.html#embeddings">chapter 02</a>).</p>
+  <p>The Llama 3 paper says the 128K vocabulary combines 100K tokens from tiktoken with 28K added to support non-English languages, and that compression on a sample of English rose from 3.17 to 3.94 characters per token against the Llama 2 tokenizer. The table comes from tokenizer and configuration files fetched in November 2026.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Tokenizer</th><th>Algorithm</th><th>Vocabulary</th><th>Digits</th></tr></thead>
+    <tbody>
+      <tr><td class="term">GPT-2</td><td>Byte-level BPE</td><td>50,257</td><td>Learned merges</td></tr>
+      <tr><td class="term">Mistral 7B v0.1</td><td>SentencePiece BPE</td><td>32,000</td><td>One per token</td></tr>
+      <tr><td class="term">tiktoken <code>cl100k_base</code></td><td>Byte-level BPE</td><td>100,277</td><td>Groups of up to 3</td></tr>
+      <tr><td class="term">tiktoken <code>o200k_base</code></td><td>Byte-level BPE</td><td>200,019</td><td>Groups of up to 3</td></tr>
+      <tr><td class="term">Llama 3.1</td><td>Byte-level BPE</td><td>128,256 (128,000 learned + 256 reserved)</td><td>Groups of up to 3</td></tr>
+      <tr><td class="term">Qwen3</td><td>Byte-level BPE</td><td>151,669 in the tokenizer, 151,936 in the config</td><td>One per token</td></tr>
+      <tr><td class="term">DeepSeek-V3</td><td>Byte-level BPE</td><td>129,280 in the config</td><td>Groups of up to 3</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The configuration's <code>vocab_size</code> can exceed the real token count, as the Qwen3 and DeepSeek-V3 rows show, because the embedding table is padded. Use the tokenizer for the true count.</p>
+  <p>Past some point added tokens are rare and barely trained. Larger wins when traffic is multilingual or code-heavy, where small vocabularies fragment text most.</p>
+</section>
+
+<section id="quirks">
+  <h2>Why numbers, identifiers and whitespace tokenise the way they do</h2>
+  <p>Merges are learned from frequency, so anything common is cheap and anything arbitrary is expensive. Harbourline's policy identifier is arbitrary by design. Here are the pieces for three tokenizers, produced by running them.</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">'HL-UK-4471-220'
+  llama3.1    8  ['HL', '-', 'UK', '-', '447', '1', '-', '220']
+  o200k       8  ['HL', '-', 'UK', '-', '447', '1', '-', '220']
+  qwen3      12  ['HL', '-', 'UK', '-', '4', '4', '7', '1', '-', '2', '2', '0']</code></pre></div>
+  <p>Three mechanisms are visible. The regular expression cuts digit runs into groups of up to three, left to right, so 4471 becomes <code>447</code> and <code>1</code>. The grouping depends on position, not value, which is one reason models are error-prone at long arithmetic and at copying numbers exactly. Qwen3 and Mistral emit one token per digit, which is longer but consistent. Hyphens are separate tokens because punctuation sits in its own chunk. For retrieval, a dense embedding sees this identifier as eight to twelve meaningless fragments, the failure <a href="../production-rag-deep-dive/03-embeddings.html">the RAG guide's embeddings chapter</a> describes, and the reason exact-match lookups belong in a lexical index.</p>
+  <p>Whitespace follows the same logic. In byte-level BPE, <code>Ġ</code> is the visible name of the space byte, and a leading space attaches to the word after it. <code>strawberry</code> and <code> strawberry</code> are different strings: in the Llama 3.1 tokenizer the first is three tokens and the second is one. Runs of spaces collapse into one token, so indented code is cheap: four spaces and <code>return</code> came out as three tokens in every tokenizer tested.</p>
+</section>
+
+<section id="languages">
+  <h2>Tokens per word by language, and the bill</h2>
+  <p>The vocabulary is learned from a corpus, so a language that was rare in it gets fewer merges and more fragments. Petrov et al. (2023) report that the same text translated into different languages can differ in tokenisation length by up to 15 times, even in tokenizers built for multilingual use. Ahia et al. (2023) tied it to money: vendors charge per token, so speakers of some languages pay more for the same content.</p>
+  <p>The Harbourline question, without the policy number, was run through three tokenizers. The translations are the author's and one sentence is a tiny sample, so the ratios are indicative only.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Language</th><th>Llama 3.1</th><th><code>o200k_base</code></th><th><code>cl100k_base</code></th></tr></thead>
+    <tbody>
+      <tr><td class="term">English</td><td>12 (1.0×)</td><td>12 (1.0×)</td><td>12 (1.0×)</td></tr>
+      <tr><td class="term">Japanese</td><td>24 (2.0×)</td><td>27 (2.2×)</td><td>42 (3.5×)</td></tr>
+      <tr><td class="term">Arabic</td><td>22 (1.8×)</td><td>20 (1.7×)</td><td>46 (3.8×)</td></tr>
+      <tr><td class="term">Hindi</td><td>39 (3.2×)</td><td>24 (2.0×)</td><td>66 (5.5×)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The Hindi row falls from 66 tokens on <code>cl100k_base</code> to 24 on <code>o200k_base</code>, a vocabulary change worth a factor of nearly three. Harbourline's traffic is mostly English, but a Hindi question pays the multiple on every turn, output included. At 1,421 tokens a request (counted below), a million input tokens covers about 700 requests. If the same instructions cost twice the tokens in another language, that falls to about 350, and the window holds half as much conversation. Measure your real traffic with your real tokenizer.</p>
+</section>
+
+<section id="spelling">
+  <h2>The strawberry failures are a tokenisation artefact</h2>
+  <p>Ask a model how many times <em>r</em> appears in <em>strawberry</em> and it may say two. It is not a reasoning failure in the usual sense. The Llama 3.1 tokenizer cuts the word to <code>str</code>, <code>aw</code>, <code>berry</code>, and <code>o200k_base</code> cuts it to <code>st</code>, <code>raw</code>, <code>berry</code>. The model receives three ids, and each id is a vector with no letters inside it. To count the letter it must have learned, from text, which letters make up each token, which is shaky for a split like this. The same mechanism explains failures at reversing strings and at counting characters in the policy number.</p>
+  <p>Give character-level work to code. If Harbourline's claims extraction must verify that a policy number matches <code>HL-(UK|US)-\d{4}-\d{3}</code>, a regular expression does it, and asking the model to check character by character is the wrong tool. Asking the model to spell the word out before counting can help, but it spends output tokens to work around an input representation. The rule flips when exactness is not required, as in paraphrasing a customer's message.</p>
+</section>
+
+<section id="special">
+  <h2>Special tokens and chat templates</h2>
+  <p>Vocabularies reserve ids for control symbols that never come from text. The Llama 3.1 vocabulary holds 256 of them: <code>&lt;|begin_of_text|&gt;</code> (id 128000), header markers, and <code>&lt;|eot_id|&gt;</code> (id 128009), which ends a turn. A chat template turns a list of role-tagged messages into one string with these markers. Here is Llama 3.1's, rendered for a system message <code>S</code> and a user message <code>Q</code>:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
+
+S&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;
+
+Q&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;
+
+</code></pre></div>
+  <p>The template adds 15 tokens around the two messages, and its final lines open the assistant turn so the model's next token is the first word of the reply. Three failure modes follow. The first is a <strong>wrong template</strong>: an instruct model served with a different format can degrade quietly, with no error. The second is a <strong>doubled start token</strong>: Hugging Face's documentation warns that templates already include special tokens, so tokenising a rendered string with default settings can add them twice. Pass <code>add_special_tokens=False</code> or let <code>apply_chat_template</code> tokenise directly.</p>
+  <p>The third is <strong>injection through text</strong>. Encoding the string <code>hi &lt;|eot_id|&gt;</code> with the Hugging Face Llama 3.1 tokenizer returns ids <code>6151, 220, 128009</code>: the literal text in a user's message became the real end-of-turn token. tiktoken refuses by default, raising an error for disallowed special tokens unless you pass <code>allowed_special</code>. So behaviour depends on the library. If the serving path parses them, a Harbourline customer who pastes control strings can end a turn early or forge a role boundary. Strip or escape such strings before templating, and test your own stack, since this depends on the tokenizer library and version.</p>
+</section>
+
+<section id="count">
+  <h2>Counting Harbourline's prompt</h2>
+  <p>The help-centre prompt has three parts: a system prompt, two retrieved passages, and the question. The system prompt is an illustrative text written for this guide, 973 words of rules, style and escalation instructions, and the two passages are short stand-ins for a policy schedule and a wording section. The counts describe this text only. The script takes the system prompt, the question and then the passages as file arguments.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>count_tokens.py</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-python">import sys
+import tiktoken
+from transformers import AutoTokenizer
+
+system = open(sys.argv[1]).read().strip()
+question = open(sys.argv[2]).read().strip()
+context = "\n\n".join(open(p).read().strip() for p in sys.argv[3:])
+user = f"CONTEXT\n{context}\n\nQUESTION\n{question}"
+body = system + "\n\n" + user                     # the text, with no chat framing
+
+print(f"characters {len(body)}  words {len(body.split())}")
+for name in ("o200k_base",):
+    enc = tiktoken.get_encoding(name)
+    print(f"{name:12s} vocab {enc.n_vocab:&gt;7,}  tokens {len(enc.encode(body)):&gt;5,}")
+
+for repo in ("NousResearch/Meta-Llama-3.1-8B-Instruct",):
+    tok = AutoTokenizer.from_pretrained(repo)
+    plain = len(tok(body, add_special_tokens=False)["input_ids"])
+    chat = tok.apply_chat_template(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        add_generation_prompt=True, tokenize=True)
+    chat = chat["input_ids"] if hasattr(chat, "keys") else chat
+    print(f"{repo.split('/')[1]:28s} vocab {len(tok):&gt;7,}  text {plain:&gt;5,}  chat-templated {len(chat):&gt;5,}")</code></pre>
+</div>
+  <p>The script was run in a fresh virtual environment with <code>tiktoken</code>, <code>transformers</code> and <code>jinja2</code>, using an ungated mirror of the gated Llama tokenizer files. The output:</p>
+  <div class="code-wrap"><button class="copy-btn">Copy</button><pre><code class="language-text">characters 6723  words 1145
+o200k_base   vocab 200,019  tokens 1,422
+Meta-Llama-3.1-8B-Instruct   vocab 128,256  text 1,406  chat-templated 1,421</code></pre></div>
+  <p>The system prompt alone is 1,187 Llama 3.1 tokens, the "about 1,200" this guide uses. The question and passages add about 220 and the chat template 15. The whole request is 1,421 tokens, and the two tokenizers differ by about 1% on this English prose. A rough count with the wrong tokenizer is fine for English and unreliable for other languages, code and identifiers. Count with the tokenizer of the model you call.</p>
+  <p>The 1,421 tokens are what <a href="06-the-generation-loop.html">prefill</a> processes before the first output token, and they set a floor on cost, worked through in <a href="../ai-engineer-interview-prep/10-latency-and-cost-at-scale.html">Latency and Cost at Scale</a>.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory first.</p>
+  <ol>
+    <li>
+      <p>Two engineers count the same prompt, one with <code>o200k_base</code> and one with the Llama 3.1 tokenizer, and the counts differ by 16 on 1,400 tokens. Why is that unremarkable for English, and for which input would you expect it to become a problem?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Both are byte-level BPE vocabularies trained on large, mostly English corpora, so common English words are single tokens in each. They diverge on non-English text, code and identifiers: the Hindi sentence differed by more than a factor of two between <code>cl100k_base</code> and <code>o200k_base</code>. See <a href="#languages">Tokens per word by language</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A colleague says the model "can't count letters because it isn't smart enough". What is a more accurate explanation, and what do you build for a claims form that needs the check?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The input is token ids, and a token is one vector with no letters in it, so the model must infer spelling from training data. The tempting answer, a capability limit, misses the representation. For the form, use code such as a regular expression on the policy number. See <a href="#spelling">The strawberry failures</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Your serving code renders the chat template to a string and then calls the tokenizer on it with default settings. Quality drops slightly and no error appears. What is the likeliest cause, and how do you confirm it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The start-of-text token is probably present twice. Decode the first ten ids and look for two <code>&lt;|begin_of_text|&gt;</code> entries, then tokenise with special-token addition off. See <a href="#special">Special tokens and chat templates</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Harbourline wants the help-centre assistant to answer in six languages and has budgeted from an English token count. What do you tell them, and what would make you accept the budget anyway?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Counts run higher in most other languages, from 1.8 to 3.2 times in this sample on Llama 3.1 and up to 15 times in published work, so measure per language with the production tokenizer. Accept the English budget if non-English traffic is small enough that a 3× multiplier on it stays inside your margin. See <a href="#languages">Tokens per word by language</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>A tokenizer is a frozen, corpus-trained function from a string to integer ids, and the model never sees characters.</li>
+    <li>Byte-level BPE learns merges by repeatedly joining the most frequent adjacent pair, after a regular expression splits the text into chunks that merges cannot cross.</li>
+    <li>A larger vocabulary shortens sequences but adds two vocabulary-by-hidden-size matrices, about 1.05 billion parameters in Llama 3.1 8B.</li>
+    <li>Identifiers, digits and non-English text fragment because merges follow frequency, so cost, context and retrieval behave worse on them than on English prose.</li>
+    <li>Letter-level failures come from the input representation, so give character work to code.</li>
+    <li>Use the exact chat template and tokenizer of the model you call, and treat control strings in user text as an injection risk. Harbourline's help-centre request is 1,421 tokens under Llama 3.1, of which the system prompt is 1,187.</li>
+  </ul>
+  <p>Those ids are only labels until they become vectors with a position, which is the next chapter's job. → <a href="02-embeddings-and-position.html">Embeddings and Position</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener"><strong>Language Models are Unsupervised Multitask Learners</strong></a> — Radford et al., 2019. Section 2.2 explains byte-level BPE and the rule against merging across character categories.</li>
+    <li><a href="https://arxiv.org/abs/1804.10959" target="_blank" rel="noopener"><strong>Subword Regularization</strong></a> — Kudo, 2018. The Unigram language model tokenizer and its pruning loop.</li>
+    <li><a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener"><strong>The Llama 3 Herd of Models</strong></a> — Meta, 2024. Section 3.1 gives the 128K vocabulary and the compression gain from 3.17 to 3.94 characters per token.</li>
+    <li><a href="https://arxiv.org/abs/2305.15425" target="_blank" rel="noopener"><strong>Language Model Tokenizers Introduce Unfairness Between Languages</strong></a> — Petrov et al., 2023. Good for measured tokenisation-length gaps across languages.</li>
+    <li><a href="https://huggingface.co/docs/transformers/en/chat_templating" target="_blank" rel="noopener"><strong>Chat templates</strong></a> — Hugging Face Transformers documentation. Good for the double special token pitfall and <code>add_generation_prompt</code>.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+<button class="theme-toggle" id="themeToggle" title="Toggle theme">🌙</button>
+
+</body>
+</html>
