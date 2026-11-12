@@ -11,7 +11,10 @@ Per chapter it reports
         Check-yourself answers, external links without rel="noopener", code without the highlight.js tags,
         inline <script> / on*= handlers
   WARN  no Takeaway, no Check yourself, yes/no "Do you understand…" questions, Takeaway without a hand-off link,
-        no intra-site links beyond the sidebar
+        no intra-site links beyond the sidebar. A page can opt out by kind with a comment in its <head>:
+        `<!-- review: reference -->` (glossaries, cheat sheets, question lists, day-of and domain-context pages
+        need no Check yourself or Takeaway) or `<!-- review: code-only -->` (a commands-only setup page may have
+        few intra-site links). Start Here (00-) chapters are exempt without a marker.
   INFO  no Further reading, word count
 
 `--summary` prints one line per guide instead of per chapter (for planning a backfill). Exit status is 1 when any
@@ -86,8 +89,12 @@ def review(rel):
     if re.search(r"<[a-z][^>]*\son[a-z]+\s*=", s, re.I): fail.append("on*= handler attribute")
     if re.search(r'<code class="language-', s) and "highlight.min.js" not in s: fail.append("code blocks but no highlight.js tags")
 
-    # closing sections
-    orientation = bool(re.search(r"(^|/)00-", rel))
+    # closing sections. A page may declare its kind in a comment: `<!-- review: reference -->` (glossary, cheat sheet,
+    # question list, day-of, domain context: no Check yourself or Takeaway expected) or `<!-- review: code-only -->`
+    # (a setup page that is mostly commands: few intra-site links expected).
+    kind = re.search(r"<!--\s*review:\s*(reference|code-only)\s*-->", s)
+    kind = kind.group(1) if kind else None
+    orientation = bool(re.search(r"(^|/)00-", rel)) or kind == "reference"
     take = section(main, r"^takeaways?\b|^key takeaways?")
     if take is None:
         if not orientation: warn.append("no Takeaway")
@@ -106,7 +113,7 @@ def review(rel):
 
     inner = [h for h in re.findall(r'<a\b[^>]*\bhref="([^"]+)"', re.sub(r"<aside\b.*?</aside>", "", s, flags=re.S))
              if not re.match(r"(https?:|mailto:|//|#)", h)]
-    if len(inner) < 2: warn.append("few intra-site links in the body (%d)" % len(inner))
+    if len(inner) < 2 and kind != "code-only": warn.append("few intra-site links in the body (%d)" % len(inner))
     info.append("%d words" % len(text(main).split()))
     return fail, warn, info
 
