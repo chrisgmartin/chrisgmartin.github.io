@@ -592,7 +592,16 @@
     d.note(30,200,'founded by a teenager · bootstrapped · recent funding',{size:10.5});
     d.note(30,262,'same shape as Vast, different bet on supply quality');
   };
-  B['neocloud/together-ai']=function(d){
+  B['neocloud/fluidstack']=function(d){
+    d.title('Build the hall, borrow the credit');
+    var p=d.box(24,64,96,44,'power +\nsite',{size:11}),b=d.box(152,64,96,44,'build\n(6 months?)',{size:11,wash:1}),o=d.box(280,64,96,44,'operate\ncustomer chips',{size:11});
+    d.connect(p,b);d.connect(b,o);
+    var l=d.box(40,170,110,40,'landlord\nborrows',{size:10.5}),g=d.box(250,170,110,40,'Google\nguarantees rent',{size:10.5,wash:1});
+    d.connect(l,b);d.connect(g,b);d.text(200,186,'tenant: Fluidstack',{size:10});
+    d.note(36,250,'rent starts at lease commencement;\nrevenue only when halls open',{size:11});d.ring(26,232,350,52,{red:1});
+  };
+  
+B['neocloud/together-ai']=function(d){
     d.title('Research credibility, inference economics');
     var r=d.box(40,60,130,44,'FlashAttention\nRedPajama',{size:11}),p=d.box(230,60,130,44,'inference +\ntraining API',{size:11,wash:1});d.connect(r,p);
     d.text(200,50,'research → product',{size:10.5});
