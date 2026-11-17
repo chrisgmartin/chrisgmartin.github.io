@@ -599,7 +599,7 @@
     d.connect(s1,id);d.connect(s2,id);d.connect(s3,id);d.connect(s4,id);
     var q=d.box(292,96,92,78,'answer:\nfact + source\n+ freshness\n+ permission',{size:10});d.connect(id,q);
     d.text(216,88,'who may see it?',{size:10});d.text(216,196,'when did we know?',{size:10});
-    d.note(24,262,'fresh, traceable, permissioned: or it is a warehouse',{size:11});d.ring(14,250,372,30,{red:1});
+    d.note(48,262,'fresh, traceable, permissioned: or it is a warehouse',{size:11});d.ring(22,246,364,34,{red:1});
   };
   
 B['neocloud/fluidstack']=function(d){
