@@ -19,7 +19,13 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#join">Why a join breaks row-level security</a>
+    <a href="#rebac">Relationships as the model</a>
+    <a href="#abac">When attributes are the better tool</a>
+    <a href="#derived">Derived facts: the most restrictive source wins</a>
+    <a href="#filter">Filtering results: before or after the query</a>
+    <a href="#documents">Documents, spans and the lag problem</a>
+    <a href="#agents">Agents and audit</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -39,9 +45,154 @@
   <p class="subtitle">Relationship-based access control over the object graph, source restrictions enforced in search and in derived answers, and what happens when an answer combines three systems with three policies.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="join">
+  <h2>Why a join breaks row-level security</h2>
+  <p>Take the first of GridDP's questions: which Reserved servers promised to customer X for November are at risk, and why? The answer touches a Salesforce commitment, a NetSuite purchase order, a NetBox rack, a carrier delay, and a Slack thread where a site lead explained the delay. Each system has its own idea of who may read its rows. Row-level security in Postgres, a NetSuite role and a Slack private channel are each correct inside their own walls, and none of them can say what the join of the three may show to a vendor contractor at Reno.</p>
+  <p>The ontology has to hold one permission model of its own and map every source policy into it at ingestion. There is no alternative, because the join happens in the ontology and no source database can enforce a rule over rows it does not hold. The roles are fixed by the guide: procurement, site operations, finance, executives, vendor contractors (per site) and agents acting for a user. Site, rack and device inherit downwards; finance documents are limited to finance and executives; a contractor sees only their own site; an agent never sees more than its caller. All GridDP figures in this chapter are illustrative.</p>
+  <p>This chapter owns who may see which fact. It relies on the per-fact source and history of <a href="04-provenance-history-and-evidence.html">chapter 04</a>, because a derived fact's audience is computed from its inputs, and it hands deletion on a permission change to <a href="06-deletions-corrections-and-replay.html">chapter 06</a>.</p>
+</section>
+
+<section id="rebac">
+  <h2>Relationships as the model</h2>
+  <p>Google's Zanzibar paper (USENIX ATC 2019) gives the model most open implementations follow. Access control lists are stored as relation tuples such as <code>doc:readme#parent@folder:A#...</code>, meaning doc:readme is in folder:A, alongside <code>group:eng#member@11</code>, user 11 is a member of group:eng. A namespace configuration then rewrites relations: its Figure 1 makes owners editors, editors viewers, and "viewers of the parent folder are also viewers of the document". Permission is therefore a graph walk, not a per-object list, and one tuple, a document's parent, grants an audience that would take thousands of list entries to write out.</p>
+  <p>OpenFGA is the open-source implementation. Its documentation defines the pieces plainly: "a type is a string" naming a class of objects, "a relation is a string defined in the type definition of an authorization model", and "a relationship tuple is a base tuple/triplet consisting of a user, relation, and object". A Check "returns whether the user has a certain relationship"; ListObjects "returns all objects of a given type" the user relates to. Its JSON syntax "closely follows the original syntax in the Zanzibar Paper". The DSL below follows the configuration-language page's operators: <code>from</code> for inheritance from a related object, <code>or</code> and <code>and</code> for union and intersection. It is a sketch of GridDP's site tree and has not been run against a server.</p>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>griddp.fga (sketch, OpenFGA DSL)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-text">model
+  schema 1.1
+
+type user
+type group
+  relations
+    define member: [user]
+
+type site
+  relations
+    define operator: [group#member]
+    define contractor: [user]
+    define can_view: operator or contractor
+
+type rack
+  relations
+    define site: [site]
+    define can_view: can_view from site
+
+type device
+  relations
+    define rack: [rack]
+    define can_view: can_view from rack
+
+type document
+  relations
+    define site: [site]            # site plans, vendor quotes for a site
+    define reader: [group#member]  # explicit audience, e.g. finance
+    define can_view: reader or can_view from site</code></pre>
+  </div>
+  <p>Three tuples then carry the contractor rule: <code>site:reno#contractor@user:vendor-7</code>, <code>rack:r12#site@site:reno</code> and <code>device:5519#rack@rack:r12</code>. A Check of vendor-7 on device 5519 walks device to rack to site and succeeds. The same vendor on a Dallas device finds no path and fails. Nothing was written for Dallas; the absence of an edge is the denial. Finance documents get a <code>reader</code> tuple naming the finance and executive groups and no <code>site</code> tuple, so no site relationship can reach them. Moving a rack between sites is one tuple change, and every device under it follows.</p>
+  <p>Zanzibar is also the source of the hard consistency requirement. The paper's "new enemy" problem has two cases: a user removed from a folder's list who can still see documents added to it afterwards, and a stale ACL applied to new content. Zanzibar prevents both with external consistency and snapshot reads, carried by an opaque token it calls a zookie. OpenFGA's consistency page offers a coarser tool: with caching enabled the default mode is that "OpenFGA will serve queries from the cache when possible", and <code>HIGHER_CONSISTENCY</code> skips the cache. The cost is stated: always using it "will have a significant impact in performance". GridDP should use the default for ordinary reads and force fresh reads on the path that follows a revocation, such as the minute after a contractor's access ends. That choice is the flip point for the whole system: if a stale grant can leak a vendor quote, the extra latency is cheap.</p>
+</section>
+
+<section id="abac">
+  <h2>When attributes are the better tool</h2>
+  <p>NIST SP 800-162 describes attribute-based access control as a "logical access control methodology where authorization to perform a set of operations is determined by evaluating attributes", of the user, the resource, the action and the environment. Relationships suit questions of structure: this rack is in that site, this person works for that contractor. Attributes suit questions of value or state: the quote is under a spending limit, the grant has not expired, the request comes from the site's network.</p>
+  <p>OpenFGA folds the second kind into the first through conditions: "a condition is a function composed of one or more parameters and an expression", attached to a tuple, with context merged from the tuple and the request, and the tuple's value winning on a clash. GridDP's use is time-boxed contractor access. The tuple for vendor-7 carries an expiry attribute (not shown in the sketch), the request supplies the current time, and the grant lapses without anyone deleting it.</p>
+  <p>Combine them in that order of preference: relationships for the structure that matches the org chart and the site tree, a condition for the time or value limit on a single edge. Pure attribute rules over many fields are harder to audit, because no one can list who may see a fact without evaluating every user; ListObjects and ListUsers are cheap questions only when access is relationships. The case where attributes should lead is a policy that does not follow an entity tree at all, such as "no one outside finance sees any amount over a threshold".</p>
+</section>
+
+<section id="derived">
+  <h2>Derived facts: the most restrictive source wins</h2>
+  <p>A derived fact is readable only by someone who may read everything it was derived from. The reasoning is mechanical: if the audience of a derived fact were wider than that of any input, the fact would be a side channel for the input. A "reorder at risk" fact computed from a PO's unit price leaks that price to anyone who can see the flag.</p>
+  <p>The model above cannot express this directly for variable inputs, because <code>and</code> joins a fixed set of relations. The workable design uses policy labels. Every source field is mapped at ingestion to a small set of labels such as <code>finance</code> or <code>site:reno</code>. Every derived fact stores the union of its inputs' labels, computed at derivation and carried beside the <code>inputs</code> array from chapter 04. A caller may read the fact when a Check passes for every label on it. Labels number in the tens, so the check is a few calls; the label set is far smaller than the input set.</p>
+  <p>Label the field, not the record. A PO's delivery date belongs to procurement and site operations, and its unit price to finance. A "late" flag derived from the date alone carries no finance label, so site operations can act on it. Record-level labels would hide it from them and turn the permission system into the thing that blinds the people closest to the problem.</p>
+  <p>There are two honest exceptions. A rule may declassify, for example publishing to executives a count of at-risk servers per site that omits amounts. A declassification is an Activity in chapter 04's sense: a named rule, a named approver, a version, and an agent on record, so that widening an audience leaves evidence. And a few facts are open to every employee by policy, such as a hostname. Without these two escapes the rule produces answers nobody may see, and people respond by exporting data to spreadsheets, where no label follows it.</p>
+  <div class="callout danger">
+    <span class="callout-label">A summary is a derived fact too</span>
+    <p>Counts, rankings and "top reasons" computed over restricted rows inherit the restriction unless a declassification rule says otherwise. The helpful aggregate is an easy path to a leak, because nobody thinks of it as data.</p>
+  </div>
+</section>
+
+<section id="filter">
+  <h2>Filtering results: before or after the query</h2>
+  <p>There are two ways to apply permissions to a result set. Pre-filtering asks the permission system for the objects the user may see, then restricts the query to them. Post-filtering runs the query, then Checks each result. OpenFGA's relationship-queries page positions ListObjects for "access-aware filtering on small object collections" and states its limits: results come back only if found within <code>listObjectsDeadline</code>, default 3 seconds, and are capped by <code>listObjectsMaxResults</code>, default 1,000.</p>
+  <p>Those limits sort GridDP's collections. A site operator's visible Reserved servers number at most 600, growing by about 200 a quarter, so ListObjects returns the whole set under the default cap for about two more quarters; raise the cap or move to the next scheme before then. The marketplace's 40,000 machines and the 30,000 documents are over the cap by a wide margin, and a finance user may legitimately see all of them.</p>
+  <table>
+    <thead>
+      <tr><th></th><th>Pre-filter (ListObjects)</th><th>Post-filter (Check per result)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Suits</td><td>Visible set under the cap, structured queries</td><td>Search, ranking, large visible sets</td></tr>
+      <tr><td class="term">Cost</td><td>One call, but cap and deadline apply</td><td>One Check per candidate</td></tr>
+      <tr><td class="term">Failure</td><td>Silent truncation past the cap</td><td>Pages that come back short</td></tr>
+    </tbody>
+  </table>
+  <p>Post-filtering has the arithmetic problem. If a contractor may see 2% of the documents that match a query and the page size is 10, the search must fetch about 10 ÷ 0.02 = 500 candidates to fill one page, then run 500 Checks. At an assumed 5 ms each, done one after another, that is 2.5 seconds, so the Checks must run in parallel or in batches. The standard answer is to do both. Copy a coarse label, such as site and audience group, into each search document as a filter field so the index discards most candidates cheaply, then Check the surviving top results exactly. The coarse label is only a hint; the Check is the authority, so a stale label causes a short page and never a leak. The cost is a second copy of the permission to keep current, which chapter 06 treats as one more place a revocation must reach.</p>
+</section>
+
+<section id="documents">
+  <h2>Documents, spans and the lag problem</h2>
+  <p>A document's audience is the source's own: a Drive file's sharing list, a Slack channel's membership. Ingestion syncs these into tuples, and a span cited as evidence inherits its document's audience. This makes permission lag the sharp edge. GridDP's freshness target for documents and Slack is 24 hours, which is acceptable for content. It is not acceptable for permissions, where a person removed from a private channel at 10:00 must stop seeing its messages at once. Sync permissions on their own faster path, minutes and not a day, and fail closed: when the permission sync for a source is older than its limit, deny that source's documents and report the gap.</p>
+  <p>A fact can be broader than its evidence. The fact "GD-7F21 shipment delayed four days" may be visible to site operations while the vendor PDF it came from is finance-only. Chapter 04 stores a short quote with each evidence link; decide per source whether the quote may travel. The default that holds up is to show the fact, show that evidence exists and is restricted, and name who can open it. Hiding the fact is the right answer only when the fact itself would reveal what the document says, as with a negotiated price.</p>
+</section>
+
+<section id="agents">
+  <h2>Agents and audit</h2>
+  <p>An agent acts for a user and may not exceed that user. The query service therefore authenticates the caller by a token that names both the user and the agent, runs every Check and ListObjects as the user, and treats the agent's identity as extra restriction: a tool may narrow what the user can reach, never widen it. This is the confused-deputy defence that the <a href="../../ai-engineering/securing-llm-applications/04-agents-tools-and-excessive-agency.html#privilege">least-privilege section</a> of the LLM security guide develops for tools, applied here to the data layer. The model must never be asked to filter; filtering is done before data reaches it, which chapter 07 builds into the retrieval path. The same separation appears in the RAG guide's treatment of <a href="../../ai-engineering/production-rag-deep-dive/08-freshness-tenancy-and-access.html#access">access control in retrieval</a>.</p>
+  <p>Audit is one record per answer: request id, user, agent, the authorization model version, the fact ids returned, and each Check's result. Store ids and not values, so the audit log is not a second copy of the restricted data. A weekly question, "which contractor accounts read finance-labelled facts", becomes a query. At an illustrative 10,000 answers a day with about 50 ids each, that is 500,000 rows a day, a small table beside the fact history of chapter 04. The audit log needs the same retention and erasure thinking as everything else, which chapter 06 takes up. The broader governance context sits in the <a href="../data-platform-systems-design/11-governance-security.html#access">governance chapter of the systems-design guide</a>.</p>
+</section>
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>Postgres row-level security, a NetSuite role and a Slack channel list are each configured correctly. Why does that not settle who may see an answer that joins all three?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The join happens in the ontology, over rows no source database holds, so no source can enforce a rule on the combination. The ontology needs its own permission model with source policies mapped in at ingestion. See <a href="#join">Why a join breaks row-level security</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A vendor contractor works at Reno and a new rack is added there. What must be written for the contractor to see its devices, and what must be written to keep them out of Dallas?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Only the rack's site tuple, since devices inherit through rack to site. Nothing is written for Dallas: the denial is the absence of a path. See <a href="#rebac">Relationships as the model</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A "reorder at risk" flag is derived from a PO's delivery date and its unit price. Site operations cannot see it. Which design choice caused that, and how would you fix it without exposing the price?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Record-level labels. Label fields, so a flag derived from the date alone carries no finance label; if the flag really uses the price, a declassification rule with a named approver can release the flag. See <a href="#derived">Derived facts</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A contractor may see 2% of the documents matching a query, and a page holds 10 results. Estimate the work of post-filtering and say what you would change.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>About 500 candidates and 500 Checks per page. Add a coarse site and audience label to the index as a filter and Check only the top results exactly, keeping the Check as the authority. See <a href="#filter">Filtering results</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Document content is refreshed every 24 hours. A reviewer proposes syncing permissions on the same schedule. What is wrong, and what should the system do when the sync falls behind?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A removal would stay effective for up to a day. Sync permissions separately and fast, and fail closed: deny that source's documents past the sync limit and report the gap. See <a href="#documents">Documents, spans and the lag problem</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Argue whether an agent should hold its own grants or run every check as its caller. Say when your answer changes.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Run as the caller, with the agent's identity only narrowing scope, so it can never exceed the user. A background agent with no user, such as a nightly report, needs its own narrowly scoped grants and its own owner. See <a href="#agents">Agents and audit</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Source-system permissions cannot govern a join, so the ontology holds its own permission model and maps every source policy into it at ingestion.</li>
+    <li>Relationship-based control models structure well: one tuple per edge, inheritance by walking the graph, and denial by the absence of a path. Attributes, through conditions, handle limits such as expiry on a single edge.</li>
+    <li>A derived fact is readable only by someone who may read all its inputs. Carry field-level policy labels on each fact and Check each; allow declassification only through a named, recorded rule.</li>
+    <li>Pre-filter with ListObjects when the visible set is small and under the cap; for search and large sets, filter coarsely in the index and Check the top results exactly.</li>
+    <li>Permission sync must be faster than content sync and fail closed, and after a revocation reads should bypass caches.</li>
+    <li>Agents run as their caller and may only narrow access. Every answer records who asked, which ids came back and which checks passed.</li>
+  </ul>
+  <p>Permissions say who may see a fact now; the next chapter covers what must happen to every copy of a fact when access ends, a source is corrected or a person asks for erasure. → <a href="06-deletions-corrections-and-replay.html">Deletions, Corrections and Replay</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/" target="_blank" rel="noopener"><strong>Zanzibar: Google's Consistent, Global Authorization System</strong></a> — Pang et al., USENIX ATC 2019. Good for the tuple model, userset rewrites and the "new enemy" problem with its consistency answer.</li>
+    <li><a href="https://openfga.dev/docs/concepts" target="_blank" rel="noopener"><strong>OpenFGA concepts</strong></a> — OpenFGA documentation. Good for the exact definitions of type, relation, tuple, Check, ListObjects and contextual tuples.</li>
+    <li><a href="https://openfga.dev/docs/interacting/relationship-queries" target="_blank" rel="noopener"><strong>OpenFGA relationship queries</strong></a> — OpenFGA documentation. Good for ListObjects limits: the result cap, deadline and intended use.</li>
+    <li><a href="https://openfga.dev/docs/interacting/consistency" target="_blank" rel="noopener"><strong>OpenFGA consistency</strong></a> — OpenFGA documentation. Good for the cache and fresh-read trade-off after a permission change.</li>
+    <li><a href="https://openfga.dev/docs/modeling/conditions" target="_blank" rel="noopener"><strong>OpenFGA conditions</strong></a> — OpenFGA documentation. Good for attaching attribute checks, such as expiry, to a relationship.</li>
+    <li><a href="https://csrc.nist.gov/pubs/sp/800/162/upd2/final" target="_blank" rel="noopener"><strong>Guide to Attribute Based Access Control (ABAC) Definition and Considerations</strong></a> — NIST SP 800-162. Good for a standard definition of ABAC to set beside relationship-based control.</li>
+  </ul>
 </section>
 
 </main>
