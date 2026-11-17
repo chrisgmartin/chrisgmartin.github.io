@@ -26,7 +26,7 @@ window.FG = (function () {
       ['Tooling & the Modern Stack', 'becoming-a-data-platform-engineer/tooling-stack'], ['Capstone Labs', 'becoming-a-data-platform-engineer/capstone-labs'],
       ['Career & Getting the Job', 'becoming-a-data-platform-engineer/career'], ['Glossary & Cheat Sheets', 'becoming-a-data-platform-engineer/glossary'],
       { sub: 'Reference' },
-      ['Systems Design — GPU Marketplace', 'data-platform-systems-design'], ['ML Data Architecture', 'ml-data-architecture'], ['ML Data Architecture — Interview Prep', 'ml-data-architecture-interview-prep']] },
+      ['Systems Design — GPU Marketplace', 'data-platform-systems-design'], ['ML Data Architecture', 'ml-data-architecture'], ['Building an Operational Ontology', 'building-an-operational-ontology'], ['ML Data Architecture — Interview Prep', 'ml-data-architecture-interview-prep']] },
     { label: 'Data Science', name: 'Data Science', folder: 'data-science', guides: [
       ['Product & Analytics Data Science', 'product-analytics-ds'], ['Full-Stack & Applied Data Science', 'full-stack-applied-ds'],
       ['Data Science for Neoclouds', 'data-science-for-neoclouds'], ['Senior DS, Business Analytics — Prep', 'senior-ds-business-analytics-prep'],

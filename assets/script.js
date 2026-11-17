@@ -66,6 +66,7 @@
         { name: 'Glossary & Cheat Sheets', folder: 'glossary', group: DPE_CURRICULUM },
         { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' },
         { name: 'ML Data Architecture', folder: 'ml-data-architecture' },
+        { name: 'Building an Operational Ontology', folder: 'building-an-operational-ontology' },
         { name: 'ML Data Architecture — Interview Prep', folder: 'ml-data-architecture-interview-prep' }
       ]
     },
