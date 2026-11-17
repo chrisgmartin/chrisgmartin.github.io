@@ -19,7 +19,14 @@
   <button class="mobile-toc-toggle">☰ Contents</button>
   <nav>
     <h2>Sections</h2>
-    <a href="#overview">Overview</a>
+    <a href="#chain">From event to knowing</a>
+    <a href="#capture">Log, poll or dual write</a>
+    <a href="#time">Event time and late data</a>
+    <a href="#nolog">Sources with no log</a>
+    <a href="#idempotent">Idempotent ingestion</a>
+    <a href="#measure">Freshness as a number</a>
+    <a href="#tiers">GridDP's three tiers</a>
+    <a href="#delay">A four-day delay</a>
     <a href="#check">✓ Check yourself</a>
     <a href="#takeaway">Takeaway</a>
     <a href="#further-reading">Further reading</a>
@@ -39,9 +46,169 @@
   <p class="subtitle">Cutting the time from something happening to the platform knowing it: log-based CDC, event time against processing time, documents and conversations as change streams, freshness as a measured number.</p>
 </header>
 
-<section id="overview">
-  <h2>Overview</h2>
-  <p>DRAFT PENDING. This chapter has not been written yet.</p>
+<section id="chain">
+  <h2>The chain from event to knowing</h2>
+  <p>Freshness is the age of what the platform knows, and that age is the sum of every hop between something happening and a person or agent being able to read it. The previous chapter gave each server one identity. This one asks how quickly a change to that server, a late shipment or a failing DIMM, reaches the graph that carries the identity. Nothing here improves by working on the hop that is already fast, so start by writing the hops down.</p>
+  <p>Take one telemetry-derived fact at GridDP, with all numbers illustrative. A GPU metric is emitted every 10 seconds, ingested within 5, resolved to its server within 2, aggregated over a 60-second window, turned into a derived fact such as "server health" within 30, and visible in the search index after another 30.</p>
+  <div class="flow">event          source          capture       resolve        window         derive        index
+happens ─▶ emit  10 s ─▶ ingest 5 s ─▶ identity 2 s ─▶ aggregate 60 s ─▶ derive 30 s ─▶ visible 30 s
+                                                                                 = 137 s
+target for telemetry-derived facts: 300 s     slack: 163 s (54 %)</div>
+  <p>The sum is 10 + 5 + 2 + 60 + 30 + 30 = 137 seconds, which leaves 163 of the 300 seconds of the five-minute target. The window dominates: 60 seconds of the 137 are spent waiting for enough events to aggregate. Shaving the capture hop from 5 seconds to 1 gains almost nothing; shortening the window to 30 seconds gains 30. The lesson holds across the guide: measure each hop, then work on the largest one.</p>
+</section>
+
+<section id="capture">
+  <h2>Capturing changes: log, poll or dual write</h2>
+  <p>For a database you control, there are three ways to learn that a row changed, and they fail in different ways.</p>
+  <ul>
+    <li><strong>Polling</strong> queries the table on a schedule. It is simple and needs no special access. It adds half the interval on average, so a 5-minute poll adds about 2.5 minutes, and it cannot see changes that cancel out between polls or, without extra columns, hard deletes.</li>
+    <li><strong>Dual writes</strong> make the application write to the database and to a queue. They look cheap and fail quietly: if the process dies between the two writes, the two stores disagree and nothing records it.</li>
+    <li><strong>Log-based change data capture</strong> reads the database's own transaction log, so it sees what the database committed, in the order it committed it.</li>
+  </ul>
+  <p>Debezium's features page, for version 3.7 as of November 2026, states the contrast directly: "Unlike other approaches, such as polling or dual writes, log-based CDC as implemented by Debezium ensures that all data changes are captured," and it "produces change events with a very low delay while avoiding increased CPU usage required for frequent polling." Its PostgreSQL connector takes "a consistent snapshot of all schemas" first, then "continues streaming changes from the exact point at which the snapshot was made." For tables too large to snapshot in one go, incremental snapshots are available and can be "triggered at connector runtime"; the connector "sorts each table by primary key and then splits the table into chunks," and uses watermarks to track its progress.</p>
+  <p>Two cautions from Debezium's own FAQ shape the design downstream. Delivery is exactly once only when everything stops gracefully; after a crash the application "sees every event at least once," and the FAQ adds that duplicates "will always be visible to downstream consuming applications." Plan for repeats, which the section on idempotent ingestion does.</p>
+  <p>At GridDP, only the marketplace Postgres is a database the platform team can read the log of; the other eleven systems are SaaS products, files or people. So the recommendation is log-based capture for the one source where it applies, and polling or events for the rest. The curriculum covers the mechanics of <a href="../becoming-a-data-platform-engineer/the-de-craft/06-change-data-capture.html">change data capture</a> in detail, and the systems-design guide places it in the wider <a href="../data-platform-systems-design/04-ingestion-and-pipelines.html">ingestion design</a>. The recommendation flips for a small table that changes rarely, where a poll every few minutes is cheaper to run than a replication slot and a connector.</p>
+</section>
+
+<section id="time">
+  <h2>Event time, processing time and late data</h2>
+  <p>A shipment scan has two times. The Dataflow Model paper, published at VLDB in 2015, defines them: event time is "the time at which the event itself actually occurred," and processing time is "the time at which an event is observed at any given point during processing within the pipeline." Event time of an event "essentially never changes," while processing time "changes constantly for each event as it flows through the pipeline." Between them sits an inherent and changing skew.</p>
+  <p>The distinction is not academic for GridDP. A carrier scans the pallet on Tuesday at 09:00, and the platform learns of it at 10:00 because the poll runs hourly. A fact stamped with the processing time says Tuesday 10:00; a fact stamped with the event time says 09:00. Compute "how long was the pallet at the depot" from the first and the answer is wrong by the polling interval, and wrong differently every day. The platform therefore stores both on every event, and uses event time for questions about the world and processing time for questions about itself, such as freshness.</p>
+  <p>Late data is what makes the two diverge widely. Some events arrive hours after they happened, and the paper's argument is that waiting for completeness is the wrong aim: "we will never know if or when we have seen all of our data, only that new data will arrive." A watermark is the practical device. The paper describes it as "a lower bound (often heuristically established) on event times that have been processed by the pipeline," and notes that "most watermarks must be heuristically defined," so it is an estimate of completeness, not a guarantee.</p>
+  <p>Set the allowed lateness per source, not globally. Telemetry from a rack can sensibly wait a couple of minutes before a window closes. A vendor PDF is routinely a day old before anyone mails it, and a window that waits for it would hold every dependent fact for 24 hours. The recommendation is to close windows on the watermark for streams with a short tail, and to accept late events as restatements for slow sources, writing a corrected fact with its event time and noting what was believed before. <a href="04-provenance-history-and-evidence.html">Chapter 04</a> shows how history records that restatement. The exception is any fact that triggers an irreversible action: gate such actions on the watermark passing, not on the first event.</p>
+</section>
+
+<section id="nolog">
+  <h2>Sources with no log</h2>
+  <p>In this illustration, eleven of GridDP's twelve sources have no log to read. The honest design names the mechanism for each and the floor on its latency.</p>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr><th>Source</th><th>Mechanism</th><th>Event time comes from</th><th>Latency floor</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="term">Vendor order portals (emailed PDFs)</td><td>Mailbox watcher, text extraction, field parsing</td><td>The date inside the PDF, else the email's sent date</td><td>The vendor's send rhythm; treat as 24 hours</td></tr>
+      <tr><td class="term">Google Drive spreadsheets and plans</td><td>Poll for modified files, diff rows against the last version</td><td>The file's modified time, which is not the time the change was true</td><td>The poll interval</td></tr>
+      <tr><td class="term">Slack</td><td>Pushed events if the workspace allows them, else poll channel history with a cursor</td><td>Message timestamp</td><td>Seconds if pushed, the poll interval if not</td></tr>
+      <tr><td class="term">SaaS with webhooks (such as ticketing)</td><td>Webhook for speed, plus a reconciling poll</td><td>The record's own updated time</td><td>Seconds, with a poll as backstop</td></tr>
+      <tr><td class="term">SaaS without webhooks (such as ERP, carrier)</td><td>Poll with an updated-since cursor</td><td>The record's updated time</td><td>The poll interval</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Webhooks fail silently when the receiver is down or the sender drops them, so treat a webhook as an accelerator and the poll as the source of truth. If the poll finds a record the webhook never delivered, count it: a rising rate is a freshness incident forming, and the measurement section below picks it up.</p>
+  <p>A PDF deserves one more note. Extraction produces a fact whose confidence is lower than a database row's, because a parser read a table. Keep the page and the extracted span with the fact. A later chapter uses them as evidence, and without them a wrong parse is unfindable.</p>
+</section>
+
+<section id="idempotent">
+  <h2>Idempotent ingestion and ordering per key</h2>
+  <p>Duplicates, retries and late arrivals are normal, so ingestion has to give the same state whether an event arrives once, twice or after its successor. Three rules do it.</p>
+  <ol>
+    <li>Give every event a stable identity made from the source, the native key and the source's own position, such as a log offset or a record version. Never use arrival time.</li>
+    <li>Append the event to raw history once; a second copy with the same identity changes nothing.</li>
+    <li>Update current state only if the incoming position is higher than the stored one. A late, older event still enters history but cannot overwrite a newer state.</li>
+  </ol>
+  <div class="code-wrap">
+<div class="code-header"><span class="filename"><span class="dot"></span>ingest/apply.sql (sketch; the same logic ran in SQLite)</span><button class="copy-btn">Copy</button></div>
+<pre><code class="language-sql">insert into raw_event (source, native_key, source_pos, event_time, payload)
+values ($1, $2, $3, $4, $5)
+on conflict do nothing;                      -- redelivery: no second row
+
+insert into current_state (source, native_key, source_pos, payload)
+values ($1, $2, $3, $5)
+on conflict (source, native_key) do update
+  set source_pos = excluded.source_pos, payload = excluded.payload
+  where excluded.source_pos > current_state.source_pos;   -- older event: no overwrite</code></pre>
+  </div>
+  <p>Run on a carrier record, an event at position 2 is applied, the same event redelivered is dropped as a duplicate, and an older event at position 1 arriving afterwards lands in history and leaves the state at position 2. Ordering per key matters here and ordering across keys does not, so route every event for one native key to one partition and let different keys run in parallel. That gives a sequence for each shipment without a global order across 1,200 events a second. The caveat: this only works while the source's position is trustworthy. For a spreadsheet diff there is no position, so use the file version and the row content hash, and accept that two edits between polls look like one.</p>
+</section>
+
+<section id="measure">
+  <h2>Freshness as a measured number</h2>
+  <p>"Real time" is not a number and cannot be tested. The Google SRE Workbook defines a service-level indicator as "the number of good events divided by the total number of events," and its table of indicators for different components gives the pipeline one: freshness, "the proportion of the data that was updated more recently than some time threshold." That definition is what to implement, per source and per derived fact.</p>
+  <p>Take 4,800 Reserved GPUs, each with a telemetry-derived fact and a five-minute threshold. If 48 of them have not been updated in the last five minutes, the indicator reads 4,752 / 4,800 = 99.0%. The metric counts every fact, not every arrival. That choice is the important one. A source that goes silent produces no late events to count, so a measure built on the events that did arrive stays green while the data rots. Counting every fact against its age catches the silence.</p>
+  <p>A derived fact is no fresher than its stalest input. The "server at risk" fact reads from the carrier, Salesforce, NetBox, telemetry and possibly a vendor PDF. Its freshness bound is that of the slowest input it actually uses: 24 hours if the PDF is required, 1 hour if it is not. Store the input ages with the fact so the bound can be shown to the reader. The SLO, the target and its window, and the error budget around this indicator are the subject of <a href="09-operating-guarantees.html">chapter 09</a>.</p>
+</section>
+
+<section id="tiers">
+  <h2>GridDP's three tiers, with arithmetic</h2>
+  <p>At a peak of about 1,200 change events a second, GridDP's platform handles 1,200 × 86,400 = 103.68 million events a day, and in a five-minute window 1,200 × 300 = 360,000. Treating all of them at the fastest tier would be wasteful. Freshness costs money, so the platform buys it only where a decision needs it.</p>
+  <ul>
+    <li><strong>Five minutes, telemetry-derived facts.</strong> A failing GPU or a rack going dark matters now. This tier needs streaming, windowing and an index refresh inside the 163 seconds of slack computed above.</li>
+    <li><strong>One hour, ERP and ticketing.</strong> Purchase orders, incidents, commitments and shipments change on human timescales. A poll every 15 minutes leaves 45 minutes of budget for the rest of the chain.</li>
+    <li><strong>Twenty-four hours, documents and Slack.</strong> 30,000 documents refreshed over a day is 1,250 an hour, about one every three seconds, which a batch job handles easily. A faster tier would cost more and change no decision.</li>
+  </ul>
+  <p>The recommendation flips per source when a decision moves. If Slack becomes the place where site operators declare an outage, the Slack tier for that channel rises, and the cost of reading it faster is justified for that channel only. The curriculum's <a href="../becoming-a-data-platform-engineer/the-de-craft/09-streaming-fundamentals.html">streaming fundamentals</a> chapter covers the windowing and state that the five-minute tier needs.</p>
+</section>
+
+<section id="delay">
+  <h2>A four-day delay, propagating</h2>
+  <p>Return to <code>GD-7F21</code>. Shipment 1Z-…-88 slips four days, which is 96 hours. How soon the platform knows depends on which source reports it.</p>
+  <div class="flow">carrier scan, Tue 09:00 (event time)
+   ├─ poll hourly ─▶ known by Tue 10:00 at worst                      1 h   =  1 % of the 96 h
+   └─ vendor PDF, mailed next day ─▶ known by Wed 09:00 at worst     24 h   = 25 % of the 96 h
+
+then, either way:
+   shipment ─▶ identity (chapter 02) ─▶ server GD-7F21 ─▶ expected at Reno: +4 days
+            ─▶ derived fact "late" updated within the 5-minute tier
+            ─▶ commitment slack recomputed (chapter 08)</div>
+  <p>The carrier path spends about 1% of the delay before the platform knows; the PDF path spends 25%. That difference is the whole argument for polling the carrier hourly and for treating the vendor's mail as confirmation, not as the first signal. When both disagree, the fresher source wins on the date and the older one is kept as a candidate fact, as the survivorship rule in <a href="02-entity-identity-and-resolution.html#survivorship">chapter 02</a> prescribes.</p>
+  <p>Note what propagates and what does not. The platform's event is the change to a date on one server, and everything downstream of that date is recomputed from it: the "late" flag, the slack against the November promise, the ranking of at-risk servers. The delay does not travel as a message to people. It travels as a fact, and the people and agents who ask the two recurring questions see it because the graph changed, not because someone remembered to tell them.</p>
+</section>
+
+<section id="check">
+  <h2>✓ Check yourself</h2>
+  <p>Answer from memory before opening each one.</p>
+  <ol>
+    <li>
+      <p>A latency budget for a telemetry fact sums to 137 s against a 300 s target. An engineer proposes cutting ingest from 5 s to 1 s. What is wrong with spending effort there, and what would you change first?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>The ingest hop is 4 s of a 137 s chain, so the saving is under 3%. The 60 s aggregation window is the largest hop, so shorten it first if freshness is the problem, or accept the slack if it is not. See <a href="#chain">the chain</a>.</p></div></details>
+    </li>
+    <li>
+      <p>The team proposes dual writes from the marketplace application to Postgres and to a queue, because log-based CDC "needs a connector". What failure does the proposal accept, and when is a poll the better choice than either?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A crash between the two writes leaves the stores disagreeing with no record of it. A poll is better for a small, slow-changing table where its delay is within the tier and a connector and replication slot cost more to run. See <a href="#capture">capturing changes</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A carrier event happened at 09:00 and was ingested at 10:00. Which timestamp do you use to compute how long a pallet sat at a depot, which for how stale the platform's knowledge is, and why does storing only one fail?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Event time for the depot duration, processing time for staleness. With only processing time, the duration is wrong by the poll interval and by a different amount each day. See <a href="#time">event time and processing time</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A carrier record at position 2 arrives, then the same record again, then an older record at position 1. What are the final contents of raw history and of current state, and why?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>History holds positions 1 and 2, once each; current state holds position 2. The duplicate is dropped on its identity and the older event cannot overwrite a higher position. See <a href="#idempotent">idempotent ingestion</a>.</p></div></details>
+    </li>
+    <li>
+      <p>A freshness dashboard built from the events that arrived shows 100% green for the PagerDuty source, yet nobody has been paged in a week during an outage. What did the measure miss, and how would you rebuild it?</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>A silent source produces no late events, so a measure over arrivals stays green. Count every expected fact against its age, as the SRE Workbook's proportion of data updated within a threshold, so silence lowers the number. See <a href="#measure">freshness as a measured number</a>.</p></div></details>
+    </li>
+    <li>
+      <p>Finance asks that every source run at the five-minute tier "to be safe". Argue the cost, and name the condition under which you would raise one source's tier.</p>
+      <details class="reveal"><summary>Show answer</summary><div class="reveal-body"><p>Faster tiers cost streaming, state and index work for no change in any decision at sources like documents, at about 1,250 per hour. Raise a source when a decision depends on it, such as a Slack channel where outages are declared. See <a href="#tiers">the three tiers</a>.</p></div></details>
+    </li>
+  </ol>
+</section>
+
+<section id="takeaway">
+  <h2>Takeaway</h2>
+  <ul>
+    <li>Freshness is the sum of every hop from event to readable fact, so write the hops down, measure each one and work on the largest.</li>
+    <li>Log-based CDC captures all committed changes with low delay, but it applies only to a database you can read the log of, and its delivery can repeat after a failure.</li>
+    <li>Store event time and processing time on every event: the first answers questions about the world, the second questions about the platform's own lag.</li>
+    <li>Set allowed lateness per source, and accept late events from slow sources as restatements instead of holding every dependent fact.</li>
+    <li>Idempotent ingestion identifies events by source and position, appends history once and advances current state only on a higher position, with one partition per native key.</li>
+    <li>Freshness is the proportion of data updated within a threshold, counted over every expected fact, so a silent source lowers the number instead of hiding.</li>
+    <li>The three tiers of five minutes, one hour and 24 hours buy speed only where a decision needs it, and which source reports a delay decides how much of it passes before anyone knows.</li>
+  </ul>
+  <p>Knowing quickly is not the same as being able to say where a fact came from and what was believed when, which is the job of the next chapter. → <a href="04-provenance-history-and-evidence.html">Provenance, History and Evidence</a></p>
+</section>
+
+<section id="further-reading">
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href="https://debezium.io/documentation/reference/stable/features.html" target="_blank" rel="noopener"><strong>Debezium features</strong></a> — Debezium documentation, version 3.7. Good for what log-based CDC captures and how it differs from polling and dual writes.</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html" target="_blank" rel="noopener"><strong>Debezium connector for PostgreSQL</strong></a> — Debezium documentation, version 3.7. Good for snapshots, incremental snapshots and the chunk and watermark mechanism.</li>
+    <li><a href="https://debezium.io/documentation/faq/" target="_blank" rel="noopener"><strong>Debezium FAQ</strong></a> — Debezium documentation. Good for exactly-once and at-least-once behaviour and why consumers must tolerate duplicates.</li>
+    <li><a href="https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/" target="_blank" rel="noopener"><strong>The Dataflow Model</strong></a> — Akidau et al., Proceedings of the VLDB Endowment 8, 2015. Good for event time, processing time, watermarks and late data.</li>
+    <li><a href="https://sre.google/workbook/implementing-slos/" target="_blank" rel="noopener"><strong>Implementing SLOs</strong></a> — Google, The Site Reliability Workbook. Good for the SLI definition and the freshness indicator for pipelines.</li>
+  </ul>
 </section>
 
 </main>
