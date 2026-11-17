@@ -592,7 +592,17 @@
     d.note(30,200,'founded by a teenager · bootstrapped · recent funding',{size:10.5});
     d.note(30,262,'same shape as Vast, different bet on supply quality');
   };
-  B['neocloud/fluidstack']=function(d){
+  B['data-platform/building-an-operational-ontology']=function(d){
+    d.title('One identity, every fact with its source');
+    var s1=d.box(16,60,72,34,'ERP',{size:10.5}),s2=d.box(16,104,72,34,'tickets',{size:10.5}),s3=d.box(16,148,72,34,'telemetry',{size:10.5}),s4=d.box(16,192,72,34,'PDFs, chat',{size:10.5});
+    var id=d.round(140,100,110,70,'GD-7F21\none object',{size:11,wash:1});
+    d.connect(s1,id);d.connect(s2,id);d.connect(s3,id);d.connect(s4,id);
+    var q=d.box(292,96,92,78,'answer:\nfact + source\n+ freshness\n+ permission',{size:10});d.connect(id,q);
+    d.text(216,88,'who may see it?',{size:10});d.text(216,196,'when did we know?',{size:10});
+    d.note(48,262,'fresh, traceable, permissioned: or it is a warehouse',{size:11});d.ring(22,246,364,34,{red:1});
+  };
+  
+B['neocloud/fluidstack']=function(d){
     d.title('Build the hall, borrow the credit');
     var p=d.box(24,64,96,44,'power +\nsite',{size:11}),b=d.box(152,64,96,44,'build\n(6 months?)',{size:11,wash:1}),o=d.box(280,64,96,44,'operate\ncustomer chips',{size:11});
     d.connect(p,b);d.connect(b,o);
