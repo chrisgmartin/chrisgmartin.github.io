@@ -98,6 +98,7 @@
         { name: 'RunPod', folder: 'runpod' },
         { name: 'CoreWeave', folder: 'coreweave' },
         { name: 'Crusoe', folder: 'crusoe' },
+        { name: 'Fluidstack', folder: 'fluidstack' },
         { name: 'Together.AI', folder: 'together-ai' },
         { name: 'Lambda', folder: 'lambda' },
         { name: 'Hyperbolic', folder: 'hyperbolic' },
@@ -511,11 +512,11 @@
     const root = getRootPrefix();
     if (!document.querySelector('link[href*="assets/nav.css"]')) {
       const css = document.createElement('link');
-      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=24';
+      css.rel = 'stylesheet'; css.href = root + 'assets/nav.css?v=25';
       document.head.appendChild(css);
       const fonts = document.createElement('link');
       fonts.rel = 'stylesheet';
-      fonts.href = root + 'assets/fonts.css?v=24';   // self-hosted (assets/fonts/); no third-party font origin
+      fonts.href = root + 'assets/fonts.css?v=25';   // self-hosted (assets/fonts/); no third-party font origin
       document.head.appendChild(fonts);
     }
     // Derive the guide path ('topic/[group/]guide') and current chapter file from the URL.
@@ -525,7 +526,7 @@
     if (current && /^index\.html?$/i.test(current)) current = null;
     let guidePath = parts.length >= 2 ? parts.join('/') : null;
     const s = document.createElement('script');
-    s.src = root + 'assets/nav.js?v=24';
+    s.src = root + 'assets/nav.js?v=25';
     s.onload = () => {
       if (!window.FG) return;
       // Clean-URL hosts (Cloudflare Pages) serve chapters without ".html". If the path isn't a
