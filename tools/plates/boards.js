@@ -593,13 +593,13 @@
     d.note(30,262,'same shape as Vast, different bet on supply quality');
   };
   B['data-platform/building-an-operational-ontology']=function(d){
-    d.title('One identity, every fact with its source');
-    var s1=d.box(16,60,72,34,'ERP',{size:10.5}),s2=d.box(16,104,72,34,'tickets',{size:10.5}),s3=d.box(16,148,72,34,'telemetry',{size:10.5}),s4=d.box(16,192,72,34,'PDFs, chat',{size:10.5});
-    var id=d.round(140,100,110,70,'GD-7F21\none object',{size:11,wash:1});
-    d.connect(s1,id);d.connect(s2,id);d.connect(s3,id);d.connect(s4,id);
-    var q=d.box(292,96,92,78,'answer:\nfact + source\n+ freshness\n+ permission',{size:10});d.connect(id,q);
-    d.text(216,88,'who may see it?',{size:10});d.text(216,196,'when did we know?',{size:10});
-    d.note(48,262,'fresh, traceable, permissioned: or it is a warehouse',{size:11});d.ring(22,246,364,34,{red:1});
+    d.title('Name the things, then the links, then who may act');
+    var c=d.box(20,56,92,36,'Commitment',{size:10}),po=d.box(154,56,92,36,'PO line',{size:10}),sh=d.box(288,56,92,36,'Shipment',{size:10});
+    var r=d.box(20,136,92,36,'Rack',{size:10}),sv=d.round(140,126,120,56,'Server\nGD-7F21',{size:11,wash:1}),inc=d.box(288,136,92,36,'Incident',{size:10});
+    d.connect(po,sh);d.connect(c,sv);d.connect(po,sv);d.connect(sh,sv);d.connect(r,sv);d.connect(inc,sv);
+    d.text(200,48,'one object per real thing',{size:10});
+    d.arrow(200,182,200,222,{red:1});d.text(262,206,'RaiseRMA (an action)',{size:10});
+    d.note(52,262,'each fact: source + time + who may see it',{size:11});d.ring(28,246,336,34,{red:1});
   };
   
 B['neocloud/fluidstack']=function(d){
