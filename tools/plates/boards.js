@@ -602,6 +602,17 @@
     d.note(52,262,'each fact: source + time + who may see it',{size:11});d.ring(28,246,336,34,{red:1});
   };
   
+B['data-platform/ooda-loops-case-study-prep']=function(d){
+    d.title('What is, what should be, and the gap between');
+    var c=d.box(20,70,120,56,'current state\nfacts + sources',{size:10.5}),w=d.box(260,70,120,56,'intended state\nnumber + date',{size:10.5,wash:1});
+    var g=d.box(150,160,100,44,'the gap\ncause each',{size:10.5});
+    d.connect(c,g);d.connect(g,w);
+    d.text(200,56,'observe',{size:10});d.text(112,150,'orient',{size:10});d.text(290,150,'decide',{size:10});
+    d.arrow(200,204,200,236,{red:1});d.text(262,224,'act, then look again',{size:10});
+    d.route([[320,126],[320,250],[80,250],[80,126]],{dash:1});
+    d.note(44,286,'the loop: last column of the plan is the next first column',{size:10});
+  };
+  
 B['neocloud/fluidstack']=function(d){
     d.title('Build the hall, borrow the credit');
     var p=d.box(24,64,96,44,'power +\nsite',{size:11}),b=d.box(152,64,96,44,'build\n(6 months?)',{size:11,wash:1}),o=d.box(280,64,96,44,'operate\ncustomer chips',{size:11});

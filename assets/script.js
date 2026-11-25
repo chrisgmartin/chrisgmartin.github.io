@@ -67,7 +67,8 @@
         { name: 'Data Platform Systems Design — GPU Marketplace', folder: 'data-platform-systems-design' },
         { name: 'ML Data Architecture', folder: 'ml-data-architecture' },
         { name: 'Building an Operational Ontology', folder: 'building-an-operational-ontology' },
-        { name: 'ML Data Architecture — Interview Prep', folder: 'ml-data-architecture-interview-prep' }
+        { name: 'ML Data Architecture — Interview Prep', folder: 'ml-data-architecture-interview-prep' },
+        { name: 'OODA Loops — Case Study Prep', folder: 'ooda-loops-case-study-prep' }
       ]
     },
     {
